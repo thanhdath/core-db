@@ -1,0 +1,51 @@
+{
+ "db": "store_1",
+ "operator_io_quirks": [
+  "All table/column names are lowercase ASCII; no spaces or mixed case, so quoting is trivial but still required for reserved-ish names (e.g. 'title', 'name').",
+  "employees.reports_to is a SELF-FK to employees.id; process_order must ignore the table self-edge and the child column must draw from the parent's FINAL filtered id list (upstream draws before PK filter only for same-table self-FK).",
+  "playlist_tracks has a COMPOSITE PK (playlist_id, track_id) declared via CONSTRAINT PK_PlaylistTrack; both members are also FKs to playlists.id and tracks.id, so composite-PK-member max_l0=30 applies and PK-duplicate dropping must use the tuple.",
+  "playlist_tracks also has a redundant UNIQUE INDEX index_playlist_track_on_id on (playlist_id, track_id) \u2014 same tuple as PK; drop_unique_duplicates on single unique columns must not treat this as a single-column unique.",
+  "Every table has an AUTOINCREMENT INTEGER PRIMARY KEY id plus a redundant CREATE UNIQUE INDEX index_<t>_on_id ON <t>(id); the line-based 'unique' scan will mark id unique twice \u2014 harmless superset, but record it.",
+  "birth_date/hire_date/invoice_date are declared TIMESTAMP but stored as TEXT 'YYYY-MM-DD HH:MM:SS' (space-separated, zero-padded, midnight time). TS dispatches to Date (first element not int-parsable) with template %Y-%m-%d %H:%M:%S; the '00:00:00' time part is constant in the original.",
+  "NUMERIC(10,2) columns (invoices.total, tracks.unit_price, invoice_lines.unit_price) store REAL (e.g. 1.98, 0.99); TS Number(scale=2, precision=10) will emit floats in [-100,100] and perturb by \u00b10.01/\u00b10.02 \u2014 declared type and storage class agree on 'numeric' but not on integer-ness.",
+  "INTEGER columns store integer storage class throughout; no column has a storage class contradicting its declared type (no text-in-INTEGER, no int-in-VARCHAR).",
+  "tracks.bytes and tracks.milliseconds are large INTEGERs (up to ~1.1e8); Number(scale=4) full range is [-10^4,10^4] so TS fresh draws are far below the original magnitudes \u2014 list range [min(el), 10^4] quirk applies.",
+  "invoice_lines.quantity has distinct=1 (all 1); TS Number will still perturb by \u00b11/\u00b12 and draw fresh values, so quantity will not stay 1.",
+  "tracks.unit_price and invoice_lines.unit_price have distinct=2 (0.99, 1.99); TS Number list range [0.99, 100] (min(el), MAX) \u2014 the overwrite quirk means fresh draws can exceed 1.99.",
+  "customers.company (null_rate 0.83), customers.fax (0.80), customers.state (0.49), invoices.billing_state (0.49), tracks.composer (0.28) are heavily NULL; TS String sampler drops None elements and never emits NULL, so these columns will be non-NULL in generated units.",
+  "customers.first_name/last_name/address/city contain non-ASCII (Lu\u00eds, K\u00f6hler, S\u00e3o Jos\u00e9 dos Campos, Stra\u00dfe); TS String CHARSET is a-zA-Z 0-9() so generated values are ASCII-only \u2014 no encoding issue but a distribution shift."
+ ],
+ "operator_ts_expectations": [
+  "Date fuzzer on birth_date/hire_date/invoice_date: template %Y-%m-%d %H:%M:%S (first parsable element), range = [min,max] of parsed originals (e.g. 1947..2003 for employees, 2007 for invoices); fresh draws uniform in that range, formatted with the template \u2014 plausible dates, but time always 00:00:00.",
+  "String fuzzer on name/title/company/address/city/state/country/postal_code/phone/fax/email: random strings over a-zA-Z 0-9() of length in [min len, max len+1] of the 5 sampled originals, with 50% contaminate (suffix/prefix/around/drop-first/drop-last) \u2014 implausible emails, phones, postal codes; drives FN on LIKE/format predicates.",
+  "Number fuzzer on id/artist_id/customer_id/support_rep_id/reports_to/album_id/media_type_id/genre_id/track_id/invoice_id/playlist_id/milliseconds/bytes/quantity: full range [-10^scale,10^scale] (scale=4 for INTEGER, scale=2 for NUMERIC(10,2)); fresh draws are tiny vs. original magnitudes for bytes/milliseconds, and \u00b11/\u00b12 perturbation on quantity breaks the all-1 invariant.",
+  "Number on NUMERIC(10,2) total/unit_price: scale=2, precision=10, is_int=False; fresh draws uniform in [-100,100] with \u00b10.01/\u00b10.02 perturbation \u2014 plausible magnitude but not the 0.99/1.99 grid; drives FN on unit_price=0.99/1.99 equality and FP on total ranges.",
+  "FK columns (albums.artist_id, tracks.album_id/media_type_id/genre_id, invoices.customer_id, invoice_lines.invoice_id/track_id, playlist_tracks.playlist_id/track_id, customers.support_rep_id, employees.reports_to) draw from the parent's FINAL filtered PK list with replacement \u2014 referential integrity holds, but the parent PK list is itself TS-generated (small, e.g. 1..N) so FK values are small integers, not the original 1..3503 spread.",
+  "Self-FK employees.reports_to: parent employees.id is generated first (same table), then reports_to draws from the filtered id list; with 8 original rows and TS size ~30-2500, reports_to will be a small subset of generated ids \u2014 plausible but the 12.5% NULL rate is lost (TS never emits NULL).",
+  "PK/unique filtering: sample_fresh_primary_keys drops duplicate id tuples (first kept), drop_unique_duplicates drops rows repeating any single unique column \u2014 with AUTOINCREMENT id and Number sampler, id collisions are rare but possible; playlist_tracks composite PK (playlist_id,track_id) will be deduped, shrinking the table below the chosen size.",
+  "NOT NULL columns (albums.title, albums.artist_id, employees.last_name/first_name, customers.first_name/last_name/email, invoices.customer_id/invoice_date/total, tracks.name/media_type_id/milliseconds/unit_price, invoice_lines.*, playlist_tracks.*) are not enforced in Python; String sampler never emits NULL so NOT NULL text is safe, but Number sampler can emit NULL only via empty parent FK (not here) \u2014 rows should mostly insert.",
+  "CHECK constraints: none in this DDL; the line-based 'checked' scan finds no 'check (' so p=0 (no fresh draws) never triggers \u2014 all columns use the default p=0.2 (or 0 for the whole instance w.p. 0.3).",
+  "Known misses driven by implausible values: emails/phones/postal codes/addresses are random strings (FN on LIKE '%@%', format predicates); dates have constant 00:00:00 time (FN on time-of-day predicates, though none in this DB); unit_price not on 0.99/1.99 grid (FN on equality, FP on BETWEEN ranges); quantity not 1 (FN on quantity=1).",
+  "Known misses driven by missing ties/duplicates: original has duplicate artist_id (204 distinct over 347 albums), duplicate track_id in invoice_lines (1984 distinct over 2240), duplicate playlist_id in playlist_tracks (14 distinct over 8715) \u2014 TS FK draws with replacement preserve some duplication but the parent PK list is small, so join cardinalities differ; GROUP BY/HAVING counts will differ (FP/FN).",
+  "playlists.name has 14 distinct over 18 rows (duplicates); TS String sampler draws from 5 sampled originals + literal pool, so duplicates are likely but the exact multiset differs \u2014 GROUP BY name counts will differ."
+ ],
+ "challenger_refs": [
+  "g75ac0924",
+  "gd84e90c8",
+  "g20f3fb08",
+  "g23939be6",
+  "g0a86846d",
+  "g25b62a8f",
+  "g80b73d68",
+  "g59557e60",
+  "g413815db",
+  "g4e4dcf88"
+ ],
+ "challenger_cases_file": "reviewer_cases.json",
+ "consumed_by": {
+  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
+  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ },
+ "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
+ "package_sha": "39d508cfb2e98d15"
+}

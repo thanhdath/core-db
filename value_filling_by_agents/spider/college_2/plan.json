@@ -1,0 +1,49 @@
+{
+ "db": "college_2",
+ "operator_io_quirks": [
+  "All identifiers lowercase, no spaces; but DDL uses backticks around `department` in course FK and commented-out FK lines \u2014 sqlparse/pragma must tolerate backticks and `--` comments inside CREATE TABLE.",
+  "Composite FKs: section(building,room_number)->classroom(building,room_number) and teaches/takes(course_id,sec_id,semester,year)->section(...) \u2014 pragma foreign_key_list returns them as separate single-column rows (id groups), so read_schema must group by fk id to recover the composite edge.",
+  "teaches/takes have 5-column composite PKs; each FK column is also a PK member \u2014 fill_foreign_keys_consistently must draw each column independently from the parent's final column, not as a tuple, or PK dedup will collapse rows.",
+  "advisor.s_ID is PK and FK to student.ID; advisor.i_ID FK to instructor.ID \u2014 parent PK is single-column, fine, but advisor has 2000 rows = student count, so s_ID is effectively a 1:1 copy of student.ID.",
+  "prereq has two FKs both to course.course_id (course_id and prereq_id) \u2014 self-ish reference to same parent table, two distinct child columns; process_order must not treat as cycle.",
+  "section.year numeric(4,0) but values 2001-2010; check (year>1701 and year<2100) \u2014 Number fuzzer with scale=4 will produce values in [-10^4,10^4] mostly failing the CHECK, rows dropped at insert.",
+  "time_slot.start_hr/start_min/end_hr/end_min numeric(2) with CHECK 0<=x<24 / <60 \u2014 Number scale=2 gives [-100,100], most rows fail CHECK.",
+  "department.budget numeric(12,2) check(budget>0); instructor.salary numeric(8,2) check(salary>29000) \u2014 Number fuzzer range [-10^12,10^12] / [-10^8,10^8] mostly violates; salary>29000 rarely met.",
+  "course.credits numeric(2,0) check(credits>0) with only 2 distinct values (3,4); student.tot_cred numeric(3,0) check(>=0) 130 distinct \u2014 Number fuzzer will scatter widely, CHECK drops many.",
+  "section.semester varchar(6) check(semester in ('Fall','Winter','Spring','Summer')) \u2014 String fuzzer produces random strings, CHECK drops most rows; only 2 distinct in original (Fall,Spring).",
+  "takes.grade varchar(2) samples include 'A ' (trailing space) and 'C-','B+' \u2014 String fuzzer with length range [0,2] will produce 1-2 char strings, some matching, many not.",
+  "All declared types are varchar/numeric; no date/time/bool/bit/year types \u2014 no Date/Time/Bool fuzzer dispatch, no crash-fallback columns; storage classes match declared (text/integer/real)."
+ ],
+ "operator_ts_expectations": [
+  "String fuzzer (length from varchar(n) arg, default 20) for all varchar columns: building, room_number, dept_name, course_id, title, name, ID, sec_id, semester, time_slot_id, day, grade \u2014 random a-zA-Z0-9() strings, so joins on these keys mostly fail to match across tables unless FK fill copies parent values.",
+  "Number fuzzer for numeric(p,s): scale=s, precision=p; capacity numeric(4,0)->[-10^4,10^4] ints; budget numeric(12,2)->[-10^12,10^12] floats; salary numeric(8,2)->[-10^8,10^8]; year numeric(4,0)->[-10^4,10^4] \u2014 CHECK constraints (budget>0, salary>29000, year 1701-2100, credits>0, tot_cred>=0, start_hr<24 etc.) reject most rows at insert, so tables end up much smaller than chosen size.",
+  "FK fill copies parent column values with replacement, so section.course_id matches course.course_id, teaches/takes.course_id matches section.course_id \u2014 but composite FK columns drawn independently means (course_id,sec_id,semester,year) tuples in teaches/takes rarely exist in section, so joins on full composite key return few/no rows.",
+  "advisor.s_ID drawn from student.ID (2000 values) with replacement then PK-deduped -> ~2000 rows but many duplicates dropped; advisor.i_ID from instructor.ID (50 values) -> heavy repetition, so 'students advised by instructor X' counts inflated.",
+  "section.semester String fuzzer produces random strings failing CHECK -> most section rows dropped; surviving rows have semester from literal pool (Fall/Spring) only if pool seeded, else random 6-char strings that fail CHECK -> section may end up near-empty, cascading to teaches/takes FK fill giving NULLs.",
+  "String fuzzer contaminate (0.5 prob) adds/drops chars, so course_id '101' may become '101x' or '10' \u2014 breaks equality joins with section.course_id even when FK fill intended a match (FK fill uses parent's final values so this is consistent, but literal-pool values in WHERE clauses won't match).",
+  "Number fuzzer perturb (+-1,+-2 for int; +-0.01,+-0.02 for float) applied after sampling, so year 2009 may become 2011 or 2007 \u2014 still in CHECK range sometimes, but budget/salary perturbed values often cross the CHECK boundary.",
+  "Literal pool from train SQL: values like 'Fall','Spring','A','B','C','D','F','M','W','R','T','1','2','3','A-','B+','C-' get injected into String samplers, so semester/day/grade/sec_id may match original domain \u2014 this is the main source of plausible values.",
+  "Known FN driver: CHECK constraints silently drop rows, so tables like section, time_slot, department, instructor, course, student end up with far fewer rows than chosen size; queries counting these tables get implausibly small results, and joins through dropped rows return empty.",
+  "Known FP driver: FK fill with replacement creates many-to-one duplicates (e.g. many takes rows share same (course_id,sec_id,semester,year) but different ID), so COUNT(DISTINCT ID) vs COUNT(*) distinctions may be preserved but ties/duplicates in non-key columns (dept_name, building) are over-represented vs original.",
+  "No Date/Time/Bool/Year fuzzer dispatch and no crash-fallback columns on this DB \u2014 TS behaviour is purely String+Number, so date/time-specific misses do not apply here."
+ ],
+ "challenger_refs": [
+  "G13",
+  "G7",
+  "G4",
+  "G3",
+  "G2",
+  "G6",
+  "G8",
+  "G5",
+  "G1",
+  "G14"
+ ],
+ "challenger_cases_file": "reviewer_cases.json",
+ "consumed_by": {
+  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
+  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ },
+ "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
+ "package_sha": "277556861949c7da"
+}

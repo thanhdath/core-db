@@ -1,0 +1,50 @@
+{
+ "db": "retail_complains",
+ "operator_io_quirks": [
+  "Mixed-case + spaced identifiers: 'Date received', 'Complaint ID', 'rand client', 'vru+line', 'Sub-product', 'Consumer consent provided?', 'Timely response?', 'Consumer disputed?', 'Date sent to company', 'Company response to consumer', 'Consumer complaint narrative', 'Sub-issue', 'Client_ID' \u2014 must be double-quoted; '?' and '+' and spaces inside names.",
+  "Table 'state' has column 'State' and 'Region'; client has column 'state' (TEXT abbrev) and 'district_id' FK; district has 'state_abbrev' FK to state.StateCode \u2014 column name 'state' collides with table name 'state'.",
+  "DATE-declared columns store TEXT 'YYYY-MM-DD' (callcenterlogs.'Date received', events.'Date received', reviews.'Date'): ts_fuzzer dispatch = Date|Number(int elements) \u2014 first element parses as int? '2017-03-27' does NOT parse as int, so Date fuzzer with template %Y-%m-%d.",
+  "events.'Date sent to company' is declared TEXT but stores 'YYYY-MM-DD' dates \u2014 String fuzzer, not Date; text-stored dates in a TEXT column.",
+  "callcenterlogs.ser_start/ser_exit/ser_time are TEXT storing 'HH:MM:SS' \u2014 String fuzzer, not Time (declared type is TEXT not TIME).",
+  "callcenterlogs.'Complaint ID' is PK but null_rate 0.374 and distinct 2504 < rows 3999 \u2014 PK column contains NULLs and duplicates in the original (SQLite allows NULL in TEXT PK).",
+  "events PK is composite ('Complaint ID','Client_ID'); events.'Complaint ID' FK -> callcenterlogs.'Complaint ID' (parent PK has NULLs/dups), events.Client_ID FK -> client.client_id.",
+  "reviews PK is 'Date' (DATE-declared, text-stored) \u2014 Date fuzzer must produce unique dates or PK-duplicate rows get dropped; only 377 rows.",
+  "events.'Sub-issue' is 100% NULL (distinct 0, no samples) \u2014 String sampler gets empty element list, p:=1, all fresh random strings.",
+  "client.address_2 null_rate 0.985 (24 distinct); events.'Consumer complaint narrative' 0.809; reviews.Reviews 0.881; Tags 0.86 \u2014 heavy NULL columns.",
+  "No NOT NULL constraints anywhere (notnull=0 on every column) \u2014 TS will not enforce; NULLs appear via element dropout / FK empty-parent.",
+  "FK chain: state <- district <- client <- callcenterlogs/events/reviews; events also -> callcenterlogs. Topological levels: state(0), district(1), client(2), callcenterlogs(3), events(4), reviews(3)."
+ ],
+ "operator_ts_expectations": [
+  "Date fuzzer on 'Date received'/'Date' with template %Y-%m-%d: parses samples, range ~[2012,2017], generates plausible dates \u2014 good for date-range predicates; but strips leading zeros quirk may emit '2017-3-7' style if no element starts with 0 or contains '-0' (here elements like '2017-03-27' start with '2', so leading-zero strip triggers -> '2017-3-27' format drift).",
+  "String fuzzer on phonefinal/phone/social/email/address_1: random CHARSET strings + contaminate \u2014 implausible values (e.g. 'aB3()x') drive FN on LIKE '%@%' / phone-pattern predicates.",
+  "String fuzzer on low-cardinality enums (sex 2, outcome 3, type 6, priority 3, Stars 3, Product 2-3, 'Timely response?' 2, 'Consumer disputed?' 2, Region 4, division 9): fresh random strings dominate -> equality/IN predicates on these enums almost never match -> FN.",
+  "Number fuzzer on priority (0,1,2), Stars (1,2,5), day/month/year/age/zipcode: full-range uniform [-10^scale,10^scale] with scale=0 -> [-1,1] for INTEGER? scale from type args absent -> scale=0, range [-1,1] \u2014 priority/Stars values outside {0,1,2}/{1,2,5} -> FN on priority=2, Stars=5.",
+  "Number fuzzer on year (1960-1990) and age: scale=0 range [-1,1] unless list range from elements used \u2014 list_max quirk (min(el), full max) means upper end overwritten to 1, so year/age mostly in [-1,1] -> implausible ages/years -> FN on age>50, year=1990.",
+  "Number fuzzer on district_id (1..77), call_id (34536..): scale=0 -> [-1,1] plus element perturbation +-1/+-2 \u2014 district_id FK values drawn from parent's generated district_id (also [-1,1]-ish) so joins still work but district_id=65 predicates miss.",
+  "String fuzzer on client_id 'C00000001' / Complaint ID 'CR0000072': int-like suffix handling adds str(i+1)/str(i-1) only for pure int-like strings; 'C00000001' is not int-like -> random strings, breaking FK join plausibility and 'C%' LIKE predicates -> FN.",
+  "FK fill: events.Client_ID drawn from client.client_id final values; events.'Complaint ID' from callcenterlogs.'Complaint ID' final (after PK dedup) \u2014 but callcenterlogs PK has NULLs in original, TS drops PK-duplicate rows so parent may be smaller; child draws with replacement -> duplicates in child, fine for composite PK only if pair unique.",
+  "reviews PK 'Date' unique: Date fuzzer with max_l0=inf (single-col PK) generates fresh dates; PK dedup drops collisions; 377 rows target but Date range ~[2013,2013] narrow -> many PK collisions dropped -> reviews may end up tiny -> FN on reviews joins.",
+  "callcenterlogs.'Complaint ID' PK with NULLs: TS String sampler may emit NULL (element dropout 0.9 keeps NULLs? base drops None) \u2014 PK dedup keeps first; NULL PK rows survive in SQLite -> join to events on 'Complaint ID' loses NULL matches.",
+  "Empty 'Sub-issue' (all NULL): String sampler with no elements -> p=1, all fresh random strings -> any predicate on Sub-issue IS NULL fails (no NULLs generated) -> FN; conversely IS NOT NULL always true.",
+  "No NOT NULL: TS freely emits NULLs in FK columns when parent empty or element dropout -> joins silently drop rows -> FN on inner-join counts."
+ ],
+ "challenger_refs": [
+  "G20",
+  "G18",
+  "G8",
+  "G17",
+  "G4",
+  "G1",
+  "G7",
+  "G19",
+  "G12",
+  "G14"
+ ],
+ "challenger_cases_file": "reviewer_cases.json",
+ "consumed_by": {
+  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
+  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ },
+ "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
+ "package_sha": "aeb0496b4503caeb"
+}

@@ -1,0 +1,52 @@
+{
+ "db": "local_govt_and_lot",
+ "operator_io_quirks": [
+  "Mixed-case identifiers everywhere: tables Customers/Properties/Residents/Organizations/Services/Things/Customer_Events/Customer_Event_Notes/Timed_Status_of_Things/Timed_Locations_of_Things; columns Customer_Event_ID, Type_of_Thing_Code, Date_and_Date, Date_and_Time, Status_of_Thing_Code, Location_Code \u2014 must be double-quoted verbatim.",
+  "No spaces in table names here (unlike BIRD), but column names contain underscores and mixed case; case-insensitive column lookup still required.",
+  "Composite PKs: Residents(resident_id,property_id,date_moved_in); Residents_Services(resident_id,service_id); Timed_Status_of_Things(thing_id,Date_and_Date,Status_of_Thing_Code); Timed_Locations_of_Things(thing_id,Date_and_Time,Location_Code) \u2014 composite-PK members get max_l0=30, not inf.",
+  "Multi-column FKs: Residents_Services(resident_id,property_id,date_moved_in)->Residents(...) and Customer_Events(resident_id,property_id,date_moved_in)->Residents(...) \u2014 pragma foreign_key_list reports these as separate single-column rows with the same id; the spec's fks dict is (child_t,child_c)->(parent_t,parent_c) so each leg is a separate edge; parent Residents PK is composite so each leg alone is NOT unique in the parent.",
+  "Residents_Services.property_id and .date_moved_in are nullable FK legs of the composite FK to Residents; Customer_Events.customer_id, .date_moved_in, .property_id, .resident_id nullable; Customer_Event_Notes has resident_id/property_id/date_moved_in NOT NULL but NO declared FK to Residents (only to Customer_Events) \u2014 dangling-by-design columns.",
+  "Organizations.parent_organization_id is a self-referencing-looking column (values 7,8 = organization_id values) but has NO declared FK; table self-edge must not create a cycle in process_order.",
+  "All DATETIME columns store TEXT in format 'YYYY-MM-DD HH:MM:SS' (e.g. '2017-06-17 15:43:33'); storage class text contradicts declared DATETIME \u2014 TS dispatches to Date|Number(int elements) branch; first element does not parse as int so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
+  "Residents.date_moved_in has only 3 distinct values (2015-03-27 12:00:00, 2016-09-27 12:00:00, 2017-06-17 15:43:33) \u2014 Date range collapses to [min,max] of 3 dates; <2 distinct would fall back to 1800..2100.",
+  "All tables tiny (3\u201318 rows); original_values read fully, no rowid sampling needed; original_sizes exact.",
+  "Organizations has only 3 rows and is the FK root for Services.organization_id and Things.organization_id \u2014 child FK draws with replacement from 3 values, heavy duplication.",
+  "Properties.other_details has distinct=1 ('USA') and null_rate=0.0 despite being nullable; Organizations.parent_organization_id distinct=2 with null_rate=0.0 despite nullable \u2014 TS will still emit NULLs for nullable columns via String/Number samplers.",
+  "No views, triggers, or indexes beyond PKs in DDL; empty clone is just the 10 CREATE TABLEs."
+ ],
+ "operator_ts_expectations": [
+  "Number fuzzer on all INTEGER PKs/FKs: range [-10^0,10^0]=[-1,1] for scale 0 (no args) \u2014 fresh draws are tiny ints, then perturbed by \u00b11/\u00b12; PKs will collide heavily and sample_fresh_primary_keys will drop most rows, shrinking tables far below chosen size.",
+  "String fuzzer on VARCHAR(255)/CHAR(15)/CHAR(10): length range [0,255] or [0,15]/[0,10] from args[0]; fresh strings over a-zA-Z 0-9() plus 50% contaminate \u2014 property_type_code/service_type_code/Status_of_Thing_Code/Location_Code get random garbage instead of the 2\u20134 real codes, driving FN on equality filters like property_type_code='apartment'.",
+  "Date fuzzer on DATETIME: template %Y-%m-%d %H:%M:%S from first parsable element; range [2015-03-27, 2018-03-17] (Residents.date_moved_out) or narrower per column; p=0.2 means 20% element reuse, 80% fresh uniform dates \u2014 date-range predicates (BETWEEN, <, >) will mostly miss the real 2015\u20132018 cluster.",
+  "Residents.date_moved_in only 3 distinct values: Date range [2015-03-27,2017-06-17]; fresh draws uniform over 2+ years \u2014 joins on (resident_id,property_id,date_moved_in) to Residents_Services/Customer_Events will rarely match because the composite FK legs are drawn independently from parent columns (property_id from Residents.property_id, date_moved_in from Residents.date_moved_in) \u2014 no tuple-level consistency, so composite-FK joins produce near-empty results (FP on join-count queries).",
+  "Organizations.parent_organization_id has no FK: TS treats it as plain Number, draws [-1,1]\u00b1perturb \u2014 self-join Organizations o1 JOIN Organizations o2 ON o1.parent_organization_id=o2.organization_id will almost never match (real values 7,8).",
+  "Organizations only 3 rows: Services.organization_id and Things.organization_id draw from 3 values with replacement \u2014 GROUP BY organization_id yields \u22643 groups vs real 3, but counts wildly skewed.",
+  "Nullable columns (customer_details, other_details, parent_organization_id, Residents_Services.date_moved_in/property_id/date_requested/date_provided, Customer_Events.customer_id/date_moved_in/property_id/resident_id) get NULLs from String/Number/Date samplers when p<1 \u2014 real data has null_rate=0.0 everywhere, so IS NULL / IS NOT NULL predicates flip (FP/FN).",
+  "NOT NULL not enforced in Python: rows violating NOT NULL (e.g. NULL in Residents.date_moved_in from Date sampler) fail at INSERT and are silently skipped \u2014 table sizes shrink further, and PK/unique filtering happens before insert so counts are unpredictable.",
+  "Composite PKs on Timed_* tables: sample_fresh_primary_keys drops duplicate (thing_id,Date_and_Date,Status_of_Thing_Code) tuples \u2014 with Number thing_id in [-1,1] and String Status_of_Thing_Code random, collisions are rare but thing_id collisions common, so rows survive mostly on the random string leg.",
+  "Literal pool from train SQL: real codes ('apartment','house','flat','Cleanning','Check','Moving Out','Pay bills','Open','Close','In Progress','Satisfied','Unsatisfied','Electronics','Commen','Furniture') enter the pool and are sampled as elements with prob 1-p=0.8 \u2014 this is the main source of plausible values; but p=0.2 fresh draws still inject garbage.",
+  "Known misses: FN from implausible fresh strings/dates/numbers on equality and range predicates; FP from missing ties (Number PKs collapse to few distinct values, so COUNT(DISTINCT) and GROUP BY cardinality are wrong) and from composite-FK tuple inconsistency (joins return fewer rows than real)."
+ ],
+ "challenger_refs": [
+  "G1",
+  "g240b835a",
+  "ga1942dc6",
+  "g15f0654b",
+  "g502d0c4b",
+  "g5f58c536",
+  "g7c84cef3",
+  "gc76211fc",
+  "gfcf76c32",
+  "G2",
+  "g30f2e9f5",
+  "gc032b1b3",
+  "G3"
+ ],
+ "challenger_cases_file": "reviewer_cases.json",
+ "consumed_by": {
+  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
+  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ },
+ "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
+ "package_sha": "aeb0496b4503caeb"
+}

@@ -1,0 +1,50 @@
+{
+ "db": "retails",
+ "operator_io_quirks": [
+  "Mixed DDL style: customer uses backtick-quoted identifiers and inline `PRIMARY KEY (...)`/`FOREIGN KEY ... ON DELETE CASCADE`; other tables use bare identifiers and lowercase `primary key`/`foreign key` \u2014 line-based unique/check scan must tolerate both.",
+  "Huge tables: lineitem 4.42M rows, orders 1.5M, partsupp 800k, part 200k, customer 150k \u2014 rowid%k sampling mandatory; original_values for these columns will be sampled, original_sizes must still be full count(*).",
+  "lineitem has a COMPOSITE FK (l_partkey,l_suppkey)->partsupp(ps_partkey,ps_suppkey); pragma foreign_key_list reports it as two separate rows (id shared) \u2014 the fks dict keyed by single (child_t,child_c) will hold two independent edges, losing the pairing.",
+  "lineitem PK is composite (l_orderkey,l_linenumber); partsupp PK composite (ps_partkey,ps_suppkey) \u2014 composite-PK members get max_l0=30, not inf.",
+  "DATE columns (l_shipdate, l_commitdate, l_receiptdate, o_orderdate) are declared DATE but stored as TEXT 'YYYY-MM-DD' \u2014 Date fuzzer with template %Y-%m-%d; first element does not parse as int so Date branch, not Number.",
+  "All null_rate = 0.0 across every column despite many `DEFAULT NULL` / nullable declarations \u2014 original_values contain no NULLs; TS base drops None anyway.",
+  "o_shippriority has distinct=1 (all '0') \u2014 String/Number sampler with a single element; Number list range collapses.",
+  "c_phone/s_phone are TEXT with format 'NNN-NNN-NNNN' (distinct ~= row count) \u2014 String fuzzer will not reproduce the dash pattern; only literal-pool values from train SQL carry it.",
+  "c_name/s_name/o_clerk/p_brand/p_mfgr are TEXT with '#'-embedded patterns ('Customer#000000001', 'Brand#43', 'Clerk#000000916') \u2014 String fuzzer's int-like +1/-1 rule may fire on the numeric tail only if the whole string parses as int (it does not), so these stay opaque strings.",
+  "FKs all resolve to existing parents (no dangling); nation/region are tiny (25/5 rows) so FK child draws from parent final values will heavily repeat \u2014 ties/duplicates expected.",
+  "No self-references, no non-unique FK parents (all FK targets are PKs), no missing parents \u2014 clean FK graph; topological order is a simple DAG region->nation->{customer,supplier}->orders->lineitem, part->partsupp->lineitem.",
+  "REAL columns (c_acctbal, l_extendedprice, o_totalprice, p_retailprice, ps_supplycost, s_acctbal) have negative values (c_acctbal -926.96) \u2014 Number full range [-10^scale,10^scale] with scale from `REAL` (no args -> scale default) will produce plausible magnitudes."
+ ],
+ "operator_ts_expectations": [
+  "Date fuzzer on l_shipdate/l_commitdate/l_receiptdate/o_orderdate: template %Y-%m-%d, range from min/max parsed originals (~1992-1998), so fresh dates stay in that window \u2014 good for range predicates, but no dates outside 1992-1998 (misses on 'before 1992' style queries).",
+  "String fuzzer on c_mktsegment/l_returnflag/l_linestatus/l_shipmode/l_shipinstruct/o_orderpriority/o_orderstatus/p_container/p_type: 5 original samples + distinct literal-pool values, p=0.2 fresh random CHARSET strings \u2014 fresh values are implausible ('aB3 ()'), driving FN on equality/IN predicates over these enums.",
+  "Number fuzzer on l_discount/l_tax (REAL, distinct 11/9): list range [min(el), 10^scale] with the upstream overwrite quirk \u2014 fresh draws can exceed 1.0, so 'discount between 0.05 and 0.07' may see out-of-range values (FP risk on range predicates).",
+  "Number fuzzer on l_quantity (INTEGER, distinct 50, values 1-50): full range [-10^scale,10^scale] with scale from INTEGER (no args) \u2014 fresh ints far outside 1-50, FN on 'quantity < 10' style.",
+  "Number fuzzer on PKs (c_custkey, o_orderkey, p_partkey, s_suppkey, ps_partkey, ps_suppkey, l_orderkey, l_linenumber, n_nationkey, r_regionkey): single-col PK -> max_l0=inf, so fresh draws never reused; composite members capped at 30 \u2014 PKs stay unique-ish but values unrelated to original ranges.",
+  "FK consistency: o_custkey drawn from customer final c_custkey; l_orderkey from orders final o_orderkey; l_partkey/l_suppkey drawn INDEPENDENTLY from partsupp.ps_partkey/ps_suppkey (composite FK pairing lost) \u2014 join predicates on (l_partkey,l_suppkey)=(ps_partkey,ps_suppkey) will mostly fail (FN).",
+  "Tiny parents (region 5, nation 25): FK child columns n_regionkey, c_nationkey, s_nationkey get heavy duplicate draws \u2014 ties present, good for GROUP BY/COUNT DISTINCT, but distinct counts collapse.",
+  "o_shippriority single value '0': Number sampler with 1 element -> list range degenerate, fresh draws from full range \u2014 'shippriority = 0' predicates may see nonzero (FP).",
+  "String fuzzer on c_comment/l_comment/o_comment/ps_comment/s_comment/n_comment/r_comment/p_comment (long text, distinct ~= rows): fresh random strings of length 0-20 + contaminate \u2014 LIKE '%express%' predicates will mostly miss (FN), but substring spans from neighbor_queries may hit.",
+  "p_retailprice REAL distinct 20899 with values 901.0,902.0,... (near-integer): Number float perturb +-0.01/+-0.02 \u2014 'retailprice = 901' equality may see 900.99/901.01 (FP).",
+  "c_phone/s_phone TEXT 'NNN-NNN-NNNN': String fuzzer fresh strings lack dashes; literal pool from train SQL may carry a few phone literals \u2014 LIKE '%-%' predicates fragile.",
+  "No CHECK constraints, no UNIQUE columns beyond PKs \u2014 drop_unique_duplicates is a no-op here; NOT NULL on many columns (l_discount, l_extendedprice, l_quantity, l_tax, l_orderkey, l_linenumber, l_partkey, l_suppkey, o_custkey, c_custkey, ps_* keys) \u2014 TS does not enforce NOT NULL in Python, so NULLs from empty-parent FK draws or String allow_none would fail at insert and be skipped (row loss)."
+ ],
+ "challenger_refs": [
+  "G25",
+  "G8",
+  "G26",
+  "G4",
+  "G5",
+  "G7",
+  "G17",
+  "G6",
+  "G18",
+  "G23"
+ ],
+ "challenger_cases_file": "reviewer_cases.json",
+ "consumed_by": {
+  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
+  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ },
+ "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
+ "package_sha": "feaf27a71b480913"
+}
