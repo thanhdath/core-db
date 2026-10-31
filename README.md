@@ -34,6 +34,23 @@ RQ3, RQ6 and training) is downloaded with
 python scripts/coredb_members.py --out data/core-db
 ```
 
+## Repository layout
+
+| Path | Content |
+|---|---|
+| `scripts/` | CoRE-DB download (`coredb_members.py`), inference and scoring on the benchmarks (`run_inference.py`, `reproduce_rq2.sh`), spurious-correctness measurement (`rq1_decode.py`, `rq1_spurious_rate.py`), scoring of CoRE-DB against the original databases (`score_evaluation_sets.py`) |
+| `db_execution/` | `api.py`: SQLite execution service used by inference and by the training reward; `bundle_proxy.py`: CoRE-DB proxy that executes a query on every member (compact database + selected instances) of a database |
+| `inference/` | candidate generation with vLLM and execution (`generate_and_execute.py`), vote-after-verify selection (`vote_after_verify.py`) |
+| `evaluation/` | official BIRD evaluation script and the Spider test-suite wrapper |
+| `evaluation_sets/` | training questions and labelled (gold, predicted) SQL pairs (`spurious`, `correct`, `wrong`) |
+| `agentic_coding/` | the five CoRE-DB build steps: `compaction/`, `neighbor_query_generation/`, `value_filling/` (Designer, Engineer and Reviewer agents), `separation.py`, `selection.py`; run by `build_db.sh` |
+| `value_filling_by_agents/` | the generation program (`tscore_gen/`), specification (`plan.json`) and literal pool (`pool_sqls.json.gz`; works_cycles: on the Hub) of each of the 215 training databases |
+| `training/` | GRPO training (`train_grpo.py`, `reward.py`), reward endpoint (`serve_coredb.sh`) and accelerate configs |
+
+`scripts/run_inference.py` starts and stops the execution API itself; training needs the reward endpoint of
+`training/serve_coredb.sh` (execution API on port 8011, CoRE-DB proxy on port 8021, stopped with
+`kill $(cat coredb_tree/servers.pid)`).
+
 ## Reproduce
 
 ### RQ2: execution accuracy
