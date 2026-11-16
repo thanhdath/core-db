@@ -3,10 +3,83 @@ import datetime as dt
 import re
 import string
 
-# fuzz/number.py:5 MAX = 9223372036854775807 - epsilon (int64, no 2^31 clamp)
-MAX = 9223372036854775807 - 1e-9
+_MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+BOUNDARY = {
+    ('podcasts', 'title'): ['Moist Boys', 'moist boys', 'Scaling Global', 'scaling global',
+                            'More Stupider: A 90-Day Fiance Podcast', 'more stupider: a 90-day fiance podcast'],
+    ('categories', 'category'): ['fiction-science-fiction', 'FICTION-SCIENCE-FICTION', 'technology', 'TECHNOLOGY'],
+    ('reviews', 'content'): ["Can't stop listening", "can't stop listening"],
+    ('reviews', 'title'): ['Hosts bring the show down', 'hosts bring the show down'],
+    ('reviews', 'created_at'): ['2018-12-31', '2019-01-01', '2019-01-01T00:00:00-07:00',
+                                '2019-01-01t00:00:00-07:00', '2019-01-02', '2019-12-30', '2019-12-31',
+                                '2019-12-31T23:59:59-07:00', '2019-12-31t23:59:59-07:00', '2020-01-01'],
+    ('runs', 'run_at'): ['2022-05-31 00:00:00', '2022-06-01 00:00:00', '2022-06-02 00:00:00',
+                         '2022-06-29 00:00:00', '2022-06-30 00:00:00', '2022-07-01 00:00:00'],
+}
+LIKE_VARIANTS = {
+    ('podcasts', 'title'): ['jessica', 'jessicb', 'jessica x', 'JESSICA'],
+    ('reviews', 'created_at'): ['2016-', '2017-', '2016- x', '2019', '2010', '2019 x'],
+    ('runs', 'run_at'): ['2021-', '2022-', '2021- x', '2023-', '2022- x'],
+    ('runs', 'max_rowid'): ['2022-', '2023-', '2022- x'],
+}
+ENUM = {('reviews', 'rating'): [1, 2, 3, 4, 5]}
+DUP_SHARE_COLUMNS = {('podcasts', 'title'), ('categories', 'category'),
+                     ('reviews', 'author_id'), ('podcasts', 'itunes_url')}
+DATE_FORMAT = {('runs', 'run_at'): '%Y-%m-%d %H:%M:%S',
+               ('reviews', 'created_at'): 'iso'}
+DATE_RANGE = {('reviews', 'created_at'): (dt.datetime(2015, 1, 1), dt.datetime(2022, 12, 31, 23, 59, 59)),
+              ('runs', 'run_at'): (dt.datetime(2021, 1, 1), dt.datetime(2022, 12, 31, 23, 59, 59))}
+POSITIVE = {('runs', 'max_rowid'), ('podcasts', 'itunes_id')}
+NONNEG = {('runs', 'reviews_added')}
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _isnum(x) -> bool:
+    if isinstance(x, bool):
+        return False
+    return _num(x) is not None
+
+
+def _rand_word(rng, lo=3, hi=40) -> str:
+    n = rng.randint(lo, hi)
+    return ''.join(rng.choice(string.ascii_lowercase + ' ') for _ in range(n)).strip() or 'x'
+
+
+def _rand_sentence(rng, lo=20, hi=400) -> str:
+    n = rng.randint(lo, hi)
+    words = []
+    while sum(len(w) + 1 for w in words) < n:
+        words.append(_rand_word(rng, 2, 9))
+    return ' '.join(words)[:n]
+
+
+def _perturb_str(rng, v: str) -> str:
+    """Near-variant: case flip, trailing ' x', one-char substitution, prefix/suffix/drop."""
+    u = rng.random()
+    if u < 0.2:
+        return v.upper() if v.islower() else v.lower()
+    if u < 0.4:
+        return v + ' x'
+    if u < 0.6 and v:
+        i = rng.randrange(len(v))
+        return v[:i] + rng.choice(string.ascii_lowercase) + v[i + 1:]
+    if u < 0.8:
+        return v + rng.choice(string.ascii_lowercase)
+    return v[1:] if len(v) > 1 else v + 'x'
+
+
+def _perturb_num(rng, v):
+    d = rng.choice([-2, -1, 1, 2])
+    return v + d
 
 
 class ColumnSampler:
@@ -30,41 +103,26 @@ class ColumnSampler:
         raise NotImplementedError
 
 
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py: int64 MAX, list range [min, max+1] capped at MAX, type range [-10^scale, 10^scale]."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, MAX)) if unsigned else (-hi, hi)
-        if self.elements:
-            self.list_min = min(self.elements)
-            self.list_max = min(max(self.elements) + 1, MAX)
-        else:
-            self.list_min, self.list_max = self.min, self.max
+        hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        self.list_min = min(self.elements) if self.elements else self.min
+        self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        # number.py:88: integer columns truncate, float columns keep precision
-        return int(v) if self.is_int else (round(v, self.precision) if self.precision else v)
-
-    def _draw(self, lo, hi):
-        # number.py:79: random.random() * (end - start) + start
-        return self.rng.random() * (hi - lo) + lo
+        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: self._draw(lo, hi))
+            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
         d = 1 if self.is_int else 0.01
@@ -191,11 +249,116 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+class SpecStringSampler(ColumnSampler):
+    """String sampler with boundary literals, LIKE near-variants, near-variant perturbations and an optional
+    duplicate share (fresh-value cap)."""
+
+    def __init__(self, elements, p, max_l0, rng, key, length=20, dup_share=0.0):
+        super().__init__(elements, p, max_l0, rng)
+        self.key = key
+        self.length = length
+        self.boundary = list(BOUNDARY.get(key, []))
+        self.like = list(LIKE_VARIANTS.get(key, []))
+        self.dup_share = dup_share
+        if dup_share > 0:
+            self.max_l0 = max(1, int(round((1.0 - dup_share) / max(dup_share, 1e-6))))
+
+    def _fresh(self):
+        r = self.rng
+        u = r.random()
+        if self.boundary and u < 0.05:
+            return r.choice(self.boundary)
+        if self.like and u < 0.10:
+            return r.choice(self.like)
+        if self.elements and u < 0.10 + self.p:
+            v = str(r.choice(self.elements))
+            return _perturb_str(r, v) if r.random() < 0.1 else v
+        return _rand_word(r, 3, max(4, min(self.length, 40)))
+
+    def sample(self):
+        return self._fresh_or_reuse(self._fresh)
+
+
+class SpecDateSampler(ColumnSampler):
+    """Date/timestamp sampler honouring the declared format, the semantic range and boundary literals."""
+
+    def __init__(self, elements, p, max_l0, rng, key):
+        super().__init__(elements, p, max_l0, rng)
+        self.key = key
+        self.boundary = list(BOUNDARY.get(key, []))
+        self.like = list(LIKE_VARIANTS.get(key, []))
+        self.fmt = DATE_FORMAT.get(key, '%Y-%m-%d')
+        self.lo, self.hi = DATE_RANGE.get(key, (dt.datetime(2015, 1, 1), dt.datetime(2022, 12, 31)))
+
+    def _draw(self):
+        r = self.rng
+        u = r.random()
+        if self.boundary and u < 0.05:
+            return r.choice(self.boundary)
+        if self.like and u < 0.10:
+            return r.choice(self.like)
+        span = int((self.hi - self.lo).total_seconds())
+        d = self.lo + dt.timedelta(seconds=r.randint(0, max(span, 0)))
+        if self.fmt == 'iso':
+            return d.strftime('%Y-%m-%dT%H:%M:%S') + '-07:00'
+        return d.strftime(self.fmt)
+
+    def sample(self):
+        return self._fresh_or_reuse(self._draw)
+
+
+class EnumSampler(ColumnSampler):
+    """Enumeration sampler (reviews.rating IN (1..5))."""
+
+    def __init__(self, elements, p, max_l0, rng, values):
+        super().__init__(elements, p, max_l0, rng)
+        self.values = list(values)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                pass
+            if v in self.values:
+                return v
+        return r.choice(self.values)
+
+
+class PositiveIntSampler(NumberSampler):
+    """Positive integer sampler (itunes_id, max_rowid > 0; reviews_added >= 0)."""
+
+    def __init__(self, elements, p, max_l0, rng, allow_zero=False):
+        super().__init__(elements, p, max_l0, rng, scale=10, is_int=True)
+        self.allow_zero = allow_zero
+
+    def sample(self):
+        v = super().sample()
+        if self.allow_zero:
+            return max(0, int(v))
+        return max(1, int(v))
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, key=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
+    key = key or (column.table, column.name)
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    if key in ENUM:
+        return EnumSampler(els, p, max_l0, rng, ENUM[key])
+    if key in POSITIVE:
+        return PositiveIntSampler(els, p, max_l0, rng, allow_zero=False)
+    if key in NONNEG:
+        return PositiveIntSampler(els, p, max_l0, rng, allow_zero=True)
+    if key in DATE_FORMAT:
+        return SpecDateSampler(els, p, max_l0, rng, key)
+    if key in BOUNDARY or key in LIKE_VARIANTS or key in DUP_SHARE_COLUMNS:
+        dup = 0.3 if key in DUP_SHARE_COLUMNS else 0.0
+        length = args[0] if args else 20
+        return SpecStringSampler(els, p, max_l0, rng, key, length=length, dup_share=dup)
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':

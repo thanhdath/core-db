@@ -3,9 +3,48 @@ import datetime as dt
 import re
 import string
 
+from . import specification as S
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_int_type(t: str) -> bool:
+    return 'int' in t and 'point' not in t
+
+
+def _is_real_type(t: str) -> bool:
+    return any(k in t for k in ('real', 'float', 'double', 'decimal', 'numeric'))
+
+
+def near_variants(lit: str) -> list:
+    """L with last char changed, L + 'x', lower(L) (text_near_variant rule)."""
+    out = []
+    if lit:
+        out.append(lit[:-1] + chr((ord(lit[-1]) + 1) % 128) if lit[-1].isalpha() else lit + 'x')
+        out.append(lit + 'x')
+        out.append(lit.lower())
+    return out
+
+
+def like_variants(lit: str) -> list:
+    """LIKE patterns without '%' plus prefix/suffix/dropped-character variants."""
+    body = lit.replace('%', '')
+    out = [body]
+    if body:
+        out.append(body[:-1])
+        out.append(body[1:])
+        out.append(body + 'x')
+        out.append('x' + body)
+    return out
 
 
 class ColumnSampler:
@@ -27,13 +66,6 @@ class ColumnSampler:
 
     def sample(self):
         raise NotImplementedError
-
-
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
 
 
 class NumberSampler(ColumnSampler):
@@ -68,6 +100,58 @@ class NumberSampler(ColumnSampler):
         elif r.random() < 1 / 3:
             v -= 2 * d
         return self._cast(v)
+
+
+class RangeSampler(ColumnSampler):
+    """Uniform sampler over an explicit [lo, hi] range with a step (specification RANGES)."""
+
+    def __init__(self, lo, hi, step, rng, is_int=True):
+        super().__init__([], 1.0, float('inf'), rng)
+        self.lo, self.hi, self.step, self.is_int = lo, hi, step, is_int
+
+    def sample(self):
+        r = self.rng
+        if self.is_int:
+            n = int(round((self.hi - self.lo) / self.step))
+            return int(self.lo + self.step * r.randint(0, n))
+        n = int(round((self.hi - self.lo) / self.step))
+        return round(self.lo + self.step * r.randint(0, n), 4)
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform choice from an explicit enum pool (specification ENUMS / SHORT_TEXT / TIMES)."""
+
+    def __init__(self, pool, rng):
+        super().__init__(list(pool), 1.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class BoundarySampler(ColumnSampler):
+    """Emits the boundary literals (each at least once) plus near-variants and LIKE patterns."""
+
+    def __init__(self, literals, rng, is_int=False):
+        super().__init__([], 1.0, float('inf'), rng)
+        self.literals = list(literals)
+        self.is_int = is_int
+        self._i = 0
+
+    def sample(self):
+        r = self.rng
+        if self._i < len(self.literals):
+            v = self.literals[self._i]
+            self._i += 1
+            return v
+        base = r.choice(self.literals)
+        if self.is_int:
+            return int(base) + r.choice([-1, 0, 1, 2, -2])
+        u = r.random()
+        if u < 0.4:
+            return base
+        if u < 0.7:
+            return r.choice(near_variants(str(base)))
+        return r.choice(like_variants(str(base)))
 
 
 class StringSampler(ColumnSampler):
@@ -233,3 +317,29 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column: str, column_meta, literal_pool: list, original_values, rng,
+                 n_pk: int) -> ColumnSampler:
+    """Build the sampler for one column, honouring the specification by construction."""
+    key = (table, column)
+    t = (column_meta.type_str or '').lower()
+    if key in S.ENUMS:
+        return EnumSampler(S.ENUMS[key], rng)
+    if table == 'Checkins' and column.startswith('label_time_'):
+        pool = S.CHECKIN_LABELS if rng.random() < 0.5 else S.CHECKIN_LABELS_SMALL
+        return EnumSampler(pool, rng)
+    if key in S.RANGES:
+        lo, hi, step = S.RANGES[key]
+        return RangeSampler(lo, hi, step, rng, is_int=_is_int_type(t) or isinstance(lo, int))
+    if key in S.BOUNDARY:
+        return BoundarySampler(S.BOUNDARY[key], rng, is_int=_is_int_type(t))
+    if key in S.NEAR:
+        return BoundarySampler(S.NEAR[key], rng, is_int=False)
+    if key in S.SHORT_TEXT:
+        return EnumSampler(S.SHORT_TEXT[key], rng)
+    if table == 'Business_Hours' and column in ('opening_time', 'closing_time'):
+        return EnumSampler(S.TIMES, rng)
+    if table == 'Years' and column == 'year_id':
+        return RangeSampler(2005, 2014, 1, rng, is_int=True)
+    return _init_sampler(column_meta, literal_pool, original_values, 0.2, rng, n_pk)

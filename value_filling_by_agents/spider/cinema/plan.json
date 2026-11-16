@@ -1,55 +1,501 @@
 {
  "db": "cinema",
- "operator_io_quirks": [
-  "All identifiers are mixed-case (Film_ID, Rank_in_series, Openning_year) and must be double-quoted; column lookup case-insensitive.",
-  "Tiny tables: film=5, cinema=10, schedule=7 rows; original_values are complete, no rowid sampling needed.",
-  "schedule has composite PK (Cinema_ID, Film_ID) -> composite-PK members get max_l0=30 in TS; PK-duplicate row dropping applies to the tuple.",
-  "schedule.Film_ID and schedule.Cinema_ID are both PK members AND FK children; FK fill draws from parent's final filtered column.",
-  "All columns notnull=0 despite being PKs; sqlite PK on non-INT columns would be NOT NULL but here PKs are INT so no implicit constraint issue.",
-  "schedule.Date is TEXT storing '21 May','11 July','2 Aug' \u2014 no year, no zero-padded day; Date fuzzer will NOT dispatch (declared TEXT -> String).",
-  "film.Original_air_date TEXT stores 'September 21\u201325, 1992' with en-dash ranges \u2014 String fuzzer, not Date.",
-  "film.Production_code TEXT stores '50021\u201350025' with en-dash \u2014 String fuzzer; int-like prefix but not pure int.",
-  "cinema.Openning_year INT (misspelled) holds 2009-2015; Number fuzzer with scale from INT (no args) -> range [-10,10] roughly, will NOT produce plausible years.",
-  "schedule.Price declared 'float' (lowercase) -> Number family, scale from no args; storage real; samples 8.99-15.99.",
-  "Directed_by has non-ASCII 'Trevi\u00f1o' \u2014 String fuzzer CHARSET is ASCII-only, so accented chars never regenerated.",
-  "No dangling FKs, no self-references, no views/triggers/indexes beyond PKs."
- ],
- "operator_ts_expectations": [
-  "film.Film_ID, cinema.Cinema_ID: Number fuzzer, single-column PK -> max_l0=inf, fresh draws perturbed by +-1/+-2; values stay near [-10,10] plus pool literals.",
-  "schedule FK columns draw from parent's final Film_ID/Cinema_ID lists with replacement -> ties/duplicates in schedule expected, PK dedup then drops rows.",
-  "schedule.Date, film.Original_air_date, film.Production_code, cinema.Name, film.Title, film.Directed_by: String fuzzer, random a-zA-Z0-9() strings length 0-20, 50% contaminated -> implausible values (FN risk for LIKE/date-format predicates).",
-  "cinema.Openning_year, film.Rank_in_series, film.Number_in_season, schedule.Show_times_per_day: Number fuzzer small range -> implausible (years, ranks) -> FN on range predicates.",
-  "schedule.Price: Number float, range ~[-10,10] with +-0.01/0.02 perturbation -> misses 8.99-15.99 band -> FN on price thresholds.",
-  "String fuzzer adds str(i+1)/str(i-1) for int-like elements and %-stripped variants -> some plausible numeric strings survive.",
-  "Date fuzzer never fires (no 'date'/'timestamp' in declared types) -> text dates are random strings, so date-format queries (strftime, month names) get FP/FN.",
-  "Tiny original sizes (5-10) mean original_values contribute only 5 sampled elements per column; pool literals dominate.",
-  "Composite PK on schedule: TS drops duplicate (Cinema_ID,Film_ID) tuples, so join cardinalities stay small; missing ties -> FP on COUNT/aggregate queries.",
-  "FK consistency: schedule rows always reference existing cinema/film after parent filtering, so join queries return rows; but parent PK dedup may shrink parents below child demand -> NULLs possible if parent empties (unlikely here).",
-  "Number fuzzer list_max quirk (overwrites with full-range max) means pool literals like 2010 do not widen the range -> years stay small.",
-  "String fuzzer contaminate 50% -> many garbage strings; equality predicates on Title/Name rarely match -> FN."
- ],
- "challenger_refs": [
-  "G4",
-  "g3a99b05d",
-  "g3a99b05d",
-  "g6875efcd",
-  "g5a3d4265",
-  "G5",
-  "ge5c84756",
-  "G1",
-  "ge8e2bf90",
-  "ge8e2bf90",
-  "ge8e2bf90",
-  "ge8e2bf90",
-  "ge8e2bf90",
-  "G6",
-  "g3f8bb779"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1; unique; never NULL; never overwritten by boundary planting.",
+   "int_foreign_key": "Sample from parent primary-key pool; for composite-PK child tables, the FK pair is sampled jointly without replacement against the parent's taken set so no INSERT OR IGNORE is dropped; for nullable columns include at least one NULL (share ~1/n) and at least one parent row without children.",
+   "int_range": "Uniform integer within the column's range rule; include boundary values and one step on each side where a boundary literal is listed.",
+   "int_quantity": "Integer > 0; include 1 and a value near the upper bound.",
+   "float_price": "Decimal >= 0 with two fractional digits; include 0.00 and a value near the upper bound.",
+   "text_short": "Short ASCII text; include near-variants (case change, one-character substitution, appended suffix) of listed LIKE literals.",
+   "text_date": "Date string in the column's observed format; keep any order rule.",
+   "text_enum": "Sample from the explicit enum list; include each value at least once.",
+   "null_share": "For each nullable column, at least one NULL row per instance; NULL share is 1/n for the generated rows (small, present in every instance). NULL planting is applied AFTER all construction targets (group_sizes, duplicates, ties, boundaries, LIKE variants) so a planted NULL is never overwritten; FK NULL share uses the same 1/n default, not 0.05.",
+   "fresh_value_share": "About 20% of text values are fresh near-variants not equal to any observed value.",
+   "composite_pk_unique": "For tables with a composite primary key (schedule.Cinema_ID, schedule.Film_ID), sample distinct tuples of the key columns jointly against the taken set (compact PKs + generated) and retry until exactly n distinct tuples are produced; the specified row count is reached by construction and no row is dropped by INSERT OR IGNORE.",
+   "group_size_construction": "For columns listed with pattern group_sizes, partition the generated values into groups of size 1, 2, and >= 3 (e.g. by repeating values) so the target distribution is realized; only applied to non-PK columns.",
+   "duplicate_share_construction": "For columns listed with pattern duplicates_for_distinct, repeat values so that the duplicate share (distinct count / row count) falls in the target range; only applied to non-PK columns.",
+   "tie_construction": "For columns listed with pattern ties_for_order_limit, ensure at least two rows share the top value of the ORDER expression in the listed direction; for aggregate ties (SUM/COUNT over a child table) coordinate the parent values with the child rows so the aggregate is tied at the top rank.",
+   "boundary_construction": "For columns listed with pattern comparison_boundary, plant values equal to and one step from the listed boundary literals; applied to PK/FK columns only after PK/FK filling so they are not overwritten.",
+   "like_variant_construction": "For columns listed with pattern like_near_variant, plant the exact literal bodies and listed variants without mutation so the LIKE predicates match.",
+   "aggregate_boundary_construction": "For columns listed with pattern aggregate_boundary, ensure the group counts (COUNT(*) or COUNT(DISTINCT col)) take the listed values [1,2,3] across the generated groups."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "cinema",
+    "column": "Cinema_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "schedule.Cinema_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Capacity",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      299,
+      300,
+      301,
+      302,
+      706,
+      707,
+      708,
+      799,
+      800,
+      801
+     ]
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Capacity",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Location",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Location",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT cinema.name)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "cinema",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "film",
+    "column": "Film_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "schedule.Film_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "film",
+    "column": "Film_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "equal_and_one_step_from": [
+      "schedule.Film_ID"
+     ]
+    }
+   },
+   {
+    "table": "film",
+    "column": "Directed_by",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "SUM(schedule.show_times_per_day)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "film",
+    "column": "Directed_by",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "film",
+    "column": "Title",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "film",
+    "column": "Title",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Dummy%",
+      "%Dumm%",
+      "% Dummy%"
+     ],
+     "variants": [
+      "Dummy",
+      "Dummz",
+      "Dummy x",
+      "dummy",
+      "Dumm",
+      "Dumn",
+      "Dumm x",
+      "dumm"
+     ]
+    }
+   },
+   {
+    "table": "schedule",
+    "column": "Cinema_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "cinema.Cinema_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "schedule",
+    "column": "Cinema_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "schedule",
+    "column": "Film_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "schedule",
+    "column": "Film_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "film.Film_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "schedule",
+    "column": "Film_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "equal_and_one_step_from": [
+      "film.Film_ID"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "schedule",
+    "child_column": "Film_ID",
+    "parent_table": "film",
+    "parent_column": "Film_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "schedule",
+    "child_column": "Cinema_ID",
+    "parent_table": "cinema",
+    "parent_column": "Cinema_ID",
+    "copied_columns": []
+   },
+   {
+    "table": "film",
+    "unique_tuples": [
+     [
+      "Film_ID"
+     ]
+    ]
+   },
+   {
+    "table": "cinema",
+    "unique_tuples": [
+     [
+      "Cinema_ID"
+     ]
+    ]
+   },
+   {
+    "table": "schedule",
+    "unique_tuples": [
+     [
+      "Cinema_ID",
+      "Film_ID"
+     ]
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "cinema",
+    "column": "Capacity",
+    "formula": "Capacity > 0",
+    "evidence": "Observed 1100, 368, 364, 305, 325, 208, 203, 225 all positive."
+   },
+   {
+    "table": "cinema",
+    "column": "Openning_year",
+    "formula": "Openning_year BETWEEN 1900 AND 2100",
+    "evidence": "Observed 2009-2015 all in range."
+   },
+   {
+    "table": "film",
+    "column": "Rank_in_series",
+    "formula": "Rank_in_series > 0",
+    "evidence": "Observed 26-30 all positive."
+   },
+   {
+    "table": "film",
+    "column": "Number_in_season",
+    "formula": "Number_in_season > 0",
+    "evidence": "Observed 1-5 all positive."
+   },
+   {
+    "table": "schedule",
+    "column": "Show_times_per_day",
+    "formula": "Show_times_per_day > 0",
+    "evidence": "Observed 2-5 all positive."
+   },
+   {
+    "table": "schedule",
+    "column": "Price",
+    "formula": "Price >= 0",
+    "evidence": "Observed 8.99-15.99 non-negative."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "cinema": 10,
+   "film": 5,
+   "schedule": 7
+  },
+  "null_targets": [
+   "cinema.Name",
+   "cinema.Openning_year",
+   "cinema.Capacity",
+   "cinema.Location",
+   "film.Rank_in_series",
+   "film.Number_in_season",
+   "film.Title",
+   "film.Directed_by",
+   "film.Original_air_date",
+   "film.Production_code",
+   "schedule.Date",
+   "schedule.Show_times_per_day",
+   "schedule.Price"
+  ],
+  "supporting_evidence": {
+   "cinema.Capacity > 0": "All observed capacities (1100, 368, 364, 305, 325, 208, 203, 225) are positive.",
+   "cinema.Openning_year BETWEEN 1900 AND 2100": "Observed years 2009-2015 fall in range.",
+   "film.Rank_in_series > 0": "Observed ranks 26-30 are positive.",
+   "film.Number_in_season > 0": "Observed numbers 1-5 are positive.",
+   "schedule.Show_times_per_day > 0": "Observed values 2-5 are positive.",
+   "schedule.Price >= 0": "Observed prices 8.99-15.99 are non-negative."
+  },
+  "uncertainty": "No date-pair order rule exists (single Date column). No calculated column formula is supported by the sample. NULL shares are observed as 0.0 but at least one NULL per nullable column is planted per instruction 10; NULL share is 1/n for all nullable columns including FK columns (not 0.05). NULL planting is applied after all construction targets so it is never overwritten. Composite PK (Cinema_ID, Film_ID) on schedule is sampled jointly without replacement to ensure the specified row count is reached. PK columns (cinema.Cinema_ID, film.Film_ID) are never given duplicate/group-size targets; the earlier duplicate/group-size entries for cinema.Cinema_ID were removed. Film.Film_ID comparison_boundary is applied after the sequential PK fill. Film.Directed_by aggregate ties (SUM/COUNT over schedule) are implemented by coordinating schedule rows with the Directed_by values; schedule.Cinema_ID/Film_ID group_sizes targets are realized by the FK pair sampling while respecting the composite PK uniqueness. aggregate_boundary targets for cinema.Location and cinema.Name are realized by the group-size construction."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: schedule rows_added=70 but rows_skipped=69 across 20 instances (i.e. ~3.5 of 7 generated schedule rows per instance are rejected). The schedule PK is (Cinema_ID, Film_ID). In instance.py, fill_foreign_keys_consistently draws Cinema_ID and Film_ID independently with replacement from the parent pools (cinema: 10 rows, film: 5 rows), so the 7 generated schedule rows collide on (Cinema_ID, Film_ID) with high probability. The writer uses INSERT OR IGNORE, so the collisions are silently dropped rather than counted as failures, and the resulting schedule table has far fewer rows than the spec's table_sizes_per_instance (schedule: 7).",
+     "requested_revision": "Generate schedule rows so that the (Cinema_ID, Film_ID) composite PK is unique per instance (e.g. sample distinct pairs, or dedupe the FK pair before insert), so that the specified schedule size of 7 is actually achieved and rows_skipped for schedule is 0. Also make the writer report INSERT OR IGNORE drops as skipped rather than silently succeeding."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions require group_sizes targets of '1, 2 and >= 3' for film.Directed_by, film.Title, cinema.Cinema_ID, cinema.Name, schedule.Cinema_ID, schedule.Film_ID, and film.Film_ID. The program never plants these group-size distributions: _build_values_for_table samples each column independently from a StringSampler/NumberSampler with p=0.2 (or duplicate_share for duplicates_for_distinct columns), and there is no logic that constructs groups of size 1, 2, and >=3 for the listed columns. The only duplicate-share handling is via spec['duplicate_targets'], which is never populated by load_spec (it reads 'duplicate_share' as a scalar, not 'duplicate_targets'), so the duplicates_for_distinct targets (20-50% duplicate share for cinema.Cinema_ID, cinema.Location, cinema.Name) are also not enforced.",
+     "requested_revision": "Implement explicit group-size construction for the listed columns (e.g. partition the generated values into groups of size 1, 2, and >=3) and wire the duplicates_for_distinct targets into spec['duplicate_targets'] so the 20-50% duplicate share is actually produced. Currently load_spec never sets 'duplicate_targets', so the branch in _sampler_for_column is dead code."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec requires ties_for_order_limit targets: film.Directed_by tie at rank 1 on SUM(schedule.show_times_per_day) and COUNT(*) in both ASC and DESC; cinema.Capacity tie at rank 1 DESC; cinema.Location tie at rank 1 DESC. The program has no code that plants ties for these ORDER BY targets. The only tie-related code is the unused spec['tie_target'] scalar in _BUILTIN, which is never read by instance.py. Execution feedback shows construction_pairs separated=15 of 60 eligible, consistent with many tie/boundary patterns not being realized.",
+     "requested_revision": "Add explicit tie construction for the listed ORDER BY targets (e.g. ensure at least two rows share the top SUM/COUNT for Directed_by, and at least two cinemas share the max Capacity and max Location), so the ties_for_order_limit patterns are realizable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec comparison_boundary for film.Film_ID and schedule.Film_ID requires 'equal_and_one_step_from' values (e.g. schedule.Film_ID <= film.Film_ID with equal and one-step-apart values). The program's _fill_primary_keys assigns sequential ints starting after the compact max, and fill_foreign_keys_consistently draws FK values uniformly from the parent pool; there is no logic ensuring schedule.Film_ID values equal or are one step from film.Film_ID values. The boundary_literals for film.Film_ID [1,2,3,4,5] and schedule.Film_ID [4,5] are placed in spec['boundary'] but _sampler_for_column only uses pool_vals for numeric range widening, not for planting the equal/one-step relationship.",
+     "requested_revision": "Plant schedule.Film_ID values that are equal to and one step from film.Film_ID values (e.g. include pairs (f, f) and (f, f+1)) so the comparison_boundary target is realized."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's null_targets list includes cinema.Name, cinema.Openning_year, cinema.Capacity, cinema.Location, film.Rank_in_series, film.Number_in_season, film.Title, film.Directed_by, film.Original_air_date, film.Production_code, schedule.Date, schedule.Show_times_per_day, schedule.Price. The supporting_evidence states 'NULL shares are observed as 0.0' but the interface rule requires at least one NULL per nullable column per instance. The program plants NULLs at ~5-10% share (execution feedback shows e.g. cinema.Capacity NULL 21/200, schedule.Price NULL 10/63), which is far above the observed 0.0 share. The spec's uncertainty note acknowledges this tension but does not resolve the share value.",
+     "requested_revision": "Clarify the intended NULL share: the interface says 'NULL share follows the compact database's share' (0.0 observed) but also 'at least one NULL row per nullable column'. Recommend specifying a small explicit share (e.g. 1/n per instance) rather than the current ~5-10%, and confirm this is acceptable given the 0.0 observed share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's like_near_variant target for film.Title lists variants ['Dummy','Dummz','Dummy x','dummy','Dumm','Dumn','Dumm x','dumm'] and literals ['%Dummy%','%Dumm%','% Dummy%']. The program's like_variant_set builds variants from the literals and the variant list, but StringSampler applies random mutations (append/prepend/truncate) with 50% probability to every sampled value, which can destroy the planted LIKE variants (e.g. 'Dummy' -> 'Dummyx' or 'Dumm'). There is no guarantee that the exact variants appear in the generated film.Title values.",
+     "requested_revision": "Ensure the exact LIKE variants (and the literal bodies) appear at least once in generated film.Title values without mutation, e.g. by planting them directly rather than passing them through StringSampler's mutation step."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact rows are preserved: the writer copies the compact DB and appends, and integrity checks show 0 FK/not-null/PK violations, but the execution feedback does not explicitly confirm compact row counts are unchanged after append.",
+    "Whether the 20 instances are reproducible: the feedback says reproducible=true, but the seed derivation (seed_base*100003+i) and the use of rng in make_column_sampler's 0.9 filter are not independently verified.",
+    "Whether the group_sizes '1, 2 and >= 3' targets are actually realized in the generated data (no per-column group-size histogram is reported)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped.schedule = 118 across 20 instances (~5.9 per instance) while rows_added.schedule = 69 (~3.45 per instance). The spec's table_sizes_per_instance requires schedule = 7 rows per instance. The writer counts INSERT OR IGNORE drops as skipped, so the composite PK (Cinema_ID, Film_ID) is colliding with compact rows or with generated rows. In instance.py, _dedupe_composite_pk only dedupes against `taken` (compact PK tuples) and within the generated batch, but fill_foreign_keys_consistently draws FK values with replacement from the parent pool without regard to the composite PK, and _fill_primary_keys for schedule's composite PK is not invoked (only single-int PKs get sequential values). The spec explicitly states 'composite_pk_unique: ... sample distinct tuples of the key columns (dedupe before insert) so the specified row count is achieved and no row is dropped by INSERT OR IGNORE.' The achieved row count is not 7.",
+     "requested_revision": "In build_random_instance / _dedupe_composite_pk, generate distinct (Cinema_ID, Film_ID) tuples for schedule that avoid compact PK tuples and reach exactly the spec size (7). Either sample FK pairs jointly without replacement against the taken set, or loop/retry until n distinct tuples are produced before returning. Verify rows_skipped.schedule == 0 and rows_added.schedule == 7 * n_instances in the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: cinema.Capacity, cinema.Location, cinema.Name, film.Directed_by, film.Title all report 'generated rows: NULL 0 / n' despite being listed in null_targets. In _build_values_for_table the NULL planting branch is guarded by `if n > 0 and key in null_targets and not cm.notnull and cm.pk_pos == 0`, but _sampler_for_column wraps the base sampler in NullSampler only when `null_target and not cm.notnull and cm.pk_pos == 0`; for these columns the sampler is wrapped but _pick_null_share returns max(1.0/n, 0.0) which is small, and the subsequent _plant_group_sizes / _plant_duplicates / _plant_ties / _plant_boundary_values / _plant_like_variants overwrite positions without preserving the planted NULL. For example _plant_duplicates rebuilds the whole list from non-NULL bases (`pool = [v for v in vals if v is not None]`), erasing any NULL. _plant_group_sizes similarly uses only non-NULL pool values. The spec's null_share rule requires 'at least one NULL row per instance' for every nullable column.",
+     "requested_revision": "Ensure the NULL planting happens AFTER all construction targets (group_sizes, duplicates, ties, boundaries, LIKE variants) so a planted NULL is not overwritten, or make the construction helpers preserve existing NULL positions. Re-run and confirm each nullable column shows NULL >= 1 per instance in the execution feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions list includes 'cinema.Cinema_ID' with pattern 'duplicates_for_distinct' targets duplicate_share '20-50 %', and 'cinema.Cinema_ID' with pattern 'group_sizes' targets '1, 2 and >= 3'. But Cinema_ID is the PRIMARY KEY of cinema (single int PK). The generic_sampling_rules state 'int_primary_key: Sequential integers starting at 1; unique; never NULL.' These two rules are contradictory: a PK cannot simultaneously be unique/sequential and have a 20-50% duplicate share or group sizes 1/2/>=3. The atomic-operation extraction appears to have mis-attributed the duplicate/group-size patterns to the PK column (likely because the query grouped by cinema.Cinema_ID while counting distinct cinema.Cinema_ID). The program's _fill_primary_keys correctly overrides with sequential integers, so the spec's stated targets for cinema.Cinema_ID are not (and cannot be) realized.",
+     "requested_revision": "Remove the 'cinema.Cinema_ID' entries from per_column_exceptions for duplicates_for_distinct and group_sizes (or re-attribute them to a non-PK column such as cinema.Name/Location), since a single-int primary key must be unique and sequential. Similarly review 'film.Film_ID' group_sizes and 'schedule.Cinema_ID'/'schedule.Film_ID' group_sizes entries \u2014 these are FK/PK columns whose group-size targets conflict with PK uniqueness and FK referential integrity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for 'film.Directed_by' ties_for_order_limit require tie_at_rank [1] with direction 'ASC and DESC' and tie_on ['SUM(schedule.show_times_per_day)', 'COUNT(*)']. The program's _plant_ties only handles a single direction string and operates on the raw column values, not on aggregate expressions over schedule. It cannot construct ties on SUM(schedule.show_times_per_day) or COUNT(*) grouped by Directed_by, because those aggregates depend on the schedule table's join, not on Directed_by values alone. The spec's tie_construction rule says 'ensure at least two rows share the top value of the ORDER expression (SUM/COUNT for aggregate ties ...)'. The program's _plant_ties only handles plain column ORDER ties.",
+     "requested_revision": "Either (a) extend _plant_ties to handle aggregate tie targets by coordinating film.Directed_by values with schedule rows so that at least two Directed_by groups share the top SUM(show_times_per_day) and top COUNT(*), or (b) document in the spec that aggregate ties are not constructed and remove the tie_on targets for film.Directed_by. The current implementation silently ignores the aggregate tie requirement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for 'cinema.Location' aggregate_boundary requires HAVING(COUNT(*) >= 2) with values [1,2,3], and 'cinema.Name' aggregate_boundary requires HAVING(COUNT(DISTINCT cinema.name) >= 2) with values [1,2,3]. The program's _build_values_for_table applies _plant_duplicates for cinema.Location and cinema.Name (both in duplicate_columns with 0.35), but there is no code path that constructs the aggregate boundary condition (at least one group with COUNT(*) >= 2 and one with COUNT(*) < 2, or COUNT(DISTINCT name) >= 2). The duplicate planting produces repeated values but does not guarantee the specific boundary distribution [1,2,3].",
+     "requested_revision": "Add construction logic for aggregate_boundary targets: for cinema.Location, ensure the generated values contain groups of size 1, 2, and >=3 (so COUNT(*) takes values 1, 2, 3); for cinema.Name, ensure COUNT(DISTINCT name) takes values 1, 2, 3 across groups. Alternatively, remove these targets from the spec if they are not intended to be constructed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty note states 'NULL shares are observed as 0.0 but at least one NULL per nullable column is planted per instruction 10; the intended share is 1/n per instance (small, not 5-10%).' However, the program's _pick_null_share returns max(1.0/n, 0.0) = 1/n, and fill_foreign_keys_consistently uses spec.get('null_share', 0.05) for FK columns \u2014 a 5% share, not 1/n. The spec's null_share rule says 'NULL share follows the compact database's share for that column (0.0 observed, so keep NULLs rare but present)'. The 0.05 default for FKs is inconsistent with the stated 0.0 observed share and the 1/n intent.",
+     "requested_revision": "Set the FK null_share default to 1/n (or 0.0 with at least one planted NULL) to match the spec's stated intent, and document the FK NULL handling explicitly in the spec's null_share rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for 'film.Film_ID' comparison_boundary requires equal_and_one_step_from ['schedule.Film_ID']. The program's _plant_boundary_values for film.Film_ID uses boundary_targets [1,2,3,4,5] and plants b-1, b, b+1 for each \u2014 but film.Film_ID is a single-int PK filled sequentially by _fill_primary_keys AFTER _build_values_for_table, so the planted boundary values are overwritten by sequential integers 1..n. The comparison_boundary target for film.Film_ID is therefore not realized. Similarly schedule.Film_ID boundary targets [4,5] are overwritten by fill_foreign_keys_consistently.",
+     "requested_revision": "Apply comparison_boundary planting to PK/FK columns after _fill_primary_keys and fill_foreign_keys_consistently, or exclude PK/FK columns from comparison_boundary targets in the spec. Verify the boundary values appear in the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for 'cinema.Capacity' comparison_boundary lists values [299,300,301,302,706,707,708,799,800,801], and the program's _plant_boundary_values plants b-1, b, b+1 for each b \u2014 producing 297,298,299,300,301,302,303,705,706,707,708,709,798,799,800,801,802. The spec's boundary_construction rule says 'plant values equal to and one step from the listed boundary literals' \u2014 the program plants one step on BOTH sides (b-1 and b+1), which is more than specified but not incorrect. However, the spec's comparison_boundary targets for cinema.Capacity also include the set_r variants 'PRED(cinema.capacity > 707)' and 'PRED(cinema.capacity > 800)' \u2014 the program does not specifically ensure values just above 707 and 800 (708 and 801 are planted, which is correct). This is acceptable but should be noted.",
+     "requested_revision": "No change required; note that the boundary planting is correct but the spec's set_r variants (>707, >800) are satisfied by the planted 708 and 801 values."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 13/60 separated pairs with 0 unknown executions. The remaining 47 pairs are not separated \u2014 this may be due to the row-skipping issue (schedule rows dropped) or the NULL planting being overwritten. After fixing the row-skipping and NULL issues, re-run to see if separation improves.",
+    "The spec's per_column_exceptions for 'cinema.Cinema_ID' group_sizes and duplicates_for_distinct conflict with PK uniqueness; the program correctly ignores them, but the spec should be revised to avoid confusion.",
+    "The spec's tie_on targets for film.Directed_by (SUM/COUNT aggregates) are not implemented; the program only handles plain column ties. This is a gap between spec and program.",
+    "The spec's aggregate_boundary targets for cinema.Location and cinema.Name are not constructed by the program; only duplicate planting is applied.",
+    "The comparison_boundary targets for film.Film_ID and schedule.Film_ID are overwritten by PK/FK filling; the spec should either exclude PK/FK columns or the program should plant boundaries after PK/FK assignment."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added film=20, rows_skipped film=80 across 20 instances (i.e. 4 of 5 film rows dropped per instance). The spec sets table_sizes film=5, but film.Film_ID is a single-int PK filled sequentially starting at 1 (instance.py _fill_primary_keys: start=1, range(start, start+n)), which collides with the compact film rows (Film_ID 1..5). sample_fresh_primary_keys then drops the duplicates, so only ~1 generated film row survives per instance. The 'taken' set is built from schema.original_values, but _fill_primary_keys only advances start past taken keys when they are ints >= start; the compact film PKs are 1..5 so start should become 6 \u2014 yet the observed 80/100 drop rate shows the collision is not avoided (likely because taken is keyed by table name case or original_values lookup mismatch, or because post-fill boundary planting on film.Film_ID re-plants 1..5 after the sequential fill, re-creating collisions).",
+     "requested_revision": "Ensure generated single-int PKs never collide with compact PKs: verify the 'taken' lookup key matches schema.original_values keys, and do not apply post_fill_boundary_targets to film.Film_ID in a way that overwrites the fresh sequential PKs with compact values (1..5). The film table must reach the specified size of 5 generated rows per instance with 0 skipped."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: schedule rows_added=125, rows_skipped=35 across 20 instances (spec size 7/instance = 140 expected; ~1.75 dropped per instance). The composite-PK joint sampler (_sample_composite_pk_jointly) draws FK values from parent pools that include compact values, and _coordinate_aggregate_ties then overwrites schedule.Film_ID values after the joint sampling, which can create duplicate (Cinema_ID, Film_ID) tuples that INSERT OR IGNORE silently drops. Also _apply_post_fill_boundaries plants schedule.Film_ID values 4,5 after joint sampling, again risking composite-PK collisions.",
+     "requested_revision": "Apply all post-sampling mutations (aggregate-tie coordination, post-fill boundaries) before the composite-PK uniqueness check, or re-dedupe the composite PK after those mutations, so the specified schedule row count (7) is reached with 0 skipped rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _coordinate_aggregate_ties hard-codes target_sum=10, target_cnt=2 and overwrites the first four schedule rows' Film_ID and Show_times_per_day. This (a) can violate the composite PK, (b) ignores the semantic rule Show_times_per_day > 0 only incidentally, and (c) does not guarantee the tie is at the TOP rank \u2014 it only makes d1 and d2 share sum 10/count 2, but other Directed_by groups may exceed that. The spec requires 'at least two rows share the top value of the ORDER expression' for both SUM(show_times_per_day) and COUNT(*).",
+     "requested_revision": "Compute the actual per-Directed_by SUM and COUNT after schedule construction, then adjust schedule rows so two groups are tied at the maximum (not at an arbitrary constant), while preserving composite-PK uniqueness and the Show_times_per_day > 0 rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets lists all nullable columns and the interface rule requires NULL share to follow the compact database's share for that column. The compact DB has NULL share 0.0 for every column (stated in uncertainty: 'NULL shares are observed as 0.0'), yet the spec instructs 'NULL share is 1/n for all nullable columns'. This contradicts the interface rule 'NULL share following the compact database's share for that column' \u2014 with compact share 0.0 the only compliant behavior is at least one NULL per column (the floor), which 1/n satisfies, but the spec should state this explicitly rather than implying 1/n is the target share.",
+     "requested_revision": "Clarify in the specification that since compact NULL share is 0.0, the NULL share is the floor of at least one NULL per nullable column (1/n), and that this is the intended interpretation of 'following the compact share'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows film.Directed_by NULL 7/20, film.Number_in_season 5/20, film.Original_air_date 4/20, film.Production_code 2/20, film.Rank_in_series 8/20, film.Title 3/20 \u2014 these are far above 1/n (1/5 = 20% would be 4/20, but 7/20 and 8/20 exceed it). This is because _build_values_for_table plants an extra NULL with probability 0.5 for non-null-target nullable columns ('elif not cm.notnull ... rng.random() < 0.5'), in addition to the NullSampler's 1/n share. The spec says NULL share is 1/n; the extra 0.5 planting inflates it.",
+     "requested_revision": "Remove the extra 0.5-probability NULL planting for non-null-target nullable columns, or make it consistent with the specified 1/n share, so the observed NULL share matches the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible=60, separated=14. Only 14 of 60 atomic-operation pairs are separated by the generated instances. While a missing separation alone does not prove an error, the low rate combined with the film row-drop (issue 1) and schedule row-drop (issue 2) means many construction targets (group_sizes, ties, boundaries) are not realized because the rows carrying them are dropped by INSERT OR IGNORE.",
+     "requested_revision": "After fixing the PK/FK collision and composite-PK dedupe issues, re-run and confirm that the construction targets (group_sizes 1/2/>=3, duplicate share 20-50%, ties at rank 1, boundary values) are actually present in the written instances, not just in the in-memory instance dict before INSERT OR IGNORE."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 'taken' set in _fill_primary_keys correctly matches schema.original_values keys (case sensitivity of table names) \u2014 needs code inspection or a targeted test.",
+    "Whether post_fill_boundary_targets on film.Film_ID is the actual cause of the 80/100 film row drops, or whether it is the sequential start computation.",
+    "Whether the aggregate-tie coordination produces a tie at the true top rank for both SUM and COUNT after all schedule mutations."
+   ]
+  }
+ ]
 }

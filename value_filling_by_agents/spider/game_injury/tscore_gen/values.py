@@ -6,6 +6,16 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+           'October', 'November', 'December']
+
+ENUM_POOLS = {
+    'competition': ['League', 'Cup', 'Supercup'],
+    'home_team': ['Quruvchi', 'Pakhtakor', 'Bunyodkor'],
+    'away_team': ['Quruvchi', 'Pakhtakor', 'Bunyodkor'],
+    'source': ['inter.it'],
+}
+PLAYER_BOUNDARY = ['Walter Samuel', 'walter samuel', 'Thiago Motta', 'thiago motta']
 
 
 class ColumnSampler:
@@ -107,6 +117,49 @@ class StringSampler(ColumnSampler):
         return v
 
 
+class EnumSampler(ColumnSampler):
+    """Explicit enum pool: every listed value appears; near-variants (case) are added."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        els = [str(e) for e in elements if e is not None]
+        variants = []
+        for e in els:
+            variants.append(e)
+            variants.append(e.lower())
+            variants.append(e.upper())
+        super().__init__(variants, p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return r.choice(self.elements) if self.elements else ''
+
+
+class PlayerSampler(ColumnSampler):
+    """injury_accident.Player: comparison-boundary literals + case variants + one-step neighbours."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        els = [str(e) for e in elements if e is not None]
+        pool = list(PLAYER_BOUNDARY)
+        for e in els:
+            pool.append(e)
+            pool.append(e.lower())
+            pool.append(e.upper())
+            pool.append(e + ' ')
+            pool.append(' ' + e)
+            if len(e) > 1:
+                pool.append(e[:-1])
+                pool.append(e[1:])
+        super().__init__(pool, p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return r.choice(self.elements) if self.elements else ''
+
+
 def _parse_date(s: str):
     s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
@@ -115,6 +168,20 @@ def _parse_date(s: str):
         except ValueError:
             pass
     return None, None
+
+
+def _parse_dmy(s: str):
+    """Parse 'D Month YYYY' (the observed game.Date shape)."""
+    m = re.fullmatch(r'\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*', s or '')
+    if not m:
+        return None
+    mon = m.group(2).title()
+    if mon not in _MONTHS:
+        return None
+    try:
+        return dt.date(int(m.group(3)), _MONTHS.index(mon) + 1, int(m.group(1)))
+    except ValueError:
+        return None
 
 
 class DateSampler(ColumnSampler):
@@ -136,6 +203,22 @@ class DateSampler(ColumnSampler):
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
+        self.dmy = [d for d in (_parse_dmy(s) for s in strs) if d is not None]
+        self.dmy_mode = bool(self.dmy) and len(self.dmy) >= max(1, len(strs) // 2)
+        self.dmy_boundary = []
+        for d in self.dmy:
+            for delta in (-1, 0, 1):
+                self.dmy_boundary.append(d + dt.timedelta(days=delta))
+
+    def _draw_dmy(self):
+        r = self.rng
+        if self.dmy_boundary and r.random() < 0.5:
+            d = r.choice(self.dmy_boundary)
+        else:
+            lo, hi = (min(self.dmy), max(self.dmy)) if len(self.dmy) >= 2 else (dt.date(2000, 1, 1), dt.date(2030, 12, 31))
+            span = (hi - lo).days
+            d = lo + dt.timedelta(days=r.randint(0, max(0, span)))
+        return '%d %s %d' % (d.day, _MONTHS[d.month - 1], d.year)
 
     def _draw(self):
         r = self.rng
@@ -149,6 +232,35 @@ class DateSampler(ColumnSampler):
     def sample(self):
         if self.elements and self.rng.random() < self.p:
             return self.rng.choice(self.elements)
+        if self.dmy_mode:
+            return self._fresh_or_reuse(self._draw_dmy)
+        return self._fresh_or_reuse(self._draw)
+
+
+class ScoreSampler(ColumnSampler):
+    """game.Score: 'N-M' or 'N-M (P:Q)' with near-variants of the observed literals."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        els = [str(e) for e in elements if e is not None]
+        pool = list(els)
+        for e in els:
+            pool.append(e.replace('\u2013', '-'))
+            pool.append(e.replace('-', '\u2013'))
+            pool.append(e + ' ')
+            pool.append(' ' + e)
+        super().__init__(pool, p, max_l0, rng)
+
+    def _draw(self):
+        r = self.rng
+        a, b = r.randint(0, 4), r.randint(0, 4)
+        if r.random() < 0.2:
+            return '%d\u2013%d (%d:%d)' % (a, b, r.randint(0, 9), r.randint(0, 9))
+        return '%d\u2013%d' % (a, b)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
         return self._fresh_or_reuse(self._draw)
 
 
@@ -186,7 +298,14 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
+    name = (column.name or '').lower()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    if name in ENUM_POOLS:
+        return EnumSampler(ENUM_POOLS[name], p, max_l0, rng)
+    if name == 'player':
+        return PlayerSampler(els, p, max_l0, rng)
+    if name == 'score':
+        return ScoreSampler(els, p, max_l0, rng)
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':

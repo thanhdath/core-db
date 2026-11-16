@@ -34,6 +34,8 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: list = field(default_factory=list)
+    checks: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +60,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +77,20 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _resolve_parent_column(tables, pt, fk_row, child):
+    """Parent column for a foreign key row."""
+    if fk_row[4] is not None:
+        want = str(fk_row[4]).lower()
+        pc = next((c.name for c in tables[pt].columns if c.name.lower() == want), None)
+        if pc is not None:
+            return pc
+    pk = tables[pt].primary_key
+    if pk:
+        return pk[0]
+    want = str(child).lower()
+    return next((c.name for c in tables[pt].columns if c.name.lower() == want), None)
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -85,6 +101,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        unique_tuples = []
+        checks: dict = {}
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -96,28 +114,37 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     uniq.add(tok)
                 if ('check (' in ll or 'check(' in ll) and tok in low:
                     chk.add(tok)
+                    checks[(t, low[tok])] = line
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
+                    names = [c[2] for c in cols if c[2]]
+                    if len(names) == 1 and names[0].lower() not in uniq:
+                        uniq.add(names[0].lower())
+                        from_index.append((t, names[0]))
+                    if len(names) > 1:
+                        unique_tuples.append((t, names))
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
+            if len(pk) > 1:
+                unique_tuples.append((t, pk))
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
             for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
                 pt = tlow.get(str(r[2]).lower())
+                if pt is None:
+                    warnings.warn('dropping FK to unknown table %s.%s -> %s' % (t, r[3], r[2]))
+                    continue
                 child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
-                pc = None
-                if pt is not None:
-                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
-                if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
+                if child is None:
+                    warnings.warn('dropping FK with unknown child column %s.%s' % (t, r[3]))
+                    continue
+                pc = _resolve_parent_column(tables, pt, r, child)
+                if pc is None:
+                    warnings.warn('dropping FK with unresolvable parent %s.%s -> %s' % (t, child, pt))
                     continue
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
@@ -139,4 +166,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_tuples, checks)

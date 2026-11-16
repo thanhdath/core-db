@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -7,7 +7,7 @@ import random
 import sys
 import time
 
-from .instance import build_random_instance
+from .instance import build_instance, read_compact
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
 from .writer import unit_path, write_instance_sqlite
@@ -18,24 +18,32 @@ _G: dict = {}
 def _init(orig: str, pool: dict, args: dict) -> None:
     """Worker initializer: read the original ONCE per process."""
     _G['schema'] = read_schema(orig)
+    _G['compact'] = read_compact(orig)
     _G['pool'] = pool
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int) -> dict:
+    """Build and write unit i; returns a dict, never raises."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return {'ok': True, 'added': {}, 'skipped': {}}
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        inst = build_instance(_G['schema'], _G['compact'], _G['pool'], rng, a['spec'])
+        stats = write_instance_sqlite(_G['schema'], _G['compact'], inst, p, orig_path=a['orig'])
+        return {'ok': True, 'added': stats['rows_ok'], 'skipped': stats['rows_failed']}
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return {'ok': False, 'error': type(e).__name__, 'added': {}, 'skipped': {}}
+
+
+def _load_spec(path: str) -> dict:
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
 
 
 def main(argv=None) -> None:
@@ -50,6 +58,7 @@ def main(argv=None) -> None:
     g.add_argument('--seed-base', type=int, default=42)
     g.add_argument('--procs', type=int, default=6)
     g.add_argument('--tag', default='gen')
+    g.add_argument('--spec', default=None)
     a = ap.parse_args(argv)
     t0 = time.time()
     with open(a.pool_sqls) as f:
@@ -63,21 +72,31 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    spec = _load_spec(a.spec)
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base,
+            'spec': spec, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
+        _init(a.orig, pool, args)
         res = [_one(i) for i in idx]
     else:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
+    added: dict = {}
+    skipped_rows: dict = {}
     for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        if not r['ok']:
+            errs[r['error']] = errs.get(r['error'], 0) + 1
+        for t, v in r['added'].items():
+            added[t] = added.get(t, 0) + v
+        for t, v in r['skipped'].items():
+            skipped_rows[t] = skipped_rows.get(t, 0) + v
+    n_ok = sum(1 for r in res if r['ok'])
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows}))
 
 
 if __name__ == '__main__':

@@ -182,6 +182,96 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+def _near_variants(v: str, rng) -> str:
+    """5% fresh near-variants: case change, trailing space, one-char edit."""
+    u = rng.random()
+    if u < 0.25:
+        return v.upper() if rng.random() < 0.5 else v.lower()
+    if u < 0.5:
+        return v + ' '
+    if u < 0.75 and v:
+        i = rng.randrange(len(v))
+        return v[:i] + rng.choice(string.ascii_letters) + v[i + 1:]
+    return v + rng.choice(string.ascii_letters)
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform over the listed enum values; 5% case-variant near-duplicates."""
+
+    def __init__(self, values: list, rng, p: float = 0.0, max_l0: float = float('inf')):
+        super().__init__(values, p, max_l0, rng)
+        self.values = list(values)
+
+    def sample(self):
+        r = self.rng
+        v = r.choice(self.values)
+        if r.random() < 0.05:
+            v = _near_variants(v, r)
+        return v
+
+
+class RangeSampler(ColumnSampler):
+    """Uniform in [min, max], rounded to 1 decimal; 5% boundary values at min/max and one step outside."""
+
+    def __init__(self, lo: float, hi: float, rng, is_int: bool = False, boundaries: list = None,
+                 p: float = 0.0, max_l0: float = float('inf')):
+        super().__init__([], p, max_l0, rng)
+        self.lo, self.hi, self.is_int = lo, hi, is_int
+        self.boundaries = list(boundaries or [])
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.05:
+            v = r.choice(self.boundaries)
+        elif r.random() < 0.05:
+            v = r.choice([self.lo, self.hi, self.lo - 1, self.hi + 1])
+        else:
+            v = r.uniform(self.lo, self.hi)
+        if self.is_int:
+            return int(round(v))
+        return round(float(v), 1)
+
+
+class NanTextSampler(ColumnSampler):
+    """TEXT column storing numeric strings and the 'nan' marker (range applies to non-'nan')."""
+
+    def __init__(self, lo: float, hi: float, rng, boundaries: list = None, nan_share: float = 0.10,
+                 p: float = 0.0, max_l0: float = float('inf')):
+        super().__init__([], p, max_l0, rng)
+        self.lo, self.hi = lo, hi
+        self.boundaries = list(boundaries or [])
+        self.nan_share = nan_share
+
+    def sample(self):
+        r = self.rng
+        if r.random() < self.nan_share:
+            return 'nan' if r.random() < 0.9 else 'NAN'
+        if self.boundaries and r.random() < 0.05:
+            v = r.choice(self.boundaries)
+        elif r.random() < 0.05:
+            v = r.choice([self.lo, self.hi])
+        else:
+            v = r.uniform(self.lo, self.hi)
+        return repr(round(float(v), 4))
+
+
+class BoundaryStringSampler(ColumnSampler):
+    """String column with planted boundary literals plus the generic string pool."""
+
+    def __init__(self, elements, boundaries: list, rng, p: float = 0.2, max_l0: float = float('inf'),
+                 boundary_share: float = 0.10):
+        super().__init__(elements, p, max_l0, rng)
+        self.boundaries = list(boundaries or [])
+        self.boundary_share = boundary_share
+        self._inner = StringSampler(elements, p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < self.boundary_share:
+            return r.choice(self.boundaries)
+        return self._inner.sample()
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -231,5 +321,25 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, rng, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column: str, spec: dict, rng, elements: list, p: float,
+                 max_l0: float) -> ColumnSampler:
+    """Build a specification-aware sampler for (table, column); falls back to the generic one."""
+    key = '%s.%s' % (table, column)
+    enums = spec.get('enums', {})
+    ranges = spec.get('ranges', {})
+    boundaries = spec.get('boundaries', {})
+    nan_cols = set(spec.get('nan_columns', []))
+    if key in enums:
+        return EnumSampler(enums[key], rng, p, max_l0)
+    if key in nan_cols and key in ranges:
+        lo, hi = ranges[key]
+        return NanTextSampler(lo, hi, rng, boundaries.get(key), p=p, max_l0=max_l0)
+    if key in ranges:
+        lo, hi = ranges[key]
+        is_int = isinstance(lo, int) and isinstance(hi, int)
+        return RangeSampler(lo, hi, rng, is_int=is_int, boundaries=boundaries.get(key), p=p, max_l0=max_l0)
+    return None

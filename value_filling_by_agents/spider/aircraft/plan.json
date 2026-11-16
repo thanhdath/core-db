@@ -1,61 +1,474 @@
 {
  "db": "aircraft",
- "operator_io_quirks": [
-  "Mixed quoting in DDL: pilot/aircraft use backticks, match/airport/airport_aircraft use double quotes; identifiers must be re-quoted with \" and \" doubled.",
-  "Table name `match` is a SQL keyword; must always be double-quoted in generated SQL and in pragma/sqlite_master lookups.",
-  "Column `%_Change_2007` starts with `%`; needs quoting and will exercise sqlparse tokenization (percent is not a normal identifier char).",
-  "Column `Date` is declared TEXT and stores non-ISO strings like 'March 26\u201327' (en-dash, no year); declared type dispatches to String fuzzer, not Date.",
-  "match.Winning_Pilot / match.Winning_Aircraft are declared TEXT but store integer-looking strings ('1','4','6'); FK to int PKs \u2014 storage class contradicts declared type.",
-  "aircraft.Max_Gross_Weight / Total_disk_area / Max_disk_Loading are varchar(50) holding formatted measurements with commas, units, superscript \u00b2 \u2014 String fuzzer will produce garbage, not these formats.",
-  "airport_aircraft has composite PK (Airport_ID, Aircraft_ID) and a separate non-PK `ID` column; composite-PK members get max_l0=30 in TS.",
-  "match.Round is REAL PK with values 1.0..7.0 (integer-valued floats); Number fuzzer with scale from `real` (no args) will perturb by \u00b10.01/\u00b10.02.",
-  "All tables tiny (4\u201312 rows); original_values sampling (k=min(5,len)) will nearly exhaust the distinct values, so TS will mostly reuse originals.",
-  "No NOT NULL on match/airport/airport_aircraft columns despite PKs; sqlite allows NULL in non-INTEGER PKs, so TS may insert NULL PKs that survive.",
-  "airport_aircraft.ID is not a PK and not unique; TS will not dedupe it, so duplicates expected.",
-  "FKs all resolve to existing parents (pilot, aircraft, airport); no dangling FKs, no self-references, no cycles."
- ],
- "operator_ts_expectations": [
-  "pilot.Pilot_Id, aircraft.Aircraft_ID, airport.Airport_ID: Number fuzzer, int scale 0 \u2192 range [-1,1] perturbed; PK dedupe keeps ~1\u20132 rows, so parent tables shrink drastically and FK children get few distinct values.",
-  "match.Round: Number(scale=4) from `real` \u2192 range [-10^4,10^4] floats; PK dedupe on floats almost never collides, so match keeps its full size.",
-  "match.Winning_Pilot / Winning_Aircraft: String fuzzer (declared TEXT) \u2192 random a-zA-Z0-9() strings, NOT integers; FK fill overrides with parent values only when parent non-empty, else NULL.",
-  "aircraft.Max_Gross_Weight etc.: String fuzzer with length range from varchar(50) \u2192 random 0\u201350 char strings; loses the '1,370 lb (635 kg)' format entirely.",
-  "airport.%_Change_2007: String fuzzer; '%' in elements triggers the replace('%','') variant, so '1.5%' becomes '1.5' in the pool \u2014 format lost.",
-  "match.Date: String fuzzer (TEXT) \u2192 random strings, not dates; any query filtering on date format will get implausible values (FN driver).",
-  "airport numeric columns (Total_Passengers etc.): Number(scale=4) \u2192 range [-10^4,10^4], far below real magnitudes (10^7\u201310^8); implausible values drive FN on range/aggregate queries.",
-  "airport_aircraft composite PK: both members get max_l0=30, so fresh draws capped; FK fill from airport/aircraft (which shrank) yields few distinct pairs \u2192 PK dedupe keeps few rows.",
-  "airport_aircraft.ID: Number fuzzer, no dedupe \u2192 duplicates; queries counting distinct ID will see ties (FP driver).",
-  "Small originals (\u226412 rows) mean TS's 5-sample original_values nearly covers the table; with p=0.2 most draws reuse originals, so many units look like the original (weak discrimination).",
-  "pilot.Name: String fuzzer over 'a-zA-Z 0-9()' \u2192 random names, not 'Prof. Zackery Collins' style; LIKE/pattern queries on names get implausible values (FN).",
-  "No CHECK constraints and no NOT NULL on most columns \u2192 TS inserts NULLs freely; queries with IS NOT NULL / comparisons get NULL-heavy results (FP/FN mix)."
- ],
- "challenger_refs": [
-  "G1",
-  "G7",
-  "G2",
-  "G6",
-  "G4",
-  "G5",
-  "G8",
-  "G9",
-  "G3",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914",
-  "g69592914"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table, never NULL; PK columns are excluded from group-size, NULL and freshness rewriting.",
+   "integer_fk": "Sample from the parent table's FINAL generated primary-key values (after all post-processing); allow NULL only if the column is nullable.",
+   "real_quantity": "Positive real numbers drawn from a log-uniform distribution over [1, 1e8]; round to 1 decimal.",
+   "real_rate": "Real numbers in [0, 1] rounded to 4 decimals.",
+   "text_short": "Random title-cased words, 1-3 words, length 3-40 characters.",
+   "text_name": "Random person-like name: title-cased first and last word, length 5-40 characters.",
+   "text_enum": "Uniform choice from the column's enum list (see per_column_exceptions).",
+   "text_near_variant": "For LIKE/equality literals, generate the literal itself plus near-variants (case change, one extra character, one substituted character) with 20% share.",
+   "text_date_range": "Format 'Month D-D' or 'Month D' with a valid month name and day 1-28.",
+   "numeric_boundary": "For each listed literal L, include L-1, L, L+1 (or step-scaled) with equal share; remaining values uniform in the column's range.",
+   "null_share": "For nullable columns, at least one NULL row per instance and a NULL share following the compact database's share for that column (5-30% for the listed null_targets); the rest get non-NULL values; planted NULLs are never replaced to satisfy a rule.",
+   "duplicate_share": "For DISTINCT-targeted columns, 20-50% of rows reuse an already-generated value.",
+   "tie_share": "For ORDER/LIMIT-targeted columns, plant at least two rows sharing the boundary value.",
+   "fresh_value_share": "70% of text values are fresh; 30% may repeat an earlier value."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "aircraft.Aircraft",
+     "pilot.Age"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "columns": [
+     "aircraft.Aircraft"
+    ],
+    "targets": {
+     "having": [
+      "COUNT(*) >= 2",
+      "COUNT(*) > 1"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "aircraft.Aircraft",
+     "pilot.Name",
+     "match.Location"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "pilot.Pilot_Id",
+     "match.Winning_Pilot",
+     "airport.Total_Passengers",
+     "match.Country"
+    ],
+    "targets": {
+     "pilot.Pilot_Id": {
+      "equal_and_one_step_from": [
+       "match.Winning_Pilot"
+      ]
+     },
+     "match.Winning_Pilot": {
+      "equal_and_one_step_from": [
+       "pilot.Pilot_Id"
+      ]
+     },
+     "airport.Total_Passengers": {
+      "values": [
+       9999999,
+       10000000,
+       10000001
+      ]
+     },
+     "match.Country": {
+      "values": [
+       "Australia",
+       "australia"
+      ]
+     }
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "match.Winning_Pilot",
+     "match.Winning_Aircraft"
+    ],
+    "targets": {
+     "joins_with": [
+      "pilot.Pilot_Id",
+      "aircraft.Aircraft_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "columns": [
+     "airport.Airport_Name"
+    ],
+    "targets": {
+     "literals": [
+      "London%",
+      "%London%"
+     ],
+     "variants": [
+      "London",
+      "Londoo",
+      "London x",
+      "london"
+     ]
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "columns": [
+     "airport.International_Passengers"
+    ],
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "pattern": "enum",
+    "columns": [
+     "aircraft.Description"
+    ],
+    "targets": {
+     "values": [
+      "Light utility helicopter",
+      "Turboshaft utility helicopter",
+      "Tandem rotor helicopter",
+      "Heavy-lift helicopter"
+     ]
+    }
+   },
+   {
+    "pattern": "format",
+    "columns": [
+     "aircraft.Max_Gross_Weight",
+     "aircraft.Total_disk_area",
+     "aircraft.Max_disk_Loading"
+    ],
+    "targets": {
+     "format": "number with thousands separator + unit in parentheses, e.g. '1,370 lb (635 kg)'"
+    }
+   },
+   {
+    "pattern": "format",
+    "columns": [
+     "airport.%_Change_2007"
+    ],
+    "targets": {
+     "format": "signed percentage string, e.g. '1.5%'"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "match.Winning_Aircraft",
+    "parent_table": "aircraft",
+    "parent_column": "Aircraft_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "match.Winning_Pilot",
+    "parent_table": "pilot",
+    "parent_column": "Pilot_Id",
+    "copied_columns": []
+   },
+   {
+    "child": "airport_aircraft.Airport_ID",
+    "parent_table": "airport",
+    "parent_column": "Airport_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "airport_aircraft.Aircraft_ID",
+    "parent_table": "aircraft",
+    "parent_column": "Aircraft_ID",
+    "copied_columns": []
+   },
+   {
+    "unique_tuple": "airport_aircraft(Airport_ID, Aircraft_ID)",
+    "note": "composite primary key; generate distinct pairs"
+   },
+   {
+    "unique_tuple": "pilot(Pilot_Id)",
+    "note": "primary key"
+   },
+   {
+    "unique_tuple": "aircraft(Aircraft_ID)",
+    "note": "primary key"
+   },
+   {
+    "unique_tuple": "airport(Airport_ID)",
+    "note": "primary key"
+   },
+   {
+    "unique_tuple": "match(Round)",
+    "note": "primary key"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "pilot",
+    "column": "Age",
+    "formula": "Age BETWEEN 18 AND 70"
+   },
+   {
+    "table": "pilot",
+    "column": "Pilot_Id",
+    "formula": "Pilot_Id > 0"
+   },
+   {
+    "table": "aircraft",
+    "column": "Aircraft_ID",
+    "formula": "Aircraft_ID > 0"
+   },
+   {
+    "table": "airport",
+    "column": "Airport_ID",
+    "formula": "Airport_ID > 0"
+   },
+   {
+    "table": "airport",
+    "column": "Total_Passengers",
+    "formula": "Total_Passengers >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "International_Passengers",
+    "formula": "International_Passengers >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "Domestic_Passengers",
+    "formula": "Domestic_Passengers >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "Transit_Passengers",
+    "formula": "Transit_Passengers >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "Aircraft_Movements",
+    "formula": "Aircraft_Movements >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "Freight_Metric_Tonnes",
+    "formula": "Freight_Metric_Tonnes >= 0"
+   },
+   {
+    "table": "airport",
+    "column": "Total_Passengers",
+    "formula": "Total_Passengers = International_Passengers + Domestic_Passengers + Transit_Passengers",
+    "condition": "International_Passengers IS NOT NULL AND Domestic_Passengers IS NOT NULL AND Transit_Passengers IS NOT NULL",
+    "evidence": "airport rows 1-8: 61344438+5562516+147791=67054745; 30431051+3730963+43873=34205887; 19996947+2343428+19989=22360364"
+   },
+   {
+    "table": "match",
+    "column": "Round",
+    "formula": "Round > 0"
+   },
+   {
+    "table": "match",
+    "column": "Winning_Pilot",
+    "formula": "Winning_Pilot IS NULL OR CAST(Winning_Pilot AS INTEGER) IN (SELECT Pilot_Id FROM pilot)"
+   },
+   {
+    "table": "match",
+    "column": "Winning_Aircraft",
+    "formula": "Winning_Aircraft IS NULL OR CAST(Winning_Aircraft AS INTEGER) IN (SELECT Aircraft_ID FROM aircraft)"
+   },
+   {
+    "table": "airport_aircraft",
+    "column": "Airport_ID",
+    "formula": "Airport_ID IN (SELECT Airport_ID FROM airport)"
+   },
+   {
+    "table": "airport_aircraft",
+    "column": "Aircraft_ID",
+    "formula": "Aircraft_ID IN (SELECT Aircraft_ID FROM aircraft)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "pilot": 12,
+   "aircraft": 5,
+   "airport": 10,
+   "match": 7,
+   "airport_aircraft": 4
+  },
+  "null_targets": [
+   "airport.Airport_Name",
+   "airport.Total_Passengers",
+   "airport.%_Change_2007",
+   "airport.International_Passengers",
+   "airport.Domestic_Passengers",
+   "airport.Transit_Passengers",
+   "airport.Aircraft_Movements",
+   "airport.Freight_Metric_Tonnes",
+   "airport_aircraft.ID",
+   "match.Location",
+   "match.Country",
+   "match.Date",
+   "match.Fastest_Qualifying",
+   "match.Winning_Pilot",
+   "match.Winning_Aircraft"
+  ],
+  "supporting_evidence": {
+   "airport.Total_Passengers formula": [
+    "row1: 61344438+5562516+147791=67054745",
+    "row2: 30431051+3730963+43873=34205887",
+    "row3: 19996947+2343428+19989=22360364"
+   ],
+   "pilot.Age range": [
+    "min 20, max 37 in shown rows; widened to 18-70"
+   ],
+   "aircraft.Description enum": [
+    "4 distinct values shown in sample"
+   ]
+  },
+  "uncertainty": [
+   "match.Winning_Pilot and match.Winning_Aircraft are TEXT but reference integer PKs; generation stores the integer as text and fills them from the FINAL parent PK set after all post-processing.",
+   "airport_aircraft.ID is nullable and not a key; treated as a free integer.",
+   "airport_aircraft sample contains Airport_ID=9 which is not in the shown airport rows; generation restricts to generated parent keys.",
+   "match.Fastest_Qualifying is a free text name, not a FK; no formula stated.",
+   "airport.%_Change_2007 is text; no numeric range rule enforced beyond format.",
+   "Total_Passengers boundary values (9999999/10000000/10000001) are planted by back-solving one of International/Domestic/Transit so the sum rule still holds on those rows; rows with a NULL component keep the boundary value directly.",
+   "match.Winning_Pilot/Winning_Aircraft are excluded from group-size planting because they are FK copies of integer PKs; group-size targets are realized on aircraft.Aircraft and pilot.Age instead.",
+   "The 'duplicate_share' is interpreted as the share of rows that copy an earlier value (20-50%)."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports \"fk_violations\": 389 across 20 instances and validity reason \"new_integrity_failures\": 16. The writer copies the compact DB (which is already FK-valid) and only appends generated rows, so these 389 violations are introduced by the generated rows. Root cause: in tscore_gen/instance.py, the round-1 post-processing is applied *after* foreign keys are filled. `_null_rule`, `_fresh_pk_values`, and (for the airport table) `_apply_sum_rule` mutate pilot.Pilot_Id / aircraft.Aircraft_ID / airport.Airport_ID after the children (match.Winning_Pilot, match.Winning_Aircraft, airport_aircraft.Airport_ID/Aircraft_ID) have already drawn from the parents' pre-shift values. Concretely, `_fresh_pk_values` bumps parent PKs to values not in the compact set (e.g. 13, 14, ...) while children still hold the pre-bump values; and `_apply_null_rule` / `_plant_groups` on aircraft.Aircraft_ID (a GROUP_SIZE_COLUMNS / PK column processed after FK fill) leaves children pointing at stale parent keys. The smoke run's 367 skipped airport_aircraft rows and the FK count confirm many child rows are simply rejected by SQLite but the match-table FK values (nullable, so accepted) are not filtered \u2014 leaving dangling references.",
+     "requested_revision": "Make FK values consistent with the *final* parent key sets. Either (a) fill foreign keys last (after `_apply_group_sizes`, `_apply_null_rule`, `_fresh_pk_values`), re-drawing child FK values from the post-processing parent PK lists; or (b) after all post-processing, validate every FK child value against the final parent PK set and replace invalid ones with a final parent PK (or NULL for nullable FKs). Also exclude PK columns (e.g. aircraft.Aircraft_ID, pilot.Pilot_Id) from `_plant_groups`/NULL rewriting, since those columns are constrained to stay unique/sequential; re-run and confirm integrity.fk_violations == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "match.Winning_Pilot and match.Winning_Aircraft are declared TEXT but are FKs to integer PKs (schema.py reads them via pragma foreign_key_list and fills them from the parent int PK list). In `fill_foreign_keys_consistently` and the post-fill loop for self-consistency in instance.py they are drawn from int parent PKs; however `_apply_unmatched_join` is a no-op stub and the spec's `comparison_boundary` rule for pilot.Pilot_Id / match.Winning_Pilot ('equal and one step from') is only planted for pilot.Pilot_Id (`_apply_comparison_boundary` only touches `table == 'pilot'`). The match-table side never plants the equal/near values, and `match.Winning_Pilot` gets no `_apply_comparison_boundary`. So the comparison_boundary pair is not realized on the child column, and the 'unmatched_join_rows' pattern (child rows with NULL FK, parent rows without children) is claimed in the docstring but the function returns `cols` unchanged.",
+     "requested_revision": "Implement the match-side of comparison_boundary: in `_apply_comparison_boundary`, for table == 'match' set some Winning_Pilot values equal to a pilot.Pilot_Id and one step from another (and analogously for Winning_Aircraft if intended). Implement `_apply_unmatched_join` (or document it is satisfied by the NULL rule) so the specification's unmatched_join_rows pattern is genuinely produced: guarantee at least one parent Pilot/Aircraft with no child in `match` and at least one match row with NULL Winning_Pilot/Winning_Aircraft (currently only ~29/512 match rows are NULL, which does satisfy the NULL side, but the parent-without-child side is not enforced)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec encodes numeric comparison_boundary for airport.Total_Passengers at values [9999999, 10000000, 10000001] (spec.NUMERIC_BOUNDARIES) and `BoundaryNumberSampler` plants L-1/L/L+1 with 50% share. However `_apply_sum_rule` runs *after* the sampler-generated values and overwrites airport.Total_Passengers = Intl + Domestic + Transit for every row where all three are non-NULL. The boundary values 9999999/10000000/10000001 are therefore overwritten in most rows (those with the boundary are only preserved when one of the three components is NULL). The spec explicitly requires the boundary values to appear; the sum rule silently destroys them. The `_apply_sum_rule` runs on every row regardless of whether the row was planted as a boundary row.",
+     "requested_revision": "Reconcile the sum rule with the numeric boundary. Pick one of: (a) plant Total_Passengers boundary values and back-solve one of Intl/Domestic/Transit so the sum equals the boundary value; or (b) run boundary planting on Total_Passengers *after* the sum rule, tolerating the sum inconsistency on those boundary rows and documenting it as a known tension between the two rules; or (c) drop the numeric boundary for Total_Passengers from the spec. Currently the boundary is not realized reliably, and construction_pairs shows 12/47 separated / no execution of the boundary predicate."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.table_sizes_per_instance specifies pilot:12, aircraft:5, airport:10, match:7, airport_aircraft:4, but the execution feedback shows rows_added pilot:336, aircraft:342, match:512, airport:444, airport_aircraft:933 across 20 instances. Per instance that's ~16.8 pilot, ~17.1 aircraft, ~25.6 match, ~22.2 airport, ~46.6 airport_aircraft \u2014 none of which match the declared sizes (pilot 12 gives 240 expected, but 336 observed; airport_aircraft 4 gives 80 expected, but 933 observed). `build_random_instance` uses `choose_table_sizes` (rand_lin / level sizes x4, capped at 2500) since `size` is None, ignoring the spec's per-instance sizes entirely; spec.table_sizes_per_instance is never read by the code.",
+     "requested_revision": "In `build_random_instance`, when a specification exists, honor `spec.table_sizes_per_instance` (e.g. pass it as `size` to `build_random_instance` from the CLI, or read spec.SIZES inside `build_random_instance`). Update spec.py to expose TABLE_SIZES_PER_INSTANCE = {...} and have the CLI construct `size` from it. Otherwise the spec's per-instance sizes are unenforced and rows_added drift is expected."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists `match.Winning_Aircraft` and `match.Winning_Pilot` in GROUP_SIZE_COLUMNS and DISTINCT-adjacent targets, and lists NULL as a valid value for them (null_targets). The schema declares them TEXT with FOREIGN KEY to integer PKs. In instance.py, `fill_foreign_keys_consistently` draws them from parent int PKs with replacement, but `_fresh_pk_values` is applied to aircraft/pilot last and bumps those PKs past compact values (e.g. beyond 5/12), while children hold pre-bump values; combined with the FK issue above, many match rows point at PKs that no longer exist. `_apply_group_sizes` on `match.Winning_Aircraft`/`match.Winning_Pilot` plants 1/2/3-repeats, which is fine for group_sizes, but the exact combination of (a) TEXT type, (b) FK to int PK, (c) group-size planting on the FK column, and (d) PK-bump for freshness makes a consistent generation hard/impossible. `_apply_unmatched_join` is a stub, so the 'child rows with NULL FK' / 'parent rows without children' targets are satisfied only incidentally by the general NULL rule, not by design.",
+     "requested_revision": "Decide whether the specification's unmatched_join_rows, group_sizes on match-winning columns, and comparison_boundary on match.Winning_Pilot can co-exist under the FK constraint. Recommend: (a) keep the FK to integer PKs and plant a small number of NULL rows plus a few parents with no child; (b) do NOT plant 1/2/3-size groups on the winning columns simultaneously (those are text copies of integer ids; groups on those columns are essentially meaningless). Update the spec to drop `match.Winning_Aircraft`/`match.Winning_Pilot` from GROUP_SIZE_COLUMNS, OR update the engineer's code to fill these FKs last and guarantee at least one NULL child and one childless parent per nullable FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "post-process sequence does not observe the general rule that NULL is a value to be planted and never replaced to satisfy a rule. In instance.py, `_apply_sum_rule` overwrites `Total_Passengers` only when the three components are non-NULL (fine), but `_apply_semantic_ranges` clamps `Total_Passengers = max(0.0, float(v)) if v is not None`, converting planted NULLs to 0 in the case where `v is None` \u2014 this happens because the list comprehension is `max(0.0, float(v)) if v is not None else None`, so it's fine, but `_apply_null_rule` on `International_Passengers` applies a NULL share 5-30% via `spec.NULL_SHARE_OVERRIDE` and the sum rule then skips those rows; this part matches the rule. However `_apply_distinct_duplicates` mutates `aircraft.Aircraft` and `pilot.Name` and `match.Location` *before* `_apply_null_rule`, and `aircraft.Aircraft` is not the PK but is a `varchar(50)`, so it can be NULL; the duplicate share then interacts with `_plant_groups`. More importantly, the duplicated string values can include a value that was originally NULL from a previous pass? No \u2014 `_apply_null_rule` runs after `_apply_distinct_duplicates`, so NULLs are introduced last and not copied. This specific point is acceptable.",
+     "requested_revision": "No change needed for this specific point; included only to document that it was checked and passed. However, `_apply_group_sizes` calls `_plant_groups` which uses only `values` and replaces some entries with repeats of the first three distinct representatives; that overwrites some of the NULLs already planted? Actually `_apply_group_sizes` runs *before* `_apply_null_rule`, so this is fine. But `_apply_group_sizes` on `aircraft.Aircraft_ID` and `pilot.Pilot_Id` violates PK / FK consistency as described above; restrict it there."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether comparison_boundary construction for `match.Winning_Pilot` can be validated by constructor: construction_pairs shows 12/47 separated with 0 unknown executions; the specific pair (predicate on pilot.Pilot_Id vs. match.Winning_Pilot) may not be separated because the construction is not directly observed on match side (see engineer issue #2).",
+    "The 'duplicates_for_distinct' share is implemented as '20-50 % of rows copy an earlier value', which is a share of *rows* (20-50%), not the duplicate share (shared values/shared rows). The spec says '20-50 % duplicate share', which is ambiguous; the current code is acceptable under a broad reading but the semantics of 'share' should be clarified (designer).",
+    "The generic rule `null_share` states '10% of generated rows get NULL' for nullable columns, but `_null_share` overrides with `max(original_share, 0.05)` per column and `NULL_SHARE_OVERRIDE` uses 5-30% for International_Passengers; the actual shares across the run (e.g. airport.%_Change_2007: 28/444 \u2248 6.3%, match.Location: 29/512 \u2248 5.7%) are at the 5% floor, consistent with 'at least one NULL row and a share following the compact DB'; acceptable but the '10%' generic vs. per-column share is not reconciled (designer).",
+    "Possibly worth confirming: `airport_aircraft.ID` is nullable per the schema but is treated as a 'free integer' by the program; spec.null_targets includes `airport_aircraft.ID`, but the generic rule shows 64/1283 NULLs \u2014 consistent with the rule; ok."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification lists null_targets including match.Winning_Pilot and match.Winning_Aircraft, and the unmatched_join_rows pattern requires 'child_rows_with_null_fk: true'. The program's _apply_null_rule plants NULLs on these columns (feedback: match.Winning_Pilot NULL 17/142, match.Winning_Aircraft NULL 26/142), and _ensure_childless_parent additionally guarantees a childless parent. This is consistent, but the spec's uncertainty note about TEXT-typed FK columns referencing integer PKs is only partially addressed: _apply_match_comparison_boundary writes str(base) and str(base+1) where base+1 may not be a valid pilot PK (it is only guaranteed to be a valid PK if base+1 happens to be in the generated pilot set).",
+     "requested_revision": "Clarify in the specification that the 'one step from' comparison boundary for match.Winning_Pilot is satisfied by the pilot side (Pilot_Id values base, base+1, base+2) and that the match side only needs to equal a valid pilot PK; or require the match side to also plant a value equal to a valid pilot PK and a value one step from it that is itself a valid pilot PK. The current code plants str(base+1) which may violate the FK formula 'CAST(Winning_Pilot AS INTEGER) IN (SELECT Pilot_Id FROM pilot)' if base+1 is not a generated pilot PK. Execution feedback shows 0 FK violations, so this is not currently blocking, but the rule is not guaranteed by construction."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "writer.py: the executemany path appends all rows to good_rows unconditionally ('for r in rows: good_rows.append(r)'), so the 'skip and count' fallback only triggers on a batch-level error. The feedback shows airport_aircraft rows_skipped 22/85, meaning the fallback did run and isolated failures. However, the code comment claims 'a failing row is skipped and counted' but the primary path does not pre-filter; this is acceptable behavior but the comment is misleading.",
+     "requested_revision": "Either update the comment to reflect that executemany is attempted first and row-by-row isolation only happens on batch failure, or pre-validate rows. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _apply_sum_rule: when a boundary row has a NULL component, the code falls through to 'cols[Total_Passengers][i] = total' only when all three components are non-NULL; when a component is NULL the boundary value is kept as-is (per spec uncertainty note). This matches the spec. However, the sum rule is applied AFTER the NULL rule, so a row whose Total_Passengers was planted as a boundary value but whose Transit was NULLed will keep the boundary value without back-solving \u2014 consistent with the spec's stated behavior.",
+     "requested_revision": "No change required; note that the spec's uncertainty entry about boundary rows with NULL components is correctly implemented."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's generic_sampling_rules says 'real_quantity: Positive real numbers drawn from a log-uniform distribution over [1, 1e8]'. The BoundaryNumberSampler for airport.Total_Passengers uses scale=8, is_int=False, precision=1, and plants L-1/L/L+1 with 50% probability; the remaining 50% falls back to NumberSampler which draws from [list_min, list_max] or [-1e8, 1e8] (signed, not strictly positive). The semantic range rule clamps to >= 0 afterward, so negatives become 0, but the 'positive' and 'log-uniform' aspects are not strictly honored for the non-boundary share.",
+     "requested_revision": "Either relax the spec wording to 'non-negative real numbers' for Total_Passengers (consistent with the semantic rule Total_Passengers >= 0) or adjust the sampler to draw log-uniformly over [1, 1e8] for the non-boundary share. Not blocking since the semantic rule is enforced."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _apply_group_sizes is applied to aircraft.Aircraft and pilot.Age, but _plant_groups requires n >= 6 and at least 3 distinct representatives. With table_sizes_per_instance aircraft=5 (jittered 0.5x-1.5x \u2192 2-8), aircraft.Aircraft may have n < 6 and skip group planting. Feedback shows 20 instances generated without error, but the group-size target '1, 2 and >= 3' is not guaranteed for small aircraft tables.",
+     "requested_revision": "Either raise the minimum aircraft table size in the spec (e.g., ensure jittered size >= 6) or lower the _plant_groups threshold. Not blocking since the pattern is best-effort and the spec's table_sizes_per_instance is a base, not a hard minimum."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _apply_duplicate_share: the loop 'for j in idx[:k]: src = rng.randrange(n); if src != j: values[j] = values[src]' can copy from a position that was itself already overwritten, and can fail to produce the intended duplicate share if src == j frequently. The share is approximate, not exact. Feedback does not report duplicate-share measurements, so this is unverified.",
+     "requested_revision": "Consider copying from the original (pre-mutation) list to guarantee the duplicate share, or measure and report the realized duplicate share. Not blocking."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's semantic_rules_and_formulas includes 'Total_Passengers = International_Passengers + Domestic_Passengers + Transit_Passengers' with evidence from airport rows 1-8. The program implements this in _apply_sum_rule. However, the spec's null_targets includes airport.Total_Passengers, International_Passengers, Domestic_Passengers, Transit_Passengers, so the sum rule only applies when all are non-NULL (per SQL three-valued logic). The program correctly skips NULL operands. This is consistent.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "values.py make_column_sampler: 'els = [e for e in elements if rng.random() < 0.9]' randomly drops 10% of elements per column per instance. This is a fuzzing heuristic, not specified. It could reduce the chance that boundary literals (e.g., 'Australia', 'australia', 'London') appear, though the dedicated BoundaryTextSampler/LikeVariantSampler plant them with 50% probability regardless of els. For non-boundary columns this is harmless.",
+     "requested_revision": "No change required; note that boundary samplers bypass the 10% drop."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's per_column_exceptions includes 'format' for aircraft.Max_Gross_Weight, Total_disk_area, Max_disk_Loading with example '1,370 lb (635 kg)'. The program's WeightFormatSampler derives units and ratio from parsed original values, defaulting to ('lb','kg') and 0.45. This is a reasonable implementation but the spec does not state the unit or ratio; the program's choice is an assumption.",
+     "requested_revision": "Document the assumed units and ratio in the spec, or confirm they match the compact database. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback: construction_pairs eligible 47, separated 12, unknown_executions 0. 12/47 pairs separated means 35 pairs were not separated by the generated instances. Per instruction 4, a missing separation alone does not establish a generation error. The feedback does not list which pairs failed to separate, so I cannot verify whether the unseparated pairs are due to value variation being too narrow (e.g., boundary values not planted often enough) or due to genuine query equivalence.",
+     "requested_revision": "Request the engineer to report per-pair separation details (which pairs, and whether the unseparated pairs share a denotation on the compact DB) so the reviewer can distinguish insufficient variation from true equivalence. Not blocking for pass, but unresolved."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-pair separation details for the 35 unseparated construction pairs are not provided; cannot confirm whether value variation is sufficient or the pairs are genuinely equivalent.",
+    "Realized duplicate share for DISTINCT-targeted columns (aircraft.Aircraft, pilot.Name, match.Location) is not measured in the feedback.",
+    "Realized group-size distribution for aircraft.Aircraft and pilot.Age is not measured; small aircraft tables may skip group planting.",
+    "Whether match.Winning_Pilot values planted as str(base+1) are always valid pilot PKs (FK formula) is not verified per-instance; feedback shows 0 FK violations overall, but the construction does not guarantee it.",
+    "Whether the 10% element drop in make_column_sampler affects boundary literal coverage for non-dedicated samplers is not measured."
+   ]
+  }
+ ]
 }

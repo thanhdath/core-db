@@ -1,83 +1,463 @@
 {
  "db": "college_3",
- "operator_io_quirks": [
-  "All identifiers are simple ASCII, no spaces/mixed case; but DDL has tabs and multi-line CREATE TABLE \u2014 line-based unique/check scan must tolerate tabs.",
-  "No NOT NULL, no UNIQUE, no CHECK anywhere; every column nullable, so TS's NULL injection is never blocked by constraints.",
-  "Member_of, Minor_in, Enrolled_in have NO primary key (pk=[]); sample_fresh_primary_keys must no-op on empty PK, not crash.",
-  "Enrolled_in.Grade is a VARCHAR(2) FK to Gradeconversion.lettergrade (text->text, fine) but Grade values like 'A-','B+' are 1-2 chars; String fuzzer length range [0,2] will produce junk that fails the FK at insert (skipped).",
-  "Course.CID is VARCHAR(7) PK with dotted codes '050.102'; String fuzzer will emit random 0-7 char strings, many colliding -> PK dedupe drops rows.",
-  "Student.Advisor is INTEGER but NOT declared as FK to Faculty.FacID; TS treats it as plain Number, so advisor values will not match any FacID (semantic FK, not schema FK).",
-  "Student.Major is INTEGER with no FK to Department.DNO; same semantic-FK gap.",
-  "Course.Hours is VARCHAR(11) holding both '3' and '10:30-12' \u2014 mixed numeric/time text; String fuzzer, not Time (declared type has no 'time').",
-  "Course.Days VARCHAR(5) holds 'MTW','Th','MW' \u2014 day-code text, String fuzzer.",
-  "Gradeconversion.gradepoint is FLOAT stored as real; Number fuzzer with scale from no args -> default scale, will emit values far outside [0,4].",
-  "Faculty.Phone and Department.DPhone are INTEGER phone numbers (4-digit); Number fuzzer range will produce huge/negative ints.",
-  "All tables tiny (10-210 rows); no huge-table sampling concern, but original_values lists are short so 5-draw rng.choices with replacement is heavily duplicated."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on StuID/FacID/DNO/Credits/Age/Phone: uniform in [-10^scale,10^scale] then +-1/+-2 perturbation; PKs like 1001-1034 will be replaced by arbitrary ints, breaking joins to literal '1001' in gold SQL -> FN.",
-  "String fuzzer on LName/Fname/DName/CName: random a-zA-Z0-9() strings of length 0-12/15/25/40; gold SQL filtering on 'Smith','Biology' etc. returns empty -> FN.",
-  "String fuzzer on Sex VARCHAR(1): random 0-1 char strings, not 'M'/'F'; gold 'Sex = M' queries get empty -> FN.",
-  "String fuzzer on Rank VARCHAR(15): random strings, not 'Professor'/'Instructor'; gold rank filters -> FN.",
-  "String fuzzer on Gradeconversion.lettergrade VARCHAR(2) PK: random 0-2 char strings; Enrolled_in.Grade FK draws from these, so Grade values become junk; gold 'Grade = A' -> FN.",
-  "String fuzzer on Course.CID VARCHAR(7): random strings, not '050.102'; gold CID filters and joins to Enrolled_in.CID -> FN.",
-  "String fuzzer on Division VARCHAR(2): random 0-2 chars, not 'AS'/'EN' -> FN on division filters.",
-  "String fuzzer on Building VARCHAR(13): random strings, not 'NEB'/'Mudd' -> FN on building filters.",
-  "String fuzzer on city_code VARCHAR(3): random 0-3 chars, not 'BAL'/'HKG' -> FN.",
-  "Number fuzzer on gradepoint FLOAT: uniform over huge range, not [0,4]; gold 'gradepoint > 3.5' -> mostly true or mostly false -> FP/FN.",
-  "FK columns (Member_of.FacID/DNO, Course.Instructor/DNO, Minor_in.StuID/DNO, Enrolled_in.StuID/CID/Grade) draw from parent's FINAL filtered values with replacement -> many duplicate child rows; no PK on these tables so duplicates survive -> FP on COUNT(DISTINCT) vs COUNT queries.",
-  "PK dedupe on Student/Faculty/Department/Course/Gradeconversion keeps first occurrence; with random Number/String PKs collisions are rare for ints but common for short VARCHAR PKs (lettergrade, CID) -> table sizes shrink below chosen size -> FP on COUNT(*) queries."
- ],
- "challenger_refs": [
-  "gbe84a326",
-  "g5b7e762c",
-  "g5b7e762c",
-  "g5b7e762c",
-  "g5b7e762c",
-  "gdebd9cb3",
-  "gfd95a34d",
-  "gfd95a34d",
-  "gac7add8e",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g73296c19",
-  "g867fdc3b",
-  "g1ac022a4",
-  "g2e9c0def",
-  "g2e9c0def",
-  "g7747fc07",
-  "g7747fc07",
-  "g7747fc07"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential or random unique integers within the observed range; never NULL; no duplicates.",
+   "integer_fk": "Sample from the parent table's generated key pool; allow NULL with the compact share when the column is nullable; include at least one NULL row and at least one parent row without children.",
+   "integer_numeric": "Uniform integer within the observed min/max; include boundary values at listed literals and one step on each side; NULL share per compact database when nullable.",
+   "varchar_text": "Random strings of length within the declared width; include near-variants (case, trailing space, one-character edit) of listed literals; NULL share per compact database when nullable.",
+   "varchar_enum": "Sample uniformly from the listed enum values; include near-variants of listed literals; NULL share per compact database when nullable.",
+   "varchar_code": "Random uppercase alphanumeric strings of the declared length; include near-variants of listed literals; NULL share per compact database when nullable.",
+   "float_numeric": "Uniform float within the observed min/max; include boundary values at listed literals and one step on each side; NULL share per compact database when nullable.",
+   "distinct_columns": "Ensure the duplicate share on DISTINCT columns is 20-50% by repeating values from a small pool.",
+   "order_tie_columns": "Ensure at least two rows tie at the listed LIMIT rank on ORDER columns.",
+   "group_size_columns": "Ensure group sizes of 1, 2 and >= 3 occur on GROUP columns.",
+   "aggregate_boundary_columns": "Ensure counts straddle the listed HAVING literals (one below, one at, one above).",
+   "null_rule": "Every nullable column gets at least one NULL row per instance; NULL share follows the compact database; planted NULLs are never replaced.",
+   "boundary_probe_rule": "Out-of-pool comparison-boundary literals (e.g. DNO 139/140/141/519/520/521) are query-side probes only; they are never stored in primary-key or foreign-key columns. Stored key/FK values always come from the parent key pool or are NULL."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Department.DNO",
+     "Minor_in.DNO",
+     "Member_of.DNO"
+    ],
+    "targets": {
+     "values": [
+      139,
+      140,
+      141,
+      519,
+      520,
+      521
+     ],
+     "storage": "query_literal_only"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Department.Division"
+    ],
+    "targets": {
+     "values": [
+      "EN",
+      "en"
+     ]
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "Department.DNO",
+     "Minor_in.DNO",
+     "Course.CName",
+     "Course.CID",
+     "Enrolled_in.CID"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "key_columns": "preserve uniqueness and referential integrity"
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "columns": [
+     "Course.CName",
+     "Course.CID",
+     "Enrolled_in.CID",
+     "Enrolled_in.StuID"
+    ],
+    "targets": {
+     "aggregate": [
+      "COUNT(*)",
+      "COUNT(enrolled_in.stuid)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Department.DNO",
+     "Faculty.Lname",
+     "Student.Fname",
+     "Student.LName",
+     "Department.DName",
+     "Department.Room",
+     "Faculty.Room"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "Department.DNO",
+     "Minor_in.DNO",
+     "Course.Instructor",
+     "Faculty.Rank"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC/ASC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT minor_in.stuid)",
+      "COUNT(faculty.facid)"
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "Minor_in.DNO",
+     "Member_of.DNO",
+     "Course.DNO",
+     "Course.Instructor"
+    ],
+    "targets": {
+     "joins_with": [
+      "Department.DNO",
+      "Faculty.FacID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "pk_columns_excluded": [
+      "Department.DNO",
+      "Faculty.FacID"
+     ]
+    }
+   },
+   {
+    "pattern": "format",
+    "columns": [
+     "Course.CID"
+    ],
+    "targets": {
+     "format": "NNN.NNN",
+     "near_variants": "preserve dot and digit pattern"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Student.Major",
+    "parent": "Department",
+    "parent_column": "DNO",
+    "copied": []
+   },
+   {
+    "child": "Student.Advisor",
+    "parent": "Faculty",
+    "parent_column": "FacID",
+    "copied": []
+   },
+   {
+    "child": "Member_of.FacID",
+    "parent": "Faculty",
+    "parent_column": "FacID",
+    "copied": []
+   },
+   {
+    "child": "Member_of.DNO",
+    "parent": "Department",
+    "parent_column": "DNO",
+    "copied": []
+   },
+   {
+    "child": "Course.Instructor",
+    "parent": "Faculty",
+    "parent_column": "FacID",
+    "copied": []
+   },
+   {
+    "child": "Course.DNO",
+    "parent": "Department",
+    "parent_column": "DNO",
+    "copied": []
+   },
+   {
+    "child": "Minor_in.StuID",
+    "parent": "Student",
+    "parent_column": "StuID",
+    "copied": []
+   },
+   {
+    "child": "Minor_in.DNO",
+    "parent": "Department",
+    "parent_column": "DNO",
+    "copied": []
+   },
+   {
+    "child": "Enrolled_in.StuID",
+    "parent": "Student",
+    "parent_column": "StuID",
+    "copied": []
+   },
+   {
+    "child": "Enrolled_in.CID",
+    "parent": "Course",
+    "parent_column": "CID",
+    "copied": []
+   },
+   {
+    "child": "Enrolled_in.Grade",
+    "parent": "Gradeconversion",
+    "parent_column": "lettergrade",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Student",
+    "column": "Age",
+    "formula": "Age BETWEEN 16 AND 26"
+   },
+   {
+    "table": "Student",
+    "column": "Sex",
+    "formula": "Sex IN ('F','M')"
+   },
+   {
+    "table": "Faculty",
+    "column": "Rank",
+    "formula": "Rank IN ('Instructor','Professor','AssocProf','AsstProf')"
+   },
+   {
+    "table": "Faculty",
+    "column": "Sex",
+    "formula": "Sex IN ('F','M')"
+   },
+   {
+    "table": "Department",
+    "column": "Division",
+    "formula": "Division IN ('AS','EN')"
+   },
+   {
+    "table": "Course",
+    "column": "Credits",
+    "formula": "Credits BETWEEN 1 AND 4"
+   },
+   {
+    "table": "Member_of",
+    "column": "Appt_Type",
+    "formula": "Appt_Type IN ('Primary','Secondary')"
+   },
+   {
+    "table": "Gradeconversion",
+    "column": "gradepoint",
+    "formula": "gradepoint BETWEEN 0.0 AND 4.0"
+   },
+   {
+    "table": "Enrolled_in",
+    "column": "Grade",
+    "formula": "Grade IN (SELECT lettergrade FROM Gradeconversion)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Department": 26,
+   "Faculty": 58,
+   "Student": 34,
+   "Course": 76,
+   "Member_of": 63,
+   "Minor_in": 10,
+   "Enrolled_in": 210,
+   "Gradeconversion": 13
+  },
+  "null_targets": [
+   "Student.Major",
+   "Student.Advisor",
+   "Student.city_code",
+   "Faculty.Phone",
+   "Faculty.Room",
+   "Faculty.Building",
+   "Department.Division",
+   "Department.Room",
+   "Department.Building",
+   "Department.DPhone",
+   "Course.CName",
+   "Course.Credits",
+   "Course.Instructor",
+   "Course.Days",
+   "Course.Hours",
+   "Course.DNO",
+   "Member_of.FacID",
+   "Member_of.DNO",
+   "Member_of.Appt_Type",
+   "Minor_in.StuID",
+   "Minor_in.DNO",
+   "Enrolled_in.StuID",
+   "Enrolled_in.CID",
+   "Enrolled_in.Grade",
+   "Gradeconversion.gradepoint"
+  ],
+  "supporting_evidence": [
+   {
+    "rule": "Student.Age BETWEEN 16 AND 26",
+    "rows": [
+     "Student 1001 Age=18",
+     "Student 1006 Age=17",
+     "Student 1005 Age=26"
+    ]
+   },
+   {
+    "rule": "Course.Credits BETWEEN 1 AND 4",
+    "rows": [
+     "Course 050.102 Credits=3",
+     "Course 050.109 Credits=1",
+     "Course 050.203 Credits=4"
+    ]
+   },
+   {
+    "rule": "Gradeconversion.gradepoint BETWEEN 0.0 AND 4.0",
+    "rows": [
+     "Gradeconversion A=4.0",
+     "Gradeconversion B=3.0",
+     "Gradeconversion C+=2.0"
+    ]
+   },
+   {
+    "rule": "Student.Sex IN ('F','M')",
+    "rows": [
+     "Student 1001 Sex=F",
+     "Student 1002 Sex=M"
+    ]
+   },
+   {
+    "rule": "Faculty.Rank IN ('Instructor','Professor','AssocProf','AsstProf')",
+    "rows": [
+     "Faculty 1082 Rank=Instructor",
+     "Faculty 1121 Rank=Professor",
+     "Faculty 1148 Rank=AssocProf"
+    ]
+   },
+   {
+    "rule": "Department.Division IN ('AS','EN')",
+    "rows": [
+     "Department 10 Division=AS",
+     "Department 20 Division=EN"
+    ]
+   },
+   {
+    "rule": "Member_of.Appt_Type IN ('Primary','Secondary')",
+    "rows": [
+     "Member_of 7792 Appt_Type=Primary",
+     "Member_of 9210 Appt_Type=Secondary"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "Exact NULL shares per column are not given; use the compact database share and at least one NULL per nullable column.",
+   "Department.DNO boundary literals 140 and 520 are outside the observed DNO pool (10-90); they are query-side probes only and are never stored in PK/FK columns.",
+   "Minor_in.DNO boundary 140 is outside observed pool; query-side probe only.",
+   "Course.CID format is 'NNN.NNN'; near-variants preserve the dot and digit pattern.",
+   "Faculty.Rank tie direction is ASC per atomic summary; Department.DNO tie direction is DESC.",
+   "table_sizes_per_instance are exact per-instance generated row counts; jitter is not applied.",
+   "Group-size and aggregate-boundary shaping on key/FK columns must preserve uniqueness and referential integrity; verify post-conditions after dedup."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "cli.py line 79 calls `seed_literal_pool_from_queries(good, schema)` but this name is never imported. The module imports `extract_columns_from_sql, load_spec` from `.literals` (and re-imports `load_spec`), but `seed_literal_pool_from_queries` is defined in `literals.py` and is not imported. Execution feedback confirms: `NameError: name 'seed_literal_pool_from_queries' is not defined`, returncode 1, n_instances 0.",
+     "requested_revision": "Add `seed_literal_pool_from_queries` to the import from `.literals` in cli.py (e.g. `from .literals import extract_columns_from_sql, load_spec, seed_literal_pool_from_queries`). Re-run generation to confirm instances are produced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `EnumSampler.__init__` references an undefined name `extra_variants` (`for lit in extra_variants: pass`). This will raise `NameError` the first time an EnumSampler is constructed (e.g. for Student.Sex, Faculty.Rank, Department.Division, Member_of.Appt_Type, Gradeconversion domains). This is a latent crash that will surface once the cli import bug is fixed.",
+     "requested_revision": "Remove the dead `for lit in extra_variants: pass` loop (or define `extra_variants`). The near-variant logic is already handled by the preceding lines."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `RangeSampler.__init__` sets `self.boundary = list(boundaries)` but the parameter is named `boundary`; `boundaries` is undefined. This raises `NameError` whenever a RangeSampler is built (e.g. Student.Age, Course.Credits, Gradeconversion.gradepoint via `ranges` spec).",
+     "requested_revision": "Change to `self.boundary = list(boundary)`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_domain_sampler` looks up `spec.get('ranges', {})`, `spec.get('enums', {})`, `spec.get('codes', {})`, `spec.get('domains', {})`, `spec.get('boundary', {})`, `spec.get('cid_prefixes', ...)`. None of these keys exist in DEFAULT_SPEC (spec.py) nor in the supplied generation specification, which instead uses `semantic_rules_and_formulas` (e.g. `Age BETWEEN 16 AND 26`, `Credits BETWEEN 1 AND 4`, `Division IN ('AS','EN')`, `Rank IN (...)`, `Sex IN ('F','M')`, `Appt_Type IN (...)`, `gradepoint BETWEEN 0.0 AND 4.0`). Consequently the semantic domain rules are never applied by construction; columns fall back to generic samplers (NumberSampler/StringSampler) that can emit values outside the declared domains (e.g. Age outside 16-26, Credits outside 1-4, Rank/Sex/Division/Appt_Type outside their enums).",
+     "requested_revision": "Either (a) translate the specification's `semantic_rules_and_formulas` into the `ranges`/`enums`/`domains` structures that `_domain_sampler` consumes, or (b) extend `_domain_sampler`/`DEFAULT_SPEC` to parse and enforce the `semantic_rules_and_formulas` entries. Ensure Age\u2208[16,26], Credits\u2208[1,4], gradepoint\u2208[0,4], and Sex/Rank/Division/Appt_Type/Grade are drawn from their declared enums."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_comparison_boundary` writes boundary probes (e.g. Department.DNO 139/140/141/519/520/521, Minor_in.DNO 139/140/141, Member_of.DNO 519/520/521) directly into the column values. For Department.DNO (a primary key) and for FK columns (Minor_in.DNO, Member_of.DNO), these probes are outside the parent key pool (observed DNO pool 10-90). Writing them into a PK column produces keys not present in the parent pool; writing them into FK columns produces dangling references. The spec's `uncertainty` explicitly notes these literals are outside the observed pool and should be 'boundary probes', not necessarily inserted as actual key/FK values. This conflicts with the FK integrity requirement and with `_fk_values` which otherwise draws only from the parent pool.",
+     "requested_revision": "Do not inject out-of-pool boundary literals into primary-key or foreign-key columns. Restrict comparison-boundary probes to non-key, non-FK columns, or route them through the literal pool used for query generation rather than into stored key values. Ensure FK columns only contain values from the parent key pool (or NULL)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_unmatched_join` sets `out[0] = None` for columns listed in `unmatched_join_columns`, which includes `Department.DNO` and `Faculty.FacID` \u2014 both primary keys. Setting a PK to NULL violates the NOT NULL/PK constraint. Also `_apply_unmatched_join` is applied to non-FK columns (Department.DNO, Faculty.FacID) where the 'child rows with NULL FK' semantics do not apply.",
+     "requested_revision": "Apply the unmatched-join NULL planting only to nullable FK child columns (Minor_in.DNO, Member_of.DNO, Course.DNO, Course.Instructor), never to primary keys. Parent-side 'rows without children' should be achieved by leaving some parent keys unreferenced, not by nulling the parent key."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_group_sizes` and `_apply_aggregate_boundary` rewrite values in place on columns including primary keys (Department.DNO, Course.CID) and FK columns (Minor_in.DNO, Enrolled_in.CID). Rewriting PK values after `_dedup_against_compact`/`sample_fresh_primary_keys` can reintroduce duplicates or collisions with compact rows (dedup runs before postprocess? \u2014 actually postprocess runs before dedup in build_random_instance, but the group-size rewrite can still create duplicate PKs that dedup then drops, silently shrinking the table and possibly breaking the intended group sizes). More importantly, rewriting FK columns (Minor_in.DNO, Enrolled_in.CID) to arbitrary values can produce dangling references.",
+     "requested_revision": "Apply group-size and aggregate-boundary shaping only to non-key, non-FK columns (e.g. Course.CName), or ensure any reshaping of key/FK columns preserves uniqueness and referential integrity (draw reshaped values from the parent pool). Verify post-conditions after dedup."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fk_values` and `fill_foreign_keys_consistently` draw FK values from `_parent_pool(instance, ...)` which includes compact + generated parent values. However `_apply_comparison_boundary`/`_apply_unmatched_join`/`_apply_group_sizes` are applied to FK columns *after* `_fk_values` in `_postprocess`? \u2014 actually `_postprocess` is only called for non-FK columns in `build_random_instance` (FK columns are filled separately and not postprocessed). But `_apply_unmatched_join` lists FK columns and is only invoked via `_postprocess`, so it never runs on FK columns; the 'child rows with NULL FK' requirement is instead handled by `_fk_values` (first row NULL when null_share>0). This is acceptable, but the `unmatched_join_columns` list including PK columns (Department.DNO, Faculty.FacID) is misleading and, if ever routed through postprocess, would corrupt PKs. Also `_fk_values` forces `out[0]=None` only when `null_share>0`; for FK columns whose compact share is 0 (no NULLs observed), no NULL is planted, which may not satisfy 'at least one NULL row per nullable column'.",
+     "requested_revision": "Ensure every nullable FK column gets at least one NULL row per instance regardless of compact share (per the NULL rule), and remove PK columns from `unmatched_join_columns`. Confirm FK values are always drawn from the parent pool or NULL."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` \u2014 without `orig_path`. In that branch the writer builds an empty clone from DDL and inserts *all* rows from `instance` (which already includes compact rows copied in `build_random_instance`). This means the compact rows are re-inserted from the in-memory copy rather than preserved from the original file. The docstring claims 'compact rows are never deleted or changed', but the actual path re-inserts them; if any compact row fails insertion (e.g. due to a constraint), it is silently dropped and counted as failed, violating preservation. Also `orig_path` is never passed, so the `shutil.copyfile` preservation branch is dead code.",
+     "requested_revision": "Pass `orig_path` to `write_instance_sqlite` from cli.py so the compact database is copied and only generated rows are appended, OR verify that the in-memory compact prefix is byte-identical and that insertion cannot fail. Ensure compact-row preservation is actually exercised and verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `choose_table_sizes` uses `spec.get('table_sizes', {})` but DEFAULT_SPEC stores sizes under `table_sizes` (correct) \u2014 however the supplied generation specification uses `table_sizes_per_instance`. `load_spec` merges user spec over DEFAULT_SPEC; if specification.json uses `table_sizes_per_instance`, `choose_table_sizes` will not see it and fall back to DEFAULT_SPEC's `table_sizes` (which happens to match). This is fragile but currently consistent. More importantly, `choose_table_sizes` jitters sizes by \u00b125-33%, so the exact `table_sizes_per_instance` values are not honored; the spec says these are the per-instance sizes.",
+     "requested_revision": "Confirm whether exact table sizes are required; if so, remove or bound the jitter. Align the key name (`table_sizes` vs `table_sizes_per_instance`) between spec.py and the supplied specification."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` are stated as formulas (e.g. `Age BETWEEN 16 AND 26`) but the program's spec loader (spec.py DEFAULT_SPEC) does not encode them in a machine-consumable form (`ranges`/`enums`/`domains`). The specification also lists `comparison_boundary` values (139/140/141/519/520/521) that are outside the observed DNO pool and are described as 'boundary probes' \u2014 but it does not clarify whether these should be stored as actual key/FK values or only used as query literals. This ambiguity led to the PK/FK corruption issues above.",
+     "requested_revision": "Clarify in the specification: (a) provide the semantic domains in a structured form the generator can consume (ranges/enums per column), and (b) state explicitly that out-of-pool boundary literals are query-side probes, not stored key/FK values. Also clarify whether `table_sizes_per_instance` are exact or approximate."
+    }
+   ],
+   "unresolved_checks": [
+    "Generation could not be executed to completion (NameError in cli.py), so integrity-constraint satisfaction, dependent-value consistency, compact-row preservation, and reproducibility were not empirically verified.",
+    "Whether the semantic domain rules (Age, Credits, gradepoint, enums) are enforced at runtime is unverified because the domain samplers are never wired to the specification's `semantic_rules_and_formulas`.",
+    "Whether FK columns ever contain dangling references after boundary/group-size postprocessing is unverified (postprocessing is currently only applied to non-FK columns, but the `unmatched_join_columns` list includes PK columns and the design is fragile).",
+    "Whether compact rows are preserved depends on the writer branch actually taken; the `orig_path` argument is not passed, so the preservation branch is dead code."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback 20/20 valid, 0 FK violations, 0 PK duplicates, 0 not-null violations, 0 row failures, reproducible=true. Program implements semantic formulas via spec.py (_apply_semantic_rules -> ranges/enums) and atomic ops via _apply_atomic_ops; samplers in values.py; FK drawing in instance._fk_values uses parent pools; writer preserves compact rows by copying orig DB and appending only the generated suffix.",
+     "requested_revision": "None blocking. Optional: tighten generic sampling so NULL-only on some column lines (e.g. Department.DName 0/65) is noted for the engineer; per instructions item 7 this does not block.",
+     "unresolved_checks": []
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction_pairs separated=19 of 73 eligible; groups list empty. This is expected because boundary probes (DNO 139/140/141/519/520/521) are query-side only per spec's boundary_probe_rule and per_column_exceptions storage 'query_literal_only'. Program enforces this in spec._apply_atomic_ops by routing _KEY_COLUMNS to boundary_probe_columns (never stored) and in instance._postprocess via _is_key_or_fk guard. Does not prove generation error or query equivalence.",
+     "requested_revision": "None blocking; separation shortfall is consistent with spec (query-side probes only).",
+     "unresolved_checks": [
+      "No per-group breakdown was produced (construction_pairs_by_group empty); full pattern-level separation not verifiable from the run, but the run succeeded and construction is by construction."
+     ]
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec is internally consistent: semantic_rules_and_formulas backed by supporting_evidence (Age, Credits, gradepoint, Sex, Rank, Division, Appt_Type); atomic op list translated to machine structures by spec.load_spec via _apply_semantic_rules / _apply_atomic_ops; remaining patterns (group_sizes, aggregate_boundary, duplicates_for_distinct, ties_for_order_limit, unmatched_join_rows) are encoded in per_column_exceptions and implemented in instance._apply_* helpers. Boundary literals 140/520 declared out-of-pool (uncertainty) and marked storage=query_literal_only. Course.CID format 'NNN.NNN' implemented by CIDSampler.",
+     "requested_revision": "None blocking; only check: some spec fields (e.g. mismatched bounds like Course.CName group_sizes with VARCHAR(40), Course.Days varchar_enum with no listed enum source) are inherited from schema/observed widths and the existing original values pool rather than spec literals; not a blocking error.",
+     "unresolved_checks": []
+    }
+   ]
+  }
+ ]
 }

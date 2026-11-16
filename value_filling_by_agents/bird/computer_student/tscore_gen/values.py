@@ -107,6 +107,27 @@ class StringSampler(ColumnSampler):
         return v
 
 
+class EnumSampler(ColumnSampler):
+    """Domain sampler: uniform choice from the column's enum list, with occasional case variants."""
+
+    def __init__(self, elements, p, max_l0, rng, case_variant_rate=0.15):
+        super().__init__(elements, p, max_l0, rng)
+        self.case_variant_rate = case_variant_rate
+
+    def sample(self):
+        r = self.rng
+        if not self.elements:
+            return None
+        v = r.choice(self.elements)
+        if isinstance(v, str) and r.random() < self.case_variant_rate:
+            u = r.random()
+            if u < 0.5:
+                v = v.lower()
+            else:
+                v = v.upper()
+        return v
+
+
 def _parse_date(s: str):
     s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
@@ -182,9 +203,11 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, enum: bool = False) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
+    if enum:
+        return EnumSampler(els, p, max_l0, rng)
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
@@ -215,7 +238,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), enum: bool = False) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +248,12 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, enum=enum)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), enum: bool = False) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, enum=enum)
     return [s.sample() for _ in range(n)]

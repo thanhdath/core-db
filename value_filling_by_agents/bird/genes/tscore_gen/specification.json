@@ -1,0 +1,205 @@
+{
+ "generic_sampling_rules": {
+  "text": "Sample from the column's declared value pool (enum, code, identifier format) when one exists; otherwise generate a fresh token from a compact alphabet matching the observed format. Keep 20-50% of distinct values duplicated across rows so DISTINCT and COUNT(DISTINCT) differ. For a near-variant column, insert a near-variant (one case change, one extra character, one truncated character) of each listed boundary literal that is already in the column's pool. Never emit a value outside the column's declared enum/format pool. Never place NULL in a NOT NULL column.",
+  "integer": "Sample from the observed range; boundary values are the minimum and maximum of the observed range plus one step on each side where no range rule forbids it. Never emit NULL in a NOT NULL column.",
+  "real": "Sample from the observed range; keep the value in [0, 1] when the column is a correlation or rate. Insert distinct values within a group so aggregates like MIN/MAX are non-degenerate. Never emit NULL in a NOT NULL column.",
+  "null": "For nullable columns only: insert NULL in the share of the compact database's observed NULL rate for that column, with at least one NULL row per instance. For NOT NULL columns never insert NULL.",
+  "tie": "For a column with an ORDER BY in the atomic-operation summary, insert at least one tie at the rank-1 limit of the ORDER BY value, on a non-unique column, so that ORDER BY ... LIMIT returns the same set regardless of row order. Compute the tie value as the maximum over the combined (compact + generated) row set and plant at least two generated rows at that value; assert the tie is at the global maximum. Re-plant after deduplication and assert against the final written row set.",
+  "parent": "Insert every parent row before its child rows; for each FK insert at least one parent row that has no child row and at least one child row per parent row where the FK is NOT NULL. Plant the unmatched-parent target by construction: after generating child rows, verify at least one parent key has no child in any child table; if not, add one, and assert it survives.",
+  "child": "Every child row's NOT NULL FK value must reference an existing parent row; insert at least one child row for every parent row and at least one parent row with no child row. Draw child FK keys from the parent key pool (compact + generated) with replacement; document that with-replacement sampling is acceptable and assert the unmatched-parent target separately.",
+  "fresh": "For a fresh table (no FK dependency), insert the primary key first and the dependent rows after their parent rows.",
+  "copy": "A copied column is derived from the parent row through the FK after the parent row exists; the copy rule is applied last, after any group-size or tie planting on the child column, and the planted targets are re-asserted against the final written row set. A child key with no parent is never generated: child keys are drawn strictly from the parent key pool (compact + generated).",
+  "planting_assertion_symmetry": "Only assert a planted target when the planting precondition was met, or guarantee the precondition by choosing n large enough. After perturbing a value to create a difference, verify the two values actually differ (retry with a larger delta or a fresh in-range draw) before asserting. Assertions are checked against the final written row set after deduplication and after the copy rule.",
+  "determinism": "Seed all randomness from random.Random(seed_base*100003+i) only. Avoid any dependence on set/dict ordering when emitting rows (sort keys before writing). Ensure failed units do not leave partial state that changes later units. Re-run twice with the same seed and confirm byte-identical files."
+ },
+ "per_column_exceptions": [
+  {
+   "pattern": "unmatched_join_rows",
+   "targets": [
+    "Classification.GeneID",
+    "Genes.GeneID",
+    "Interactions.GeneID1",
+    "Interactions.GeneID2"
+   ],
+   "rule": "Insert at least one Classification row with no Genes row and no Interactions row. All FKs are NOT NULL, so no orphan child rows are planted; parent rows without children are planted by generating extra Classification rows. Genes.GeneID and Interactions.GeneID1/GeneID2 are drawn strictly from the Classification key pool (compact + generated), so every child row has a parent. Plant the unmatched-parent target by construction and assert it survives."
+  },
+  {
+   "pattern": "comparison_boundary",
+   "targets": [
+    "Genes.Localization",
+    "Classification.Localization",
+    "Genes.Phenotype",
+    "Genes.Chromosome",
+    "Genes.Function",
+    "Interactions.Type",
+    "Genes.Essential",
+    "Genes.GeneID"
+   ],
+   "rule": "For enum/domain columns emit each listed literal that is in the column's declared pool and one case-change near-variant of that literal. Off-pool near-variants (e.g. 'Nucleic acid cts', 'Nucleic acid metefects', 'ec', 'metabolism defec' for Phenotype; 'asma', 'sm' for Localization; 'TRANSCRIPTION' for Function) are recorded only as near_variant_candidates and are emitted only if the pool contains them; otherwise they are dropped. For numeric Chromosome emit the listed integers and one step on each side within 1..17. Comparison_boundary literals routed to identifier columns (Genes.GeneID) and integer columns (Genes.Chromosome) are dropped: only format-valid identifiers / in-range integers are planted. This removes the ambiguity between the atomic-operation summary and the per-column exceptions."
+  },
+  {
+   "pattern": "group_sizes",
+   "targets": [
+    "Genes.Localization",
+    "Classification.Localization"
+   ],
+   "rule": "Plant at least one Localization value with group size 1, at least one with group size 2, and at least one with group size >= 3, on a non-unique column. For Genes.Localization, plant the groups on Classification.Localization and let the copy rule propagate them to Genes, or plant on Genes after the copy rule has been applied; re-assert survival against the final written row set. Only assert when the planting precondition (enough rows and distinct pool values) was met, or guarantee the precondition by choosing n large enough."
+  },
+  {
+   "pattern": "ties_for_order_limit",
+   "targets": [
+    "Genes.Localization",
+    "Genes.Chromosome",
+    "Interactions.Expression_Corr"
+   ],
+   "rule": "Plant at least two rows with the maximum value of the ORDER BY column on a non-unique column so ORDER BY ... DESC LIMIT 1 has a tie at rank 1, after deduplication. The tie value is the maximum over the combined (compact + generated) row set; assert the tie is at the global maximum and survives. Re-plant after dedup and assert against the final row set."
+  },
+  {
+   "pattern": "rows_with_different_values",
+   "targets": [
+    "Interactions.Expression_Corr"
+   ],
+   "rule": "For each GeneID1 group insert at least two rows with distinct Expression_Corr values so MIN/MAX are non-degenerate. After perturbation verify the two values actually differ (retry with a larger delta or a fresh in-range draw) before asserting; only assert when the planting precondition was met."
+  },
+  {
+   "pattern": "duplicates_for_distinct",
+   "targets": [
+    "Genes.Localization",
+    "Genes.Function",
+    "Classification.Localization"
+   ],
+   "rule": "On non-key columns keep 20-50% of distinct values duplicated across rows so COUNT(DISTINCT) < COUNT. Genes.GeneID and Classification.GeneID are primary keys and never duplicate."
+  },
+  {
+   "pattern": "like_near_variant",
+   "targets": [
+    "Genes.Phenotype"
+   ],
+   "rule": "Emit 'Nucleic acid metabolism defects' from the Phenotype pool and one case-change near-variant. Near-variants 'Nucleic acid cts' and 'Nucleic acid metefects' are emitted only if documented as allowed values in the pool; otherwise they are dropped."
+  }
+ ],
+ "dependencies": [
+  {
+   "child": "Genes",
+   "child_column": "GeneID",
+   "parent": "Classification",
+   "parent_column": "GeneID",
+   "copied_columns": [
+    "Localization"
+   ],
+   "on_update": "cascade",
+   "on_delete": "cascade"
+  },
+  {
+   "child": "Interactions",
+   "child_column": "GeneID1",
+   "parent": "Classification",
+   "parent_column": "GeneID",
+   "copied_columns": [],
+   "on_update": "cascade",
+   "on_delete": "cascade"
+  },
+  {
+   "child": "Interactions",
+   "child_column": "GeneID2",
+   "parent": "Classification",
+   "parent_column": "GeneID",
+   "copied_columns": [],
+   "on_update": "cascade",
+   "on_delete": "cascade"
+  }
+ ],
+ "semantic_rules_and_formulas": [
+  {
+   "table": "Classification",
+   "column": "Localization",
+   "formula": "Localization IN ('cytoplasm','cytoskeleton','nucleus','plasma membrane','mitochondria','vacuole','ER','golgi')",
+   "evidence": "Observed values from compact sample (8 distinct) plus stats distinct=15; this list is observed, not exhaustive (inferred-only, may add other organelle names)."
+  },
+  {
+   "table": "Genes",
+   "column": "Essential",
+   "formula": "Essential IN ('Essential','Non-Essential','?','Ambiguous-Essential')",
+   "evidence": "Observed values; stats distinct=4."
+  },
+  {
+   "table": "Genes",
+   "column": "Class",
+   "formula": "Class IN ('GTP/GDP-exchange factors (GEFs)','ATPases','Molecular chaperones','Motorproteins','Cyclins','Transcription factors','Protein Kinases','Major facilitator superfamily proteins (MFS)')",
+   "evidence": "Inferred-only: 8 of 24 observed distinct values shown; pool is a likely subset."
+  },
+  {
+   "table": "Genes",
+   "column": "Complex",
+   "formula": "Complex IS NULL OR Complex IN ('Translation complexes','?','Cytoskeleton','Cyclin-CDK (Cyclin-dependent kinases) complexes','Transcription complexes/Transcriptosome','Respiration chain complexes','Nucleosomal protein complex','Intracellular transport complexes')",
+   "evidence": "Observed values (8 of 52 distinct); nullable column."
+  },
+  {
+   "table": "Genes",
+   "column": "Phenotype",
+   "formula": "Phenotype IN ('?','Mating and sporulation defects','Cell cycle defects','Cell morphology and organelle mutants','Conditional phenotypes','Stress response defects','Carbohydrate and lipid biosynthesis defects','Nucleic acid metabolism defects')",
+   "evidence": "Observed values; stats distinct=13."
+  },
+  {
+   "table": "Genes",
+   "column": "Motif",
+   "formula": "Motif GLOB 'PS[0-9][0-9][0-9][0-9][0-9]'",
+   "evidence": "Inferred-only format from observed PS00xxx values; stats distinct=236."
+  },
+  {
+   "table": "Genes",
+   "column": "Chromosome",
+   "formula": "Chromosome BETWEEN 1 AND 17",
+   "evidence": "Observed values 1..8 in compact sample; stats distinct=17 overall. Range widened to 1..17 to match full-stats distinct count and to allow comparison-boundary queries on chromosomes 9..17 to be separated."
+  },
+  {
+   "table": "Genes",
+   "column": "Function",
+   "formula": "Function IN ('CELLULAR ORGANIZATION (proteins are localized to the corresponding organelle)','PROTEIN SYNTHESIS','CELL RESCUE, DEFENSE, CELL DEATH AND AGEING','CELLULAR TRANSPORT AND TRANSPORTMECHANISMS','PROTEIN DESTINATION','CELL GROWTH, CELL DIVISION AND DNA SYNTHESIS','CELLULAR COMMUNICATION/SIGNAL TRANSDUCTION','METABOLISM')",
+   "evidence": "Observed values; stats distinct=13. 'TRANSCRIPTION' and variants are NOT in this pool and must not be planted; this exclusion is documented here rather than implicit."
+  },
+  {
+   "table": "Genes",
+   "column": "Localization",
+   "formula": "Genes.Localization = Classification.Localization",
+   "condition": "Genes.GeneID = Classification.GeneID",
+   "evidence": "Copied through FK; must hold for every Genes row whose GeneID has a Classification parent. Unmatched keys must not fabricate a copy; child keys are drawn strictly from the parent key pool."
+  },
+  {
+   "table": "Interactions",
+   "column": "Type",
+   "formula": "Type IN ('Genetic-Physical','Genetic','Physical')",
+   "evidence": "Observed values; stats distinct=3."
+  },
+  {
+   "table": "Interactions",
+   "column": "Expression_Corr",
+   "formula": "Expression_Corr BETWEEN 0 AND 1",
+   "evidence": "Observed values 0.54176406..0.939001091; correlation lies in [0,1]."
+  }
+ ],
+ "table_sizes_per_instance": {
+  "Classification": 24,
+  "Genes": 24,
+  "Interactions": 24
+ },
+ "null_targets": [
+  "Genes.Complex"
+ ],
+ "supporting_evidence": [
+  "Genes.Localization = Classification.Localization via FK on GeneID: computed from all 8 compact rows; holds on every row where a parent exists.",
+  "Genes.Function pool: confirmed against compact distinct values; TRANSCRIPTION not present.",
+  "Interactions.Expression_Corr range: min 0.54176406, max 0.939001091 over compact rows.",
+  "Interactions.Type: Genetic-Physical, Genetic, Physical over compact rows (distinct=3).",
+  "Genes.Chromosome observed values 1..8 in compact sample; full stats distinct=17, so range widened to 1..17."
+ ],
+ "uncertainty": [
+  "Enum pools for Motif (236 distinct), Class (24), Complex (52), Function (13), Localization (15) are inferred-only from a compact sample; the compact database shows only a small subset of values and the implemented domain may be a proper subset.",
+  "Genes.Chromosome distinct=17 in the full stats but the compact subset shows only 1..8; the range rule is widened to 1..17 to match the full-stats distinct count. If the true domain is 1..8, the range rule should be narrowed back.",
+  "Genes.Localization copy invariant: child keys are drawn strictly from the Classification key pool (compact + generated) so every Genes row has a parent and the copy is well-defined; an explicit assertion checks Genes.Localization == Classification.Localization for every Genes row with a parent.",
+  "Planting order for group-size/tie/'different-value' targets must occur after deduplication/unique filtering and after the copy rule for copied columns so the targets survive; assertions are checked against the final written row set. Planting and assertion must be symmetric: only assert a target when the planting precondition was met, or guarantee the precondition by choosing n large enough.",
+  "Reproducibility: re-run generation twice with the same seed and confirm byte-identical instance files; investigate any nondeterminism source. Seed all randomness from random.Random(seed_base*100003+i) only, avoid dependence on set/dict ordering when emitting rows (sort keys before writing), and ensure failed units do not leave partial state that changes later units.",
+  "NULL share for Genes.Complex: generated rows show a very low NULL share; the compact NULL share should be checked to confirm it matches the spec's 'observed NULL rate' rule.",
+  "Unmatched-parent target: the program's _sample_table draws FK columns with replacement and does not guarantee a child row for every parent row; the spec's per_column_exceptions for unmatched_join_rows requires at least one Classification row with no Genes row and no Interactions row. Plant this target by construction and assert it survives."
+ ]
+}

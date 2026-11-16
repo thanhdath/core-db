@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -31,11 +31,31 @@ def _one(i: int) -> str:
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
+        stats = write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])
+        _G.setdefault('rows', {})
+        for t, n in stats['rows_ok'].items():
+            _G['rows'].setdefault((t, 'ok'), 0)
+            _G['rows'][(t, 'ok')] += n
+        for t, n in stats['rows_failed'].items():
+            _G['rows'].setdefault((t, 'bad'), 0)
+            _G['rows'][(t, 'bad')] += n
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
         return type(e).__name__
+
+
+def _aggregate_rows(rows_seen: list) -> tuple:
+    added: dict = {}
+    skipped: dict = {}
+    for r in rows_seen:
+        for k, v in r.items():
+            t, kind = k
+            if kind == 'ok':
+                added[t] = added.get(t, 0) + v
+            else:
+                skipped[t] = skipped.get(t, 0) + v
+    return added, skipped
 
 
 def main(argv=None) -> None:
@@ -63,21 +83,27 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag,
+            'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
+        _G.update(schema=schema, pool=pool, args=args, rows={})
         res = [_one(i) for i in idx]
+        rows_seen = [_G['rows']] if _G.get('rows') else []
     else:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
+        rows_seen = []
     errs: dict = {}
     for r in res:
         if r:
             errs[r] = errs.get(r, 0) + 1
+    added, skipped_rows = _aggregate_rows(rows_seen)
     print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
-                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good),
+                      'pool_skipped': skipped,
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows}))
 
 
 if __name__ == '__main__':

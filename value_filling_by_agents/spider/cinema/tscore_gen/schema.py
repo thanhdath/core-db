@@ -1,5 +1,7 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) plus append-copy helpers."""
 import math
+import os
+import shutil
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +36,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    uniques: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +61,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +78,21 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _parse_unique_tuples(create_sql: str, low_to_real: dict) -> list:
+    """Extract UNIQUE(...) / UNIQUE (a, b) column tuples from CREATE TABLE text."""
+    import re
+    out = []
+    for m in re.finditer(r'unique\s*\(([^)]*)\)', create_sql, flags=re.I):
+        names = []
+        for p in m.group(1).split(','):
+            tok = p.strip().split()[-1] if p.strip() else ''
+            tok = tok.strip('"`[]')
+            names.append(low_to_real.get(tok.lower(), tok))
+        if names:
+            out.append(tuple(names))
+    return out
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -84,6 +102,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         tnames = [n for ty, n, s in master if ty == 'table' and not str(n).startswith('sqlite_')]
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
+        uniques: dict = {}
         from_index = []
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
@@ -96,16 +115,29 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     uniq.add(tok)
                 if ('check (' in ll or 'check(' in ll) and tok in low:
                     chk.add(tok)
+            ulist = []
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
+                    cn = [c[2] for c in cols if c[2]]
+                    if len(cn) == 1 and cn[0].lower() not in uniq:
+                        uniq.add(cn[0].lower())
+                        from_index.append((t, cn[0]))
+                    if cn:
+                        ulist.append(tuple(cn))
+            for tu in _parse_unique_tuples(create[t], low):
+                ulist.append(tu)
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
+            u = []
+            seen = set()
+            for tu in ([tuple(pk)] if pk else []) + ulist:
+                if tu and tu not in seen:
+                    seen.add(tu)
+                    u.append(tu)
+            uniques[t] = u
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -139,4 +171,10 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, uniques)
+
+
+def copy_compact_db(orig_path: str, part_path: str) -> None:
+    """Copy the compact DB file to part_path (the append base)."""
+    os.makedirs(os.path.dirname(part_path) or '.', exist_ok=True)
+    shutil.copyfile(orig_path, part_path)

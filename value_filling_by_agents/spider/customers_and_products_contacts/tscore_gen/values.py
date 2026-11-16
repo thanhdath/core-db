@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -131,8 +133,8 @@ class DateSampler(ColumnSampler):
             if d is not None:
                 self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.template = self.template or '%Y-%m-%d %H:%M:%S'
+        self.full = (dt.datetime(1970, 1, 1), dt.datetime(2020, 12, 31))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -182,6 +184,167 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Pick from a fixed enumeration; near-variants (case) are part of the enum."""
+
+    def __init__(self, values, p, max_l0, rng):
+        super().__init__(list(values), p, max_l0, rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class NonNegativeNumberSampler(NumberSampler):
+    """product_price >= 0, positive decimal with 2-6 decimal places."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng, scale=8, is_int=False, precision=6, unsigned=True)
+
+    def sample(self):
+        v = super().sample()
+        if v is None or v < 0:
+            v = abs(v) if v is not None else 0.0
+        return round(float(v), self.rng.randint(2, 6))
+
+
+class QuantitySampler(ColumnSampler):
+    """order_quantity: integer string 1-20; one non-numeric 'male' observed."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.nonnum = spec.QUANTITY_NONNUMERIC
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.1:
+            return self.nonnum
+        if self.elements and r.random() < self.p:
+            e = str(r.choice(self.elements))
+            if re.fullmatch(r'\d+', e):
+                return e
+        return str(r.randint(1, 20))
+
+
+class NameSampler(ColumnSampler):
+    """Capitalized first/last names with near-variants."""
+
+    def __init__(self, pool, p, max_l0, rng):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.pool = list(pool)
+
+    def sample(self):
+        r = self.rng
+        v = r.choice(self.pool)
+        u = r.random()
+        if u < 0.1:
+            v = v.lower()
+        elif u < 0.2:
+            v = v.upper()
+        elif u < 0.3 and len(v) > 2:
+            v = v[:-1]
+        return v
+
+
+class AddressSampler(ColumnSampler):
+    """Random street address format."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        num = r.randint(1, 99999)
+        word = r.choice(spec.STREET_WORDS)
+        suffix = r.choice(['', ' Apt. %d' % r.randint(1, 999), ' Suite %d' % r.randint(1, 999)])
+        return '%d %s%s' % (num, word, suffix)
+
+
+class PhoneSampler(ColumnSampler):
+    """Random phone format with digits and separators."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        style = r.randrange(4)
+        if style == 0:
+            return '+%d(%d)%010d' % (r.randint(1, 99), r.randint(1, 9), r.randint(0, 9999999999))
+        if style == 1:
+            return '%03d-%03d-%04dx%d' % (r.randint(100, 999), r.randint(100, 999),
+                                          r.randint(0, 9999), r.randint(1, 99999))
+        if style == 2:
+            return '(%03d)%03d-%04dx%d' % (r.randint(100, 999), r.randint(100, 999),
+                                           r.randint(0, 9999), r.randint(1, 999))
+        return '%03d.%03d.%04dx%d' % (r.randint(100, 999), r.randint(100, 999),
+                                      r.randint(0, 9999), r.randint(1, 9999))
+
+
+class EmailSampler(ColumnSampler):
+    """Random lowercase name@domain."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        first = r.choice(spec.FIRST_NAMES).lower()
+        last = r.choice(spec.LAST_NAMES).lower()
+        dom = r.choice(['example.com', 'example.net', 'example.org'])
+        sep = r.choice(['.', '_', ''])
+        return '%s%s%s@%s' % (first, sep, last, dom)
+
+
+class CodeSampler(ColumnSampler):
+    """Random short uppercase code 2-15 chars."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        k = r.randint(2, 15)
+        return ''.join(r.choice(string.ascii_uppercase + string.digits) for _ in range(k))
+
+
+class CitySampler(ColumnSampler):
+    """City names with 20-50 % duplicate share (small pool)."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.CITIES), p, max_l0, rng)
+        self.pool = list(spec.CITIES)
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class StateSampler(ColumnSampler):
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.STATES), p, max_l0, rng)
+        self.pool = list(spec.STATES)
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class ZipSampler(ColumnSampler):
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        return '%03d' % self.rng.randint(0, 999)
+
+
+class ProductNameSampler(ColumnSampler):
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.PRODUCT_NAMES), p, max_l0, rng)
+        self.pool = list(spec.PRODUCT_NAMES)
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -214,9 +377,41 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     return StringSampler(els, p, max_l0, rng)
 
 
+def _spec_sampler(table: str, col: str, column, literal_pool: list, original_values, p: float,
+                  rng, max_l0: float):
+    """Specification-driven sampler for a (table, column), or None if generic."""
+    key = (table, col)
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], p, max_l0, rng)
+    if key in spec.NONNEGATIVE_COLUMNS:
+        return NonNegativeNumberSampler(original_values, p, max_l0, rng)
+    if key == spec.QUANTITY_COLUMN:
+        return QuantitySampler(original_values, p, max_l0, rng)
+    if col in ('first_name', 'last_name', 'customer_name'):
+        pool = spec.FIRST_NAMES if col == 'first_name' else spec.LAST_NAMES
+        return NameSampler(pool, p, max_l0, rng)
+    if col == 'customer_address' or col == 'line_1_number_building':
+        return AddressSampler(p, max_l0, rng)
+    if col in ('contact_phone', 'customer_phone'):
+        return PhoneSampler(p, max_l0, rng)
+    if col == 'customer_email':
+        return EmailSampler(p, max_l0, rng)
+    if col == 'customer_number':
+        return CodeSampler(p, max_l0, rng)
+    if col == 'city':
+        return CitySampler(p, max_l0, rng)
+    if col == 'state_province_county':
+        return StateSampler(p, max_l0, rng)
+    if col == 'zip_postcode':
+        return ZipSampler(p, max_l0, rng)
+    if col == 'product_name':
+        return ProductNameSampler(p, max_l0, rng)
+    return None
+
+
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), table: str = '') -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224, with spec overrides."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,11 +420,15 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
+    s = _spec_sampler(table, column.name, column, literal_pool, ov, p, rng, max_l0)
+    if s is not None:
+        return s
     return make_column_sampler(column, els, p, max_l0, rng)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), table: str = '') -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng,
+                      1 if column_meta.pk_pos else 0, max_l0, table)
     return [s.sample() for _ in range(n)]

@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_constraints: list = field(default_factory=list)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +76,36 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _parse_unique_constraints(create_sql: str, table: str, colnames: list) -> list:
+    """Extract UNIQUE(...) / UNIQUE (col, ...) composite constraints from CREATE TABLE text."""
+    out = []
+    low = create_sql.lower()
+    idx = 0
+    while True:
+        j = low.find('unique', idx)
+        if j < 0:
+            break
+        k = low.find('(', j)
+        if k < 0:
+            break
+        depth, m = 0, k
+        while m < len(create_sql):
+            if create_sql[m] == '(':
+                depth += 1
+            elif create_sql[m] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            m += 1
+        inner = create_sql[k + 1:m]
+        cols = [c.strip().strip('"`[]').lower() for c in inner.split(',')]
+        cols = [c for c in cols if c in {x.lower() for x in colnames}]
+        if len(cols) >= 2:
+            out.append(tuple(cols))
+        idx = m + 1
+    return out
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -85,6 +116,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        unique_constraints = []
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -106,6 +138,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
+            for uc in _parse_unique_constraints(create[t], t, [c.name for c in cols]):
+                unique_constraints.append((t, uc))
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -116,6 +150,10 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 pc = None
                 if pt is not None:
                     pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
+                    if pc is None:
+                        ppk = tables[pt].primary_key
+                        if len(ppk) == 1:
+                            pc = ppk[0]
                 if pt is None or pc is None or child is None:
                     warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
                     continue
@@ -139,4 +177,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_constraints)

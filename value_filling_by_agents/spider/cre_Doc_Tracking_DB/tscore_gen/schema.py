@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py), extended with compact-row key pools."""
 import math
 import sqlite3
 import warnings
@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    compact_keys: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -123,6 +124,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
+        compact_keys: dict = {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -137,6 +139,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+            pk = tables[t].primary_key
+            if pk:
+                idxs = [next(j for j, c in enumerate(tables[t].columns) if c.name == p) for p in pk]
+                compact_keys[t] = [tuple(r[j] for j in idxs) for r in rows]
+            else:
+                compact_keys[t] = []
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, compact_keys)

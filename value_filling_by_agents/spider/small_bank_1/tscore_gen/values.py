@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -70,6 +72,29 @@ class NumberSampler(ColumnSampler):
         return self._cast(v)
 
 
+class BalanceSampler(ColumnSampler):
+    """FLOAT_balance domain: non-negative amounts from small/medium/large bands."""
+
+    def __init__(self, elements, p, max_l0, rng, forced=None):
+        super().__init__(elements, p, max_l0, rng)
+        self.forced = list(forced or [])
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = float(r.choice(self.elements))
+        else:
+            v = spec.draw_balance(r)
+        u = r.random()
+        if u < 1 / 6:
+            v += 1.0
+        elif u < 1 / 3:
+            v = max(0.0, v - 1.0)
+        elif u < 1 / 2:
+            v += 2.0
+        return round(max(0.0, v), 2)
+
+
 class StringSampler(ColumnSampler):
     """fuzz/string.py (allow_none dropped)."""
 
@@ -105,6 +130,24 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class NameSampler(ColumnSampler):
+    """VARCHAR_name domain: realistic surnames with near-duplicate variants."""
+
+    def __init__(self, elements, p, max_l0, rng, forced=None):
+        super().__init__(elements, p, max_l0, rng)
+        self.forced = list(forced or [])
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            base = str(r.choice(self.elements))
+        else:
+            base = r.choice(spec.SURNAMES)
+        if r.random() < 0.15:
+            base = r.choice(spec.name_variants(base, r))
+        return base
 
 
 def _parse_date(s: str):
@@ -182,10 +225,15 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, forced=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
+    key = (column.table, column.name)
+    if key in spec.NON_NEGATIVE:
+        return BalanceSampler(els, p, max_l0, rng, forced=forced)
+    if column.name.lower() == 'name' and ('char' in t or 'text' in t or t == ''):
+        return NameSampler(els, p, max_l0, rng, forced=forced)
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
@@ -215,7 +263,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), forced=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +273,11 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, forced=forced)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]

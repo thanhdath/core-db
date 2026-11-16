@@ -7,6 +7,18 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+PAPER_ID_LITERALS = ['chakrabarti01integrating', 'CHAKRABARTI01INTEGRATING',
+                     'schmidt99advanced', 'SCHMIDT99ADVANCED',
+                     'sima01computational', 'SIMA01COMPUTATIONAL',
+                     'butz01algorithmic', 'BUTZ01ALGORITHMIC']
+CITING_ID_LITERALS = ['schmidt99advanced', 'SCHMIDT99ADVANCED', 'd', 'D', 'schminced', 'SCHMINCED',
+                      'sct99advanced', 'SCT99ADVANCED', 'sima01computational', 'SIMA01COMPUTATIONAL']
+CITED_ID_LITERALS = ['butz01algorithmic', 'BUTZ01ALGORITHMIC', 'schmidt99advanced', 'SCHMIDT99ADVANCED',
+                     'word3555', 'WORD3555']
+CLASS_LABELS = ['Agents', 'IR', 'ML', 'AI', 'DB', 'HCI']
+CLASS_LABEL_LITERALS = ['Agents', 'agents', 'ML', 'ml', 'AI', 'ai']
+WORD_LITERALS = ['word3555', 'WORD3555', '3554', '3555', '3556', '19', '20', '21']
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -182,10 +194,105 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+class PaperIdSampler(ColumnSampler):
+    """paper.paper_id: fresh unique TEXT id, observed style (digits or author-year-word), literal pool values plus
+    case variants, never NULL."""
+
+    def __init__(self, elements, p, max_l0, rng, taken: set):
+        super().__init__(elements, p, max_l0, rng)
+        self.taken = set(taken)
+        self.literals = list(PAPER_ID_LITERALS)
+        self.counter = 0
+
+    def _fresh(self):
+        r = self.rng
+        while True:
+            self.counter += 1
+            if r.random() < 0.5:
+                v = str(r.randint(100000, 999999))
+            else:
+                v = '%s%02d%s' % (r.choice(['smith', 'jones', 'lee', 'wang', 'chen', 'kim', 'brown']),
+                                  r.randint(0, 99), r.choice(['introduction', 'analysis', 'survey', 'model',
+                                                              'learning', 'agents', 'systems']))
+            if v not in self.taken:
+                self.taken.add(v)
+                return v
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.35:
+            v = r.choice(self.literals)
+            if v not in self.taken:
+                self.taken.add(v)
+                return v
+        return self._fresh()
+
+
+class ClassLabelSampler(ColumnSampler):
+    """paper.class_label: enum ('Agents','IR','ML','AI','DB','HCI') plus case variants; duplicate share 20-50% on
+    DISTINCT (small enum gives that naturally)."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.pool = list(CLASS_LABELS) + list(CLASS_LABEL_LITERALS)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.5:
+            return r.choice(CLASS_LABELS)
+        return r.choice(self.pool)
+
+
+class WordIdSampler(ColumnSampler):
+    """content.word_cited_id: 'word' + integer 1..4000, plus word3555/WORD3555 and numeric boundary variants
+    3554/3555/3556 and 19/20/21; duplicate share 20-50% on DISTINCT."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.pool = list(WORD_LITERALS)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.3:
+            return r.choice(self.pool)
+        return 'word%d' % r.randint(1, 4000)
+
+
+class CitesIdSampler(ColumnSampler):
+    """cites.cited_paper_id / citing_paper_id: paper-id style plus the column's literal pool (case variants,
+    near-variants, word3555)."""
+
+    def __init__(self, elements, p, max_l0, rng, literals: list):
+        super().__init__(elements, p, max_l0, rng)
+        self.literals = list(literals)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.4:
+            return r.choice(self.literals)
+        if r.random() < 0.5:
+            return str(r.randint(100000, 999999))
+        return '%s%02d%s' % (r.choice(['smith', 'jones', 'lee', 'wang', 'chen', 'kim', 'brown']),
+                             r.randint(0, 99), r.choice(['introduction', 'analysis', 'survey', 'model',
+                                                         'learning', 'agents', 'systems']))
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, taken=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
+    name = column.name.lower()
+    tbl = column.table.lower()
+    if tbl == 'paper' and name == 'paper_id':
+        return PaperIdSampler(els, p, max_l0, rng, taken or set())
+    if tbl == 'paper' and name == 'class_label':
+        return ClassLabelSampler(els, p, max_l0, rng)
+    if tbl == 'content' and name == 'word_cited_id':
+        return WordIdSampler(els, p, max_l0, rng)
+    if tbl == 'cites' and name == 'cited_paper_id':
+        return CitesIdSampler(els, p, max_l0, rng, CITED_ID_LITERALS)
+    if tbl == 'cites' and name == 'citing_paper_id':
+        return CitesIdSampler(els, p, max_l0, rng, CITING_ID_LITERALS)
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
@@ -215,7 +322,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), taken=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,7 +332,7 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, taken=taken)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

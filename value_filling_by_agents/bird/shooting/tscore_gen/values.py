@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,6 +184,67 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Sample only from the enumerated pool; plant boundary near-variants when listed."""
+
+    def __init__(self, pool: list, boundary: list, p: float, max_l0: float, rng):
+        super().__init__(pool, p, max_l0, rng)
+        self.boundary = list(boundary)
+        self._planted = 0
+
+    def sample(self):
+        if self._planted < len(self.boundary):
+            v = self.boundary[self._planted]
+            self._planted += 1
+            return v
+        return self.rng.choice(self.elements)
+
+
+def _expand_date_boundary(literals: list) -> list:
+    """Each listed date literal plus one day before and one day after (boundary_values rule)."""
+    out, seen = [], set()
+    for lit in literals:
+        t, d = _parse_date(str(lit))
+        if d is None:
+            if lit not in seen:
+                seen.add(lit)
+                out.append(lit)
+            continue
+        for delta in (-1, 0, 1):
+            nd = d + dt.timedelta(days=delta)
+            s = nd.strftime(t or '%Y-%m-%d')
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+class BoundaryDateSampler(DateSampler):
+    """Date sampler that first plants the listed boundary literals and their +/-1 day neighbours."""
+
+    def __init__(self, elements, p, max_l0, rng, boundary: list):
+        super().__init__(elements, p, max_l0, rng)
+        self.boundary = _expand_date_boundary(boundary)
+        self._planted = 0
+
+    def sample(self):
+        if self._planted < len(self.boundary):
+            v = self.boundary[self._planted]
+            self._planted += 1
+            return v
+        return super().sample()
+
+
+class NameSampler(ColumnSampler):
+    """Surname / given-name pool sampler; NULL handled by the caller (NULL rule)."""
+
+    def __init__(self, pool: list, p: float, max_l0: float, rng):
+        super().__init__(pool, p, max_l0, rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -216,7 +279,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224, with spec overrides by construction."""
+    key = (column.table, column.name)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,6 +289,15 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], spec.BOUNDARY.get(key, []), p, max_l0, rng)
+    if key in spec.BOUNDARY and ('date' in (column.type_str or '').lower()):
+        return BoundaryDateSampler(els, p, max_l0, rng, spec.BOUNDARY[key])
+    if column.name in ('last_name', 'first_name'):
+        pool = spec.SURNAMES if column.name == 'last_name' else spec.GIVEN_NAMES
+        return NameSampler(pool, p, max_l0, rng)
+    if column.name == 'location':
+        return NameSampler(spec.LOCATIONS, p, max_l0, rng)
     return make_column_sampler(column, els, p, max_l0, rng)
 
 

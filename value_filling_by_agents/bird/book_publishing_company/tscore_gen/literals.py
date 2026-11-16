@@ -12,12 +12,11 @@ _COL = r'((?:[`"]?[\w -]+?[`"]?\.)*[`"]?[\w-]+[`"]?)'
 _IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
 _BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
 _CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
-# a bare qualifier token: identifier possibly quoted, no spaces
 _QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
 
 
 def _unquote(v: str) -> str:
-    """Strip surrounding quotes, collapse doubled quotes (parse.py:246-253)."""
+    """Strip surrounding quotes, collapse doubled quotes."""
     v = v.strip().rstrip(';')
     if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
         v = v[1:-1].replace(v[0] * 2, v[0])
@@ -66,8 +65,10 @@ def _is_literal(tok) -> bool:
     if tok.is_group:
         return False
     v = tok.value.strip()
-    if not v or v.lower() in ('select', 'not', 'null', 'true', 'false'):
+    if not v or v.lower() in ('select', 'not', 'true', 'false'):
         return False
+    if v.lower() == 'null':
+        return True
     if v[0] in '\'"':
         return True
     return bool(re.fullmatch(r'-?\d+(?:\.\d+)?', v))
@@ -96,6 +97,8 @@ def _is_ident_operand(v: str) -> bool:
         return False
     if re.fullmatch(r'-?\d+(?:\.\d+)?', v):
         return False
+    if v.lower() == 'null':
+        return False
     return bool(re.fullmatch(r'[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*', v))
 
 
@@ -104,7 +107,6 @@ def _clean_qualifier(q: str) -> str:
     q = q.strip().replace('"', '').replace('`', '').lower()
     if not q:
         return ''
-    # take the last whitespace-separated token (drops 'and', 'where', 'on', ...)
     tok = q.split()[-1] if q.split() else ''
     if not _QUAL.match(tok):
         return ''
@@ -125,8 +127,7 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -137,7 +138,7 @@ def extract_typed_values(sql: str) -> list:
             pass
         for m in _CMP.finditer(s):
             v = m.group(2)
-            if v.lower() in ('select', 'not', 'null'):
+            if v.lower() in ('select', 'not'):
                 continue
             if _is_ident_operand(v):
                 continue
@@ -196,7 +197,7 @@ def _routing_items(tv: list) -> list:
 
 
 def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> dict:
-    """Route literals to FK-root columns = type_values_w_db(loose=True) (value_typing.py:31-75)."""
+    """Route literals to FK-root columns = type_values_w_db(loose=True)."""
     pool: dict = {}
     cache: dict = {}
 

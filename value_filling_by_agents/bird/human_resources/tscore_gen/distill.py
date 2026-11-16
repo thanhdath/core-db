@@ -2,7 +2,6 @@
 
 
 def distill_instances(kills: dict, neighbors: dict, max_keep=None) -> list:
-    """Greedy set cover: keep the unit killing most not-yet-killed neighbours, ties -> smallest id."""
     targets = {n for ids in neighbors.values() for n in ids}
     killed: set = set()
     kept: list = []

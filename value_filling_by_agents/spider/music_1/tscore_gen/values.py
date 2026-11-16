@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,6 +184,173 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Enumerated domain with case variants and a duplicate share (DISTINCT targets)."""
+
+    def __init__(self, domain, variants, dup_share, rng, boundary=()):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.domain = list(domain)
+        self.variants = variants or {}
+        self.dup_share = dup_share
+        self.boundary = list(boundary)
+        self.seen: list = []
+
+    def _one(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.35:
+            return r.choice(self.boundary)
+        base = r.choice(self.domain)
+        if r.random() < 0.25 and self.variants.get(base):
+            return r.choice(self.variants[base])
+        return base
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < self.dup_share:
+            return r.choice(self.seen)
+        v = self._one()
+        self.seen.append(v)
+        return v
+
+
+class RatingSampler(ColumnSampler):
+    """Integers 1..10 with boundary values 6,7,8,9 and ties at rank 1."""
+
+    def __init__(self, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.30:
+            return r.choice(self.seen)
+        if r.random() < 0.55:
+            v = r.choice(spec.RATING_BOUNDARIES)
+        else:
+            v = r.randint(spec.RATING_MIN, spec.RATING_MAX)
+        self.seen.append(v)
+        return v
+
+
+class ResolutionSampler(ColumnSampler):
+    """Integers from {320,512,720,1080} plus comparison boundary values."""
+
+    def __init__(self, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.30:
+            return r.choice(self.seen)
+        if r.random() < 0.45:
+            v = r.choice(spec.RESOLUTION_BOUNDARIES)
+        else:
+            v = r.choice(spec.RESOLUTIONS)
+        self.seen.append(v)
+        return v
+
+
+class DurationSampler(ColumnSampler):
+    """'M:SS' strings with LIKE near-variants and ties at rank 1."""
+
+    def __init__(self, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.seen: list = []
+
+    def _one(self):
+        r = self.rng
+        u = r.random()
+        if u < 0.20:
+            return r.choice(spec.DURATION_VARIANTS)
+        if u < 0.35:
+            return r.choice(['3:45', '4:12', '4:30'])
+        return '%d:%02d' % (r.randint(1, 9), r.randint(0, 59))
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.30:
+            return r.choice(self.seen)
+        v = self._one()
+        self.seen.append(v)
+        return v
+
+
+class FileSizeSampler(ColumnSampler):
+    """'N.NN MB' strings with a duplicate share."""
+
+    def __init__(self, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.30:
+            return r.choice(self.seen)
+        v = '%d.%02d MB' % (r.randint(1, 9), r.randint(0, 99))
+        self.seen.append(v)
+        return v
+
+
+class NameSampler(ColumnSampler):
+    """Entity names with a duplicate share and group sizes 1, 2 and >= 3."""
+
+    def __init__(self, pool, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.pool = [str(x) for x in pool if x is not None] or ['name']
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.30:
+            return r.choice(self.seen)
+        if r.random() < 0.6:
+            v = r.choice(self.pool)
+        else:
+            v = r.choice(self.pool) + str(r.randint(1, 99))
+        self.seen.append(v)
+        return v
+
+
+class GenreSampler(EnumSampler):
+    """Genre names with case variants and comparison boundary values."""
+
+    def __init__(self, rng):
+        super().__init__(spec.GENRES, spec.GENRE_CASE_VARIANTS, 0.0, rng,
+                         boundary=spec.BOUNDARY_VALUES['genre.g_name'])
+
+
+class CountrySampler(EnumSampler):
+    """Countries with case variants and a duplicate share."""
+
+    def __init__(self, rng):
+        super().__init__(spec.COUNTRIES, spec.COUNTRY_CASE_VARIANTS, 0.30, rng,
+                         boundary=spec.BOUNDARY_VALUES['artist.country'])
+
+
+class LanguageSampler(EnumSampler):
+    """Languages with case variants and group sizes 1, 2 and >= 3."""
+
+    def __init__(self, rng):
+        super().__init__(spec.LANGUAGES, spec.LANGUAGE_CASE_VARIANTS, 0.0, rng,
+                         boundary=spec.BOUNDARY_VALUES['song.languages'])
+
+
+class FormatSampler(EnumSampler):
+    """File formats with case variants, duplicate share and ties at rank 1."""
+
+    def __init__(self, rng):
+        super().__init__(spec.FORMATS, spec.FORMAT_CASE_VARIANTS, 0.30, rng,
+                         boundary=spec.BOUNDARY_VALUES['files.formats'])
+
+
+class GenderSampler(EnumSampler):
+    """Genders Male/Female."""
+
+    def __init__(self, rng):
+        super().__init__(spec.GENDERS, {}, 0.0, rng)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +402,31 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler_for(table: str, column: str, schema, literal_pool: list, rng):
+    """Return a specification-driven sampler for a column, or None to use the generic fuzzer."""
+    key = '%s.%s' % (table, column)
+    if key in ('genre.g_name', 'artist.preferred_genre', 'song.genre_is'):
+        return GenreSampler(rng)
+    if key in ('artist.country', 'song.country'):
+        return CountrySampler(rng)
+    if key == 'song.languages':
+        return LanguageSampler(rng)
+    if key == 'files.formats':
+        return FormatSampler(rng)
+    if key == 'artist.gender':
+        return GenderSampler(rng)
+    if key == 'song.rating':
+        return RatingSampler(rng)
+    if key == 'song.resolution':
+        return ResolutionSampler(rng)
+    if key == 'files.duration':
+        return DurationSampler(rng)
+    if key == 'files.file_size':
+        return FileSizeSampler(rng)
+    if key in ('artist.artist_name', 'song.song_name'):
+        pool = [v for v in schema.original_values.get((table, column), []) if v is not None]
+        pool += [str(v) for v in literal_pool]
+        return NameSampler(pool, rng)
+    return None

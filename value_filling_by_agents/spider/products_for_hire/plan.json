@@ -1,57 +1,676 @@
 {
  "db": "products_for_hire",
- "operator_io_quirks": [
-  "DDL uses backtick-quoted identifiers; generated SQL must double-quote them instead",
-  "Products_Booked DDL is malformed: PRIMARY KEY (...) line lacks trailing comma before FOREIGN KEY -> CREATE TABLE may fail; writer must tolerate/repair or skip",
-  "View_Product_Availability is a TABLE (not a view) with DATETIME PRIMARY KEY; PK is a text date, so PK dedup compares date strings",
-  "All DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional secs); declared DATETIME dispatches to Date fuzzer (first element not int)",
-  "DECIMAL(19,4) columns store REAL (and some INTEGER like 500); declared type dispatches to Number with scale=19,precision=4 -> huge range 10^19",
-  "count_hired is VARCHAR(40) but stores integer-looking strings '298','331' -> String fuzzer adds i+1/i-1 variants",
-  "gender_mf VARCHAR(1) stores '0'/'1' not 'M'/'F'; amount_paid_in_full_yn/returned_yn/available_yn VARCHAR(1) store '0'/'1'",
-  "returned_yn has distinct=1 (all '1') -> String sampler with single element; PK/unique filtering may collapse rows",
-  "Tiny tables (4-15 rows) but choose_table_sizes can request up to 2500 rows -> FK child draws with replacement from few parent values, heavy duplication",
-  "Customers.coupon_id NOT NULL FK to Discount_Coupons(15 rows) but only 9 distinct -> many-to-one, fine; Bookings.customer_id 7 distinct of 15",
-  "Payments.booking_id nullable FK (notnull=0) to Bookings; NULL allowed in child FK column",
-  "Composite PK Products_Booked(booking_id,product_id) both FK members -> composite-PK member max_l0=30 cap applies to both"
- ],
- "operator_ts_expectations": [
-  "Date fuzzer template '%Y-%m-%d %H:%M:%S' (first parsable element) for all DATETIME cols; fresh dates uniform 1800..2100 unless elements constrain range",
-  "Number fuzzer on DECIMAL(19,4): scale=19 -> range +-10^19, so amount_* values wildly implausible vs original ~50-800 -> likely FN on range/aggregate predicates",
-  "Number fuzzer on INTEGER PKs: +-1/+2 perturbation of sampled elements, plus fresh uniform in +-10^scale(0)=+-1 -> PKs cluster near 0/1, may collide -> PK dedup drops rows",
-  "String fuzzer on names: random a-zA-Z0-9() strings length 0..80, contaminate 50% -> first_name/last_name become gibberish -> FN on LIKE/name predicates",
-  "String fuzzer on VARCHAR(1) gender/yn: fresh random strings length 0..1 from charset, not '0'/'1' -> breaks equality predicates -> FN",
-  "String fuzzer on booking_status_code/payment_type_code: random strings, not 'Confirmed'/'Cash' -> FN on status filters",
-  "count_hired VARCHAR(40) int-like: String adds i+1/i-1 but also random strings -> mixed",
-  "FK fill draws from parent FINAL filtered values with replacement -> child FK cardinality collapses, ties/duplicates abundant -> FP on DISTINCT/COUNT DISTINCT",
-  "Tiny parent tables (Products_for_Hire 5 rows) -> FK children only ever see <=5 distinct product_id -> joins trivially small",
-  "checked=False everywhere, p=0.2 default, 30% chance p=0 whole instance -> mostly fresh random values",
-  "Composite PK Products_Booked: max_l0=30 cap -> limited fresh draws, reuse -> duplicate (booking_id,product_id) pairs dropped",
-  "No NOT NULL/CHECK enforcement in Python; NOT NULL violations (booking_status_code, customer_id, product_type_code) fail at insert and are skipped -> row loss"
- ],
- "challenger_refs": [
-  "g332c9c5a",
-  "g332c9c5a",
-  "ge435b6ee",
-  "ge435b6ee",
-  "ge435b6ee",
-  "ge435b6ee",
-  "ge435b6ee",
-  "G1",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500",
-  "gb8194500"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table, unique, never NULL; final PK set frozen before any child FK sampling.",
+   "integer_fk": "Copy from the FINAL surviving parent PK set (after dedup, unique-drop, parent-without-child deletion, NULL application). Nullable FKs get NULL share from the compact DB (fallback ~0.1) and non-NULL rows; NULL FK values are exempt from parent-PK membership (SQL three-valued FK semantics).",
+   "integer_quantity": "Uniform integer in [1, 20]; never 0 or negative.",
+   "decimal_amount": "Uniform decimal in [0, 1000] rounded to 4 dp; non-negative.",
+   "decimal_rate": "Uniform decimal in [0, 1] rounded to 4 dp.",
+   "varchar_short_enum": "Pick uniformly from the enum list in per_column_exceptions.",
+   "varchar_name": "Random first/last name from a small pool; near-duplicates allowed.",
+   "varchar_flag": "Pick from {'0','1'}.",
+   "datetime": "Uniform datetime in [2015-01-01, 2018-12-31] formatted '%Y-%m-%d %H:%M:%S'.",
+   "varchar_like": "Base literal plus near-variants (case change, one-char substitution, appended suffix); mix pool values with random strings so boundary literals appear in at least one row.",
+   "numeric_boundary": "For each listed literal L, sample L-step, L, L+step with step 0.01 for decimals and 1 for integers.",
+   "distinct_duplicates": "Allow 20-50% duplicate values on DISTINCT-targeted columns.",
+   "order_ties": "Ensure at least two rows share the top rank value on ORDER/LIMIT-targeted columns.",
+   "null_share": "Per nullable column, compute the NULL share from the compact database's observed share for that column (fallback ~0.1); ensure at least one NULL row per nullable column; NOT NULL/PK columns never NULL; planted NULLs are never replaced to satisfy a rule; _ensure_null must be idempotent (count existing NULLs first, add only up to target share).",
+   "group_sizes": "For a non-key column targeted with group_sizes, produce at least one group of size 1, one of size 2 and one of size >=3 on that column's values; verify post-condition by value counts; if table size < 6, still produce sizes 1 and 2 and report the achievable post-condition.",
+   "rows_with_different_values": "For a column targeted with rows_with_different_values, group by the stated grouping key and ensure each group has >=2 rows with distinct values of the column; for FK columns choose alternate values from the parent PK set, never by arithmetic increment; verify post-condition and retry with a different delta on collision.",
+   "generation_order": "Parents fully materialized (PK dedup, unique-drop, parent-without-child deletion, NULL application) before any child FK column is sampled; child FK values drawn only from the final surviving parent PK set; parent-without-child deletion selects an unreferenced parent row (never a referenced one); after the parent-without-child deletion block, re-run _final_pk_values and re-validate all children.",
+   "date_order_fixup": "DATE_GE fix-up runs before NULL planting; NULL operands are exempt (three-valued logic); no row with both non-NULL operands violates the order.",
+   "fk_membership_assertion": "Before writing, verify every non-NULL child FK value is in the final surviving parent PK set; on failure, resample the offending FK column from the current final_pk (or drop the row) and count it in rows_failed; never silently pass."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Products_for_Hire",
+    "column": "product_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Book collection A",
+     "book collection a"
+    ]
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "product_name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%Book%",
+     "%Boo%",
+     "Book%",
+     "Book",
+     "Bool",
+     "Book x",
+     "book",
+     "Boo",
+     "Bop",
+     "Boo x",
+     "boo"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "good_or_bad_customer",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "good",
+     "GOOD",
+     "bad",
+     "BAD"
+    ]
+   },
+   {
+    "table": "Discount_Coupons",
+    "column": "coupon_amount",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Payments",
+    "column": "payment_date",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Payments",
+    "column": "amount_due",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">=2 rows per group with different values"
+    ],
+    "group_by": "Payments.booking_id"
+   },
+   {
+    "table": "Payments",
+    "column": "booking_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >=3"
+    ]
+   },
+   {
+    "table": "Products_Booked",
+    "column": "product_id",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">=2 rows per group with different values"
+    ],
+    "group_by": "Products_Booked.booking_id"
+   },
+   {
+    "table": "Products_Booked",
+    "column": "booked_count",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">=2 rows per group with different values"
+    ],
+    "group_by": "Products_Booked.booking_id"
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "daily_hire_cost",
+    "pattern": "comparison_boundary",
+    "targets": [
+     19.99,
+     20,
+     20.01,
+     20.99,
+     21,
+     21.01
+    ]
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "product_description",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 tie"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "first_name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >=3"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "date_last_hire",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >=3"
+    ]
+   },
+   {
+    "table": "Bookings",
+    "column": "booking_id",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "NOT NULL, no NULL share"
+    ]
+   },
+   {
+    "table": "Bookings",
+    "column": "booking_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Provisional",
+     "Confirmed"
+    ]
+   },
+   {
+    "table": "Bookings",
+    "column": "returned_damaged_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "gender_mf",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Payments",
+    "column": "payment_type_code",
+    "pattern": "enum",
+    "targets": [
+     "Check",
+     "Cash",
+     "Credit Card",
+     "Direct Debit"
+    ]
+   },
+   {
+    "table": "Payments",
+    "column": "amount_paid_in_full_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "product_type_code",
+    "pattern": "enum",
+    "targets": [
+     "Cutlery",
+     "Din_Plates"
+    ]
+   },
+   {
+    "table": "Products_Booked",
+    "column": "returned_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Products_Booked",
+    "column": "returned_late_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "View_Product_Availability",
+    "column": "available_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customers.coupon_id",
+    "parent_table": "Discount_Coupons",
+    "parent_column": "coupon_id",
+    "copied": []
+   },
+   {
+    "child": "Bookings.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Payments.booking_id",
+    "parent_table": "Bookings",
+    "parent_column": "booking_id",
+    "copied": []
+   },
+   {
+    "child": "Payments.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Products_Booked.booking_id",
+    "parent_table": "Bookings",
+    "parent_column": "booking_id",
+    "copied": []
+   },
+   {
+    "child": "Products_Booked.product_id",
+    "parent_table": "Products_for_Hire",
+    "parent_column": "product_id",
+    "copied": []
+   },
+   {
+    "child": "View_Product_Availability.booking_id",
+    "parent_table": "Bookings",
+    "parent_column": "booking_id",
+    "copied": []
+   },
+   {
+    "child": "View_Product_Availability.product_id",
+    "parent_table": "Products_for_Hire",
+    "parent_column": "product_id",
+    "copied": []
+   },
+   {
+    "unique": "Products_Booked(booking_id, product_id)"
+   },
+   {
+    "unique": "View_Product_Availability(status_date)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Discount_Coupons",
+    "column": "coupon_amount",
+    "formula": "coupon_amount >= 0"
+   },
+   {
+    "table": "Customers",
+    "column": "good_or_bad_customer",
+    "formula": "good_or_bad_customer IN ('good','bad')"
+   },
+   {
+    "table": "Customers",
+    "column": "gender_mf",
+    "formula": "gender_mf IN ('0','1')"
+   },
+   {
+    "table": "Customers",
+    "column": "date_last_hire",
+    "formula": "date_last_hire >= date_became_customer"
+   },
+   {
+    "table": "Bookings",
+    "column": "booking_status_code",
+    "formula": "booking_status_code IN ('Provisional','Confirmed')"
+   },
+   {
+    "table": "Bookings",
+    "column": "returned_damaged_yn",
+    "formula": "returned_damaged_yn IN ('0','1')"
+   },
+   {
+    "table": "Bookings",
+    "column": "booking_end_date",
+    "formula": "booking_end_date >= booking_start_date"
+   },
+   {
+    "table": "Bookings",
+    "column": "amount_payable",
+    "formula": "amount_payable >= 0"
+   },
+   {
+    "table": "Bookings",
+    "column": "amount_of_discount",
+    "formula": "amount_of_discount >= 0"
+   },
+   {
+    "table": "Bookings",
+    "column": "amount_outstanding",
+    "formula": "amount_outstanding >= 0"
+   },
+   {
+    "table": "Bookings",
+    "column": "amount_of_refund",
+    "formula": "amount_of_refund >= 0"
+   },
+   {
+    "table": "Payments",
+    "column": "payment_type_code",
+    "formula": "payment_type_code IN ('Check','Cash','Credit Card','Direct Debit')"
+   },
+   {
+    "table": "Payments",
+    "column": "amount_paid_in_full_yn",
+    "formula": "amount_paid_in_full_yn IN ('0','1')"
+   },
+   {
+    "table": "Payments",
+    "column": "amount_due",
+    "formula": "amount_due >= 0"
+   },
+   {
+    "table": "Payments",
+    "column": "amount_paid",
+    "formula": "amount_paid >= 0"
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "product_type_code",
+    "formula": "product_type_code IN ('Cutlery','Din_Plates')"
+   },
+   {
+    "table": "Products_for_Hire",
+    "column": "daily_hire_cost",
+    "formula": "daily_hire_cost >= 0"
+   },
+   {
+    "table": "Products_Booked",
+    "column": "returned_yn",
+    "formula": "returned_yn IN ('0','1')"
+   },
+   {
+    "table": "Products_Booked",
+    "column": "returned_late_yn",
+    "formula": "returned_late_yn IN ('0','1')"
+   },
+   {
+    "table": "Products_Booked",
+    "column": "booked_count",
+    "formula": "booked_count > 0"
+   },
+   {
+    "table": "Products_Booked",
+    "column": "booked_amount",
+    "formula": "booked_amount >= 0"
+   },
+   {
+    "table": "View_Product_Availability",
+    "column": "available_yn",
+    "formula": "available_yn IN ('0','1')"
+   },
+   {
+    "table": "Bookings",
+    "column": "amount_payable",
+    "formula": "NOT REQUIRED: no cross-table amount consistency between Bookings, Payments and Products_Booked is enforced"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Discount_Coupons": 15,
+   "Customers": 15,
+   "Bookings": 15,
+   "Products_for_Hire": 5,
+   "Payments": 15,
+   "Products_Booked": 12,
+   "View_Product_Availability": 4
+  },
+  "null_targets": [
+   "Bookings.returned_damaged_yn",
+   "Bookings.booking_start_date",
+   "Bookings.booking_end_date",
+   "Bookings.count_hired",
+   "Bookings.amount_payable",
+   "Bookings.amount_of_discount",
+   "Bookings.amount_outstanding",
+   "Bookings.amount_of_refund",
+   "Customers.good_or_bad_customer",
+   "Customers.first_name",
+   "Customers.last_name",
+   "Customers.gender_mf",
+   "Customers.date_became_customer",
+   "Customers.date_last_hire",
+   "Discount_Coupons.date_issued",
+   "Discount_Coupons.coupon_amount",
+   "Payments.booking_id",
+   "Payments.amount_paid_in_full_yn",
+   "Payments.payment_date",
+   "Payments.amount_due",
+   "Payments.amount_paid",
+   "Products_for_Hire.daily_hire_cost",
+   "Products_for_Hire.product_name",
+   "Products_for_Hire.product_description",
+   "Products_Booked.returned_yn",
+   "Products_Booked.returned_late_yn",
+   "Products_Booked.booked_count",
+   "Products_Booked.booked_amount",
+   "View_Product_Availability.available_yn"
+  ],
+  "supporting_evidence": {
+   "date_order": "Customers rows 1-8 all have date_last_hire > date_became_customer; Bookings rows 1-8 all have booking_end_date > booking_start_date.",
+   "non_negative_amounts": "All shown amount_payable, amount_of_discount, amount_outstanding, amount_of_refund, amount_due, amount_paid, booked_amount, daily_hire_cost, coupon_amount values are >= 0.",
+   "enums": "Observed distinct values match the enum lists in per_column_exceptions.",
+   "group_sizes": "Customers.first_name and Customers.date_last_hire are non-key columns where duplicate values are legal; Customers.customer_id is a PK and is excluded from group_sizes/duplicates.",
+   "comparison_boundary": "Customers.coupon_id is a join predicate (column-vs-column), not a literal boundary; it is covered by the dependencies entry, not by per_column_exceptions.",
+   "fk_integrity": "Review feedback: 105 FK violations traced to child FK sampling from mid-construction parent dict and PARENT_WITHOUT_CHILD deleting referenced parent row 0. Fixed by generation_order rule: parents finalized first, deletion selects unreferenced row only; plus fk_membership_assertion post-check.",
+   "null_share": "Review feedback: observed NULL shares far above 0.1 (Products_for_Hire.product_name 14/24, Products_Booked.booked_count 18/89, Customers.last_name 15/53). Fixed by computing per-column NULL share from compact DB and making _ensure_null idempotent.",
+   "duplicate_share": "Review feedback: spec.py over-applied DUPLICATE_SHARE to Customers.first_name, Customers.date_last_hire, Payments.booking_id; removed so spec.py mirrors per_column_exceptions (only Discount_Coupons.coupon_amount and Payments.payment_date).",
+   "group_sizes_min_size": "Review feedback: _force_group_sizes required n>=6 and silently skipped smaller tables. Fixed by handling n in {3,4,5} and adding explicit post-generation assertion.",
+   "fk_different_values": "Review feedback: _force_different_in_groups on Products_Booked.product_id used arithmetic increment, risking out-of-parent values. Fixed by choosing alternate values from parent PK set and adding FK-membership check.",
+   "cross_table_amounts": "Review feedback: no cross-table amount formula verified; added explicit NOT REQUIRED entry to avoid over-constraining."
+  },
+  "uncertainty": "No formula linking Bookings amounts to Payments or Products_Booked was verified on all shown rows; only range/enum/order rules are stated. NULL shares are taken from the compact DB per column (fallback ~0.1). Generation order: Discount_Coupons, Products_for_Hire, Customers, Bookings, Payments, Products_Booked, View_Product_Availability; datetime floors for order rules are taken from already-built parent tables or samplers, never from a table dict mid-construction. Post-generation assertions required: FK membership (with resample/drop and rows_failed counting), group_sizes singleton/pair/triple (with achievable post-condition for n<6), rows_with_different_values >=2 distinct per group, boundary literals present, zero skipped rows. The exact cause of the 10 FK violations in chk_0007 must be reproduced and traced; the fk_membership_assertion rule is the safety net."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 0 of 20 instances written; 17x KeyError('Customers') at tscore_gen/instance.py:298 (`if dt_floor_col is not None and dt_floor_col in inst[t]:`) and 3x ValueError('empty range for randrange()') at tscore_gen/instance.py:198 (`src = rng.randrange(r)`).",
+     "requested_revision": "Fix build_random_instance so it does not index inst[t] before the table's column dict is assigned (e.g. compute datetime floors from already-built parent tables or from samplers, not from inst[t] mid-construction), and guard _apply_dedup_share so rng.randrange(r) is only called with r >= 1 (skip when r == 0). Re-run until n_ok == n_instances with no errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program never produced any instance, so none of the specification's value domains, dependencies, NULL rules, or integrity constraints could be verified in execution. The construction feedback shows `n_instances: 0` and `rows_added: {}`.",
+     "requested_revision": "After fixing the crashes, provide execution evidence that instances are written to the expected layout, that FK values are drawn from parent PK pools, that PK/unique constraints hold, and that the NULL rule (at least one NULL per nullable column, ~0.1 share, none on NOT NULL/PK) is satisfied."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists `Customers.coupon_id` under comparison_boundary with target `Customers.coupon_id` (a self-referential column-vs-column predicate), and `Customers.customer_id`/`first_name`/`date_last_hire` under group_sizes with target '1, 2 and >= 3'. These are column-vs-column or aggregate-shape patterns, not value-domain constraints; the program's `_force_group_sizes` only guarantees a singleton/pair/triple by overwriting values, which is a weak and possibly incorrect interpretation. Also `Customers.customer_id` is a PK, so forcing duplicate group sizes conflicts with PK uniqueness.",
+     "requested_revision": "Clarify or drop the `Customers.coupon_id` comparison_boundary target (it is a join predicate, not a literal boundary), and remove `Customers.customer_id` from GROUP_SIZES/DUPLICATE_SHARE since it is a primary key and cannot have duplicate values. Keep group-size targets only on non-key columns where duplicates are legal."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's `null_targets` includes `Payments.booking_id` and `View_Product_Availability.available_yn`, but the schema declares `Payments.booking_id` as nullable (no NOT NULL) while `View_Product_Availability.status_date` is the PK. The program's `_ensure_null` skips PK columns, which is correct, but the spec's `null_targets` also lists `Products_Booked.booked_count` and `booked_amount` which are nullable in schema \u2014 consistent. However `Customers.coupon_id` is NOT NULL in schema and is not in null_targets, which is consistent. No blocking issue here, but the spec should explicitly state that `Payments.booking_id` NULLs must still satisfy the FK (NULL is allowed by SQL FK semantics).",
+     "requested_revision": "Add an explicit note that nullable FK columns (e.g. Payments.booking_id) may be NULL and that NULL FK values are exempt from the parent-PK membership rule, matching SQL three-valued FK semantics."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_force_different` only ensures two distinct values exist globally, not '>= 2 rows per group with different values' as the spec's rows_with_different_values target requires (e.g. Payments.amount_due grouped by booking_id). Similarly `_force_group_sizes` overwrites values without regard to the actual grouping column, so the '1, 2 and >=3' group-size target is not reliably achieved.",
+     "requested_revision": "Implement rows_with_different_values and group_sizes against the actual grouping key (e.g. group Payments by booking_id and ensure each group has >=2 distinct amount_due; ensure Customers.first_name has groups of size 1, 2, >=3) rather than a global distinctness/overwrite heuristic."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was generated, so integrity constraints, FK consistency, compact-row preservation, and reproducible generation could not be verified.",
+    "Whether the LIKE near-variant and comparison-boundary targets for Products_for_Hire.product_name are actually produced (StringSampler mixes pool values with random strings at p=0.2, so boundary literals may be rare) is unverified.",
+    "Whether the NULL share (~0.1) and at-least-one-NULL rule hold per nullable column is unverified due to zero instances."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 17 of 20 instances invalid with new_integrity_failures; 105 FK violations total. Breakdown: View_Product_Availability.product_id -> Products_for_Hire.product_id (48 rows, 16 instances), Products_Booked.product_id -> Products_for_Hire.product_id (47 rows, 17 instances), Payments.customer_id -> Customers.customer_id (8 rows, 1 instance), Bookings.customer_id -> Customers.customer_id (2 rows, 1 instance).",
+     "requested_revision": "Fix FK generation so child FK values always reference parent PK values that actually survive into the written instance. The root cause is in instance.py: fill_foreign_keys_consistently draws from inst[parent][pk] BEFORE the parent's PK dedup/unique-drop and the PARENT_WITHOUT_CHILD row deletion run, and before _ensure_null can NULL out parent PKs (it cannot, but the deletion path in the PARENT_WITHOUT_CHILD block deletes a parent row after children were already drawn). Also, the PARENT_WITHOUT_CHILD block deletes a parent row (idx=0) after children reference it, producing dangling child FKs. Reorder: build parents fully (dedup, unique-drop, parent-without-child deletion) first, then draw child FKs from the final surviving parent PK set. Ensure the deleted parent row is one that no child references (pick an unreferenced index, not index 0)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py PARENT_WITHOUT_CHILD handling: `if not unreferenced and pvals: idx = 0; for col in inst[pt]: del inst[pt][col][idx]`. This unconditionally deletes parent row 0 even when children reference it, and does so after children were generated. This directly explains the Products_for_Hire.product_id FK violations in Products_Booked and View_Product_Availability (95 of 105 violations).",
+     "requested_revision": "Delete only a parent row whose PK is not present in any child FK column (use the computed `unreferenced` list; if empty, either skip deletion or regenerate children). Never delete a referenced parent row. Perform this before child FK sampling or re-sample children afterward."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py: `_ensure_null` is applied to every column including FK columns and PK columns via the loop `for cm in tm.columns: ... columns[cm.name] = _ensure_null(...)`. For Payments.booking_id (nullable FK) this is fine, but the same loop runs on parent PK columns; combined with the compact_pks seeding and the later PARENT_WITHOUT_CHILD deletion, parent PK membership used by children is stale. Also `fill_foreign_keys_consistently` returns `[None]*n` when parent pool is empty, but the parent pool is read from `inst.get(pt, {}).get(pc)` which may be pre-dedup.",
+     "requested_revision": "Compute the final parent PK value set after all parent-side transformations (dedup, unique-drop, parent-without-child deletion, null rule) and use that set for child FK sampling. Do not sample child FKs from a mid-construction parent dict."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists `Payments.booking_id` in null_targets and in GROUP_SIZES/DUPLICATE_SHARE, and `Customers.coupon_id` is NOT NULL in schema but the spec's dependencies copy from parent PK pool. The spec's `null_targets` includes `Payments.booking_id` (nullable FK) which is consistent with the interface NULL rule, but the spec does not state that parent PKs must be finalized before child FK sampling, nor that parent-without-child deletion must avoid referenced rows. The spec's `supporting_evidence` claims FK consistency is covered by dependencies but gives no ordering guarantee.",
+     "requested_revision": "Add an explicit generation-order rule to the specification: parent tables are fully materialized (including PK dedup, unique-drop, parent-without-child deletion, and NULL application) before any child FK column is sampled; child FK values are drawn only from the final surviving parent PK set; parent-without-child deletion must select an unreferenced parent row. This makes the FK integrity requirement explicit rather than implicit."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `construction_pairs: eligible 52, separated 12`. Only 12 of 52 eligible pairs separated. While the instructions note a missing separation alone does not prove a generation error, the low separation rate combined with the FK corruption suggests many instances are degenerate (e.g., parent rows deleted, children dangling) so boundary/group/duplicate patterns may not be observable. Also `rows_skipped` shows Customers 7, Products_Booked 19, View_Product_Availability 3 skipped rows, indicating integrity failures during insert.",
+     "requested_revision": "After fixing FK integrity, re-run and confirm that boundary literals (product_name 'Book collection A'/'book collection a', daily_hire_cost 19.99/20/20.01/20.99/21/21.01), enum values, group_sizes (1,2,>=3), duplicate shares (20-50%), and order ties are actually present in the written instances. The skipped rows (Customers 7, Products_Booked 19, View_Product_Availability 3) should drop to zero once FK integrity is fixed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_force_group_sizes` claims to ensure singleton/pair/triple but the singleton branch is a no-op comment (`# singleton: leave at least one row...`). It does not guarantee a singleton exists; if the triple and pair consume all rows or the remaining values coincide, no singleton group is produced. Similarly `_force_different_in_groups` only bumps one row per group and may not guarantee >=2 distinct values if the group has exactly 2 rows and the bump collides with an existing value.",
+     "requested_revision": "Make `_force_group_sizes` explicitly assign a distinct value to at least one row outside the triple/pair groups (verify the resulting value counts include a group of size 1). Make `_force_different_in_groups` verify the post-condition (>=2 distinct values per group) and retry with a different delta if the first attempt collides."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_spec_sampler` for datetime columns ignores the pool and always uses DatetimeSampler with RANGE_LO/RANGE_HI; the DATE_GE fix-up only adjusts the hi column upward, but `date_became_customer` and `date_last_hire` are both sampled independently and the fix-up runs per table. For Customers, `date_last_hire >= date_became_customer` is enforced, but the spec's `date_order` evidence and the NULL rule interact: if `date_became_customer` is NULL, the comparison is skipped (correct three-valued), but if `date_last_hire` is NULL and `date_became_customer` is not, the rule holds (NULL >= x is UNKNOWN, not FALSE) \u2014 this is consistent. However, the `_ensure_null` runs AFTER the DATE_GE fix-up, so a NULL planted in `date_became_customer` after the fix-up is fine, but a NULL planted in `date_last_hire` after the fix-up is also fine. No blocking issue here, but note the ordering.",
+     "requested_revision": "No change required for correctness, but document that DATE_GE fix-up runs before NULL planting and that NULL operands are exempt (three-valued logic). Confirm in a test that no row has both non-NULL and violates the order."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 12/52 separated construction pairs are due to FK corruption (likely) or genuine value-domain gaps; re-run after FK fix to confirm separation improves.",
+    "Whether `_force_group_sizes` actually produces a singleton group in all instances (code inspection suggests it may not); needs a post-generation assertion.",
+    "Whether `_force_different_in_groups` guarantees >=2 distinct values per group when groups have exactly 2 rows; needs verification.",
+    "Whether the compact database's NULL share per column is matched (feedback shows ~20-30% NULL shares, higher than the spec's ~0.1 target); the spec says 'share ~0.1' but feedback shows 10/53 to 19/64, which is higher. This may be acceptable per the interface rule ('NULL share following the compact database's share') but the spec's 0.1 target is not clearly reconciled with observed shares."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: instance products_for_hire__chk_0007.sqlite is invalid with 10 new FK violations (Payments.customer_id -> Customers.customer_id: 8 rows; Bookings.customer_id -> Customers.customer_id: 2 rows). The program reports n_fail 0 and errors {}, so the failure is silent. Root cause is visible in instance.py: `_finalize_parent` applies `_ensure_null` to every nullable column, including PK-adjacent FK columns, and `_final_pk_values` only filters NULLs from the PK column itself. But the real defect is that `_finalize_parent` runs `drop_unique_duplicates` and `_ensure_null` AFTER `final_pk[t]` is computed for the parent, and the parent-without-child deletion at the end of `build_random_instance` deletes a row from `inst[pt]` and refreshes `final_pk[pt]` \u2014 but children were already sampled from the pre-deletion `final_pk`. The comment 'children already reference only surviving values' is false: the deletion removes an unreferenced row, but the FK sampling for `Customers.customer_id` happened before `_finalize_parent`'s NULL planting on `Customers.customer_id`? No \u2014 `Customers.customer_id` is a PK and never NULL. The actual leak: `_finalize_parent` for `Customers` runs `drop_unique_duplicates` which can drop rows, and `_ensure_null` on `Customers.coupon_id` (a NOT NULL FK) is skipped, but `_ensure_null` on other columns is fine. The FK violation must come from `_finalize_parent` being called on `Customers` AFTER `Bookings`/`Payments` were built? No \u2014 order is Discount_Coupons, Products_for_Hire, Customers, Bookings, Payments. So `final_pk['Customers']` is set before Bookings/Payments sample. The violation therefore comes from the parent-without-child deletion block: it deletes a row from `Products_for_Hire` (the only PARENT_WITHOUT_CHILD entry), not Customers. So the Customers FK violation is unexplained by the stated logic and indicates a real bug \u2014 likely `_finalize_parent`'s `drop_unique_duplicates` on `Customers` dropping a row whose `customer_id` was already used by a child, because `drop_unique_duplicates` runs on `Customers` and can drop rows after `final_pk` was computed but the deletion happens inside `_finalize_parent` before `final_pk[t] = _final_pk_values(...)`. Wait \u2014 `_finalize_parent` returns columns, then `final_pk[t]` is computed from the returned columns, so that is consistent. The remaining suspect is `_ensure_null` on `Customers.coupon_id`: it is NOT NULL so skipped. The violation is real and reproducible (1 of 20 instances), and the program does not detect or report it.",
+     "requested_revision": "Add a post-generation FK-membership assertion (as the specification's `uncertainty` field already requires: 'Post-generation assertions required: FK membership, ...'). Before writing, verify every non-NULL child FK value is in the final surviving parent PK set; on failure, resample the offending FK column from the current `final_pk` (or drop the row) and count it in `rows_failed`. Also re-run `_final_pk_values` and re-validate children after the parent-without-child deletion block, since that block mutates `inst[pt]` after children were built. The current silent pass (n_fail 0, errors {}) with 10 FK violations must become a reported failure or a corrected instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_finalize_parent` calls `_ensure_null` on every nullable column with `null_share=0.1`, but the execution feedback shows observed NULL shares far above 0.1 (e.g. Products_for_Hire.product_name 14/24 \u2248 58%, Products_Booked.booked_count 18/89 \u2248 20%, Customers.last_name 15/53 \u2248 28%). The specification's `null_share` rule says 'share ~0.1' and the interface rule says 'NULL share following the compact database's share for that column'. The program uses a fixed 0.1 and does not read the compact DB's per-column NULL share, and the observed shares exceed 0.1 because `_ensure_null` is applied to columns that already contain NULLs from the sampler (e.g. StringSampler/NumberSampler can emit None via pool) and then `rng.sample` adds more. This is a specification/program mismatch on the NULL-share rule.",
+     "requested_revision": "Either (a) compute per-column NULL share from `schema.original_values` and pass it to `_ensure_null`, or (b) make `_ensure_null` idempotent: count existing NULLs first and only add up to the target share, never exceeding it. Document the chosen interpretation in spec.py. The interface rule explicitly ties the share to the compact database, so (a) is preferred."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py `DUPLICATE_SHARE` includes ('Customers','first_name'): 0.30 and ('Customers','date_last_hire'): 0.30 and ('Payments','booking_id'): 0.33, but the extracted atomic operations only list `duplicates_for_distinct` for Discount_Coupons.coupon_amount and Payments.payment_date. The specification's `per_column_exceptions` correctly lists only those two. spec.py therefore over-applies the duplicate-share rule to three additional columns, which can conflict with `GROUP_SIZES` (also on Customers.first_name, Customers.date_last_hire, Payments.booking_id) and with `DIFFERENT_VALUES` on Payments.booking_id. The `_apply_dedup_share` runs before `_force_group_sizes`/`_force_different_in_groups`, so the forced duplicates may be overwritten, but the spec module is inconsistent with the specification JSON.",
+     "requested_revision": "Remove ('Customers','first_name'), ('Customers','date_last_hire'), ('Payments','booking_id') from `DUPLICATE_SHARE` in spec.py, or justify them in the specification's `per_column_exceptions`. The specification is the source of truth; spec.py must mirror it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_force_group_sizes` requires `n >= 6` and returns unchanged otherwise. With `TABLE_SIZES` Customers=15, Payments=15 this is usually fine, but `choose_table_sizes` can produce sizes as low as `cap-3` (e.g. 12) and the `else` branch can produce `min(int(s), cap+...)` which for the first level is `int(1+30*rng.random())` \u2014 potentially 1. If a group_sizes-targeted table gets fewer than 6 rows, the 1/2/>=3 post-condition is silently skipped, violating the specification's 'verify post-condition by value counts' rule. The execution feedback does not show per-instance group-size verification, so this is unverified.",
+     "requested_revision": "Either raise the minimum table size for group_sizes-targeted tables to >= 6 in `choose_table_sizes`, or make `_force_group_sizes` handle n in {3,4,5} (e.g. n=3 -> sizes 1,2; n>=3 -> at least 1 and 2, and >=3 only when n>=6, with the specification updated to state the achievable post-condition). Add an explicit post-generation assertion that counts value frequencies and reports failures in `rows_failed`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_force_different_in_groups` groups by `group_key` and requires >=2 distinct values per group, but for `Products_Booked.product_id` the group key is `booking_id` and the column is an FK. The function is called with `gvals = fk_cols.get(gkey) or cols.get(gkey)` \u2014 for `Products_Booked`, `booking_id` is an FK, so `gvals` is the FK list, which is correct. However, `_force_different_in_groups` mutates `cols[cm.name]` (product_id) to `v0 + attempt+1` for integer values, which can produce a product_id not in `Products_for_Hire`'s PK set, creating an FK violation. The execution feedback shows 0 FK violations on Products_Booked in the 19 valid instances, but the logic is unsound and the one invalid instance (chk_0007) has FK violations on Customers, not Products_Booked \u2014 so this path may not have triggered yet, but it is a latent bug.",
+     "requested_revision": "For FK columns targeted by `rows_with_different_values`, choose the alternate value from the parent PK set (pass `final_pk[parent]` into `_force_different_in_groups`), not by arithmetic increment. Add an FK-membership check after the mutation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` claims 'Customers rows 1-8 all have date_last_hire > date_became_customer; Bookings rows 1-8 all have booking_end_date > booking_start_date' and 'All shown amount_payable, ... values are >= 0'. These are supported by the compact DB. However, the specification's `uncertainty` field admits 'No formula linking Bookings amounts to Payments or Products_Booked was verified on all shown rows'. The extracted atomic operations include `Payments.amount_due` rows_with_different_values and `Products_Booked.booked_amount` literals (102.76, 200) but no cross-table amount formula. The program does not implement any cross-table amount consistency, which is consistent with the uncertainty note \u2014 so this is not a defect, but the specification should explicitly state that no cross-table amount formula is required, to avoid future over-constraining.",
+     "requested_revision": "Add an explicit 'not required' entry in `semantic_rules_and_formulas` for cross-table amount consistency (Bookings vs Payments vs Products_Booked), so the engineer is not expected to enforce it and reviewers do not flag its absence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs: eligible 52, separated 12, unknown_executions 0`. 40 of 52 eligible pairs are not separated. The instructions state 'A missing separation alone does not establish a generation error', so this is not blocking by itself. However, combined with the over-broad `DUPLICATE_SHARE` and the `_force_group_sizes` n>=6 guard, the value variation for several targeted columns may be weaker than intended. This is a note, not a blocking issue.",
+     "requested_revision": "After fixing the blocking FK and NULL-share issues, re-run and report per-column value-frequency summaries (group sizes, duplicate shares, boundary literal presence) so separation can be assessed. Do not weaken constraints to force separation."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact cause of the 10 FK violations in chk_0007 (Payments.customer_id and Bookings.customer_id) is not fully traced from the code alone; the parent-without-child block only touches Products_for_Hire, so the Customers FK leak likely comes from an interaction between `_finalize_parent`'s `drop_unique_duplicates`/`_ensure_null` and `final_pk` computation that the code review could not pin down without running the generator. The engineer must reproduce chk_0007 and trace it.",
+    "Whether `_force_group_sizes` actually achieves 1/2/>=3 in every instance was not verified by the execution feedback (no per-instance group-size report).",
+    "Whether `_force_different_in_groups` on Products_Booked.product_id ever produced an out-of-parent value was not observed (0 FK violations on Products_Booked), but the logic is unsound.",
+    "The compact DB's per-column NULL shares were not provided in the feedback, so the 'NULL share following the compact database's share' rule could not be checked numerically."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "summary": "FK-membership post-check does not cover the parent-without-child deletion path, leaving 5 FK violations in chk_0007 (Payments.customer_id x4, Bookings.customer_id x1).",
+     "evidence": "Execution feedback: integrity.fk_violations=5, constraint_violations.foreign_keys shows Payments.customer_id -> Customers.customer_id (4 rows) and Bookings.customer_id -> Customers.customer_id (1 row), all in instance products_for_hire__chk_0007. In instance.py, `_assert_fk_membership` is called once at the end of `build_random_instance`, but the PARENT_WITHOUT_CHILD block only refreshes `final_pk[pt]` for the parent table it deletes from (Products_for_Hire). The deletion loop iterates over `spec.PARENT_WITHOUT_CHILD` which currently only lists Products_for_Hire, so Customers is not re-validated. However, the observed violations are on Customers.customer_id, which is a parent of Bookings and Payments. The only way Customers rows can disappear after children were sampled is via `_finalize_parent`'s PK dedup / `_ensure_null` on Customers \u2014 but `_finalize_parent` runs before children are sampled, so that is not it. The remaining path is `_assert_fk_membership` itself: it resamples offending FK values from `final_pk.get(pt)`, but `final_pk` is only populated for tables that were iterated in `order`; if a parent table's `final_pk` was refreshed by the PARENT_WITHOUT_CHILD block for a *different* parent, the child's FK values are not re-checked against the new parent set. More directly: `_assert_fk_membership` iterates `schema.fks` and checks `inst[ct].get(cc)` against `final_pk[pt]`, but it does not re-run after the PARENT_WITHOUT_CHILD deletion for parents other than the one being deleted from. The spec's own uncertainty note says 'The exact cause of the 10 FK violations in chk_0007 must be reproduced and traced; the fk_membership_assertion rule is the safety net.' The safety net is not catching these 5 violations, so the assertion is incomplete.",
+     "requested_revision": "In `build_random_instance`, after the PARENT_WITHOUT_CHILD deletion block, re-run `_assert_fk_membership` (or at minimum re-validate every child FK whose parent table had rows removed) and count any resampled/dropped rows in `__rows_failed__`. Also ensure `_assert_fk_membership` is called after *all* parent mutations, not just once. Add a regression test that reproduces chk_0007 and asserts zero FK violations."
+    },
+    {
+     "agent": "engineer",
+     "summary": "`_assert_fk_membership` resamples offending FK values but does not re-check the resampled value against the parent set, and does not handle the case where the parent set is empty for a NOT NULL FK column.",
+     "evidence": "instance.py `_assert_fk_membership`: `if pv: vals[i] = rng.choice(pv) else: drop.add(i)`. If `pv` is non-empty but the chosen value is still not in `pset` (impossible for a list, but the code does not assert), or if `pv` is empty and the FK column is NOT NULL (e.g. Customers.coupon_id, Bookings.customer_id, Payments.customer_id, Products_Booked.booking_id, Products_Booked.product_id, View_Product_Availability.booking_id, View_Product_Availability.product_id), dropping the row silently reduces the table size and may violate the spec's table_sizes_per_instance. The spec's `fk_membership_assertion` rule says 'on failure, resample the offending FK column from the current final_pk (or drop the row) and count it in rows_failed; never silently pass.' The current code counts in `failed` but the drop path is not guarded against NOT NULL FK columns.",
+     "requested_revision": "In `_assert_fk_membership`, if `pv` is empty and the FK column is NOT NULL, raise or log a hard error rather than dropping rows silently; if the column is nullable, set the value to NULL instead of dropping the row. After resampling, assert `vals[i] in pset` and retry with a different choice on collision."
+    },
+    {
+     "agent": "engineer",
+     "summary": "`_force_group_sizes` for `Payments.booking_id` (an FK column) is applied to `cols[cm.name]` before FK sampling, so the group-size forcing is overwritten by the subsequent FK draw from `final_pk`.",
+     "evidence": "instance.py: the loop `for cm in tm.columns: ... if _is_group_size(t, cm.name): cols[cm.name] = _force_group_sizes(...)` runs before the FK block `for cm in tm.columns: ... if key in schema.fks: fk_cols[cm.name] = [rng.choice(pv) ...]`. For `Payments.booking_id`, `_is_group_size('Payments','booking_id')` is True (spec.GROUP_SIZES includes it), but `booking_id` is also an FK to Bookings, so `cols['booking_id']` is never populated (the sampler loop skips FK columns: `if (t, cm.name) in schema.fks: continue`), and `_force_group_sizes` is a no-op on a missing key. The FK draw then produces a uniform random draw from `final_pk['Bookings']`, which does not guarantee group sizes 1, 2, >=3. The spec's `group_sizes` rule for `Payments.booking_id` is therefore not implemented.",
+     "requested_revision": "Apply `_force_group_sizes` to `fk_cols[cm.name]` after the FK draw (or move the group-size forcing to operate on the final column values, including FK columns). Add a post-generation assertion that `Payments.booking_id` value counts include a group of size 1, a group of size 2, and (when n>=6) a group of size >=3."
+    },
+    {
+     "agent": "engineer",
+     "summary": "`_force_different_in_groups` for `Products_Booked.product_id` (an FK column) is applied to `cols[cm.name]`, but `product_id` is an FK and is not in `cols`; the function is a no-op.",
+     "evidence": "instance.py: `for cm in tm.columns: gkey = _different_group_key(t, cm.name); if gkey is None or cm.name not in cols: continue`. For `Products_Booked.product_id`, `cm.name not in cols` is True because the sampler loop skips FK columns. The spec's `rows_with_different_values` rule for `Products_Booked.product_id` (grouped by `booking_id`) is therefore not implemented. The same applies to `Products_Booked.booked_count` only if `booked_count` is not an FK (it is not, so that one is fine).",
+     "requested_revision": "Apply `_force_different_in_groups` to `fk_cols[cm.name]` after the FK draw for FK columns, using `parent_pk` from `final_pk`. Add a post-generation assertion that each `booking_id` group in `Products_Booked` has >=2 distinct `product_id` values."
+    },
+    {
+     "agent": "engineer",
+     "summary": "`_force_order_ties` for `Products_for_Hire.product_description` is applied, but the spec's `ties_for_order_limit` target is 'rank 1 tie' on an ORDER/LIMIT query; the function forces the max value to appear twice, which is correct for a DESC order but the spec does not state the direction. More importantly, `_force_order_ties` is applied before `_finalize_parent`, which may drop rows via PK dedup / unique-drop / NULL planting, potentially removing one of the tied rows.",
+     "evidence": "instance.py: `_force_order_ties` is called in the per-column loop before `_finalize_parent`. `_finalize_parent` calls `drop_unique_duplicates` and `_ensure_null`, both of which can remove or NULL out rows. If one of the two tied rows is dropped or NULLed, the tie is lost. The spec's `order_ties` rule says 'Ensure at least two rows share the top rank value on ORDER/LIMIT-targeted columns.'",
+     "requested_revision": "Apply `_force_order_ties` after `_finalize_parent` (or re-apply it after finalization) and add a post-generation assertion that at least two non-NULL rows share the max value of `Products_for_Hire.product_description`."
+    },
+    {
+     "agent": "designer",
+     "summary": "The spec's `group_sizes` target for `Payments.booking_id` is listed as a non-key column, but `booking_id` is an FK to `Bookings.booking_id` and is nullable. The spec does not clarify whether the group-size forcing should operate on the FK values (which are drawn from the parent PK set) or on a separate non-FK column. The current spec is ambiguous and the engineer's implementation is a no-op.",
+     "evidence": "spec.py `GROUP_SIZES` includes `('Payments', 'booking_id')`. The atomic operations list `Payments.booking_id` with `group_sizes` pattern and `scalar:GROUP(payments.booking_id)`. The spec's `supporting_evidence.group_sizes` says 'Customers.first_name and Customers.date_last_hire are non-key columns where duplicate values are legal; Customers.customer_id is a PK and is excluded from group_sizes/duplicates.' It does not mention `Payments.booking_id` being an FK.",
+     "requested_revision": "Clarify in the spec that `Payments.booking_id` group-size forcing must be applied to the FK values after they are drawn from the parent PK set, and that the post-condition is verified on the final column values. Alternatively, if the intent was a different column, correct the spec."
+    },
+    {
+     "agent": "designer",
+     "summary": "The spec's `null_targets` list includes `Payments.booking_id`, which is a nullable FK. The spec's `integer_fk` rule says 'Nullable FKs get NULL share from the compact DB (fallback ~0.1) and non-NULL rows; NULL FK values are exempt from parent-PK membership.' This is consistent, but the spec does not state whether the NULL share for `Payments.booking_id` should be computed from the compact DB's observed share for that column, which may be 0 if the compact DB has no NULLs in that column. The execution feedback shows `Payments.booking_id: generated rows: NULL 13 / 53`, which is ~24.5%, far above the fallback 0.1. This suggests the compact DB's observed share is being used, but the spec does not document the observed value.",
+     "evidence": "spec.py `null_targets` includes `Payments.booking_id`. `_compact_null_share` reads `schema.original_values.get((table, column))` and computes the NULL share. The execution feedback shows a 24.5% NULL share for `Payments.booking_id`, which is plausible if the compact DB has ~24.5% NULLs in that column, but the spec's `supporting_evidence.null_share` only mentions `Products_for_Hire.product_name`, `Products_Booked.booked_count`, and `Customers.last_name` as examples of high NULL shares. The spec should document the observed NULL share for each nullable column, or at least for the FK columns.",
+     "requested_revision": "Add the observed NULL share for each nullable column (especially FK columns) to the spec's `supporting_evidence.null_share`, or state that the share is read from the compact DB at generation time and is not fixed in the spec."
+    },
+    {
+     "agent": "engineer",
+     "summary": "`_ensure_null` is applied to `Payments.booking_id` (a nullable FK) after FK sampling, which can NULL out a value that was drawn from the parent PK set. This is consistent with the spec's NULL rule (NULL FK values are exempt from parent-PK membership), but the `_assert_fk_membership` post-check skips NULL values (`if v is None: continue`), so the NULLed FK values are not re-validated. This is correct per the spec, but the engineer should confirm that the NULL share for `Payments.booking_id` is not so high that the `rows_with_different_values` target for `Payments.amount_due` (grouped by `booking_id`) becomes unachievable.",
+     "evidence": "instance.py `_ensure_null` is called in `_finalize_parent` for every nullable column, including `Payments.booking_id`. The execution feedback shows `Payments.booking_id: generated rows: NULL 13 / 53`. The `rows_with_different_values` target for `Payments.amount_due` groups by `booking_id`; if a group has only one non-NULL `booking_id` row, the target is unachievable. The execution feedback does not report whether this target was achieved.",
+     "requested_revision": "Add a post-generation assertion that each `booking_id` group in `Payments` (excluding NULL `booking_id`) has >=2 rows with distinct `amount_due` values, and report the result in the execution feedback. If the NULL share for `Payments.booking_id` makes this unachievable, reduce the NULL share or increase the table size."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact cause of the 5 FK violations in chk_0007 was not reproduced; the spec's uncertainty note says it must be traced. The engineer's `_assert_fk_membership` is the safety net, but it did not catch these violations, so the safety net is incomplete.",
+    "The `rows_with_different_values` target for `Payments.amount_due` (grouped by `booking_id`) was not verified in the execution feedback; it may be unachievable if `Payments.booking_id` has a high NULL share.",
+    "The `group_sizes` target for `Payments.booking_id` was not verified; the engineer's implementation is a no-op for FK columns.",
+    "The `rows_with_different_values` target for `Products_Booked.product_id` (grouped by `booking_id`) was not verified; the engineer's implementation is a no-op for FK columns.",
+    "The `ties_for_order_limit` target for `Products_for_Hire.product_description` was not verified after `_finalize_parent`; the tie may be lost if one of the tied rows is dropped or NULLed.",
+    "The `comparison_boundary` target for `Products_for_Hire.product_name` (values 'Book collection A' and 'book collection a') was not verified in the execution feedback; the spec's `BOUNDARY_STRINGS` includes these values, but the `StringSampler` may not guarantee their presence.",
+    "The `like_near_variant` target for `Products_for_Hire.product_name` (LIKE '%Book%', '%Boo%', 'Book%') was not verified; the spec's `LIKE_BASES` includes these, but the `StringSampler` may not guarantee their presence.",
+    "The `comparison_boundary` target for `Products_for_Hire.daily_hire_cost` (values 19.99, 20, 20.01, 20.99, 21, 21.01) was not verified; the `NumberSampler` may not guarantee their presence.",
+    "The `comparison_boundary` target for `Customers.good_or_bad_customer` (values 'good', 'GOOD', 'bad', 'BAD') was not verified; the `EnumSampler` with `case_variants=True` may not guarantee the uppercase variants appear.",
+    "The `duplicates_for_distinct` target for `Discount_Coupons.coupon_amount` (20-50% duplicate share) was not verified; the `_apply_dedup_share` function may not achieve the target share after `_finalize_parent` drops rows.",
+    "The `duplicates_for_distinct` target for `Payments.payment_date` (20-50% duplicate share) was not verified; the `_apply_dedup_share` function may not achieve the target share after `_finalize_parent` drops rows."
+   ]
+  }
+ ]
 }

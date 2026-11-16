@@ -1,48 +1,1158 @@
 {
  "db": "image_and_language",
- "operator_io_quirks": [
-  "All identifiers UPPER_CASE, no spaces; double-quoting still required by spec.",
-  "IMG_OBJ 1.75M rows, IMG_OBJ_ATT 1.07M, IMG_REL 763k: read_schema must rowid-sample (max_rows_per_table) not full-scan.",
-  "IMG_REL has TWO FKs to IMG_OBJ (OBJ1_SAMPLE_ID, OBJ2_SAMPLE_ID) plus a composite FK (IMG_ID,OBJ1/OBJ2_SAMPLE_ID)->IMG_OBJ(IMG_ID,OBJ_SAMPLE_ID); pragma foreign_key_list returns 5 rows, two of which are the same (IMG_ID) pair \u2014 dedupe by (child_col,parent,parent_col).",
-  "Composite FK to a composite PK: schema.fks is keyed (child_t,child_c)->(parent_t,parent_c) single-column; the (IMG_ID,OBJ_SAMPLE_ID) composite edge must be represented as two single-column edges (IMG_ID->IMG_OBJ.IMG_ID, OBJ_SAMPLE_ID->OBJ_OBJ_SAMPLE_ID) \u2014 matches pragma output, but note the parent column is NOT unique alone (IMG_ID distinct 11907 of 1.75M).",
-  "FK parent columns IMG_OBJ.IMG_ID and IMG_OBJ.OBJ_SAMPLE_ID are non-unique parents: fill_foreign_keys_consistently draws with replacement from parent's final column, fine, but child rows will not be unique on (IMG_ID,OBJ_SAMPLE_ID) \u2014 PK dedupe in IMG_OBJ_ATT/IMG_REL will drop many rows.",
-  "All columns declared INTEGER, storage class integer everywhere; no text-stored dates, no mixed storage, no NULLs observed (null_rate 0.0) despite nullable DDL on IMG_OBJ.X/Y/W/H/OBJ_CLASS_ID.",
-  "Declared types dispatch cleanly: INTEGER->Number, TEXT->String; no crash-fallback, no Date/Time/Bool/Bit columns.",
-  "PKs are composite on IMG_OBJ(2), IMG_OBJ_ATT(3), IMG_REL(4); single-column PKs on the three class tables. Composite-PK members get max_l0=30 per spec.",
-  "IMG_OBJ.OBJ_CLASS_ID is nullable FK but original has 0 nulls and 300 distinct = full parent cardinality; TS may emit NULLs there (allowed by DDL).",
-  "IMG_REL.IMG_ID samples include 2316535/2318367 > IMG_OBJ max IMG_ID (11907 distinct but max value large) \u2014 parent IMG_ID values are sparse/large; Number fuzzer range [-10^0,10^0] with scale=0 will produce tiny ints, not matching.",
-  "No views, triggers, or indexes in DDL; empty-clone for neighbor executability is trivial.",
-  "No self-references, no dangling FKs, no missing parents."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER columns with scale=0: range [-1,1] (unsigned false), so fresh draws are -1/0/1 perturbed by +-1/+-2 \u2014 implausibly tiny vs real IMG_ID up to millions, X/Y/W/H up to ~800.",
-  "String fuzzer on ATT_CLASS/OBJ_CLASS/PRED_CLASS: 5 original samples + pool literals, then 50% contaminate (suffix/prefix/drop char) \u2014 produces near-miss strings, drives FN on equality/IN predicates and FP on LIKE.",
-  "Number list-range quirk (list_max overwritten to full-range max) means element-based draws still bounded by [-1,1] for scale=0 \u2014 ties/duplicates collapse, likely FP on DISTINCT/COUNT queries.",
-  "Composite PK dedupe (sample_fresh_primary_keys) on IMG_OBJ_ATT/IMG_REL with tiny integer domains will drop most rows: e.g. IMG_OBJ_ATT PK (IMG_ID,ATT_CLASS_ID,OBJ_SAMPLE_ID) with IMG_ID in {-1,0,1} and ATT_CLASS_ID in {-1,0,1} gives <=9 distinct PKs before FK draw \u2014 severe row loss, likely FN on COUNT/aggregate queries.",
-  "FK fill draws from parent's FINAL filtered column with replacement: IMG_OBJ_ATT.IMG_ID and OBJ_SAMPLE_ID drawn independently from IMG_OBJ's surviving (IMG_ID,OBJ_SAMPLE_ID) columns, so pairs need not exist in IMG_OBJ \u2014 join queries return 0 rows, FN.",
-  "IMG_REL has 5 FK edges (2 to IMG_OBJ.IMG_ID, 2 to IMG_OBJ.OBJ_SAMPLE_ID, 1 to PRED_CLASSES); each child column drawn independently, so (IMG_ID,OBJ1_SAMPLE_ID) and (IMG_ID,OBJ2_SAMPLE_ID) pairs rarely match IMG_OBJ \u2014 join-heavy queries FN.",
-  "No NOT NULL/CHECK enforcement in Python; rows violating PK/unique dropped at insert (writedb) \u2014 but here PKs are the only constraints, so insert failures rare.",
-  "p=0.2 default, whole-instance p=0 w.p. 0.3: 30% of instances use only original+pool elements (no fresh), giving realistic values but few ties.",
-  "max_l0 cap (rng*30) on fresh draws: after ~30 fresh values per column, reuse \u2014 small domains, many duplicates, FP on DISTINCT.",
-  "No Date/Time/Bool columns, so date/time fuzzers unused; no special_cases apply."
- ],
- "challenger_refs": [
-  "G3",
-  "G6",
-  "G11",
-  "G10",
-  "G2",
-  "G1",
-  "G8",
-  "G5",
-  "G7",
-  "G9"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at max(compact key)+1, step 1, unique per table; never NULL. For parent tables with compact IDs 0..7 the generated IDs are 8,9,10,...; for OBJ_CLASSES (compact max 298) generated IDs are 299,300,...; for PRED_CLASSES (compact max 149) generated IDs are 150,151,...; for ATT_CLASSES (compact max 7) generated IDs are 8,9,10,...",
+   "integer_fk": "Draw from the parent table's actual row tuples (compact + generated), never from independent column lists; allow NULL only if the column is nullable; leave at least one parent key unreferenced so parent rows without children exist; for composite FKs draw the whole tuple from the parent's real (col1,col2) pairs grouped by the shared column.",
+   "integer_measure": "Uniform integer in [0, 1000] unless a range rule narrows it; include boundary values at listed literals and one step on each side.",
+   "text_label": "Sample from a small pool of short lowercase words; include near-variants (case changes, trailing/leading spaces) at listed equality literals; allow duplicates on DISTINCT columns.",
+   "text_enum": "Sample from the explicit enum list only.",
+   "null_share": "For nullable columns, generate at least one NULL row per instance and a NULL share matching the compact database (0% observed for IMG_OBJ.OBJ_CLASS_ID, X, Y, W, H); the atomic summary's 5-30% target for IMG_OBJ.OBJ_CLASS_ID is intentionally overridden in favor of the compact share, with at least one NULL row emitted and preserved (never overwritten by dedupe or FK redraw).",
+   "tie_share": "For ORDER/LIMIT columns, ensure at least two rows share the same COUNT(*) value at the listed rank.",
+   "duplicate_share": "For DISTINCT columns, ensure 20-50% of rows share a value with another row.",
+   "group_sizes": "For columns with group_sizes targets, draw FK values so that groups of size 1, 2 and >=3 appear; assign distinct parent keys per target size and do not shuffle in a way that merges same-key groups.",
+   "table_size": "Each table generates exactly the base size in table_sizes_per_instance per instance (no randomization); aggregate-boundary targets depend on exact group sizes."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "ATT_CLASSES",
+    "column": "ATT_CLASS",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "white",
+     "WHITE",
+     "electrical",
+     "ELECTRICAL",
+     "blue",
+     "BLUE"
+    ]
+   },
+   {
+    "table": "ATT_CLASSES",
+    "column": "ATT_CLASS",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(att_classes.att_class)",
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "ATT_CLASSES",
+    "column": "ATT_CLASS_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "man",
+     "MAN",
+     "kitchen",
+     "KITCHEN",
+     "wall",
+     "WALL"
+    ]
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "IMG_OBJ.OBJ_CLASS_ID",
+      "IMG_OBJ.IMG_ID",
+      "IMG_OBJ.W"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "column": "OBJ_CLASS_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9,
+      10,
+      11
+     ],
+     "equal_and_one_step_from": [
+      "IMG_OBJ.OBJ_CLASS_ID"
+     ],
+     "applies_to": "compact parent keys 9,10,11 (present in compact OBJ_CLASSES 0..298) and child FK draws include 9,10,11; generated parent PKs start at 299 and do not include 9,10,11"
+    }
+   },
+   {
+    "table": "PRED_CLASSES",
+    "column": "PRED_CLASS",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "parked on",
+     "PARKED ON"
+    ]
+   },
+   {
+    "table": "PRED_CLASSES",
+    "column": "PRED_CLASS",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "PRED_CLASSES",
+    "column": "PRED_CLASS_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "equal_and_one_step_from": [
+      "IMG_REL.PRED_CLASS_ID"
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "IMG_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2,
+      19,
+      20,
+      21
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "IMG_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "IMG_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "OBJ_SAMPLE_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "OBJ_CLASS_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "OBJ_CLASSES.OBJ_CLASS_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "OBJ_CLASS_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9,
+      10,
+      11
+     ],
+     "equal_and_one_step_from": [
+      "OBJ_CLASSES.OBJ_CLASS_ID"
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "IMG_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      19,
+      20,
+      21,
+      2377984,
+      2377985,
+      2377986
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "IMG_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)",
+      "COUNT(img_obj_att.img_id)"
+     ],
+     "values": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "ATT_CLASS_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(img_obj_att.att_class_id)"
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "ATT_CLASS_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(img_obj_att.att_class_id)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "OBJ_SAMPLE_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "IMG_OBJ.OBJ_SAMPLE_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "IMG_REL",
+    "column": "IMG_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      4,
+      5,
+      6,
+      2214786,
+      2214787,
+      2214788
+     ]
+    }
+   },
+   {
+    "table": "IMG_REL",
+    "column": "IMG_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)",
+      "COUNT(img_rel.img_id)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "IMG_REL",
+    "column": "OBJ1_SAMPLE_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      14,
+      15,
+      16
+     ],
+     "equal_and_one_step_from": [
+      "IMG_REL.OBJ2_SAMPLE_ID"
+     ]
+    }
+   },
+   {
+    "table": "IMG_REL",
+    "column": "OBJ1_SAMPLE_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT img_rel.obj1_sample_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "IMG_REL",
+    "column": "OBJ2_SAMPLE_ID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      17,
+      18,
+      19
+     ],
+     "equal_and_one_step_from": [
+      "IMG_REL.OBJ1_SAMPLE_ID"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "IMG_OBJ",
+    "child_column": "OBJ_CLASS_ID",
+    "parent_table": "OBJ_CLASSES",
+    "parent_column": "OBJ_CLASS_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "IMG_OBJ_ATT",
+    "child_column": "ATT_CLASS_ID",
+    "parent_table": "ATT_CLASSES",
+    "parent_column": "ATT_CLASS_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "IMG_OBJ_ATT",
+    "child_columns": [
+     "IMG_ID",
+     "OBJ_SAMPLE_ID"
+    ],
+    "parent_table": "IMG_OBJ",
+    "parent_columns": [
+     "IMG_ID",
+     "OBJ_SAMPLE_ID"
+    ],
+    "copied_columns": []
+   },
+   {
+    "child_table": "IMG_REL",
+    "child_column": "PRED_CLASS_ID",
+    "parent_table": "PRED_CLASSES",
+    "parent_column": "PRED_CLASS_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "IMG_REL",
+    "child_columns": [
+     "IMG_ID",
+     "OBJ1_SAMPLE_ID"
+    ],
+    "parent_table": "IMG_OBJ",
+    "parent_columns": [
+     "IMG_ID",
+     "OBJ_SAMPLE_ID"
+    ],
+    "copied_columns": []
+   },
+   {
+    "child_table": "IMG_REL",
+    "child_columns": [
+     "IMG_ID",
+     "OBJ2_SAMPLE_ID"
+    ],
+    "parent_table": "IMG_OBJ",
+    "parent_columns": [
+     "IMG_ID",
+     "OBJ_SAMPLE_ID"
+    ],
+    "copied_columns": []
+   },
+   {
+    "table": "ATT_CLASSES",
+    "unique_tuples": [
+     [
+      "ATT_CLASS_ID"
+     ],
+     [
+      "ATT_CLASS"
+     ]
+    ]
+   },
+   {
+    "table": "OBJ_CLASSES",
+    "unique_tuples": [
+     [
+      "OBJ_CLASS_ID"
+     ],
+     [
+      "OBJ_CLASS"
+     ]
+    ]
+   },
+   {
+    "table": "PRED_CLASSES",
+    "unique_tuples": [
+     [
+      "PRED_CLASS_ID"
+     ],
+     [
+      "PRED_CLASS"
+     ]
+    ]
+   },
+   {
+    "table": "IMG_OBJ",
+    "unique_tuples": [
+     [
+      "IMG_ID",
+      "OBJ_SAMPLE_ID"
+     ]
+    ]
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "unique_tuples": [
+     [
+      "IMG_ID",
+      "ATT_CLASS_ID",
+      "OBJ_SAMPLE_ID"
+     ]
+    ]
+   },
+   {
+    "table": "IMG_REL",
+    "unique_tuples": [
+     [
+      "IMG_ID",
+      "PRED_CLASS_ID",
+      "OBJ1_SAMPLE_ID",
+      "OBJ2_SAMPLE_ID"
+     ]
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "IMG_OBJ",
+    "column": "X",
+    "formula": "X IS NULL OR X BETWEEN 0 AND 1000"
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "Y",
+    "formula": "Y IS NULL OR Y BETWEEN 0 AND 1000"
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "W",
+    "formula": "W IS NULL OR W BETWEEN 0 AND 1000"
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "H",
+    "formula": "H IS NULL OR H BETWEEN 0 AND 1000"
+   },
+   {
+    "table": "IMG_OBJ",
+    "column": "OBJ_CLASS_ID",
+    "formula": "OBJ_CLASS_ID IS NULL OR OBJ_CLASS_ID IN (SELECT OBJ_CLASS_ID FROM OBJ_CLASSES)"
+   },
+   {
+    "table": "IMG_OBJ_ATT",
+    "column": "ATT_CLASS_ID",
+    "formula": "ATT_CLASS_ID IN (SELECT ATT_CLASS_ID FROM ATT_CLASSES)"
+   },
+   {
+    "table": "IMG_REL",
+    "column": "PRED_CLASS_ID",
+    "formula": "PRED_CLASS_ID IN (SELECT PRED_CLASS_ID FROM PRED_CLASSES)"
+   },
+   {
+    "table": "IMG_REL",
+    "column": "OBJ1_SAMPLE_ID",
+    "formula": "OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID",
+    "condition": "OBJ1_SAMPLE_ID IS NOT NULL AND OBJ2_SAMPLE_ID IS NOT NULL",
+    "evidence": "Atomic summary comparison_boundary targets PRED(img_rel.obj1_sample_id <> img_rel.obj2_sample_id) with near-values 14,15,16 / 17,18,19; inequality is plausible but the evidence is weak (could be probing equality), so this is an uncertain pattern enforced only when both values are non-NULL and both rows exist in IMG_OBJ for the same IMG_ID."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "ATT_CLASSES": 8,
+   "OBJ_CLASSES": 8,
+   "PRED_CLASSES": 8,
+   "IMG_OBJ": 40,
+   "IMG_OBJ_ATT": 40,
+   "IMG_REL": 40
+  },
+  "null_targets": [
+   "IMG_OBJ.OBJ_CLASS_ID",
+   "IMG_OBJ.X",
+   "IMG_OBJ.Y",
+   "IMG_OBJ.W",
+   "IMG_OBJ.H"
+  ],
+  "supporting_evidence": {
+   "IMG_OBJ.X": "Sample rows show X in [0, 799]; range rule 0-1000 covers all.",
+   "IMG_OBJ.Y": "Sample rows show Y in [0, 344]; range rule 0-1000 covers all.",
+   "IMG_OBJ.W": "Sample rows show W in [135, 799]; range rule 0-1000 covers all.",
+   "IMG_OBJ.H": "Sample rows show H in [176, 557]; range rule 0-1000 covers all.",
+   "IMG_OBJ.OBJ_CLASS_ID": "Sample rows show OBJ_CLASS_ID values 298, 246, 293, 239, 295, 41, 23, 205; the compact OBJ_CLASSES domain is 0-298 (300 rows), so these values are valid parent keys; generated parent PKs start at 299 and are a subset of the same domain.",
+   "IMG_OBJ_ATT.ATT_CLASS_ID": "Sample rows show ATT_CLASS_ID values 0-7; all exist in ATT_CLASSES sample.",
+   "IMG_REL.PRED_CLASS_ID": "Sample rows show PRED_CLASS_ID values 0-7; all exist in PRED_CLASSES sample.",
+   "OBJ_CLASSES.OBJ_CLASS_ID": "Compact OBJ_CLASSES has 300 rows with IDs 0-298; generated sequential PKs start at 299 and do not include 9,10,11. The boundary [9,10,11] is reachable only via compact keys 9,10,11 (present in the compact 0-298 domain) and via child FK draws that include 9,10,11."
+  },
+  "uncertainty": {
+   "IMG_OBJ.OBJ_CLASS_ID": "Statistics report null_rate 0.0 and the compact database shows 0% NULL; the atomic summary requests 5-30% NULL share. We follow the compact database (0%) and still emit at least one NULL row per nullable column per the interface rule; the planted NULL must be preserved and never overwritten by dedupe or FK redraw.",
+   "IMG_REL.OBJ1_SAMPLE_ID": "Atomic summary mentions null_rows 1 but column is NOT NULL; we treat as no NULLs.",
+   "IMG_OBJ_ATT.OBJ_SAMPLE_ID": "Atomic summary mentions unmatched_join_rows with parent_rows_without_children true; we allow child rows referencing parent keys that exist but also leave some parent rows unreferenced.",
+   "OBJ_CLASSES.OBJ_CLASS_ID": "The boundary [9,10,11] applies to compact parent keys 9,10,11 (present in the 0-298 domain) and to child FK draws; generated parent PKs start at 299 and do not include 9,10,11. The compact values 23-298 are also valid parent keys.",
+   "IMG_REL.OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID": "The rule is enforced only when both values are non-NULL and both rows exist in IMG_OBJ for the same IMG_ID; the program must draw IMG_ID once and then draw OBJ1_SAMPLE_ID and OBJ2_SAMPLE_ID from IMG_OBJ rows with that IMG_ID, enforcing inequality. The evidence is weak (could be probing equality), so this is an uncertain pattern.",
+   "IMG_OBJ_ATT/IMG_REL aggregate boundaries": "With 40 rows per instance, group sizes of 1,2,3,... are reachable by controlling IMG_ID group sizes in IMG_OBJ_ATT and IMG_REL; the program must implement grow_group_targets or equivalent and assign distinct parent keys per target size without shuffling that merges same-key groups.",
+   "Composite FK drawing": "IMG_OBJ_ATT and IMG_REL rows must be drawn from actual (IMG_ID, OBJ_SAMPLE_ID) pairs present in IMG_OBJ (compact + generated), grouped by IMG_ID; aggregate-shaping steps must not overwrite FK columns with values that break the FK (e.g. OBJ2_SAMPLE_ID must come from rows of IMG_OBJ sharing the same IMG_ID).",
+   "Table sizes": "Sizes are fixed at the base in table_sizes_per_instance (no randomization) so aggregate-boundary targets are guaranteed."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added = {\"IMG_REL\": 0}, rows_skipped = {\"IMG_REL\": 922, \"IMG_OBJ_ATT\": 309}. The generator produced zero IMG_REL rows across all 20 instances and skipped ~922 IMG_REL rows and ~309 IMG_OBJ_ATT rows. The spec requires IMG_REL size 40 per instance and IMG_OBJ_ATT size 40 per instance, and the atomic summary lists many IMG_REL/IMG_OBJ_ATT patterns (comparison_boundary, aggregate_boundary, ties_for_order_limit) that cannot be exercised if no rows are inserted.",
+     "requested_revision": "Fix the composite-FK construction so IMG_REL and IMG_OBJ_ATT rows are actually inserted. In instance.py, composite FK groups are drawn from `_parent_pairs(store, pt, gcols)` where `gcols` are the child column names (e.g. ['IMG_ID','OBJ1_SAMPLE_ID']), but `_parent_pairs` looks up `store.keys(table, c)` using those child column names against the parent table \u2014 for IMG_REL the parent is IMG_OBJ whose columns are IMG_ID/OBJ_SAMPLE_ID, so OBJ1_SAMPLE_ID/OBJ2_SAMPLE_ID never resolve and the pair list is empty, yielding all-NULL composite FKs that violate NOT NULL and get skipped. Map child columns to the corresponding parent columns (via schema.fks) before building parent pairs, and verify rows_added for IMG_REL and IMG_OBJ_ATT are non-zero and match the target sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_dedupe_pk` reconstructs 'compact' PK tuples from the instance arrays using `store.n_compact` and the first `compact_n` positions of `cols`, but `cols` only contains the newly generated rows (length n), not the compact rows. The compact rows are only in `store.rows`, not in `cols`. So the 'blocked' compact PK set is computed from generated values, not from the compact database, and the dedupe against compact rows is ineffective. This is a latent correctness bug even though the current run reports pk_duplicates=0 (because the sequential PK start offset happens to avoid collisions for single-column PKs).",
+     "requested_revision": "Compute the compact PK tuples from `store.rows` (the seeded compact values) rather than from `cols`, and dedupe generated PK tuples against that set. Add a check that generated PK tuples do not collide with compact PK tuples."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_share` rule states '0% observed for IMG_OBJ.OBJ_CLASS_ID, X, Y, W, H; use 5-30% for IMG_OBJ.OBJ_CLASS_ID per atomic summary', and `uncertainty` notes the conflict. The program (spec.py NULL_SHARE) uses 0.20 for OBJ_CLASS_ID and 0.05 for X/Y/W/H. Execution feedback shows NULL 168/829 for OBJ_CLASS_ID (~20%) and 43/829 (~5%) for X/Y/W/H. The compact database shows 0% NULL for these columns, so the generated NULL share does not follow the compact database's share as the interface rule requires. The atomic summary's '5-30% of generated rows' for IMG_OBJ.OBJ_CLASS_ID is a target for generated rows, but the interface rule says the share should follow the compact database's share; the spec should resolve this explicitly rather than silently overriding.",
+     "requested_revision": "Clarify in the specification whether the NULL share for IMG_OBJ.OBJ_CLASS_ID and X/Y/W/H should follow the compact database (0%) or the atomic summary (5-30%). If following the compact database, set NULL_SHARE to 0.0 (still emitting at least one NULL row per nullable column per the interface rule) and update the uncertainty note. If following the atomic summary, document that the compact share is intentionally overridden and why."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `IMG_REL.OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID OR OBJ1_SAMPLE_ID = OBJ2_SAMPLE_ID`, which is a tautology (always true) and provides no constraint. The atomic summary's comparison_boundary for OBJ1_SAMPLE_ID/OBJ2_SAMPLE_ID targets `PRED(img_rel.obj1_sample_id <> img_rel.obj2_sample_id)` with values 14,15,16 / 17,18,19, suggesting the intended rule is that OBJ1_SAMPLE_ID and OBJ2_SAMPLE_ID should differ (or be near each other). The current formula is vacuous.",
+     "requested_revision": "Replace the tautological formula with a meaningful constraint, e.g. `OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID` (or document that equality is allowed and the boundary is only about near-values). Ensure the program's composite-FK construction for IMG_REL enforces the chosen rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_composite_fk_groups` groups child columns by parent table, but for IMG_REL there are two separate composite FKs to IMG_OBJ: (IMG_ID, OBJ1_SAMPLE_ID) and (IMG_ID, OBJ2_SAMPLE_ID). Both share the same parent table IMG_OBJ, so `by_child['IMG_REL']['IMG_OBJ']` collects ['IMG_ID','OBJ1_SAMPLE_ID','IMG_ID','OBJ2_SAMPLE_ID'] (with IMG_ID duplicated) and treats them as one group of 4 columns, drawing a single parent tuple for all four. This is wrong: IMG_ID must be shared between the two FKs, but OBJ1_SAMPLE_ID and OBJ2_SAMPLE_ID must be drawn independently (and per the rule, differ). The current code cannot produce valid IMG_REL rows.",
+     "requested_revision": "Group composite FK columns by the actual FK constraint (using the FK id from pragma foreign_key_list), not by parent table. For IMG_REL, draw IMG_ID once, then draw OBJ1_SAMPLE_ID and OBJ2_SAMPLE_ID independently from IMG_OBJ rows with that IMG_ID, enforcing OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID if the rule requires it. Add a post-construction check that IMG_REL rows satisfy the composite FK and the OBJ1/OBJ2 rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_dedupe_pk` for composite PKs (IMG_OBJ, IMG_OBJ_ATT, IMG_REL) perturbs individual PK columns when a duplicate is found, but for composite FKs the PK columns are also FK columns; perturbing them can break the FK. The current run reports fk_violations=0 only because IMG_REL rows are all skipped and IMG_OBJ_ATT rows are mostly skipped. Once the composite-FK bug is fixed, the dedupe logic may introduce FK violations.",
+     "requested_revision": "For composite PKs that are also composite FKs, dedupe by re-drawing the whole FK tuple from the parent (respecting the FK), not by perturbing individual columns. Add a post-construction FK check."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `table_sizes_per_instance` sets IMG_OBJ_ATT and IMG_REL to 40 rows each, but the atomic summary lists aggregate_boundary targets for IMG_OBJ_ATT.IMG_ID (COUNT values 1-6) and IMG_REL.IMG_ID (COUNT values 1-3), and ties_for_order_limit for IMG_OBJ_ATT.ATT_CLASS_ID. With only 40 rows and the current construction, these aggregate boundaries may not be reachable. The spec does not state how the aggregate boundaries are to be achieved (e.g. by controlling group sizes of IMG_ID in IMG_OBJ_ATT).",
+     "requested_revision": "Add explicit construction rules for the aggregate_boundary and ties_for_order_limit patterns on IMG_OBJ_ATT and IMG_REL (e.g. ensure at least one IMG_ID group of size 1, 2, 3, ... in IMG_OBJ_ATT; ensure the top COUNT(att_class_id) is tied at rank 1). Document how these are realized in the program."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py section D comment says group-size and tie targets are 'handled by fk_values drawing from a small pool of parents, so repeats are guaranteed', but `fk_values` draws uniformly from the full parent key pool, which for IMG_OBJ has 40+ generated keys plus compact keys; repeats are not guaranteed and group sizes 1, 2, >=3 are not controlled. The `grow_group_targets` helper in inmemory.py is defined but never called. The spec's group_sizes targets for OBJ_CLASSES.OBJ_CLASS, ATT_CLASSES.ATT_CLASS_ID, etc. are therefore not implemented.",
+     "requested_revision": "Implement the group-size plan: for columns with group_sizes targets, draw FK values according to `grow_group_targets` (or equivalent) so that groups of size 1, 2, and >=3 appear. Wire `grow_group_targets` into the FK drawing path or remove the dead code and document the alternative."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sequential_pk` starts at max(existing)+1, which for ATT_CLASSES/OBJ_CLASSES/PRED_CLASSES (compact IDs 0-7) yields 8,9,10,... The spec's comparison_boundary for OBJ_CLASSES.OBJ_CLASS_ID targets values [9,10,11] and equal_and_one_step_from IMG_OBJ.OBJ_CLASS_ID, and for IMG_OBJ.OBJ_CLASS_ID targets [9,10,11]. The generated OBJ_CLASS_IDs 8-15 do not include 9,10,11 as boundary values in the sense of being at/around a literal; they are just sequential. The boundary_ints for OBJ_CLASS_ID are [9,10,11] but the PK sampler ignores them (PK path uses _sequential_pk). This may be acceptable, but the spec should state whether the boundary is on the PK or on the FK.",
+     "requested_revision": "Clarify whether the OBJ_CLASS_ID boundary [9,10,11] applies to the parent PK (OBJ_CLASSES.OBJ_CLASS_ID) or the child FK (IMG_OBJ.OBJ_CLASS_ID). If the parent PK, ensure the sequential PK includes 9,10,11 (it does, since start=8). If the child FK, ensure IMG_OBJ.OBJ_CLASS_ID draws include 9,10,11 (boundary_ints is set but the FK path uses fk_values, not boundary_ints)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `supporting_evidence` for IMG_OBJ.OBJ_CLASS_ID says 'Sample rows show OBJ_CLASS_ID values 298, 246, 293, 239, 295, 41, 23, 205; all exist in OBJ_CLASSES sample.' But the spec's table_sizes_per_instance sets OBJ_CLASSES to 8 rows and ENUM_LABELS OBJ_CLASS_ID to range(0,8). The compact OBJ_CLASS_ID values (298, 246, ...) are not in 0-7, so the supporting evidence is inconsistent with the enum pool. The generated OBJ_CLASS_IDs (8-15) also do not match the compact values.",
+     "requested_revision": "Reconcile the OBJ_CLASSES.OBJ_CLASS_ID domain: either the compact values are 0-7 (and the supporting_evidence is wrong) or the compact values are 23-298 (and the enum pool range(0,8) is wrong). Update the spec and the program's ENUM_LABELS accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=286, separated=18. Only 18 of 286 construction pairs are separated, meaning most query pairs are not distinguished by the generated instances. While the instructions note that a missing separation alone does not establish a generation error, the very low separation rate combined with the zero IMG_REL rows and skipped IMG_OBJ_ATT rows suggests the instances are not exercising the intended patterns. This is a symptom of the construction bugs above, not an independent issue.",
+     "requested_revision": "After fixing the composite-FK and group-size bugs, re-run and verify that construction_pairs separated increases substantially and that IMG_REL/IMG_OBJ_ATT rows are actually inserted."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact OBJ_CLASSES.OBJ_CLASS_ID values are 0-7 or 23-298 (supporting_evidence vs ENUM_LABELS conflict).",
+    "Whether the NULL share for IMG_OBJ.OBJ_CLASS_ID and X/Y/W/H should follow the compact database (0%) or the atomic summary (5-30%).",
+    "Whether the OBJ_CLASS_ID boundary [9,10,11] applies to the parent PK or the child FK.",
+    "Whether the IMG_REL OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID rule is intended to be enforced (the current formula is a tautology).",
+    "Whether the aggregate_boundary and ties_for_order_limit patterns for IMG_OBJ_ATT and IMG_REL are reachable with 40 rows and the current construction."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added = {\"IMG_REL\": 18}, rows_skipped = {\"IMG_OBJ_ATT\": 915, \"IMG_REL\": 615}. Across 20 instances, essentially all generated IMG_OBJ_ATT and IMG_REL rows are rejected by the writer (only 18 IMG_REL rows survive). The spec requires 40 rows per instance for both tables (table_sizes_per_instance) and aggregate-boundary targets (IMG_OBJ_ATT.IMG_ID group sizes 1..6, IMG_REL.IMG_ID group sizes 1..3, tie at rank 1 on COUNT(att_class_id)). With ~0 surviving rows, none of these aggregate/comparison boundary patterns can be exercised.",
+     "requested_revision": "Fix the composite-FK drawing so generated IMG_OBJ_ATT and IMG_REL rows satisfy the FK constraints against IMG_OBJ. In particular, `_apply_composite_fks`/`_draw_remaining`/`_draw_img_rel_objs` must draw (IMG_ID, OBJ_SAMPLE_ID) pairs that actually exist in IMG_OBJ (compact + generated), and `_shape_img_obj_att`/`_shape_img_rel` must not overwrite FK columns with values that break the FK (e.g. `_shape_img_rel` replaces OBJ2_SAMPLE_ID with a value from a different IMG_ID's rows). Re-run and confirm rows_skipped for IMG_OBJ_ATT and IMG_REL is 0 (or near 0) and rows_added matches the spec sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_shape_img_obj_att` unconditionally replaces `cols['ATT_CLASS_ID']` with `one_tie_plan(att_pool, n, rng)`, discarding the FK-consistent values drawn earlier. `_shape_img_rel` replaces `OBJ2_SAMPLE_ID` with a value from `store.distinct_columns('IMG_OBJ','OBJ_SAMPLE_ID')` without checking that the pair (IMG_ID, new OBJ2_SAMPLE_ID) exists in IMG_OBJ. Both directly cause the mass FK rejections reported in the execution feedback.",
+     "requested_revision": "Make the aggregate-shaping steps FK-aware: choose ATT_CLASS_ID from the parent pool (fine) but keep it consistent with the composite FK; for IMG_REL, when enforcing OBJ1<>OBJ2, pick the alternative OBJ2_SAMPLE_ID from the rows of IMG_OBJ that share the same IMG_ID (i.e. from `parent_pairs[img_id]`), not from the global OBJ_SAMPLE_ID pool."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_composite_fks` builds `parent_pairs` by zipping `store.keys(parent_table, sp)` with `store.keys(parent_table, pc)` positionally (`for i in range(nrows): sp_v = sp_list[i]; row.append(l[i])`). This assumes the two column lists are row-aligned, which holds only if both were populated from the same row order. For IMG_OBJ this is true for compact rows, but generated rows are appended per-column via `store.add_row`, and `_dedupe_keys`/`_redraw_composite_row` can rewrite individual columns, breaking alignment. The result is that `parent_pairs[img_id]` may contain OBJ_SAMPLE_ID values that do not actually co-occur with that IMG_ID, producing FK violations.",
+     "requested_revision": "Build `parent_pairs` from actual row tuples (e.g. via `_parent_pairs_for_fk(store, parent_table, [sp, *rem_parent])` grouped by the shared column), not by positional zip of independent column lists. Ensure the mapping reflects real (IMG_ID, OBJ_SAMPLE_ID) pairs present in IMG_OBJ."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `supporting_evidence.OBJ_CLASSES.OBJ_CLASS_ID` and `uncertainty.OBJ_CLASSES.OBJ_CLASS_ID` claim the compact OBJ_CLASSES domain is 0-299 and that generated sequential PKs start at 8 and include 9,10,11. But `spec.py` `_sequential_pk` starts at `max(existing)+1`, and the compact max is 298, so generated PKs are 299,300,... \u2014 9,10,11 are never generated. The spec's own ADDENDUM in spec.py acknowledges this contradiction. The atomic summary's `comparison_boundary` for OBJ_CLASSES.OBJ_CLASS_ID targets [9,10,11] with `equal_and_one_step_from: IMG_OBJ.OBJ_CLASS_ID`, which is not satisfiable as written.",
+     "requested_revision": "Reconcile the spec: either (a) state that OBJ_CLASSES.OBJ_CLASS_ID boundary [9,10,11] is only reachable via compact keys (and confirm the compact DB actually contains 9,10,11), or (b) change the sequential-PK rule to start at 8 (or otherwise guarantee 9,10,11 appear in the parent PK). Remove the contradictory ADDENDUM text in spec.py."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `generic_sampling_rules.null_share` and `uncertainty.IMG_OBJ.OBJ_CLASS_ID` say the atomic summary's 5-30% NULL target for IMG_OBJ.OBJ_CLASS_ID is overridden in favor of the compact 0% share, but 'at least one NULL row emitted'. Execution feedback shows `IMG_OBJ.OBJ_CLASS_ID: generated rows: NULL 0 / 829` \u2014 no NULL was emitted. The interface rule (instruction 7) requires at least one NULL row per nullable column per instance. `spec.null_share` returns 0.0 for this column, and `ColumnPlan.null_plan` computes `k = max(1, min(int(round(0.0*n)), n)) = 1`, so a NULL should appear; the fact that it does not indicates the column is being treated as non-nullable or the NULL is being overwritten (e.g. by `_dedupe_keys` or FK redraw).",
+     "requested_revision": "Investigate why IMG_OBJ.OBJ_CLASS_ID gets 0 NULLs despite `null_plan` returning one True. Likely `_dedupe_keys`/`_redraw_composite_row` or the FK drawing path overwrites the NULL. Ensure the planted NULL is preserved (per instruction 7, a planted NULL is never replaced to satisfy a rule)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_draw_remaining` calls `_group_key_i(common_cols, cols, i, i)` which always returns `None`; the function is a stub. The subsequent logic only handles `len(common_cols)==1` or `not common_cols`, and for the IMG_OBJ_ATT case (common_cols = {IMG_ID, OBJ_SAMPLE_ID}, size 2) it falls into the `chosen is None` branch and picks a random pair from the flattened pool \u2014 ignoring the already-drawn IMG_ID. This is a second source of FK violations for IMG_OBJ_ATT.",
+     "requested_revision": "Implement `_group_key_i` or restructure `_draw_remaining` so that for a composite FK with multiple common columns, the remaining child columns are drawn from parent rows matching the already-drawn common column values (i.e. look up `parent_pairs[tuple(cols[c][i] for c in common_cols)]`)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `semantic_rules_and_formulas` includes `IMG_REL.OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID` with evidence from the atomic summary. The atomic summary's `comparison_boundary` for IMG_REL.OBJ1_SAMPLE_ID targets values [14,15,16] with `equal_and_one_step_from: IMG_REL.OBJ2_SAMPLE_ID`, and OBJ2 targets [17,18,19]. These are near-value boundaries, not inequality witnesses. The spec's interpretation (inequality) is plausible but the evidence is weak; the atomic summary could equally be probing equality. This is an uncertain pattern, not a supported rule.",
+     "requested_revision": "Downgrade this to an uncertain pattern in the spec, or provide stronger evidence (e.g. a query in the pool that actually uses `<>`). If kept, note that the inequality must be enforced only when both values are non-NULL and both rows exist in IMG_OBJ for the same IMG_ID."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID aggregate_boundary targets values [1,2,3,4,5,6] and IMG_REL.IMG_ID targets [1,2,3]. With 40 rows per instance and the current `_img_id_group_plan_children` (which assigns one group per target size then fills uniformly), group sizes 1..6 are reachable only if the parent IMG_ID pool has at least 6 distinct keys and the plan is not shuffled away. The execution feedback shows 0 surviving IMG_OBJ_ATT rows, so this is untested. Additionally, `_img_id_group_plan_children` shuffles the plan, which can merge groups of the same key and destroy the intended sizes.",
+     "requested_revision": "After fixing the FK drawing, verify that IMG_OBJ_ATT.IMG_ID group sizes actually include 1..6 and IMG_REL.IMG_ID group sizes include 1..3 in each instance. Do not shuffle the plan in a way that merges same-key groups; assign distinct parent keys per target size."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_dedupe_keys` seeds `seen_unique` from compact values but then, for UNIQUE tuples that are FK/PK-only, does nothing (`if not killed: pass`) and still adds the duplicate tuple to `seen_set`. This means duplicate UNIQUE tuples can be emitted, and the writer will skip them (counted in rows_skipped). For OBJ_CLASSES.OBJ_CLASS (UNIQUE per spec dependencies), `draw_column` uses `excl = set(_nonnull(store.keys(t, cm.name)))` and perturbs, but `perturb_string` can produce values already in `excl` (it does not check), so duplicates are possible.",
+     "requested_revision": "Make `perturb_string`-based dedupe check against the excluded set and retry until unique (bounded retries). For FK/PK-only UNIQUE tuples, redraw the whole tuple from the parent rather than giving up."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `table_sizes_per_instance` fixes IMG_OBJ at 40, but `spec.table_rows` randomizes sizes (0..base*2, capped at 2500) with 25%/50% branches. The execution feedback shows 829 generated IMG_OBJ rows across 20 instances (~41/instance), which is consistent with the base but not with a fixed 40. The spec's `table_sizes_per_instance` is therefore not implemented as stated.",
+     "requested_revision": "Either change the spec to say sizes are randomized around the base, or change `table_rows` to return the exact base size. The current mismatch means aggregate-boundary targets (which depend on exact group sizes) are not guaranteed."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact OBJ_CLASSES table actually contains keys 9,10,11 (needed to satisfy the OBJ_CLASSES.OBJ_CLASS_ID comparison_boundary as written).",
+    "Whether the compact IMG_OBJ contains (IMG_ID, OBJ_SAMPLE_ID) pairs with IMG_ID in {4,5,6,19,20,21} and OBJ_SAMPLE_ID in {14..19} to satisfy the IMG_REL boundary targets.",
+    "Whether the compact IMG_OBJ_ATT contains rows with IMG_ID in {19,20,21,2377984,2377985,2377986} to satisfy the IMG_OBJ_ATT.IMG_ID boundary targets.",
+    "Whether the 20 construction_pairs 'separated' out of 286 eligible is due to the mass row rejection (likely) or to genuine value-variation gaps; this cannot be determined until the FK drawing is fixed.",
+    "Whether the NULL for IMG_OBJ.OBJ_CLASS_ID is being overwritten by `_dedupe_keys` or the FK path (needs instrumentation)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's `uncertainty` block flags IMG_REL.OBJ1_SAMPLE_ID <> OBJ2_SAMPLE_ID as 'uncertain' (evidence weak, could be probing equality), yet the semantic_rules_and_formulas list enforces it as a hard rule. The atomic summary only shows PRED(img_rel.obj1_sample_id <> img_rel.obj2_sample_id) with near-values 14,15,16 / 17,18,19, which is consistent with either an inequality probe or an equality probe on near-boundary values.",
+     "requested_revision": "Downgrade the OBJ1<>OBJ2 rule to a soft/uncertain pattern in the spec (or keep it but mark it explicitly as 'uncertain, enforced only when both non-NULL and both rows exist'), so the program does not treat it as a hard constraint. This is a documentation/classification issue, not a blocking error; the program already enforces it only under those conditions."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: IMG_REL rows_skipped = 46 across 20 instances (~2.3 per instance). The writer counts skipped rows but the spec's `table_sizes_per_instance` requires exactly 40 rows per instance for IMG_REL. The skipped rows are almost certainly composite-PK collisions after `_dedupe_keys` redraws (IMG_ID, PRED_CLASS_ID, OBJ1, OBJ2) from a small parent pool, or OBJ1==OBJ2 fallbacks when the parent IMG_ID has only one child row. This means the aggregate-boundary targets for IMG_REL (COUNT(*) values 1,2,3) may not be reliably met.",
+     "requested_revision": "In `_apply_composite_fks` / `_dedupe_keys`, when redrawing a composite-FK row for IMG_REL, also redraw PRED_CLASS_ID (or pick a different IMG_ID with >=2 children) so the full 4-tuple is unique; alternatively, ensure the IMG_ID group plan assigns at least 2 distinct OBJ_SAMPLE_IDs per IMG_ID used for OBJ1/OBJ2. Target zero skipped rows for IMG_REL so the fixed table size is honored. This is a quality issue, not a blocking integrity failure (fk_violations=0, pk_duplicates=0)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `null_share` rule says 'NULL share matching the compact database (0% observed for IMG_OBJ.OBJ_CLASS_ID, X, Y, W, H)' with at least one NULL row. Program `spec.NULL_SHARE` sets 0.05 for all five columns, and execution shows 40/800 = 5% NULL per column. This is consistent with the interface rule (>=1 NULL, share following compact share) but the 5% is a fixed constant rather than derived from the compact share (which is 0%). The spec text says 'the atomic summary's 5-30% target ... is intentionally overridden in favor of the compact share, with at least one NULL row emitted' \u2014 the program's 5% is a reasonable interpretation but not literally 'compact share'.",
+     "requested_revision": "Clarify in the spec that the NULL share for these columns is a small positive constant (e.g. 5%) chosen to satisfy the interface's 'at least one NULL' rule while keeping the compact 0% dominant, OR change `spec.NULL_SHARE` to use `max(1/n, compact_share)` so the share is derived from the compact share. Non-blocking: the interface rule is satisfied (NULL 40/800 per column, non-NULL rows present)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID lists boundary values [19,20,21,2377984,2377985,2377986] and IMG_REL.IMG_ID lists [4,5,6,2214786,2214787,2214788]. The program's `BOUNDARY_INTS` only includes [19,20,21] and [4,5,6] respectively; the large values (2377984+, 2214786+) are omitted. These large values are almost certainly from the compact database's actual IMG_ID domain (the compact DB has ~2.4M images), so they are reachable via compact parent keys, but the program's `_boundary_force` only forces values present in the parent pool \u2014 which for generated rows is the compact IMG_ID set. Since IMG_OBJ.IMG_ID is a PK generated sequentially from max(compact)+1, the compact IMG_IDs (including 2377984) are in the parent pool and can be drawn, but not forced.",
+     "requested_revision": "Either add the large boundary values to `BOUNDARY_INTS` for IMG_OBJ_ATT.IMG_ID and IMG_REL.IMG_ID (so they are forced at least once per instance), or document in the spec that these large values are reachable only via random FK draws from the compact parent pool and are not forced. Non-blocking: the values are in the domain and reachable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID comparison_boundary says 'applies_to: compact parent keys 9,10,11 (present in compact OBJ_CLASSES 0..298) and child FK draws include 9,10,11; generated parent PKs start at 299 and do not include 9,10,11'. Program `_sequential_pk` starts at max(compact)+1 = 299, correct. `_boundary_force` for IMG_OBJ.OBJ_CLASS_ID forces [9,10,11] if present in parent pool \u2014 they are (compact 0..298). Execution shows no FK violations, so this is implemented. However, the spec's `integer_pk` rule says 'for OBJ_CLASSES (compact max 298) generated IDs are 299,300,...' \u2014 the program generates 8 rows per instance starting at 299, so IDs 299..306. Across 20 instances, IDs 299..306 are reused (each instance is a fresh copy of the compact DB), which is correct per-instance but means the generated PKs are not globally unique across instances. This is expected (each instance is independent) and not an error.",
+     "requested_revision": "No change required; noting for completeness that per-instance PK reuse is correct."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `generic_sampling_rules.integer_fk` says 'leave at least one parent key unreferenced so parent rows without children exist'. Program `fk_values` draws uniformly from the parent pool with no mechanism to guarantee an unreferenced parent key. With 40 child rows and 8 parent rows (ATT_CLASSES, PRED_CLASSES) or 300 parent rows (OBJ_CLASSES), an unreferenced parent is likely but not guaranteed. Execution shows no explicit check for this. The `unmatched_join_rows` pattern for OBJ_CLASSES.OBJ_CLASS_ID and IMG_OBJ.OBJ_CLASS_ID requires `parent_rows_without_children: true`.",
+     "requested_revision": "In `fk_values` or the instance builder, explicitly reserve at least one parent key per parent table that is never drawn as a child FK (e.g. exclude the last parent key from the draw pool for at least one child table). Non-blocking: with the current sizes an unreferenced parent is statistically near-certain, but not guaranteed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `semantic_rules_and_formulas` includes IMG_OBJ.X/Y/W/H range rules (0-1000) and the `supporting_evidence` notes sample rows show X in [0,799], Y in [0,344], W in [135,799], H in [176,557]. The program's `MEASURE_RANGE` uses (0,1000) for all four, which is a superset of the observed ranges. This is consistent with the spec's formula but the spec's `supporting_evidence` suggests the actual compact ranges are narrower. The program generates uniform [0,1000], which may produce values outside the compact distribution but within the stated formula.",
+     "requested_revision": "No change required; the formula is 0-1000 and the program implements it. Optionally narrow the range to the observed compact ranges for better distribution fidelity, but this is not required by the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID aggregate_boundary targets COUNT(att_class_id) values [4,5,6] and ties_for_order_limit rank-1 DESC tie on COUNT(att_class_id). Program `_shape_img_obj_att` calls `one_tie_plan(att_pool, n, rng)` which ensures the most-common value occurs at least twice (tie at rank 1) but does not explicitly target group sizes 4,5,6. With 40 rows and 8 ATT_CLASSES, uniform draws give expected group size 5, so values 4,5,6 are likely but not guaranteed. Execution shows no explicit verification of these aggregate boundaries.",
+     "requested_revision": "In `_shape_img_obj_att`, explicitly construct a plan with group sizes including 4, 5, and 6 (e.g. assign 4 rows to one ATT_CLASS_ID, 5 to another, 6 to a third, then fill the rest) to guarantee the aggregate-boundary targets. Non-blocking: the tie at rank 1 is guaranteed, and 4/5/6 are statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3]. Program `_img_id_group_plan_children` uses `target_sizes=[1,2,3]` and assigns one distinct parent key per target size, then fills the rest uniformly. This correctly guarantees group sizes 1, 2, and 3 appear. However, the 46 skipped IMG_REL rows (see issue 2) may reduce the effective group sizes if skipped rows were in the target groups.",
+     "requested_revision": "Fix the skipped-row issue (issue 2) so the aggregate-boundary groups are not perturbed. Non-blocking: the plan is correct in principle."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS ties_for_order_limit targets 'tie_at_rank: [1], direction: ASC and DESC and unordered, tie_on: COUNT(*)'. Program `draw_column` for OBJ_CLASS uses `duplicate_col` logic (35% duplicate share) but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 8 rows and a small enum pool, ties are likely but not guaranteed. Similarly for PRED_CLASSES.PRED_CLASS and ATT_CLASSES.ATT_CLASS.",
+     "requested_revision": "Add explicit tie-shaping for OBJ_CLASSES.OBJ_CLASS, PRED_CLASSES.PRED_CLASS, and ATT_CLASSES.ATT_CLASS (e.g. ensure at least two rows share the same OBJ_CLASS value) to guarantee the rank-1 tie. Non-blocking: with 8 rows and small pools, ties are statistically near-certain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `generic_sampling_rules.text_label` says 'include near-variants (case changes, trailing/leading spaces) at listed equality literals'. Program `spec.perturb_string` generates variants by appending/prepending 's','x','1',' ' or truncating, but does not specifically generate case changes (e.g. 'man' -> 'MAN') or trailing/leading spaces for the listed boundary literals. The `BOUNDARY_STRINGS` pool includes both cases (e.g. 'man','MAN'), so case variants are present via the pool, but the perturbation logic does not systematically produce them.",
+     "requested_revision": "In `perturb_string`, add case-change variants (upper/lower) and explicit trailing/leading space variants for boundary literals. Non-blocking: the boundary pool already includes case variants, so the comparison_boundary targets are met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `dependencies` lists unique_tuples for all tables including ATT_CLASSES.ATT_CLASS, OBJ_CLASSES.OBJ_CLASS, PRED_CLASSES.PRED_CLASS as unique. Program `_dedupe_keys` handles singleton UNIQUE columns by perturbing non-FK columns, but for text columns like OBJ_CLASS it uses `spec.perturb_string` which may produce values outside the enum pool (e.g. 'man' -> 'mans'). This could violate the `text_enum` rule ('Sample from the explicit enum list only') for OBJ_CLASS, PRED_CLASS, ATT_CLASS.",
+     "requested_revision": "In `_dedupe_keys`, when perturbing a text column that has an enum pool, draw the replacement from the enum pool (or a near-variant within the pool) rather than `perturb_string`. Non-blocking: execution shows no integrity violations, so duplicates were resolved, but the replacement values may be outside the enum."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `uncertainty` for IMG_OBJ.OBJ_CLASS_ID says 'Statistics report null_rate 0.0 and the compact database shows 0% NULL; the atomic summary requests 5-30% NULL share. We follow the compact database (0%) and still emit at least one NULL row per nullable column per the interface rule'. The program emits 5% NULL (40/800), which is within the atomic summary's 5-30% range but not the compact 0%. This is a deliberate override documented in the spec.",
+     "requested_revision": "No change required; the spec explicitly documents this override and the program implements it. The interface rule (>=1 NULL, share following compact share) is satisfied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `generic_sampling_rules.integer_measure` says 'Uniform integer in [0, 1000] unless a range rule narrows it; include boundary values at listed literals and one step on each side.' Program `ColumnPlan.value` for measure columns returns `r.choice([lo, hi])` with 15% probability and `r.randint(lo, hi)` otherwise. It does not include 'one step on each side' of listed literals (e.g. -1, 1001 for range 0-1000). The spec's `BOUNDARY_INTS` for IMG_OBJ.X/Y/W/H is empty, so no boundary literals are listed for these columns.",
+     "requested_revision": "No change required; no boundary literals are listed for X/Y/W/H, so the 'one step on each side' rule does not apply. The range [0,1000] is implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `generic_sampling_rules.table_size` says 'Each table generates exactly the base size in table_sizes_per_instance per instance (no randomization)'. Program `spec.table_rows` returns `min(TABLE_ROW_CAP, base)` where base is from `BASE_TABLE_ROWS`. Execution shows ATT_CLASSES 160/20=8, OBJ_CLASSES 160/20=8, PRED_CLASSES 160/20=8, IMG_OBJ 800/20=40, IMG_OBJ_ATT 800/20=40, IMG_REL 754/20=37.7 (not 40 due to 46 skipped). The IMG_REL shortfall is the only deviation.",
+     "requested_revision": "Fix the IMG_REL skipped rows (issue 2) so the table size is exactly 40 per instance. Non-blocking: all other tables meet the exact size."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID comparison_boundary targets [0,1,2,19,20,21]. Program `BOUNDARY_INTS` includes these and `_boundary_force` forces them if present in the parent pool. However, IMG_OBJ.IMG_ID is a PK generated sequentially from max(compact)+1, so the compact IMG_IDs (including 0,1,2,19,20,21) are in the parent pool and can be forced. Execution shows no explicit verification that these values appear in generated IMG_OBJ rows. Since IMG_OBJ.IMG_ID is a PK, the program's `_sequential_pk` generates new IDs starting at max(compact)+1, so the boundary values 0,1,2,19,20,21 are NOT in the generated IMG_OBJ rows (they are only in compact rows). The spec's `comparison_boundary` for IMG_OBJ.IMG_ID likely refers to queries probing these values against the compact+generated table, which is satisfied by the compact rows.",
+     "requested_revision": "No change required; the boundary values are present in the compact rows (which are preserved), and the generated rows add new IDs. The comparison_boundary is satisfied by the combined table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID comparison_boundary targets [14,15,16] with equal_and_one_step_from IMG_REL.OBJ2_SAMPLE_ID, and OBJ2_SAMPLE_ID targets [17,18,19]. Program `BOUNDARY_INTS` includes these and `_boundary_force` forces them if present in the parent pool. However, OBJ1_SAMPLE_ID and OBJ2_SAMPLE_ID are drawn from IMG_OBJ rows sharing the same IMG_ID, so the boundary values 14,15,16,17,18,19 must be present as OBJ_SAMPLE_IDs in IMG_OBJ for the same IMG_ID. The program's `_apply_composite_fks` draws from `pairs_by_key` which groups by IMG_ID, so the boundary values are only forced if they happen to be in the drawn IMG_ID's group. The `_boundary_force` function is not called for composite FK columns (only for single FKs in step C).",
+     "requested_revision": "In `_apply_composite_fks`, after drawing the shared IMG_ID, explicitly prefer OBJ_SAMPLE_ID values from the boundary list [14,15,16,17,18,19] when they are present in the parent rows for that IMG_ID. Non-blocking: the boundary values are reachable via random draws from the compact parent pool, but not forced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID comparison_boundary targets [19,20,21,2377984,2377985,2377986]. Program `BOUNDARY_INTS` includes only [19,20,21]. The large values are not forced. Additionally, IMG_OBJ_ATT.IMG_ID is part of a composite FK to IMG_OBJ, so it is drawn from `pairs_by_key` (real IMG_OBJ rows), not via `_boundary_force`. The boundary values 19,20,21 are only present if they are in the compact IMG_OBJ rows (they are, since compact IMG_IDs include 19,20,21).",
+     "requested_revision": "In `_apply_composite_fks` for IMG_OBJ_ATT, prefer IMG_ID values from the boundary list [19,20,21,2377984,2377985,2377986] when present in the parent pool. Non-blocking: the values are reachable via random draws."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS aggregate_boundary targets COUNT(att_class) values [1,2,3]. Program `draw_column` for ATT_CLASS uses enum pool with 80% direct choice and 20% perturbation, but does not explicitly shape group sizes to 1,2,3. With 8 rows and a 15-element enum pool, group sizes of 1,2,3 are likely but not guaranteed. The spec's `group_sizes` pattern for ATT_CLASSES.ATT_CLASS_ID targets '1, 2 and >= 3' but ATT_CLASS_ID is a PK (sequential), so group sizes are determined by ATT_CLASS values.",
+     "requested_revision": "Add explicit group-size shaping for ATT_CLASSES.ATT_CLASS (e.g. ensure at least one value appears once, one twice, one three times) to guarantee the aggregate-boundary targets. Non-blocking: with 8 rows and a 15-element pool, group sizes 1,2,3 are statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS group_sizes targets '1, 2 and >= 3'. Program `draw_column` for OBJ_CLASS uses duplicate_col logic (35% duplicate share) but does not explicitly shape group sizes. With 8 rows and a 13-element enum pool, group sizes 1,2,3 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for OBJ_CLASSES.OBJ_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program `draw_column` for PRED_CLASS uses duplicate_col logic (35% duplicate share), which is within range. Execution shows no explicit verification of the duplicate share.",
+     "requested_revision": "No change required; the 35% duplicate share is within the 20-50% target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID duplicates_for_distinct targets 20-50% duplicate share. Program `draw_column` for IMG_OBJ.IMG_ID: since IMG_ID is part of the composite PK (IMG_ID, OBJ_SAMPLE_ID), it is not a single-column PK, so `_sequential_pk` is not called. Instead, `draw_column` is called with `duplicate_col` logic (35% duplicate share). This is correct: IMG_ID should have duplicates (multiple objects per image). Execution shows no explicit verification.",
+     "requested_revision": "No change required; the 35% duplicate share is within range."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_SAMPLE_ID duplicates_for_distinct targets 20-50% duplicate share. Program `draw_column` for OBJ_SAMPLE_ID uses duplicate_col logic (35% duplicate share). Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID ties_for_order_limit targets tie_at_rank [1], direction ASC and DESC, tie_on COUNT(*). Program `draw_column` for IMG_OBJ.IMG_ID uses duplicate_col logic but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 40 rows and duplicate share 35%, ties are likely but not guaranteed.",
+     "requested_revision": "Add explicit tie-shaping for IMG_OBJ.IMG_ID (e.g. ensure at least two rows share the same IMG_ID). Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID ties_for_order_limit targets tie_at_rank [1], direction DESC, tie_on COUNT(att_class_id). Program `_shape_img_obj_att` calls `one_tie_plan` which ensures the most-common value occurs at least twice, satisfying the rank-1 tie. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID aggregate_boundary targets COUNT(DISTINCT obj1_sample_id) values [0,1,2]. Program `_img_id_group_plan_children` assigns distinct parent keys per target size, so COUNT(DISTINCT obj1_sample_id) is at least 3 (one per target size). The target values [0,1,2] are lower bounds; the program exceeds them, which is fine (the aggregate boundary is about reaching these values, not being limited to them).",
+     "requested_revision": "No change required; the program satisfies the aggregate boundary (COUNT(DISTINCT) >= 3)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3]. Program `_img_id_group_plan_children` with target_sizes=[1,2,3] guarantees these group sizes. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3,4,5,6]. Program `_apply_composite_fks` for IMG_OBJ_ATT draws (IMG_ID, OBJ_SAMPLE_ID) pairs uniformly from IMG_OBJ rows, so IMG_ID group sizes are determined by the IMG_OBJ distribution. With 40 IMG_OBJ rows and 40 IMG_OBJ_ATT rows, group sizes 1-6 are likely but not guaranteed. The program does not explicitly shape IMG_OBJ_ATT.IMG_ID group sizes.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.IMG_ID (e.g. assign 1,2,3,4,5,6 rows to distinct IMG_IDs) to guarantee the aggregate-boundary targets. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID aggregate_boundary targets COUNT(att_class_id) values [4,5,6]. Program `_shape_img_obj_att` uses `one_tie_plan` which ensures a tie at rank 1 but does not explicitly target group sizes 4,5,6. With 40 rows and 8 ATT_CLASSES, expected group size is 5, so 4,5,6 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.ATT_CLASS_ID (e.g. assign 4,5,6 rows to distinct ATT_CLASS_IDs). Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.OBJ_SAMPLE_ID unmatched_join_rows targets joins_with IMG_OBJ.OBJ_SAMPLE_ID, parent_rows_without_children true, child_rows_with_null_fk false. Program `_apply_composite_fks` draws (IMG_ID, OBJ_SAMPLE_ID) pairs from real IMG_OBJ rows, so all child rows reference existing parents (no null FK, no unmatched child). Parent rows without children: with 40 IMG_OBJ rows and 40 IMG_OBJ_ATT rows, some IMG_OBJ rows may be unreferenced, but not guaranteed.",
+     "requested_revision": "Explicitly reserve at least one IMG_OBJ row that is never referenced by IMG_OBJ_ATT (e.g. exclude the last IMG_OBJ pair from the draw pool). Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID unmatched_join_rows targets joins_with IMG_OBJ.OBJ_CLASS_ID, IMG_OBJ.IMG_ID, IMG_OBJ.W, parent_rows_without_children true, child_rows_with_null_fk true. Program `fk_values` for IMG_OBJ.OBJ_CLASS_ID allows NULL (5% share) and draws from parent pool. Parent rows without children: with 8 OBJ_CLASSES rows and 40 IMG_OBJ rows, some OBJ_CLASSES rows may be unreferenced, but not guaranteed. Child rows with null FK: 5% NULL share satisfies this.",
+     "requested_revision": "Explicitly reserve at least one OBJ_CLASSES row that is never referenced by IMG_OBJ. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_CLASS_ID unmatched_join_rows targets joins_with OBJ_CLASSES.OBJ_CLASS_ID, parent_rows_without_children true, child_rows_with_null_fk true. Program `fk_values` allows NULL (5% share) and draws from parent pool. Parent rows without children: with 8 OBJ_CLASSES rows and 40 IMG_OBJ rows, some OBJ_CLASSES rows may be unreferenced, but not guaranteed.",
+     "requested_revision": "Explicitly reserve at least one OBJ_CLASSES row that is never referenced by IMG_OBJ. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS_ID comparison_boundary targets equal_and_one_step_from IMG_REL.PRED_CLASS_ID. Program `BOUNDARY_INTS` does not include PRED_CLASS_ID, and `_boundary_force` is not called for PRED_CLASS_ID (it is a single FK to PRED_CLASSES, so step C calls `_boundary_force` with `spec.boundary_ints('IMG_REL', 'PRED_CLASS_ID', spec_obj)` which returns empty). The boundary is not forced.",
+     "requested_revision": "Add PRED_CLASS_ID boundary values to `BOUNDARY_INTS` for IMG_REL.PRED_CLASS_ID (e.g. [0,1,2,6,7,8] or the compact PRED_CLASS_ID range) and force them. Non-blocking: the values are reachable via random draws from the compact parent pool."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ2_SAMPLE_ID comparison_boundary targets [17,18,19] with equal_and_one_step_from IMG_REL.OBJ1_SAMPLE_ID. Program `BOUNDARY_INTS` includes these but `_boundary_force` is not called for composite FK columns. The values are reachable via random draws from the compact parent pool but not forced.",
+     "requested_revision": "In `_apply_composite_fks`, prefer OBJ2_SAMPLE_ID values from the boundary list [17,18,19] when present in the parent rows for the drawn IMG_ID. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID comparison_boundary targets [14,15,16] with equal_and_one_step_from IMG_REL.OBJ2_SAMPLE_ID. Same as above: not forced.",
+     "requested_revision": "In `_apply_composite_fks`, prefer OBJ1_SAMPLE_ID values from the boundary list [14,15,16] when present in the parent rows for the drawn IMG_ID. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID comparison_boundary targets [4,5,6,2214786,2214787,2214788]. Program `BOUNDARY_INTS` includes only [4,5,6]. The large values are not forced. Additionally, IMG_REL.IMG_ID is part of composite FKs, so it is drawn from `pairs_by_key` (real IMG_OBJ rows), not via `_boundary_force`.",
+     "requested_revision": "In `_apply_composite_fks` for IMG_REL, prefer IMG_ID values from the boundary list [4,5,6,2214786,2214787,2214788] when present in the parent pool. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID comparison_boundary targets [19,20,21,2377984,2377985,2377986]. Program `BOUNDARY_INTS` includes only [19,20,21]. The large values are not forced. IMG_OBJ_ATT.IMG_ID is part of a composite FK, so it is drawn from `pairs_by_key`.",
+     "requested_revision": "In `_apply_composite_fks` for IMG_OBJ_ATT, prefer IMG_ID values from the boundary list [19,20,21,2377984,2377985,2377986] when present in the parent pool. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID comparison_boundary targets [0,1,2,19,20,21]. Program `BOUNDARY_INTS` includes these and `_boundary_force` forces them if present in the parent pool. However, IMG_OBJ.IMG_ID is part of the composite PK (IMG_ID, OBJ_SAMPLE_ID), so `_sequential_pk` is not called; instead, `draw_column` is called with `bint` logic (40% boundary choice, 60% fresh_key_int). The boundary values 0,1,2,19,20,21 are in the compact parent pool and can be forced. Execution shows no explicit verification.",
+     "requested_revision": "No change required; the boundary values are in the compact rows and can be drawn."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS comparison_boundary targets [man, MAN, kitchen, KITCHEN, wall, WALL]. Program `BOUNDARY_STRINGS` includes these and `draw_column` for OBJ_CLASS uses `bstr` logic (35% boundary choice, 65% perturb_string). Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS comparison_boundary targets [white, WHITE, electrical, ELECTRICAL, blue, BLUE]. Program `BOUNDARY_STRINGS` includes these and `draw_column` uses `bstr` logic. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS comparison_boundary targets [parked on, PARKED ON]. Program `BOUNDARY_STRINGS` includes these and `draw_column` uses `bstr` logic. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID comparison_boundary targets values [9,10,11] with equal_and_one_step_from IMG_OBJ.OBJ_CLASS_ID. Program `BOUNDARY_INTS` includes [9,10,11] for IMG_OBJ.OBJ_CLASS_ID and `_boundary_force` forces them if present in the parent pool (they are, since compact OBJ_CLASSES has 0..298). Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_CLASS_ID comparison_boundary targets values [9,10,11] with equal_and_one_step_from OBJ_CLASSES.OBJ_CLASS_ID. Program `BOUNDARY_INTS` includes [9,10,11] and `_boundary_force` forces them. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS_ID group_sizes targets '1, 2 and >= 3'. Program `_sequential_pk` for ATT_CLASSES.ATT_CLASS_ID generates sequential IDs 8..15 (8 rows), so each ATT_CLASS_ID appears exactly once in ATT_CLASSES. The group_sizes pattern for ATT_CLASS_ID likely refers to groups in IMG_OBJ_ATT (COUNT of ATT_CLASS_ID), not ATT_CLASSES itself. Program `_shape_img_obj_att` uses `one_tie_plan` which ensures a tie at rank 1 but does not explicitly target group sizes 1,2,>=3.",
+     "requested_revision": "Clarify in the spec whether ATT_CLASSES.ATT_CLASS_ID group_sizes refers to ATT_CLASSES rows (each ID appears once, so group size 1 only) or IMG_OBJ_ATT rows (COUNT of ATT_CLASS_ID). If the latter, add explicit group-size shaping in `_shape_img_obj_att`. Non-blocking: the tie at rank 1 is guaranteed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID group_sizes targets '1, 2 and >= 3'. Program `_sequential_pk` for OBJ_CLASSES.OBJ_CLASS_ID generates sequential IDs 299..306 (8 rows), so each OBJ_CLASS_ID appears exactly once in OBJ_CLASSES. The group_sizes pattern likely refers to groups in IMG_OBJ (COUNT of OBJ_CLASS_ID). Program `fk_values` for IMG_OBJ.OBJ_CLASS_ID draws uniformly from the parent pool, so group sizes 1,2,>=3 are likely but not guaranteed.",
+     "requested_revision": "Clarify in the spec whether OBJ_CLASSES.OBJ_CLASS_ID group_sizes refers to OBJ_CLASSES rows or IMG_OBJ rows. If the latter, add explicit group-size shaping in `fk_values` for IMG_OBJ.OBJ_CLASS_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS ties_for_order_limit targets tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). Program `draw_column` for OBJ_CLASS uses duplicate_col logic (35% duplicate share) but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 8 rows and a 13-element enum pool, ties are likely but not guaranteed.",
+     "requested_revision": "Add explicit tie-shaping for OBJ_CLASSES.OBJ_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS group_sizes targets '1, 2 and >= 3'. Program `draw_column` for OBJ_CLASS uses duplicate_col logic but does not explicitly shape group sizes. With 8 rows and a 13-element enum pool, group sizes 1,2,3 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for OBJ_CLASSES.OBJ_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS aggregate_boundary targets COUNT(att_class) values [1,2,3]. Program `draw_column` for ATT_CLASS uses enum pool with 80% direct choice and 20% perturbation, but does not explicitly shape group sizes to 1,2,3. With 8 rows and a 15-element enum pool, group sizes 1,2,3 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for ATT_CLASSES.ATT_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS_ID group_sizes targets '1, 2 and >= 3'. As noted above, ATT_CLASS_ID is a PK in ATT_CLASSES (each appears once), so group size 1 only. The pattern likely refers to IMG_OBJ_ATT groups.",
+     "requested_revision": "Clarify in the spec. Non-blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID ties_for_order_limit targets tie_at_rank [1], direction ASC and DESC, tie_on COUNT(*). Program `draw_column` for IMG_OBJ.IMG_ID uses duplicate_col logic (35% duplicate share) but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 40 rows and duplicate share 35%, ties are likely but not guaranteed.",
+     "requested_revision": "Add explicit tie-shaping for IMG_OBJ.IMG_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_SAMPLE_ID duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID ties_for_order_limit targets tie_at_rank [1], direction DESC, tie_on COUNT(att_class_id). Program `_shape_img_obj_att` uses `one_tie_plan` which ensures the most-common value occurs at least twice, satisfying the rank-1 tie. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID aggregate_boundary targets COUNT(att_class_id) values [4,5,6]. Program `_shape_img_obj_att` uses `one_tie_plan` which does not explicitly target group sizes 4,5,6. With 40 rows and 8 ATT_CLASSES, expected group size is 5, so 4,5,6 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.ATT_CLASS_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3,4,5,6]. Program `_apply_composite_fks` for IMG_OBJ_ATT draws (IMG_ID, OBJ_SAMPLE_ID) pairs uniformly from IMG_OBJ rows, so IMG_ID group sizes are determined by the IMG_OBJ distribution. With 40 IMG_OBJ rows and 40 IMG_OBJ_ATT rows, group sizes 1-6 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.IMG_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3]. Program `_img_id_group_plan_children` with target_sizes=[1,2,3] guarantees these group sizes. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID aggregate_boundary targets COUNT(DISTINCT obj1_sample_id) values [0,1,2]. Program `_img_id_group_plan_children` assigns distinct parent keys per target size, so COUNT(DISTINCT obj1_sample_id) is at least 3. The target values [0,1,2] are lower bounds; the program exceeds them, which is fine.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID comparison_boundary targets [14,15,16] with equal_and_one_step_from IMG_REL.OBJ2_SAMPLE_ID. Program `BOUNDARY_INTS` includes these but `_boundary_force` is not called for composite FK columns. The values are reachable via random draws from the compact parent pool but not forced.",
+     "requested_revision": "In `_apply_composite_fks`, prefer OBJ1_SAMPLE_ID values from the boundary list [14,15,16] when present in the parent rows for the drawn IMG_ID. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ2_SAMPLE_ID comparison_boundary targets [17,18,19] with equal_and_one_step_from IMG_REL.OBJ1_SAMPLE_ID. Same as above: not forced.",
+     "requested_revision": "In `_apply_composite_fks`, prefer OBJ2_SAMPLE_ID values from the boundary list [17,18,19] when present in the parent rows for the drawn IMG_ID. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID comparison_boundary targets [4,5,6,2214786,2214787,2214788]. Program `BOUNDARY_INTS` includes only [4,5,6]. The large values are not forced. IMG_REL.IMG_ID is part of composite FKs, so it is drawn from `pairs_by_key`.",
+     "requested_revision": "In `_apply_composite_fks` for IMG_REL, prefer IMG_ID values from the boundary list [4,5,6,2214786,2214787,2214788] when present in the parent pool. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID comparison_boundary targets [19,20,21,2377984,2377985,2377986]. Program `BOUNDARY_INTS` includes only [19,20,21]. The large values are not forced. IMG_OBJ_ATT.IMG_ID is part of a composite FK, so it is drawn from `pairs_by_key`.",
+     "requested_revision": "In `_apply_composite_fks` for IMG_OBJ_ATT, prefer IMG_ID values from the boundary list [19,20,21,2377984,2377985,2377986] when present in the parent pool. Non-blocking: reachable via random draws."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID comparison_boundary targets [0,1,2,19,20,21]. Program `BOUNDARY_INTS` includes these and `draw_column` uses `bint` logic (40% boundary choice, 60% fresh_key_int). The boundary values are in the compact parent pool and can be forced. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS comparison_boundary targets [man, MAN, kitchen, KITCHEN, wall, WALL]. Program `BOUNDARY_STRINGS` includes these and `draw_column` uses `bstr` logic. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS comparison_boundary targets [white, WHITE, electrical, ELECTRICAL, blue, BLUE]. Program `BOUNDARY_STRINGS` includes these and `draw_column` uses `bstr` logic. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS comparison_boundary targets [parked on, PARKED ON]. Program `BOUNDARY_STRINGS` includes these and `draw_column` uses `bstr` logic. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID comparison_boundary targets values [9,10,11] with equal_and_one_step_from IMG_OBJ.OBJ_CLASS_ID. Program `BOUNDARY_INTS` includes [9,10,11] for IMG_OBJ.OBJ_CLASS_ID and `_boundary_force` forces them if present in the parent pool (they are, since compact OBJ_CLASSES has 0..298). Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_CLASS_ID comparison_boundary targets values [9,10,11] with equal_and_one_step_from OBJ_CLASSES.OBJ_CLASS_ID. Program `BOUNDARY_INTS` includes [9,10,11] and `_boundary_force` forces them. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS_ID group_sizes targets '1, 2 and >= 3'. Program `_sequential_pk` for ATT_CLASSES.ATT_CLASS_ID generates sequential IDs 8..15 (8 rows), so each ATT_CLASS_ID appears exactly once in ATT_CLASSES. The group_sizes pattern for ATT_CLASS_ID likely refers to groups in IMG_OBJ_ATT (COUNT of ATT_CLASS_ID), not ATT_CLASSES itself. Program `_shape_img_obj_att` uses `one_tie_plan` which ensures a tie at rank 1 but does not explicitly target group sizes 1,2,>=3.",
+     "requested_revision": "Clarify in the spec whether ATT_CLASSES.ATT_CLASS_ID group_sizes refers to ATT_CLASSES rows (each ID appears once, so group size 1 only) or IMG_OBJ_ATT rows (COUNT of ATT_CLASS_ID). If the latter, add explicit group-size shaping in `_shape_img_obj_att`. Non-blocking: the tie at rank 1 is guaranteed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS_ID group_sizes targets '1, 2 and >= 3'. Program `_sequential_pk` for OBJ_CLASSES.OBJ_CLASS_ID generates sequential IDs 299..306 (8 rows), so each OBJ_CLASS_ID appears exactly once in OBJ_CLASSES. The group_sizes pattern likely refers to groups in IMG_OBJ (COUNT of OBJ_CLASS_ID). Program `fk_values` for IMG_OBJ.OBJ_CLASS_ID draws uniformly from the parent pool, so group sizes 1,2,>=3 are likely but not guaranteed.",
+     "requested_revision": "Clarify in the spec whether OBJ_CLASSES.OBJ_CLASS_ID group_sizes refers to OBJ_CLASSES rows or IMG_OBJ rows. If the latter, add explicit group-size shaping in `fk_values` for IMG_OBJ.OBJ_CLASS_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS ties_for_order_limit targets tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). Program `draw_column` for OBJ_CLASS uses duplicate_col logic (35% duplicate share) but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 8 rows and a 13-element enum pool, ties are likely but not guaranteed.",
+     "requested_revision": "Add explicit tie-shaping for OBJ_CLASSES.OBJ_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS group_sizes targets '1, 2 and >= 3'. Program `draw_column` for OBJ_CLASS uses duplicate_col logic but does not explicitly shape group sizes. With 8 rows and a 13-element enum pool, group sizes 1,2,3 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for OBJ_CLASSES.OBJ_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS aggregate_boundary targets COUNT(att_class) values [1,2,3]. Program `draw_column` for ATT_CLASS uses enum pool with 80% direct choice and 20% perturbation, but does not explicitly shape group sizes to 1,2,3. With 8 rows and a 15-element enum pool, group sizes 1,2,3 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for ATT_CLASSES.ATT_CLASS. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for ATT_CLASSES.ATT_CLASS_ID group_sizes targets '1, 2 and >= 3'. As noted above, ATT_CLASS_ID is a PK in ATT_CLASSES (each appears once), so group size 1 only. The pattern likely refers to IMG_OBJ_ATT groups.",
+     "requested_revision": "Clarify in the spec. Non-blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID ties_for_order_limit targets tie_at_rank [1], direction ASC and DESC, tie_on COUNT(*). Program `draw_column` for IMG_OBJ.IMG_ID uses duplicate_col logic (35% duplicate share) but does not explicitly ensure a tie at rank 1 for COUNT(*) ordering. With 40 rows and duplicate share 35%, ties are likely but not guaranteed.",
+     "requested_revision": "Add explicit tie-shaping for IMG_OBJ.IMG_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.IMG_ID duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ.OBJ_SAMPLE_ID duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for PRED_CLASSES.PRED_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for OBJ_CLASSES.OBJ_CLASS duplicates_for_distinct targets 20-50% duplicate share. Program uses 35% duplicate share, within range. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID ties_for_order_limit targets tie_at_rank [1], direction DESC, tie_on COUNT(att_class_id). Program `_shape_img_obj_att` uses `one_tie_plan` which ensures the most-common value occurs at least twice, satisfying the rank-1 tie. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.ATT_CLASS_ID aggregate_boundary targets COUNT(att_class_id) values [4,5,6]. Program `_shape_img_obj_att` uses `one_tie_plan` which does not explicitly target group sizes 4,5,6. With 40 rows and 8 ATT_CLASSES, expected group size is 5, so 4,5,6 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.ATT_CLASS_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_OBJ_ATT.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3,4,5,6]. Program `_apply_composite_fks` for IMG_OBJ_ATT draws (IMG_ID, OBJ_SAMPLE_ID) pairs uniformly from IMG_OBJ rows, so IMG_ID group sizes are determined by the IMG_OBJ distribution. With 40 IMG_OBJ rows and 40 IMG_OBJ_ATT rows, group sizes 1-6 are likely but not guaranteed.",
+     "requested_revision": "Add explicit group-size shaping for IMG_OBJ_ATT.IMG_ID. Non-blocking: statistically likely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.IMG_ID aggregate_boundary targets COUNT(*) values [1,2,3]. Program `_img_id_group_plan_children` with target_sizes=[1,2,3] guarantees these group sizes. Correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` for IMG_REL.OBJ1_SAMPLE_ID aggregate_boundary targets COUNT(DISTINCT obj1_sample_id) values [0,1,2]. Program `_img_id_group_plan_children` assigns distinct parent keys per target size, so COUNT(DISTINCT obj1_sample_id) is at least 3. The target values [0,1,2] are lower bounds; the program exceeds them, which is fine.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 46 skipped IMG_REL rows (issue 2) cause the aggregate-boundary targets for IMG_REL.IMG_ID (COUNT(*) values 1,2,3) to be missed in some instances \u2014 not verified by execution feedback.",
+    "Whether the boundary values 2377984/2214786 (large IMG_IDs) are actually drawn in any instance \u2014 not verified by execution feedback.",
+    "Whether the group-size targets for OBJ_CLASSES.OBJ_CLASS, ATT_CLASSES.ATT_CLASS, IMG_OBJ_ATT.ATT_CLASS_ID, and IMG_OBJ_ATT.IMG_ID are met in every instance \u2014 not verified by execution feedback.",
+    "Whether the tie-at-rank-1 targets for OBJ_CLASSES.OBJ_CLASS, IMG_OBJ.IMG_ID, and PRED_CLASSES.PRED_CLASS are met in every instance \u2014 not verified by execution feedback.",
+    "Whether at least one parent row without children exists for OBJ_CLASSES, ATT_CLASSES, PRED_CLASSES, and IMG_OBJ in every instance \u2014 not verified by execution feedback.",
+    "Whether the `_dedupe_keys` perturbation of text columns (OBJ_CLASS, PRED_CLASS, ATT_CLASS) produces values outside the enum pool \u2014 not verified by execution feedback."
+   ]
+  }
+ ]
 }

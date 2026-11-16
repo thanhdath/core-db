@@ -1,203 +1,91 @@
-"""Literal extraction and typing (sql_util/parse.py:146-253, sql_util/value_typing.py:1-75)."""
+"""Typed literal extraction from construction SQL and routing to columns."""
 import re
 
-import sqlparse
-from sqlparse import tokens as T
-from sqlparse.sql import Comparison, Function, Identifier, Parenthesis
+try:
+    import sqlparse
+except Exception:  # pragma: no cover
+    sqlparse = None
 
-_PH = 'placeholderrare'
-_ITEM = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^,\s]+")
-_VAL = r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|-?\d+(?:\.\d+)?)"
-_COL = r'((?:[`"]?[\w -]+?[`"]?\.)*[`"]?[\w-]+[`"]?)'
-_IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
-_BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
-_CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
+_STR_RE = re.compile(r"'((?:[^']|'')*)'")
+_NUM_RE = re.compile(r'(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])')
+_IDENT_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
 
-def _unquote(v: str) -> str:
-    """Strip surrounding quotes, collapse doubled quotes (parse.py:246-253)."""
-    v = v.strip().rstrip(';')
-    if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
-        v = v[1:-1].replace(v[0] * 2, v[0])
-    return v.replace(_PH, '')
+def _unquote(s: str) -> str:
+    return s.replace("''", "'")
 
 
-def _split_cols(name: str) -> list:
-    """Column key plus tolerant table variants: (table, COL), (raw qualifier, COL), (None, COL)."""
-    raw = name.strip().split('.')
-    parts = [p.replace('"', '').replace('`', '').strip() for p in raw]
-    col = parts[-1].upper().replace(_PH.upper(), '')
-    if len(parts) == 1:
-        return [(None, col)]
-    tab = parts[-2].lower()
+def extract_typed_values(sql: str):
+    """Return a list of (kind, value) literals found in the SQL text."""
+    if not isinstance(sql, str):
+        raise ValueError('not a string')
     out = []
-    if not re.fullmatch(r't\d+', tab):
-        out.append((tab, col))
-        rq = raw[-2].strip().lower()
-        if rq != tab:
-            out.append((rq, col))
-    out.append((None, col))
+    masked = sql
+    for m in _STR_RE.finditer(sql):
+        out.append(('str', _unquote(m.group(1))))
+    masked = _STR_RE.sub("''", masked)
+    for m in _NUM_RE.finditer(masked):
+        tok = m.group(0)
+        if '.' in tok:
+            try:
+                out.append(('float', float(tok)))
+            except ValueError:
+                pass
+        else:
+            try:
+                out.append(('int', int(tok)))
+            except ValueError:
+                pass
     return out
 
 
-def _left_name(tok):
-    """Identifier, or the identifier inside a Function/Parenthesis wrapper (e.g. LOWER(x))."""
-    if isinstance(tok, Identifier) and re.fullmatch(r'[\w."` -]+', tok.value):
-        return tok.value
-    if isinstance(tok, (Function, Parenthesis, Identifier)):
-        ids = [t for t in tok.flatten() if t.ttype is not None and t.ttype in sqlparse.tokens.Name]
-        if ids:
-            return ids[-1].value
-    return None
+def _column_kind(cm) -> str:
+    t = (cm.type_str or '').lower()
+    if any(k in t for k in ('int', 'number', 'real', 'float', 'double', 'decimal', 'numeric')):
+        return 'num'
+    return 'text'
 
 
-def _is_literal(tok) -> bool:
-    """True only for a constant right operand: string/number literal, not a column reference."""
-    if tok is None:
-        return False
-    if tok.ttype is not None and tok.ttype in T.Literal:
-        return True
-    if tok.ttype is not None and tok.ttype in T.Number:
-        return True
-    if isinstance(tok, Identifier):
-        return False
-    if tok.is_group:
-        return False
-    v = tok.value.strip()
-    if not v or v.lower() in ('select', 'not', 'null', 'true', 'false'):
-        return False
-    if v[0] in '\'"':
-        return True
-    return bool(re.fullmatch(r'-?\d+(?:\.\d+)?', v))
-
-
-def _add(out: list, name: str, v: str) -> None:
-    for k in _split_cols(name):
-        out.append((k, _unquote(v)))
-
-
-def _walk(tok, out: list) -> None:
-    if isinstance(tok, Comparison):
-        parts = [x for x in tok.tokens if not x.is_whitespace]
-        if len(parts) >= 3:
-            name = _left_name(parts[0])
-            if name and _is_literal(parts[-1]):
-                _add(out, name, parts[-1].value)
-    if tok.is_group:
-        for t in tok.tokens:
-            _walk(t, out)
-
-
-def _is_ident_operand(v: str) -> bool:
-    """True if v looks like a bare (possibly qualified) column reference, not a constant."""
-    if not v or v[0] in '\'"':
-        return False
-    if re.fullmatch(r'-?\d+(?:\.\d+)?', v):
-        return False
-    return bool(re.fullmatch(r'[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*', v))
-
-
-def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
-    out: list = []
-    try:
-        s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
+def _coerce(kind: str, value, cm):
+    """Coerce a literal to the column's declared type; None if incompatible."""
+    ck = _column_kind(cm)
+    if ck == 'num':
+        if kind in ('int', 'float'):
+            return int(value) if float(value).is_integer() else float(value)
         try:
-            for st in sqlparse.parse(s):
-                _walk(st, out)
-        except Exception:
-            pass
-        for m in _CMP.finditer(s):
-            v = m.group(2)
-            if v.lower() in ('select', 'not', 'null'):
-                continue
-            if _is_ident_operand(v):
-                continue
-            _add(out, m.group(1), v)
-        for m in _IN.finditer(s):
-            inner = m.group(2).strip()
-            if not inner or inner.lower().startswith('select'):
-                continue
-            for it in _ITEM.findall(inner):
-                if _is_ident_operand(it):
-                    continue
-                _add(out, m.group(1), it)
-        for m in _BETWEEN.finditer(s):
-            _add(out, m.group(1), m.group(2))
-            _add(out, m.group(1), m.group(3))
-    except Exception:
-        pass
-    seen, res = set(), []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            res.append(x)
-    return res
+            f = float(str(value))
+            return int(f) if f.is_integer() else f
+        except (TypeError, ValueError):
+            return None
+    if kind == 'str':
+        return value
+    return str(value)
 
 
-def _isnum(x) -> bool:
-    if isinstance(x, bool):
-        return False
-    try:
-        float(x)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
-def _root(schema, key: tuple) -> tuple:
-    seen = {key}
-    while key in schema.fks and schema.fks[key] not in seen:
-        key = schema.fks[key]
-        seen.add(key)
-    return key
-
-
-def _routing_items(tv: list) -> list:
-    """One routing key per literal: the first tabled variant, or (None, COL) if none exists."""
-    best: dict = {}
-    order = []
-    for (t, c), v in tv:
-        k = (c, v)
-        if k not in best:
-            best[k] = t
-            order.append(k)
-        elif best[k] is None and t is not None:
-            best[k] = t
-    return [((best[k], k[0]), k[1]) for k in order]
-
-
-def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> dict:
-    """Route literals to FK-root columns = type_values_w_db(loose=True) (value_typing.py:31-75)."""
+def seed_literal_pool_from_queries(sqls, schema) -> dict:
+    """Route literals of the pool SQLs to (table, column) pools."""
     pool: dict = {}
-    cache: dict = {}
-
-    def vals(k):
-        if k not in cache:
-            cache[k] = {str(x) for x in schema.original_values.get(k, []) if x is not None}
-        return cache[k]
-
+    all_cols = []
+    for t, tm in schema.tables.items():
+        for cm in tm.columns:
+            all_cols.append((t, cm))
     for sql in sqls:
-        for (t, c), v in _routing_items(extract_typed_values(sql)):
-            anchors = [(tn, cm.name) for tn, tm in schema.tables.items() for cm in tm.columns
-                       if cm.name.lower() == c.lower() and (t is None or tn.lower() == t)]
-            if not anchors and t is not None:
-                anchors = [(tn, cm.name) for tn, tm in schema.tables.items() for cm in tm.columns
-                           if cm.name.lower() == c.lower()]
-            anc = sorted({_root(schema, a) for a in anchors})
-            if len(anc) > 1:
-                vn = _isnum(v)
-                anc = [a for a in anc if vn in {_isnum(x) for x in vals(a)}]
-            if len(anc) > 1 and not _isnum(v):
-                contain = [a for a in anc if v in vals(a)]
-                if contain:
-                    keep = set(contain)
-                    if loose:
-                        for a in anc:
-                            if any(vals(a) & vals(b) for b in contain):
-                                keep.add(a)
-                    anc = sorted(keep)
-            for a in anc:
-                pool.setdefault(a, []).append(str(v))
+        try:
+            lits = extract_typed_values(sql)
+        except Exception:
+            continue
+        if not lits:
+            continue
+        idents = {m.group(0).lower() for m in _IDENT_RE.finditer(sql)}
+        matched = [(t, cm) for (t, cm) in all_cols if cm.name.lower() in idents]
+        targets = matched if matched else all_cols
+        for kind, value in lits:
+            for (t, cm) in targets:
+                v = _coerce(kind, value, cm)
+                if v is None:
+                    continue
+                key = (t, cm.name)
+                lst = pool.setdefault(key, [])
+                if v not in lst:
+                    lst.append(v)
     return pool

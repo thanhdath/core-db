@@ -1,61 +1,538 @@
 {
  "db": "twitter_1",
- "operator_io_quirks": [
-  "Mixed quoting in DDL: follows/tweets use backticks, user_profiles uses double quotes; writer must replay DDL verbatim.",
-  "Tiny DB (7-9 rows/table); choose_table_sizes will massively oversize vs original \u2014 no huge-table sampling needed.",
-  "follows has composite PK (f1,f2) and TWO FKs to the same parent user_profiles(uid); both child cols draw from same parent column.",
-  "Self-consistent FK graph: follows->user_profiles, tweets->user_profiles; user_profiles is level 0, no cycles.",
-  "createdate declared 'datetime' with text storage 'YYYY-MM-DD HH:MM:SS'; ts_fuzzer dispatches to Date (first element not int) \u2014 but spec rule 3 says Number(scale=4) if first element parses as int, else Date; here Date.",
-  "createdate has DEFAULT CURRENT_TIMESTAMP and is nullable; TS ignores defaults, inserts NULL or fuzzed value.",
-  "text is char(140) -> String(length=140); samples contain apostrophes and a Unicode right-single-quote (U+2019) \u2014 writer must parameterize, not string-format.",
-  "name/email samples contain trailing newlines ('Black Widow\\n', 'susan@gmail.com\\n') \u2014 literal pool will carry them; String fuzzer keeps them.",
-  "email values contain '@' and '.'; String CHARSET is a-zA-Z 0-9() space \u2014 fresh emails will look nothing like real emails.",
-  "followers has huge ints (6662425, 99999998) -> Number scale from int(11) args: scale=11, precision=11; range [-1e11,1e11].",
-  "partitionid distinct=5 but values include 23,10 \u2014 small int domain, Number fuzzer will scatter widely.",
-  "All columns null_rate 0.0 in original; NOT NULL on f1,f2,id,uid,text,uid; name/email/partitionid/followers/createdate nullable."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on int(11)/bigint(20) columns: uniform in [-1e11,1e11] (scale=11) then +-1/+-2 perturbation; PKs become huge random ints, not 1..7.",
-  "String fuzzer on name/email/text: 20% fresh random over 'a-zA-Z 0-9()' of length up to 140/255, else original element, then 50% contaminate (suffix/prefix/drop char).",
-  "Date fuzzer on createdate: template from first parsable element ('%Y-%m-%d %H:%M:%S'), range from min/max of 3 samples (2018-03-09..2018-03-12), fresh dates in that narrow window.",
-  "FK fill: follows.f1/f2 and tweets.uid draw with replacement from user_profiles.uid AFTER its PK dedup \u2014 so FK values are the fuzzed huge ints, not 1..7.",
-  "Composite PK (f1,f2) dedup: sample_fresh_primary_keys drops duplicate (f1,f2) pairs; with huge random ints collisions are rare, so follows keeps ~n rows.",
-  "tweets.id single-col PK -> max_l0=inf, so fresh draws never reused; id stays unique.",
-  "follows has no unique single column, so drop_unique_duplicates is a no-op there.",
-  "Likely FN driver: text/name/email fresh strings are gibberish, so queries filtering on real words ('Iron Man', 'gmail') return empty -> implausible values.",
-  "Likely FP driver: createdate range is only 3 days wide, so date-range predicates (e.g. 'createdate > 2018-03-10') get near-degenerate selectivity; ties/duplicates in small int domains (partitionid) may be missing.",
-  "followers huge ints make 'followers > 1000' trivially true for most rows \u2014 predicate selectivity collapses.",
-  "No special_cases apply (twitter_1 not in college_2/advising/imdb)."
- ],
- "challenger_refs": [
-  "G4",
-  "g87413460",
-  "g87413460",
-  "gb6c7824a",
-  "gb6c7824a",
-  "gd1b671e6",
-  "G3",
-  "gaad03fd1",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "g2bf2d45f",
-  "G2",
-  "ge62b2bec",
-  "ge62b2bec",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at max(compact)+1; unique per table; never NULL; for composite PKs generate tuples that do not collide with pre-existing compact tuples; never apply aggregate/group/dup transforms to PK columns.",
+   "integer_fk": "Draw from the parent table's FINAL key pool (compact + generated, after all parent-side dedup/PK assignment); never NULL for NOT NULL FK columns; for nullable FK columns ~10% NULL (>=1 row per instance). At least one parent PK value is excluded from the draw pool per (parent, child-FK) pair so it stays childless in that child table. FK values are filled AFTER parent keys are final and are never overwritten by later re-planting; if a later step must change an FK column, re-fill from the final parent pool. FK columns are populated in a dedicated fill phase that runs after all non-FK columns exist; the row count for a table whose columns are all FKs (e.g. follows) is taken from table_sizes_per_instance, not from any column array.",
+   "integer_numeric": "Uniform integer in [min,max] from statistics; plant each listed boundary literal and one step on each side; boundary literals are guaranteed to appear (not probabilistic).",
+   "varchar_text": "Short strings; for LIKE columns plant the exact literal, a prefix variant, a case variant, and one near variant (~30% of fresh rows carry a planted match); literals are per-column (see per_column_exceptions), never a global default.",
+   "char_text": "Padded to declared length; plant exact and near-variant matches for LIKE literals; length <= declared length.",
+   "datetime": "Random timestamps within the column's declared range (see semantic rules); force at least two rows to share one timestamp (tie) for ORDER columns; NULL ~10% for nullable date columns.",
+   "null_share": "For nullable columns ~10% NULL (>=1 row per column per instance); plant NULLs after all dedup/filter steps; never NULL primary keys or NOT NULL columns; a planted NULL is never replaced to satisfy a rule.",
+   "duplicates": "For distinct-share columns target 20-50% duplicate share among non-null rows; verify post-write and adjust by adding/removing duplicates; never apply to primary-key columns."
+  },
+  "dependencies": [
+   {
+    "table": "follows",
+    "column": "f1",
+    "references": "user_profiles.uid",
+    "copied_columns": []
+   },
+   {
+    "table": "follows",
+    "column": "f2",
+    "references": "user_profiles.uid",
+    "copied_columns": []
+   },
+   {
+    "table": "tweets",
+    "column": "uid",
+    "references": "user_profiles.uid",
+    "copied_columns": []
+   },
+   {
+    "table": "follows",
+    "columns": [
+     "f1",
+     "f2"
+    ],
+    "unique": true,
+    "note": "composite PK; must not duplicate compact tuples; enforce uniqueness in the plan before insert so planned child counts survive"
+   },
+   {
+    "table": "tweets",
+    "column": "id",
+    "unique": true,
+    "note": "PK; sequential from max(compact)+1; never mutated by aggregate/group/dup transforms"
+   }
+  ],
+  "per_column_exceptions": [
+   {
+    "table": "user_profiles",
+    "column": "uid",
+    "pattern": "group_sizes",
+    "targets": "child-count histogram over tweets.uid and follows.f1 contains groups of size 1, 2 and >=3; enforce on final arrays after FK fill"
+   },
+   {
+    "table": "user_profiles",
+    "column": "uid",
+    "pattern": "unmatched_join_rows",
+    "targets": "at least one parent user_profiles.uid has zero children in tweets.uid AND at least one has zero children in follows.f1, independently per (parent, child-FK) pair; implement by excluding that parent key from the corresponding FK draw pool, never by nulling the child FK"
+   },
+   {
+    "table": "user_profiles",
+    "column": "uid",
+    "pattern": "aggregate_boundary",
+    "targets": "COUNT(*) per parent group in {0,1,2,3}; 0 comes from unmatched_join_rows, 1/2/3 from child-count distribution"
+   },
+   {
+    "table": "user_profiles",
+    "column": "uid",
+    "pattern": "duplicates_for_distinct",
+    "targets": "not applicable to PK; do not enforce duplicate share on uid"
+   },
+   {
+    "table": "tweets",
+    "column": "uid",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3; enforce on final array after FK fill, do not re-plant after"
+   },
+   {
+    "table": "tweets",
+    "column": "uid",
+    "pattern": "unmatched_join_rows",
+    "targets": "child FK column contains no reference to >=1 parent (user_profiles.uid); do NOT implement by nulling child FK; achieved by excluding a parent key from the draw pool"
+   },
+   {
+    "table": "tweets",
+    "column": "uid",
+    "pattern": "aggregate_boundary",
+    "targets": "COUNT(*) per group in {0,1,2,3}; 0 from childless parent, 1/2/3 from child-count distribution"
+   },
+   {
+    "table": "tweets",
+    "column": "uid",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share among non-null; achieved by repeating existing parent keys, not inventing new ones"
+   },
+   {
+    "table": "tweets",
+    "column": "id",
+    "pattern": "aggregate_boundary",
+    "targets": "COUNT(tweets.id) per user group in {0,1,2,3}; interpreted as tweets-per-user, not values in id column; do not re-plant on PK; never mutate the id array"
+   },
+   {
+    "table": "tweets",
+    "column": "id",
+    "pattern": "null_in_count_column",
+    "targets": "no NULL (NOT NULL column counts all rows)"
+   },
+   {
+    "table": "tweets",
+    "column": "id",
+    "pattern": "null_rows",
+    "targets": "no NULL (NOT NULL)"
+   },
+   {
+    "table": "user_profiles",
+    "column": "name",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3; enforce on final array after NULL planting"
+   },
+   {
+    "table": "user_profiles",
+    "column": "name",
+    "pattern": "like_near_variant",
+    "targets": "literal '%Swif%' plus near variants (Swif, Swif x, SWIF, Swift, Swiftt); do not use %int%/%intern% on name"
+   },
+   {
+    "table": "user_profiles",
+    "column": "name",
+    "pattern": "comparison_boundary",
+    "targets": "include exact string 'Iron Man' and a near-typo variant (e.g. 'Iron Man ', 'Iron-Man', 'Iron Manx'); no numeric boundaries on varchar"
+   },
+   {
+    "table": "user_profiles",
+    "column": "email",
+    "pattern": "like_near_variant",
+    "targets": "literals '%edu%' and '%supers%' plus near variants (edu, edux, EDU, supers, supersx, SUPERS); do not use %int%/%intern% on email"
+   },
+   {
+    "table": "user_profiles",
+    "column": "email",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share among non-null; enforce on final array"
+   },
+   {
+    "table": "user_profiles",
+    "column": "followers",
+    "pattern": "rows_with_different_values",
+    "targets": "for each group by partitionid, >=2 rows with different followers values; implement per partitionid group (not globally); verify post-write"
+   },
+   {
+    "table": "user_profiles",
+    "column": "followers",
+    "pattern": "comparison_boundary",
+    "targets": "plant 999, 1000 and 1001 explicitly (at least one row each per instance) in addition to followers >= 0"
+   },
+   {
+    "table": "user_profiles",
+    "column": "partitionid",
+    "pattern": "aggregate_boundary",
+    "targets": "COUNT(*) per partitionid group in {1,2,3}; plant NULLs in rows outside the boundary blocks or count NULL as its own group; verify post-write"
+   },
+   {
+    "table": "follows",
+    "column": "f1",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3; enforce on final array after FK fill, do not re-plant after"
+   },
+   {
+    "table": "follows",
+    "column": "f2",
+    "pattern": "comparison_boundary",
+    "targets": "domain restricted to {-1, 1}; both values must appear in every instance; never emit 0; verify post-write that f2 values are a subset of {-1,1} and both occur; reconcile with FK by ensuring user_profiles.uid includes -1 and 1 so the f2 pool restricted to {-1,1} is nonempty"
+   },
+   {
+    "table": "tweets",
+    "column": "createdate",
+    "pattern": "ties_for_order_limit",
+    "targets": "at least two generated rows share a createdate value within 2018 (tie at ORDER BY createdate ASC); keep tie when re-planting other targets"
+   },
+   {
+    "table": "tweets",
+    "column": "text",
+    "pattern": "like_near_variant",
+    "targets": "literals '%int%' and '%intern%' plus near variants inu, int x, INT, intero, intern x, INTERN"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "user_profiles",
+    "column": "uid",
+    "formula": "uid > 0",
+    "evidence": "uids 1-7 positive"
+   },
+   {
+    "table": "user_profiles",
+    "column": "followers",
+    "formula": "followers >= 0",
+    "evidence": "followers 100..99999998"
+   },
+   {
+    "table": "tweets",
+    "column": "id",
+    "formula": "id > 0",
+    "evidence": "ids 1-9 positive"
+   },
+   {
+    "table": "tweets",
+    "column": "text",
+    "formula": "length(text) <= 140",
+    "evidence": "all sample texts fit char(140)"
+   },
+   {
+    "table": "follows",
+    "column": "f2",
+    "formula": "f2 <> 0",
+    "evidence": "f2 values 1-6, none zero"
+   },
+   {
+    "table": "tweets",
+    "column": "createdate",
+    "formula": "createdate >= '2018-01-01 00:00:00' AND createdate < '2019-01-01 00:00:00'",
+    "evidence": "compact createdate values 2018-03-09 20:00:14, 2018-03-12 02:30:30 fall in 2018; rule is inferred from two compact values and marked uncertain"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "user_profiles": 8,
+   "tweets": 9,
+   "follows": 10
+  },
+  "null_targets": [
+   "user_profiles.name",
+   "user_profiles.email",
+   "user_profiles.partitionid",
+   "user_profiles.followers",
+   "tweets.createdate"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "user_profiles.uid > 0",
+    "rows": "uid 1..7"
+   },
+   {
+    "formula": "user_profiles.followers >= 0",
+    "rows": "100, 890, 6662425, 94375428"
+   },
+   {
+    "formula": "tweets.id > 0",
+    "rows": "1,2,4,5,6,7,8,9"
+   },
+   {
+    "formula": "follows.f2 <> 0",
+    "rows": "f2 1..6"
+   },
+   {
+    "formula": "length(tweets.text) <= 140",
+    "rows": "all 8 sample texts"
+   },
+   {
+    "formula": "tweets.createdate in 2018",
+    "rows": "2018-03-09 20:00:14, 2018-03-12 02:30:30"
+   }
+  ],
+  "uncertainty": "No calculated columns and no date pairs exist; createdate range rule is inferred from two compact values (2018) and is marked uncertain (not a hard constraint). NULL shares estimated at ~10% for nullable columns; compact rows kept and never deleted or modified. table_sizes_per_instance is a fixed per-instance size (8/9/10); the program must generate exactly these counts and ensure per-column targets remain achievable at that size. Sampling must plant NULLs, ties, duplicates, group-size histograms, boundary literals and childless parents on the FINAL arrays after dedup and FK fill; FK columns are filled from the final parent key pool and never overwritten by later re-planting; follows composite PK collisions must be avoided against compact tuples in the plan before insert. The follows table has only FK columns; its row count must come from table_sizes_per_instance and its column dict must be initialized empty before FK fill. Aggregate/group/dup transforms must never be applied to primary-key columns (tweets.id, user_profiles.uid). The f2 domain {-1,1} conflicts with the FK reference to user_profiles.uid; resolution: ensure user_profiles.uid includes -1 and 1 so the f2 pool restricted to {-1,1} is nonempty and both values appear. Post-write verification must confirm: every non-NULL FK value exists in the parent table; at least one parent has zero children in tweets.uid and at least one has zero children in follows.f1 (independently); child-count histogram contains 1, 2 and >=3; f2 subset of {-1,1} with both present; followers contains 999/1000/1001; createdate ties within 2018; duplicate shares 20-50% on email and tweets.uid; followers-per-partition distinct values. Fail the unit or replant on non-FK columns only when a target is unmet."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` with no `orig` argument, so it takes the `orig is None` branch and builds an empty DDL clone instead of copying the compact database. Execution feedback confirms this: validity.reasons shows `compact_rows_missing: 20` for all 20 instances, and `no_rows_added: 18` (only 2 instances had any rows survive). The docstring and module header both claim 'Each instance is a copy of the compact database plus appended generated rows', but the code path never does that.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. `write_instance_sqlite(_G['schema'], inst, p, orig=_G['orig'])` and store `orig` in `_G` in `_init`/`main`), so `_copy_compact` runs and compact rows are preserved. Re-run and confirm `compact_rows_missing` is 0 and `rows_added` is non-zero for every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped is very high: follows 69 skipped vs 48 added, tweets 128 skipped vs 63 added. The writer inserts generated rows with `pragma foreign_keys = OFF` and no dedup against compact rows, so PK collisions with compact rows (e.g. follows (f1,f2) pairs, tweets.id) are silently dropped. Because generated PKs start above the compact max (`_fresh_pk_start`) but FK values are drawn from the parent pool including compact values, composite PKs in `follows` collide with existing compact pairs. This means the intended group-size / aggregate-boundary / duplicate-share targets are not actually realized in the written instance.",
+     "requested_revision": "Either (a) generate `follows` pairs that avoid existing compact (f1,f2) tuples, or (b) count and report collisions explicitly and ensure the surviving rows still satisfy the per-column targets (group sizes 1/2/>=3, COUNT values 0..3, 20-50% duplicate share). Verify with a post-write check that the targets hold on the final instance, not just on the pre-insert column arrays."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule is not met for several nullable columns. Execution feedback: `user_profiles.followers: NULL 0 / 2`, `user_profiles.name: NULL 0 / 2`, `user_profiles.partitionid: NULL 0 / 2`, `user_profiles.email: NULL 1 / 2`. The spec's `null_targets` lists all of these as nullable, and the interface rule requires at least one NULL row per nullable column per instance. `_plant_nulls` is applied, but the subsequent `sample_fresh_primary_keys` / `drop_unique_duplicates` / FK re-fill steps and the writer's row-skipping can drop the NULL rows, and for `user_profiles` the generated row count is only 2 (base 7 * (0.5..2.0) rounded), so a single NULL is easily lost.",
+     "requested_revision": "Guarantee at least one NULL survives to the written instance for every nullable column: apply `_plant_nulls` after all filtering/dedup steps, or re-plant a NULL if the post-filter column has none. Also ensure the per-instance row count is large enough (>= 2) that a NULL share of ~10% yields at least one NULL. Re-run and confirm every nullable column shows NULL >= 1 / n."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_agg_boundary` is a no-op: the loop body only contains a comment and `pass`-like logic (`for k, tgt in enumerate(sorted(targets)): if tgt <= 0 or k >= n: continue` with no assignment). The spec requires COUNT(*) values 0,1,2,3 for `user_profiles.uid`, `tweets.uid`, `tweets.id`, `user_profiles.partitionid`. Similarly `_apply_group_sizes` overwrites the first `sum(targets)` positions with a single base value per target size, which does not reliably produce groups of sizes 1, 2 and >=3 across the column (it produces one block of each size, but the surrounding values may merge with them).",
+     "requested_revision": "Implement `_apply_agg_boundary` to actually construct the required COUNT distribution (e.g. partition rows into groups whose sizes hit 0,1,2,3 for the relevant aggregate), and make `_apply_group_sizes` produce a multiset whose group-size histogram contains 1, 2 and >=3 without accidental merging. Add a post-write assertion that the targets hold on the final instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_childless_parents` returns a random index set, and the FK re-fill sets blocked parent keys to NULL in the child column. But the spec's `unmatched_join_rows` target is 'parent rows without children' \u2014 i.e. a parent row that exists but has no child rows. Setting the child FK to NULL does not create a childless parent; it creates a child with a NULL FK. The correct construction is to ensure some parent PK value is never referenced by any child row. The current code also only blocks one random parent per FK, and only if `(t,c)` is in `unmatched_parents`, which is populated from `per_column_exceptions` with pattern `unmatched_join_rows` \u2014 but the spec lists this pattern for `user_profiles.uid`, `tweets.uid`, `follows.f1`, not for the child FK columns.",
+     "requested_revision": "Rework childless-parent construction: after generating all child rows, pick at least one parent PK value per FK that is not present in the child FK column (and not NULL), and ensure it stays unreferenced. Do not achieve 'unmatched' by nulling child FKs. Verify with a post-write query that at least one parent row has zero children for each FK."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `tweets.createdate: createdate IS NOT NULL OR createdate IS NULL`, which is a tautology and provides no constraint. `formula_kind` maps it to 'nullable', which is harmless but meaningless. The `supporting_evidence` for this rule is absent (only uid, followers, id, f2, text have evidence). The `uncertainty` field acknowledges 'createdate has no paired end date' but the rule is still listed.",
+     "requested_revision": "Remove the tautological `createdate` formula or replace it with a meaningful constraint (e.g. a plausible date range). If no constraint is intended, drop it from `semantic_rules_and_formulas` so the spec does not claim a rule that is not enforced."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `per_column_exceptions` lists `unmatched_join_rows` for `user_profiles.uid`, `tweets.uid`, `follows.f1` with target 'parent rows without children', but the atomic-operations extraction shows the actual join predicates are `JOIN(tweets.uid=user_profiles.uid)` and `JOIN(follows.f1=user_profiles.uid)`. The spec does not state which side is the parent for each join, and `follows.f1` is itself a child of `user_profiles.uid`, so 'parent rows without children' for `follows.f1` is ambiguous (follows has no children in the schema). This ambiguity is what led the engineer to implement it as NULL-ing child FKs.",
+     "requested_revision": "Clarify in the spec, for each `unmatched_join_rows` exception, which table is the parent and which is the child, and state that the target is 'a parent PK value not referenced by any child FK value'. Remove `follows.f1` from the list if it has no children, or restate the target for it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`choose_table_sizes` uses `spec['table_sizes']` as a base and multiplies by `0.5 + rng.random() * 1.5`, so `user_profiles` (base 7) yields 3..14 rows, `tweets` (base 8) yields 4..16, `follows` (base 9) yields 4..18. With such small sizes, the per-column targets (group sizes 1/2/>=3, COUNT 0..3, 20-50% duplicate share, NULL share) are frequently unachievable or lost to row-skipping. The execution feedback shows only 2 generated rows for `user_profiles` in some instances.",
+     "requested_revision": "Either fix the per-instance size to the spec's `table_sizes_per_instance` (7/8/9) or raise the minimum so the targets are achievable, and add a post-write check that each per-column target is satisfied. If a target cannot be satisfied at the chosen size, increase the size rather than silently dropping rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_duplicates` picks a random non-null index and copies another non-null value into it, but does not guarantee the resulting duplicate share is in 20-50% of non-null rows; it copies `round(len(nonnull) * share)` values, which can over- or under-shoot after subsequent filtering. The spec requires 20-50% duplicate share for `user_profiles.uid`, `tweets.uid`, `user_profiles.email`. No post-write verification is performed.",
+     "requested_revision": "After all filtering, compute the actual duplicate share and adjust (add or remove duplicates) to land in 20-50%. Add a post-write check that reports the achieved share per column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_constraints_for` sets `cons['ties']` from `schema.original_values` for `ties_order` columns, but `DateSampler.sample` returns a tie value with probability 0.30 only when `self.ties` is non-empty. If the compact `tweets.createdate` values are all distinct (likely), the ties list is non-empty but the generated rows may not actually produce ties at the ORDER BY rank. The spec requires 'ties at rank, ASC' for `tweets.createdate`. No post-write check verifies ties exist.",
+     "requested_revision": "Guarantee at least two generated rows share the same `createdate` value (e.g. force a duplicate timestamp among generated rows), and add a post-write check that the ORDER BY `createdate` ASC has at least one tie."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database actually contains rows for all three tables (the execution feedback reports compact_rows_missing for all 20 instances, which is consistent with the writer bug but could also indicate an empty compact DB; the reviewer cannot inspect the compact DB directly).",
+    "Whether the `follows` composite PK collisions are the sole cause of the high rows_skipped, or whether other constraints (e.g. NOT NULL on `tweets.text`) also contribute.",
+    "Whether the `tweets.text` LIKE variants (`%int%`, `%intern%`, and the listed near variants) are actually present in the written instances; the StringSampler plants them with probability 0.30, but row-skipping may remove them.",
+    "Whether the `follows.f2 <> 0` boundary values (-1, 0, 1) are actually generated; `NumberSampler` pins boundary values with probability 0.25, but the spec's `comparison_boundary` for `follows.f2` is set from `DEFAULT_COMPARISON_BOUNDARY = (-1, 0, 1)`, and the formula `f2 <> 0` is enforced via `nonzero`, which would reject 0 \u2014 a conflict between the boundary target and the formula that is not resolved in the code."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=109 across 20 instances (integrity.fk_violations), and validity shows 18/20 instances invalid with reason 'new_integrity_failures'. The writer disables FK enforcement (writer.py: con.execute('pragma foreign_keys = OFF')) and the instance builder nulls out blocked childless-parent keys (instance.py: inst[ct][cc] = [v if v not in blocked else None ...]) and re-fills FKs with rng.choice(pv) without re-checking that the chosen parent key still exists after sample_fresh_primary_keys/drop_unique_duplicates on the parent. The post-build _post_verify then re-plants NULLs/duplicates/group sizes on FK columns, which can overwrite a valid FK with a value not present in the parent (e.g. _apply_group_sizes/_apply_agg_boundary/_enforce_dup_share on tweets.uid, follows.f1).",
+     "requested_revision": "Guarantee FK integrity on the final column arrays: (a) do not run group_sizes/agg_values/dup_share/ties re-planting on FK child columns after FK fill, or re-fill FKs after every re-plant; (b) when nulling blocked childless-parent keys, ensure the resulting NULL is allowed (nullable FK) and that non-NULL values still reference an existing parent key; (c) keep foreign_keys=OFF only for insertion order, but add a post-write verification that every non-NULL FK value exists in the parent table and fail the unit otherwise. Re-run and confirm fk_violations=0 and validity.invalid=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires (per_column_exceptions) for tweets.uid unmatched_join_rows: 'child FK column contains no reference to >=1 parent (user_profiles.uid); do NOT implement by nulling child FK'. The program implements childless parents by nulling the child FK (instance.py: inst[ct][cc] = [v if v not in blocked else None for v in inst[ct][cc]]), which is exactly the forbidden implementation and also produces the FK violations above. Additionally, _childless_parents only registers a childless parent for columns in spec['unmatched_parents'], but load_specification adds (t,c) for the *child* column (tweets.uid, follows.f1), while _childless_parents is called on parent PK columns (user_profiles.uid) \u2014 the key never matches, so childless parents are effectively never enforced.",
+     "requested_revision": "Implement unmatched_join_rows by leaving at least one parent PK value unreferenced by any child row (choose a parent key and exclude it from the FK draw pool), never by nulling the child FK. Fix the key mismatch: map the spec's child-column entry to the parent PK column before calling _childless_parents, and verify post-write that at least one parent row has zero children in the child table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic rule tweets.createdate in 2018 ('createdate >= 2018-01-01 AND < 2019-01-01') is not implemented. DateSampler (values.py) draws from self.full = (1800-01-01, 2100-01-01) or from the compact min/max range, and _constraints_for (instance.py) never passes a date range constraint. The spec's formula_kind only classifies positive/nonneg/nonzero/maxlen, so the date-range formula is silently dropped. Generated createdate values can therefore fall outside 2018.",
+     "requested_revision": "Add a date-range constraint kind (e.g. 'between' with lo/hi datetimes) to formula_kind and pass it to DateSampler so generated createdate values satisfy 2018-01-01 <= createdate < 2019-01-01, while still planting the required tie for ORDER BY createdate ASC."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires follows.f2 comparison_boundary targets 'sample values around 0 (-1, 1) only; f2=0 is forbidden'. load_specification sets spec['comparison_boundary'][('follows','f2')] = [-1, 1], but NumberSampler._draw only uses boundary values with probability 0.25 and otherwise draws uniformly from [min,max] (values.py: full = r.random() < self.p ... v = r.randint(int(lo), int(hi))). The semantic rule f2 <> 0 is classified as 'nonzero' and applied, but the boundary values -1/1 are not guaranteed to appear, and the spec's 'only' wording is not honored. Also, the semantic rule f2 <> 0 is applied via formula_kind, but the boundary list is not enforced as the sole domain.",
+     "requested_revision": "For follows.f2, restrict the sampler domain to {-1, 1} (or at least guarantee both -1 and 1 appear in every instance) and never emit 0; do not rely on the 0.25 boundary probability. Add a post-write check that f2 values are a subset of {-1, 1} and that both values occur."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.followers comparison_boundary 'include values at 1000 and one step below/above'. load_specification sets spec['comparison_boundary'][('user_profiles','followers')] = [1000] (DEFAULT_FOLLOWERS_BOUNDARY), but NumberSampler only uses boundary values with probability 0.25 and does not plant 999/1001. The semantic rule followers >= 0 is applied, but the boundary triple (999, 1000, 1001) is not guaranteed.",
+     "requested_revision": "Plant 999, 1000 and 1001 explicitly in user_profiles.followers (at least one row each per instance) in addition to the >= 0 rule, and verify post-write that all three values occur."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.name comparison_boundary 'include exact Iron Man and a near-typo variant' and like_near_variant 'prefix/near matches for %Swif% style literals'. load_specification maps like_near_variant to DEFAULT_LIKE_LITERALS = ('%int%','%intern%') and DEFAULT_LIKE_VARIANTS for *every* like_near_variant column, including user_profiles.name and user_profiles.email. The name column therefore gets '%int%'/'%intern%' literals instead of '%Swif%' and 'Iron Man', and the comparison_boundary for name is set to DEFAULT_COMPARISON_BOUNDARY = (-1,0,1) (numeric) rather than the string 'Iron Man'.",
+     "requested_revision": "Make like_literals/like_variants and comparison_boundary per-column and type-aware: for user_profiles.name use '%Swif%' plus near variants and the exact string 'Iron Man' plus a typo variant; for user_profiles.email use '%edu%' and '%supers%' near variants; for tweets.text use '%int%'/'%intern%' with the listed variants. Do not apply numeric boundary values to varchar columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.uid group_sizes 'groups of size 1, 2 and >=3 across referenced uid children' and tweets.uid group_sizes 'groups of size 1, 2 and >=3'. _apply_group_sizes (instance.py) writes blocks of the target sizes into the column array, but for user_profiles.uid the column is a PK and is overwritten by _fresh_pk_start (sequential integers) after sampling, and for tweets.uid the FK fill (fill_foreign_keys_consistently) and the later _post_verify re-planting can destroy the group-size structure. The post-verify re-applies _apply_group_sizes to tweets.uid, but this overwrites FK values with arbitrary pool values, breaking FK integrity (see issue 1) and not guaranteeing the referenced-child group sizes on user_profiles.uid.",
+     "requested_revision": "Enforce group_sizes on the *final* arrays: for user_profiles.uid, choose the set of parent keys and the number of children per parent so that child counts hit 1, 2 and >=3, then fill tweets.uid/follows.f1 from that distribution; do not re-plant group sizes on FK columns after FK fill. Verify post-write that the child-count histogram contains 1, 2 and >=3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.uid aggregate_boundary 'COUNT(*) per group in {0,1,2,3}' and tweets.uid aggregate_boundary 'COUNT(*) per group in {0,1,2,3}'. _apply_agg_boundary (instance.py) makes blocks of distinct values of size tgt, but for user_profiles.uid the PK is overwritten by sequential integers, and for tweets.uid the FK fill and post-verify re-planting can destroy the block structure. The '0' target (a group with zero rows) is not achievable by writing values into a column; it requires a parent with no children, which is the unmatched_join_rows case and is not implemented (issue 2).",
+     "requested_revision": "Implement aggregate_boundary together with unmatched_join_rows: ensure at least one parent has 0 children (COUNT=0), and that child counts 1, 2, 3 occur. Apply on final arrays after FK fill; do not re-plant on FK columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.partitionid aggregate_boundary 'COUNT(*) per group in {1,2,3}'. _apply_agg_boundary is applied to partitionid, but partitionid is nullable and _plant_nulls runs before _apply_agg_boundary in build_random_instance, and _post_verify re-applies _apply_agg_boundary after _ensure_one_null, which can overwrite the planted NULL or the block structure. The interaction between NULL planting and aggregate-boundary planting is not verified.",
+     "requested_revision": "Order the steps so NULL planting and aggregate-boundary planting are consistent (e.g. plant NULLs in rows outside the boundary blocks, or count NULL as its own group), and verify post-write that COUNT(*) over partitionid groups takes 1, 2 and 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.email duplicates_for_distinct '20-50% duplicate share among non-null' and user_profiles.uid/tweets.uid duplicates_for_distinct '20-50%'. _enforce_dup_share (instance.py) is called in _post_verify for columns in spec['dup_share'], but for user_profiles.uid the PK is overwritten by sequential integers after sampling, so the duplicate share is 0; for tweets.uid the FK fill and re-planting can change the share. The post-verify _enforce_dup_share is applied to user_profiles.uid, which would break the PK uniqueness (it copies values into other rows), and then sample_fresh_primary_keys is not re-run after _post_verify.",
+     "requested_revision": "Do not apply duplicate-share enforcement to primary-key columns (uid, tweets.id). For user_profiles.email and tweets.uid, enforce the 20-50% share on the final arrays after FK fill and verify post-write; for tweets.uid, ensure the duplicate share is achieved by repeating existing parent keys, not by inventing new ones."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires tweets.id aggregate_boundary 'COUNT(id) values 0,1,2,3' and null_in_count_column/null_rows 'no NULL (NOT NULL)'. _apply_agg_boundary is applied to tweets.id, but tweets.id is a PK and is overwritten by _fresh_pk_start (sequential integers) after sampling, so the block structure is destroyed. The '0' target is not achievable by writing values into a NOT NULL PK column.",
+     "requested_revision": "For tweets.id, the aggregate_boundary targets should be interpreted as COUNT over groups of the *table* (e.g. COUNT(tweets.id) per user), not as values in the id column. Implement by controlling the number of tweets per user (0,1,2,3) together with unmatched_join_rows, and do not re-plant on the PK column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires tweets.createdate ties_for_order_limit 'at least two generated rows share a createdate value'. _apply_ties is applied in _post_verify for columns in spec['ties_order'], but _constraints_for also passes ties to DateSampler only if schema.original_values has non-NULL values for (tweets, createdate). The post-verify _apply_ties copies one value into another row, which is fine, but the DateSampler's 0.30 tie probability and the post-verify both operate; the execution feedback does not report a tie check. The specification's date range (2018) is not enforced (issue 3), so ties may be outside 2018.",
+     "requested_revision": "After enforcing the 2018 date range, guarantee at least two generated rows share a createdate value within 2018 (post-write check), and keep the tie when re-planting other targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.followers rows_with_different_values '>=2 rows per comparable group with different followers'. _apply_rows_diff_values (instance.py) only ensures the whole column has >=2 distinct values, not that each comparable group (e.g. per partitionid or per name) has >=2 rows with different followers. The spec's example is 'scalar:SELECT(MAX(user_profiles.followers))' with 'qualifying_rows: >= 2 per group with different values'.",
+     "requested_revision": "Implement rows_with_different_values per group: for each group (by the grouping column implied by the query, e.g. partitionid), ensure at least two rows have different followers values. Verify post-write."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires user_profiles.name group_sizes 'groups of size 1, 2 and >=3' and follows.f1 group_sizes 'groups of size 1, 2 and >=3'. _apply_group_sizes is applied to name and f1, but for follows.f1 the FK fill (fill_foreign_keys_consistently) and the later _post_verify re-planting can destroy the group-size structure; for name, _plant_nulls runs before _apply_group_sizes and _post_verify re-applies _apply_group_sizes after _ensure_one_null, which can overwrite the planted NULL or the block structure. The interaction is not verified.",
+     "requested_revision": "Apply group_sizes on the final arrays after NULL planting and FK fill, and verify post-write that the value-count histogram contains 1, 2 and >=3 for name and follows.f1."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic rule tweets.createdate in 2018 is marked as inferred ('createdate range rule is inferred from compact values (2018)') and the uncertainty field says 'No calculated columns and no date pairs exist; createdate range rule is inferred from compact values (2018)'. The evidence is only two compact values (2018-03-09, 2018-03-12), which is weak support for a full-year range rule.",
+     "requested_revision": "Either provide stronger evidence for the 2018 range (e.g. more compact createdate values or a documented business rule) or downgrade the rule to 'uncertain' and state that generated createdate values are not required to fall in 2018. If kept, the engineer must implement it (issue 3)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for user_profiles.name comparison_boundary says 'include exact Iron Man and a near-typo variant', and for user_profiles.email like_near_variant says '%edu% and %supers% near variants', but the generic_sampling_rules and the DEFAULT_* constants in spec.py use '%int%'/'%intern%' for all like_near_variant columns. The specification does not clearly separate per-column literals from the generic defaults, leading the engineer to apply the wrong literals (issue 6).",
+     "requested_revision": "Make the specification explicit per column: list the exact LIKE literals and near variants for user_profiles.name ('%Swif%', 'Iron Man' + typo), user_profiles.email ('%edu%', '%supers%'), and tweets.text ('%int%', '%intern%' + variants). Remove the ambiguity that allowed the generic defaults to be applied to all columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for tweets.uid unmatched_join_rows says 'child FK column contains no reference to >=1 parent (user_profiles.uid); do NOT implement by nulling child FK', but the generic_sampling_rules integer_fk says 'at least one NULL row per nullable FK'. tweets.uid is NOT NULL (FK to user_profiles.uid), so the NULL rule does not apply, but the specification does not state how to achieve the childless parent without nulling the child FK. The engineer's implementation nulled the child FK (issue 2).",
+     "requested_revision": "Clarify in the specification that unmatched_join_rows for a NOT NULL child FK must be achieved by leaving a parent PK unreferenced (exclude it from the FK draw pool), and that nulling the child FK is forbidden. Add a post-write check that at least one parent has zero children."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's table_sizes_per_instance is {user_profiles: 8, tweets: 9, follows: 10}, but the execution feedback shows rows_added of 113/127/121 and rows_skipped of 31/59/103 across 20 instances, i.e. ~5-6 generated rows per table per instance, not 8/9/10. choose_table_sizes (instance.py) varies the base by 0.75..1.75x with floor 6, so the per-instance sizes are not the specified 8/9/10. The specification does not state whether table_sizes_per_instance is a fixed size or a base for variation.",
+     "requested_revision": "State whether table_sizes_per_instance is a fixed per-instance size or a base for variation. If fixed, the engineer must generate exactly 8/9/10 rows per instance (or document the variation). If a base, state the allowed range and ensure the per-column targets (group sizes, COUNT 0..3, duplicate share) remain achievable at the minimum size."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows construction_pairs.separated=21 out of 60 eligible, with construction_pairs_by_group empty. The specification's per-column targets (group sizes, aggregate boundaries, duplicate shares, NULL shares, ties, boundaries) are intended to separate query pairs, but only 21/60 are separated. This is not by itself a generation error (instruction 4), but combined with the FK violations and the unimplemented targets above, it indicates the intended value variation is not fully realized.",
+     "requested_revision": "After fixing the FK integrity and the unimplemented per-column targets (issues 1-14), re-run and report construction_pairs.separated. If separation remains low, investigate whether the targets are planted on the final arrays (post-dedup, post-FK-fill) and whether the compact rows dominate the generated rows (the compact rows are preserved and may mask the planted variation)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact rows (preserved by design) dominate the generated rows enough to mask the planted per-column targets; the execution feedback does not report per-instance target verification.",
+    "Whether the 2018 createdate range is a supported rule or an uncertain inference; the specification marks it as inferred from two compact values.",
+    "Whether table_sizes_per_instance is a fixed size or a base for variation; the program varies it and the execution feedback shows ~5-6 rows per table per instance.",
+    "Whether the construction_pairs.separated=21/60 is due to the unimplemented targets or to the compact rows; a re-run after fixes is needed.",
+    "Whether the NULL share for user_profiles.name (6/113) and partitionid (6/113) matches the compact share; the compact share is not reported in the feedback."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with KeyError('f1') and n_ok=0, n_instances=0. In instance.build_random_instance, the FK fill loop computes `n = len(inst[t].get(tm.columns[0].name, []))` before FK columns exist on `follows`. follows has columns f1,f2 only (both FKs), all of which are skipped in the sampler phase (`if (t, cm.name) not in schema.fks`), so `samplers` has no entry for f1/f2 and `cols` is empty for follows. `inst['follows']` is therefore set from `sample_fresh_primary_keys(...)` over `{cm.name: cols[cm.name] ...}` \u2014 which raises KeyError('f1') since cols has no 'f1'.",
+     "requested_revision": "In build_random_instance, ensure follows gets a row count and an empty column dict before FK fill (e.g. build cols as `{cm.name: cols.get(cm.name, []) for cm in tm.columns}` and derive n from the intended table size `size[t]`, not from `tm.columns[0].name`). Then FK fill can populate f1/f2 and write rows. Re-run generation and confirm n_ok>0 and FK-integrity violations=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec requires 'follows composite PK collisions must be avoided against compact tuples' and 'exclude one parent key so it stays childless' per (parent,key). The childless_keys logic keys on `(pt, pc)`, so a single excluded uid is shared: it excludes the same uid from tweets.uid and from both follows.f1 and follows.f2 pools (only one key total per parent). That does not satisfy the spec's stronger requirement that at least one parent has zero children in tweets.uid AND at least one parent has zero children in follows.f1 independently \u2014 but this is minor since the same key being childless in both is still valid. However, composite-PK collision with compact tuples is not enforced: the writer's `_existing_keys` check will drop generated follows rows whose (f1,f2) tuple repeats a compact tuple, reducing the realized counts below the planned 0/1/2/>=3 histogram and the required size of 10, silently skewing the group_sizes/unmatched_join targets. The dedup inside the FK fill (`vals[:n]` after round-robin) can also collapse the intended histogram.",
+     "requested_revision": "Enforce composite-PK uniqueness against compact tuples in the plan (before inserting), so the planned child counts survive; verify group_sizes (1,2,>=3), childless parent, and table size 10 post-write in the program, and re-plan if violated. Currently these are only asserted in the specification, not verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "_post_verify skips FK columns and re-plants non-FK targets only. But `tweets.id` PK is rewritten after sampling (`cols[cm.name] = [start+i ...]`), then _post_verify runs `_apply_agg_boundary`/`_apply_group_sizes` on it if the spec keys map to it \u2014 spec maps `tweets.id` aggregate_boundary to 'tweets-per-user' semantics but load_specification sets `agg_values[(tweets,id)] = (0,1,2,3)` regardless, and _post_verify applies `_apply_agg_boundary` to `tweets.id` (a PK), mutating PK values (adding offsets) and possibly creating PK collisions with compact rows (ids 1..9). That breaks the PK uniqueness/integrity intent and the 'fresh primary keys above max(compact)' rule.",
+     "requested_revision": "Never apply aggregate/group/dup transforms to primary-key columns. In _post_verify, guard on `cm.pk_pos == 0` (already done for dup and null) and for agg/group/boundary conditions too; implement `tweets.id` aggregate_boundary purely as tweets-per-user (already arranged via `_child_count_plan` on the FK path) and do not touch the id array."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec (aggregate_boundary for user_profiles.uid, tweets.uid; group_sizes; unmatched_join_rows; followers rows_with_different_values per partitionid; followers 999/1000/1001; f2 subset {-1,1} both present; createdate ties within 2018; duplicate share 20-50%) requires explicit POST-WRITE verification. The program only checks FK existence (`_fk_violations`) and counts rows; it does not verify any of these targets after the write (which is where compact-PK collisions and dedup can destroy them). `rows_with_different_values` for followers per-partition is not applied at all in build_random_instance (only `_apply_rows_diff_values` over the whole column, not per partitionid group).",
+     "requested_revision": "Add a post-write (or pre-write on final arrays) verifier that asserts each numeric/pattern target from the spec (group sizes {1,2,>=3}, counts {0,1,2,3}, childless parent in both tweets and follows, followers boundary triple, f2 both {-1,1}, createdate tie, dup share in [0.20,0.50] for email and tweets.uid, followers-per-partition distinct values). Implement followers-different-values per partitionid group as the spec requires, not just globally. Fail the unit (or replant on non-FK columns only) when a target is unmet."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tweets.text is declared char(140) and spec requires LIKE literal '%int%'/'%intern%' plus variants and all values <=140 \u2014 this is satisfied by StringSampler with maxlen=140. But no evidence in feedback can confirm because generation crashed. Additionally, follows.f2 comparison_boundary domain {-1,1} is set via DOMAIN_BY_COLUMN['f2']= [-1,1] and BOUNDARY_BY_COLUMN['f2']=[-1,1]; NumberSampler picks from boundary 25% and domain always \u2014 but the NumberSampler is applied only to non-FK columns; f2 is an FK, so the sampler constraints are never applied to it. The domain {-1,1} for f2 is therefore NOT enforced by construction \u2014 FK fill draws f2 from user_profiles.uid values (positive ids), violating f2 in {-1,1}. This contradicts the requirement and would need reconciliation with FK integrity (user_profiles.uid must include -1 and 1).",
+     "requested_revision": "Resolve the conflict between f2 domain {-1,1} and 'f2 FK references user_profiles.uid': either ensure parent uid includes -1 and 1 so the f2 pool restricted to {-1,1} is nonempty and both values appear, or document that f2 cannot be a real FK with domain {-1,1} and adjust the spec. As written the program cannot satisfy both. Enforce the chosen resolution in FK fill for f2 specifically (filter/union parent pool with {-1,1}) and verify post-write."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec marks createdate range '2018-01-01 .. < 2019-01-01' as inferred from only two compact samples and explicitly 'uncertain'. This is supported weakly. Other rules (uid>0, followers>=0, id>0, f2<>0, length(text)<=140) are well supported by compact data. The `follows.f2` comparison_boundary on f2 <> 0 as {-1,0,1} targets in atomic ops, but the spec hardcodes f2 \u2208 {-1,1} \u2014 inconsistent with the extracted atomic operation target values [-1,0,1] and with the FK requirement that f2 references a valid uid.",
+     "requested_revision": "Clarify the f2 domain: extracted op PRED(follows.f2<>0) targets {-1,0,1}; spec overrides to {-1,1}. Keep the well-supported rules; downgrade/annotate the createdate 2018 range as uncertain (not a hard constraint) unless corroborated. Align f2 domain with the FK reference user_profiles.uid (see engineer issue)."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducible generation could not be confirmed (0 successful instances).",
+    "Preservation of compact rows is by construction (`_copy_compact`) and looks correct, but unverified because the program crashed before writing.",
+    "No construction pairs were produced (construction_pairs_by_group empty), so query-level variation/plausibility is unverified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for follows.f2 requires 'domain restricted to {-1, 1}; both values must appear in every instance; never emit 0' AND 'reconcile with FK by ensuring user_profiles.uid includes -1 and 1'. But the semantic_rules_and_formulas and supporting_evidence state 'follows.f2 <> 0' with evidence 'f2 values 1-6, none zero', and the schema declares FOREIGN KEY (f2) REFERENCES user_profiles(uid) with user_profiles.uid > 0 (uids 1-7 positive). The resolution 'ensure user_profiles.uid includes -1 and 1' directly contradicts the supported rule 'user_profiles.uid > 0' (evidence: uids 1-7 positive). The specification is internally inconsistent: it cannot simultaneously keep uid > 0 and have f2 in {-1,1} referencing uid.",
+     "requested_revision": "Resolve the contradiction. Either (a) drop the {-1,1} closed domain for f2 and keep f2 <> 0 with f2 drawn from the positive uid pool (consistent with the compact data and the FK), or (b) explicitly relax the uid > 0 rule and document that -1/1 are injected as parent rows. Do not leave both rules active. The current 'resolution' silently violates a supported semantic rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_extend_parent_pool_for_domain` appends parent rows carrying uid = -1 and uid = 1 to satisfy the f2 domain. This violates the supported rule 'user_profiles.uid > 0' (evidence: uids 1-7 positive) and the generic rule 'integer_pk: Sequential integers starting at max(compact)+1'. It also injects a duplicate uid=1 if 1 already exists in the compact pool (the code only checks `if d not in pv` against the generated array, not against compact values), risking a PK collision. Execution feedback shows rows_skipped user_profiles=20 across 20 instances (1 per instance), consistent with a PK collision from this injection.",
+     "requested_revision": "Remove the domain-extension hack. Implement f2 per the corrected specification (see designer issue). If a closed domain is retained, it must be consistent with the FK parent pool and must not inject values that violate uid > 0 or collide with compact PKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'at least one parent user_profiles.uid has zero children in tweets.uid AND at least one has zero children in follows.f1, independently per (parent, child-FK) pair'. In instance.py, `childless_keys` is keyed by (pt, pc, ct) and one key is excluded per child table, but the FK fill for follows.f1 and follows.f2 both draw from the same user_profiles.uid pool. The child-count plan `_child_count_plan` is applied only to the first FK column of a child table (`if cm is next(...)`), so follows.f2 is filled by uniform random choice from the pool \u2014 which can re-introduce the 'childless' key into f2, and more importantly the childless guarantee for follows.f1 is only about f1, not f2. The verifier `_verify_targets` checks childless per (parent, child-FK) pair but the construction does not independently guarantee it for both f1 and f2. Execution feedback shows construction_pairs separated=14/60, with no per-group breakdown, so the childless/group-size targets are largely unmet.",
+     "requested_revision": "Guarantee childless parents independently for each child FK column (f1 and f2 separately), and apply the child-count histogram plan to each FK column that carries a group_sizes/aggregate_boundary target, not only the first FK of the child table. Verify post-write per (parent, child-FK) pair."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires group_sizes '1, 2 and >= 3' on user_profiles.uid (child-count histogram over tweets.uid and follows.f1) and on tweets.uid, follows.f1. `_child_count_plan` targets counts (1,2,3) but the pool size after excluding a childless key and the shuffle/truncation `vals[:n]` can drop the >=3 group. `_verify_targets` reports unmet 'group_sizes' but the builder does not replant or fail \u2014 it only returns the list, which `build_random_instance` ignores (the return value of `_verify_targets` is discarded). Execution feedback: construction_pairs separated=14/60, indicating most group-size/aggregate targets are not realized.",
+     "requested_revision": "Make `build_random_instance` act on `_verify_targets` results (replant non-FK columns or raise), and ensure the child-count plan actually produces a >=3 group within the row budget (n_child=9/10 with n_parent=8 is tight; document or adjust table_sizes_per_instance so 0,1,2,>=3 are simultaneously achievable)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'followers contains 999/1000/1001' and 'for each group by partitionid, >=2 rows with different followers values'. `_plant_boundary` writes boundary values into the followers array, but `_apply_rows_diff_values_per_group` runs afterward and can overwrite the last row of a group, and `_post_verify` re-plants boundary then re-plants rows_diff \u2014 order-dependent. More critically, `_verify_targets` checks `{999,1000,1001} <= set(fv)` but the builder never guarantees it after the per-group perturbation. Execution feedback does not report followers boundary status, and construction_pairs separated=14/60 suggests these targets are frequently unmet.",
+     "requested_revision": "Guarantee the followers boundary triple and per-partition distinct values survive all later transforms (apply them last, or verify and replant in a fixed order), and surface the verification result in the run summary."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'duplicate shares 20-50% on email and tweets.uid'. `_apply_duplicates` is applied to tweets.uid only if `(tweets, uid)` is in spec['dup_share'], but `load_specification` records dup_share from per_column_exceptions with pattern 'duplicates_for_distinct' \u2014 for tweets.uid the exception exists, so it is recorded. However `_enforce_dup_share` is only called in `_post_verify` for non-FK, non-PK columns; tweets.uid is an FK column and is skipped (`if (t, cm.name) in schema.fks: continue`). So the 20-50% duplicate share on tweets.uid is never enforced or verified. Execution feedback does not report dup_share status.",
+     "requested_revision": "Enforce and verify the duplicate share on tweets.uid (an FK column) without breaking the FK pool \u2014 e.g. by repeating existing parent keys during FK fill, as the specification's per_column_exceptions for tweets.uid explicitly allows ('achieved by repeating existing parent keys, not inventing new ones')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'at least two generated rows share a createdate value within 2018 (tie at ORDER BY createdate ASC)'. `_constraints_for` sets `cons['ties']` from `schema.original_values` for createdate, and DateSampler returns a tie with 30% probability. But `_apply_ties` in `_post_verify` is only called if `(tweets, createdate)` is in spec['ties_order'], which `load_specification` sets from per_column_exceptions pattern 'ties_for_order_limit' \u2014 that exception exists for createdate, so ties_order is set. However `_apply_ties` picks two random rows and copies one value to the other, which may produce a tie outside 2018 if the source value is outside the range, and the date_range is soft. Execution feedback does not report createdate tie status.",
+     "requested_revision": "Guarantee the createdate tie within 2018 deterministically (plant two identical in-range timestamps after all other transforms) and verify it in the run summary."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification marks the createdate 2018 range as 'inferred from two compact values and marked uncertain (not a hard constraint)', yet per_column_exceptions for createdate requires the tie to be 'within 2018'. This is a soft rule being used as a hard target. The program treats it as soft (`date_range_soft`) but the tie target still references 2018.",
+     "requested_revision": "Clarify whether the 2018 range is a hard constraint for the tie target. If uncertain, the tie should be allowed anywhere in the declared datetime range, or the range should be promoted to a supported rule with more evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped user_profiles=20 (1 per instance) and rows_added user_profiles=180 for 20 instances = 9 per instance, but table_sizes_per_instance says user_profiles=8. The compact DB has 7 uids; 7+8=15 expected, but 9 added per instance suggests the domain-extension added extra rows (uid=-1,1) and one was skipped as a PK collision. This confirms the `_extend_parent_pool_for_domain` bug and the resulting PK collision.",
+     "requested_revision": "Fix the row-count accounting: generated rows per instance must equal table_sizes_per_instance (8/9/10) and no rows should be skipped due to PK collisions. Remove the domain-extension injection."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'tweets.id: sequential from max(compact)+1; never mutated by aggregate/group/dup transforms'. In `build_random_instance`, PK columns are set to `start + i` for i in range(n), but then `sample_fresh_primary_keys` and `drop_unique_duplicates` run, and `_post_verify` skips PK columns \u2014 good. However `_apply_agg_boundary` is guarded by `key not in _agg_as_child_count()`, and AGG_AS_CHILD_COUNT includes ('tweets','id'), so it is skipped \u2014 good. But the specification's per_column_exceptions for tweets.id aggregate_boundary says 'interpreted as tweets-per-user, not values in id column; do not re-plant on PK; never mutate the id array' \u2014 the program correctly skips, but the child-count histogram on tweets.uid is what should realize it, and that is not reliably enforced (see group_sizes issue).",
+     "requested_revision": "Ensure the tweets-per-user histogram (0,1,2,3) is realized on tweets.uid via the child-count plan and verified, since tweets.id itself is correctly left untouched."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 2018 createdate range should be a hard constraint (designer must clarify).",
+    "Whether the f2 {-1,1} domain or the uid > 0 rule takes precedence (designer must resolve).",
+    "Per-group construction_pairs breakdown is empty in the feedback, so the exact set of unmet targets per group could not be confirmed; the separated=14/60 ratio strongly suggests multiple unmet targets."
+   ]
+  }
+ ]
 }

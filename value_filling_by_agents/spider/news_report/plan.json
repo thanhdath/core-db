@@ -1,66 +1,465 @@
 {
  "db": "news_report",
- "operator_io_quirks": [
-  "Mixed-case identifiers: tables 'event','journalist','news_report' lowercase but columns 'Event_ID','Date','Name','journalist_ID','Work_Type' mixed case; must double-quote with original spelling.",
-  "Column name collision: 'Name' exists in both event and journalist; 'journalist_ID' in journalist and news_report; 'Event_ID' in event and news_report \u2014 case-insensitive lookup must be table-scoped.",
-  "DDL uses backtick-quoted parent refs (`journalist`, `event`) in FK clauses; sqlite_master DDL replay must preserve them verbatim.",
-  "Tiny tables: event=5, journalist=11, news_report=7 rows \u2014 choose_table_sizes (min 30) will massively oversize vs original; no huge-table sampling needed.",
-  "Declared TEXT but integer-stored: journalist.Age is TEXT holding '37','27' etc (String fuzzer, but values are numeric strings); Date is TEXT holding '13 October 2008' (String fuzzer, not Date fuzzer).",
-  "Date column format 'D Month YYYY' (e.g. '13 October 2008') \u2014 not one of TS's 7 date templates; TS will treat as plain String and generate random charset strings, losing the date shape.",
-  "news_report composite PK (journalist_ID, Event_ID) \u2014 both members are also FK children; composite-PK member max_l0=30 applies to both.",
-  "news_report.journalist_ID distinct=6 but journalist has 11 rows; news_report.Event_ID distinct=5 = event rows \u2014 FK coverage partial, not full.",
-  "All columns notnull=0 (no NOT NULL constraints) \u2014 TS NULL injection won't be rejected by sqlite; no CHECK constraints.",
-  "No self-references, no dangling FKs, no non-unique parents \u2014 clean FK graph, 2-level topological order (event,journalist -> news_report).",
-  "journalist.Nationality distinct=3 (England/Wales/Northern Ireland) \u2014 low-cardinality enum-like; TS String fuzzer will not preserve this small set.",
-  "journalist.Years_working INT distinct=10 over 11 rows; Age TEXT distinct=8 \u2014 near-unique, TS Number/String perturbation may create implausible negatives."
- ],
- "operator_ts_expectations": [
-  "Date column (TEXT, '13 October 2008'): dispatches to String fuzzer (type 'text' -> char family), NOT Date; TS emits random a-zA-Z0-9() strings of length ~[min,max] \u2014 destroys date semantics, likely FN on date-comparison queries.",
-  "Age (TEXT, numeric strings): String fuzzer; int-like strings get str(i\u00b11) added to pool, so some plausible ages survive, but contaminate() adds random suffixes \u2014 FP risk on age-range predicates.",
-  "Nationality (TEXT, 3 values): String fuzzer with p=0.2 fresh draws \u2014 will invent nationalities not in {England,Wales,Northern Ireland}; FN on 'Nationality = X' queries where X is a real value.",
-  "Name columns (person names, event names): String fuzzer random charset \u2014 implausible names; FN on LIKE/equality on names, but ties preserved via element reuse.",
-  "Event_ID / journalist_ID (INT PKs): Number fuzzer, single-col PK -> max_l0=inf, so fresh draws unbounded; PK dedup keeps first occurrence; FK children draw from parent's final values with replacement \u2014 referential integrity preserved but many-to-one skew.",
-  "news_report composite PK: both members max_l0=30; sample_fresh_primary_keys drops duplicate (journalist_ID,Event_ID) tuples \u2014 may shrink news_report below chosen size.",
-  "Event_Attendance (INT, values 225..6650): Number fuzzer scale from 'int' -> scale=0, range [-1,1] full-range but list range [min(el), 10^0] quirk caps upper at 1 \u2014 TS will emit tiny/negative attendances, FN on 'attendance > N' queries.",
-  "Years_working (INT, 3..21): same Number scale=0 quirk \u2014 list_max overwritten to 1, so fresh draws in [-1,1]; implausible negatives, FN on range predicates.",
-  "Small tables (5-11 rows) vs TS min size 30: TS instances much larger than original; COUNT(*) queries will differ in magnitude but denotation (non-empty, ordering) often preserved.",
-  "No NOT NULL: TS NULL injection (p=0.2, or p=0 whole instance w.p. 0.3) inserts NULLs freely; queries with IS NULL / IS NOT NULL may flip.",
-  "FK consistency: news_report rows always reference existing event/journalist IDs (drawn from parent final values) \u2014 join queries preserve referential semantics; but parent PK dedup may leave some child IDs orphaned if parent shrank after draw (upstream draws from final, so safe).",
-  "String contaminate() (p=0.5) on Venue/Name/Work_Type adds/removes chars \u2014 breaks exact-match and LIKE-prefix queries; Work_Type (3 values) especially vulnerable."
- ],
- "challenger_refs": [
-  "G1",
-  "g03449d42",
-  "g03449d42",
-  "g03449d42",
-  "ga31cebcf",
-  "g1b916c1c",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gbe285140",
-  "gef5291d8",
-  "gef5291d8",
-  "gef5291d8",
-  "gef5291d8",
-  "gef5291d8",
-  "gef5291d8",
-  "gf517a5ab",
-  "gf517a5ab",
-  "ged9842a3"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential unique integers starting at 1; never NULL.",
+   "int_foreign_key": "Copy an existing parent key; NOT NULL FK columns always reference a parent (unless the parent-side parent-without-children target is required); nullable FK columns get NULL in ~10% of rows.",
+   "int_quantity": "Integer in [0, 10000]; include boundary values at each listed literal (one step on each side).",
+   "int_years": "Integer in [0, 40]; include boundary values 2,3,4,9,10,11 (negatives -8,-7,-6 are unrealizable under the >= 0 rule and are not generated).",
+   "text_name": "Random combination of first/last names; unique per table where PK-adjacent; case/whitespace near-variants only on filler rows outside shaped groups.",
+   "text_short_enum": "Pick from a small explicit pool; case-variants only on filler rows outside shaped groups and only where the column is not NULL-exempt.",
+   "text_date": "Format 'D Month YYYY' (e.g. '13 October 2008'); random date in [2000-01-01, 2020-12-31].",
+   "text_free": "Random short string; near-duplicates only on filler rows outside shaped groups.",
+   "null_share": "For every nullable column (including those marked null_exempt in shape/tie protection): plant a NULL at the compact per-column NULL fraction, and at least one NULL row per nullable column per instance, even when the compact share is 0. Planted NULLs are never replaced by shape/tie logic. Exempt columns (event, journalist, news_report) are exempt from the shape/tie protection only; the NULL rule still applies to every nullable column. Rules and formulas constrain only non-NULL operands."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "journalist.Nationality",
+    "pattern": "enum + comparison_boundary + group_sizes + ties_for_order_limit + duplicates_for_distinct",
+    "targets": {
+     "enum": [
+      "England",
+      "Wales",
+      "Northern Ireland"
+     ],
+     "boundary_values": [
+      "England",
+      "england",
+      "Wales",
+      "wales"
+     ],
+     "group_sizes": "1, 2 and >= 3 (shape [1,1,2,3] = 7 rows; leaves 4 filler rows for case-variants)",
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(journalist_ID)"
+     ],
+     "duplicate_share": "20-50 %",
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler row only; case-variant substitution applied to the remaining filler rows with probability >= 0.5 so that at least one row carries 'england' and one carries 'wales'."
+    }
+   },
+   {
+    "column": "journalist.journalist_ID",
+    "pattern": "group_sizes + null_in_count_column + aggregate_boundary + duplicates_for_distinct + unmatched_join_rows",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "null_share": "none (NOT NULL)",
+     "aggregate_values": [
+      0,
+      1,
+      2
+     ],
+     "duplicate_share": "20-50 %",
+     "parent_rows_without_children": true,
+     "sequential_pk": true
+    }
+   },
+   {
+    "column": "event.Event_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "sequential_pk": true
+    }
+   },
+   {
+    "column": "journalist.Years_working",
+    "pattern": "comparison_boundary + ties_for_order_limit + aggregate_boundary + group_sizes",
+    "targets": {
+     "boundary_values": [
+      2,
+      3,
+      4,
+      9,
+      10,
+      11
+     ],
+     "unrealizable_boundary_values": [
+      -8,
+      -7,
+      -6
+     ],
+     "tie_at_rank": [
+      1,
+      1000
+     ],
+     "tie_note": "rank-1 tie: at least two rows share the maximum Years_working. rank-1000 tie is vacuous at size 11.",
+     "aggregate_values": [
+      9,
+      10,
+      11
+     ],
+     "group_sizes": "1, 2 and >= 3 (shape [1,1,2,3,4] = 11 rows)",
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler row only; the rank-1 tie is preserved."
+    }
+   },
+   {
+    "column": "news_report.Event_ID",
+    "pattern": "unmatched_join_rows + aggregate_boundary + null_in_count_column",
+    "targets": {
+     "parent_rows_without_children": true,
+     "aggregate_values": [
+      0,
+      1,
+      2
+     ],
+     "null_share": "none (NOT NULL)"
+    }
+   },
+   {
+    "column": "journalist.Name",
+    "pattern": "group_sizes + aggregate_boundary + duplicates_for_distinct + ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3 (shape [1,1,2,3] = 7 rows)",
+     "aggregate_values": [
+      0,
+      1,
+      2
+     ],
+     "duplicate_share": "20-50 %",
+     "tie_at_rank": "any (no LIMIT)",
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler row only; near-variants only on filler rows."
+    }
+   },
+   {
+    "column": "news_report.journalist_ID",
+    "pattern": "null_rows + unmatched_join_rows",
+    "targets": {
+     "null_share": "none (NOT NULL)",
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "event.Event_Attendance",
+    "pattern": "rows_with_different_values + ties_for_order_limit",
+    "targets": {
+     "qualifying_rows": ">= 2 per venue group with different attendance values",
+     "tie_at_rank": [
+      2
+     ],
+     "tie_note": "tie at rank 2 over DESC ordering must hold; vary values within each venue group (per1, per1+1, ...) while keeping SUM(event_attendance) equal across two venue groups. Verify the rank-2 tie after the venue-sum adjustment.",
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler venue row only; the two SUM-tie venue groups are never NULL."
+    }
+   },
+   {
+    "column": "journalist.Age",
+    "pattern": "group_sizes + ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3 (shape [1,1,2,3] = 7 rows)",
+     "tie_at_rank": [
+      1
+     ],
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler row only; rank-1 tie preserved."
+    }
+   },
+   {
+    "column": "event.Venue",
+    "pattern": "group_sizes + ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3 (fit event size 5, e.g. [1,1,3])",
+     "tie_at_rank": [
+      2
+     ],
+     "tie_on": [
+      "SUM(event_attendance)"
+     ],
+     "tie_note": "two venue groups must have equal attendance sums; do not NULL any row of the tie groups.",
+     "null_exempt": false,
+     "null_planting": "NULL on the singleton filler venue only; the two SUM-tie venue groups are never NULL."
+    }
+   },
+   {
+    "column": "event.Date",
+    "pattern": "date format",
+    "targets": {
+     "format": "'D Month YYYY'; range 2000-01-01..2020-12-31",
+     "null_exempt": false
+    }
+   },
+   {
+    "column": "news_report.Work_Type",
+    "pattern": "enum",
+    "targets": {
+     "enum": [
+      "Screening",
+      "Music",
+      "Host"
+     ],
+     "null_exempt": false
+    }
+   },
+   {
+    "column": "event.Name",
+    "pattern": "text_free",
+    "targets": {
+     "null_exempt": false
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "news_report.journalist_ID",
+    "parent_table": "journalist",
+    "parent_column": "journalist_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "news_report.Event_ID",
+    "parent_table": "event",
+    "parent_column": "Event_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "news_report.(journalist_ID,Event_ID)",
+    "parent_table": "composite",
+    "parent_column": "composite PK",
+    "copied_columns": [],
+    "note": "Dedupe on composite PK after FK fill; pre-dedupe target is 12 so realized count is reliably >= 7."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "event",
+    "column": "Event_Attendance",
+    "formula": "Event_Attendance >= 0",
+    "evidence": "rows 6650,369,1675,2356,225 all >= 0"
+   },
+   {
+    "table": "journalist",
+    "column": "Years_working",
+    "formula": "Years_working >= 0",
+    "evidence": "rows 10,5,6,21,3,7,12,8 all >= 0"
+   },
+   {
+    "table": "journalist",
+    "column": "Nationality",
+    "formula": "Nationality IN ('England', 'Wales', 'Northern Ireland')",
+    "evidence": "sample distinct values England, Wales, Northern Ireland"
+   },
+   {
+    "table": "news_report",
+    "column": "Work_Type",
+    "formula": "Work_Type IN ('Screening', 'Music', 'Host')",
+    "evidence": "sample distinct values Screening, Music, Host"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "event": 5,
+   "journalist": 11,
+   "news_report": 12
+  },
+  "null_targets": [
+   "event.Date",
+   "event.Name",
+   "event.Venue",
+   "event.Event_Attendance",
+   "journalist.Nationality",
+   "journalist.Name",
+   "journalist.Age",
+   "journalist.Years_working",
+   "news_report.Work_Type"
+  ],
+  "supporting_evidence": {
+   "event.Event_Attendance": "Shown rows 6650,369,1675,2356,225; all non-negative and distinct (5/5 distinct).",
+   "journalist.Years_working": "Shown rows 10,5,6,21,3,7,12,8; all non-negative (10/10 distinct).",
+   "journalist.Nationality": "Shown distinct values England, Wales, Northern Ireland.",
+   "news_report.Work_Type": "Shown distinct values Screening, Music, Host.",
+   "event.Event_ID": "5 shown events; news_report references only events 1..5 with unmatched parent rows possible.",
+   "journalist.journalist_ID": "11 journalists, 7 news_report rows with 6 distinct journalist_ID values (dup on journalist 4 in sample)."
+  },
+  "uncertainty": "news_report sample shows 6 journalist_ID values but only 5 Event_ID values across 7 rows; composite PK uniqueness forces dedupe. Pre-dedupe target raised to 12 so realized count is reliably >= 7. Both FK columns are NOT NULL: null_targets empty, FK generation keeps them non-NULL. Years_working negatives (-8,-7,-6) are unrealizable under the >= 0 semantic rule and are dropped; the '> -7' predicate is intentionally trivially true over [0,40]. Shaped/tie columns (journalist.Nationality, journalist.Years_working, journalist.Name, journalist.Age, event.Venue, event.Event_Attendance) are marked null_exempt: false in the NULL rule, so planting is applied to every nullable column; the planted NULL is placed on a filler row (outside the shaped/tie groups) so the shape survives. Event_Attendance range reconciled to [0,10000] to permit boundary value 0 under Event_Attendance >= 0. Journalist Nationality shape reduced to [1,1,2,3] = 7 so that 4 filler rows remain for case-variants; case-variant probability is raised to >= 0.5 so at least one 'england' and one 'wales' appear. Years_working rank-1 tie is added; the rank-1000 tie is vacuous at size 11. Event_Attendance rank-2 tie is verified after the venue-sum adjustment."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The generation specification's semantic_rules_and_formulas require Years_working >= 0 (supported by sample values 10,5,6,21,3,7,12,8) and Event_Attendance >= 0 (supported by 6650, 369, 1675, 2356, 225). However, the per_column_exceptions for journalist.Years_working list boundary_values [-8, -7, -6, 2, 3, 4, 9, 10, 11], which directly contradicts the non-negativity rule. The program's _BOUNDARY for Years_working includes -8, -7, -6, and _boundary_int_sequence filters bounds by lo=0, so the negative boundaries are silently dropped, meaning the comparison_boundary pattern (PRED(years_working > -7), PRED(years_working < 3) with values -8..-6) cannot be realized. The spec is internally inconsistent: it asks for negative boundary values while also declaring Years_working >= 0.",
+     "requested_revision": "Resolve the contradiction: either drop the negative boundary values (-8, -7, -6) from the Years_working comparison_boundary targets (keeping only 2,3,4,9,10,11), or relax the semantic rule Years_working >= 0. The spec must not list boundary literals that violate its own semantic rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires that for every nullable column each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share. Execution feedback shows event.Event_Attendance: NULL 8/57, event.Name: NULL 14/57, event.Venue: NULL 13/57, journalist.Age: NULL 7/82, journalist.Name: NULL 8/82, journalist.Nationality: NULL 5/82, journalist.Years_working: NULL 6/82, news_report.Work_Type: NULL 17/104. These are all non-zero, so the 'at least one NULL' part is met. However, the program's _plant_nulls uses a fixed share=0.10 for every nullable column rather than following the compact database's per-column share, and it plants NULLs on columns like Event_Attendance, Years_working, Nationality, and Work_Type that the specification's semantic rules and per-column patterns treat as constrained (e.g. Nationality IN ('England','Wales','Northern Ireland'), Work_Type IN (...), Years_working >= 0, Event_Attendance >= 0). Planting NULLs on these columns is permitted by the interface rule (rules constrain only non-NULL operands), but the fixed 10% share does not follow the compact share as required.",
+     "requested_revision": "Compute the NULL share per nullable column from the compact database's actual NULL fraction (schema.original_values) instead of a hard-coded 0.10, while still guaranteeing at least one NULL row per nullable column. Also confirm that planting NULLs on enum/quantity columns (Nationality, Work_Type, Years_working, Event_Attendance) is intended, since it weakens the enum/group-size patterns; if not intended, exclude those columns from _plant_nulls."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions for journalist.Nationality require group_sizes '1, 2 and >= 3' and tie_at_rank [1] on COUNT(*)/COUNT(journalist_ID). The program's _GROUP_SHAPES for Nationality is [1,1,2,3,4] (sum 11 = table size), which does produce groups of size 1, 2, and >=3. However, _enum_sequence then applies _plant_nulls to Nationality (it is nullable and not a FK), which can turn some of those group members into NULL, collapsing the intended group sizes and potentially removing the size-1/2/>=3 structure. Similarly, _boundary_int_sequence for Years_working builds group shapes but Years_working is not in _GROUP_SHAPES, so the group_sizes target for Years_working (listed in the atomic ops as GROUP(journalist.years_working) with sizes 1,2,>=3) is not implemented at all.",
+     "requested_revision": "Either add Years_working to _GROUP_SHAPES with a shape realizing 1,2,>=3, or remove the group_sizes target for Years_working from the spec if it is not actually required. For Nationality, ensure NULL planting does not destroy the required group-size structure (e.g. plant NULLs only on rows outside the shaped groups, or verify post-planting group sizes)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires event.Venue group_sizes '1, 2 and >= 3' and tie_at_rank [2] on SUM(event.event_attendance). The program's _GROUP_SHAPES for Venue is [1,1,2,3] (sum 7), but the table size for event is 5 (SPEC_TABLE_SIZES['event']=5). _text_group_sequence truncates out[:n] to 5, so the shape [1,1,2,3] is cut to [1,1,2,1] \u2014 the '>=3' group is lost. The tie_at_rank [2] on SUM(attendance) is also not implemented: _TIE_COLUMNS does not include Venue, and there is no logic to make two venues share a SUM(attendance) value.",
+     "requested_revision": "Fix the Venue group shape to fit within the event table size (e.g. [1,1,3] for n=5) so a >=3 group survives truncation, and implement the tie_at_rank [2] on SUM(event_attendance) for Venue (e.g. by constructing two venue groups whose attendance sums are equal)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires event.Event_Attendance ties_for_order_limit tie_at_rank [2] on ORDER(event_attendance, DESC). The program includes ('event','Event_Attendance') in _TIE_COLUMNS, and _boundary_int_sequence sets out[0]=out[1]=tie when len(out)>=2. However, _plant_nulls then plants NULLs on Event_Attendance (it is nullable), and NULLs sort last in DESC order in SQLite, so the tie at rank 2 may be broken or shifted. Additionally, the tie is only guaranteed for the first two generated rows, but the compact rows are appended before generated rows in the writer, so the rank-2 tie in the full table is not guaranteed.",
+     "requested_revision": "Ensure the Event_Attendance tie at rank 2 holds in the full table (compact + generated), e.g. by accounting for compact rows' attendance values when choosing the tie value, and by not planting NULLs on the rows that form the tie."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires journalist.Name duplicates_for_distinct '20-50 %' and group_sizes '1, 2 and >= 3'. The program's _text_group_sequence for Name uses _DUP_SHARE 0.30 and shape [1,1,2,3,4] (sum 11 = journalist size), which is consistent. However, _plant_nulls plants NULLs on journalist.Name (nullable), and _dedupe_pk/_dedupe_unique do not affect Name. The duplicate share is computed relative to the generated pool, but the compact rows also contain Name values; the combined duplicate share across compact+generated is not verified. This is a minor concern but the spec's '20-50 %' target is stated for the column overall.",
+     "requested_revision": "Verify the duplicate share for journalist.Name across the full table (compact + generated) falls in 20-50%, or document that the target applies only to generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies require news_report.journalist_ID and news_report.Event_ID to copy existing parent keys, with parent_rows_without_children true and child_rows_with_null_fk false. The program's _fill_single_fk draws from _parent_keys (compact + generated) and, because the columns are NOT NULL in the schema, never emits NULL. Execution feedback shows 0 FK violations and 0 not-null violations, and parent_rows_without_children is plausible given event size 5 and news_report size 7. This part is consistent.",
+     "requested_revision": "No change required; noted as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets lists news_report.journalist_ID and news_report.Event_ID, but the schema declares both NOT NULL and the uncertainty note says generation must keep them non-NULL. The program correctly keeps them non-NULL (cm.notnull check in _fill_single_fk and _check_row_ok). Execution feedback confirms 0 not-null violations. This is consistent, but the spec's null_targets field is misleading.",
+     "requested_revision": "Remove news_report.journalist_ID and news_report.Event_ID from null_targets in the spec, since they are NOT NULL and must never be NULL."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the negative Years_working boundary values (-8,-7,-6) are intended despite the Years_working >= 0 rule; the spec is self-contradictory and needs designer resolution.",
+    "Whether planting NULLs on enum/quantity columns (Nationality, Work_Type, Years_working, Event_Attendance) is intended, since it weakens the enum and group-size patterns; the interface rule permits it but the spec's per-column patterns assume non-NULL values.",
+    "Whether the group_sizes target for Years_working is actually required (it appears in atomic ops but not in the spec's per_column_exceptions).",
+    "Whether the tie_at_rank [2] on SUM(event_attendance) for Venue is implemented; no code path constructs equal attendance sums across venues.",
+    "Whether the duplicate share for journalist.Name is measured over compact+generated rows or generated rows only."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` plants NULLs on every nullable non-FK column, including `journalist.Nationality`, `journalist.Years_working`, `event.Event_Attendance`, `event.Venue`, `journalist.Age`, `journalist.Name`, `event.Name`, `event.Date`, `news_report.Work_Type`. The execution feedback confirms this: e.g. `journalist.Nationality: generated rows: NULL 5 / 96`, `journalist.Years_working: NULL 9 / 96`, `event.Event_Attendance: NULL 11 / 57`, `event.Venue: NULL 12 / 57`. However, the specification's per-column exceptions require these columns to carry shaped structures: `journalist.Nationality` must realize `enum + comparison_boundary + group_sizes + ties_for_order_limit` with `tie_at_rank [1]` on `COUNT(*)`/`COUNT(journalist_ID)`; `journalist.Years_working` must realize `comparison_boundary + ties_for_order_limit + aggregate_boundary + group_sizes` with `tie_at_rank [1,1000]`; `event.Event_Attendance` must realize `rows_with_different_values + ties_for_order_limit` with `tie_at_rank [2]`; `event.Venue` must realize `group_sizes + ties_for_order_limit` with `tie_at_rank [2]` on `SUM(event_attendance)`. The spec's own `null_planting` note for Nationality says 'plant NULLs only on rows outside the shaped groups so group sizes 1, 2, >=3 survive', and the `tie_note` for Event_Attendance says 'do not plant NULL on the tie rows'. `_protected_rows` only protects the first `sum(shape)` rows and rows {0,1}; it does not protect the rank-2 tie row for Event_Attendance (which is index 1 in a DESC ordering, but the tie is on the *value* at rank 2, and the code sets `out[0]=out[1]=tie` \u2014 index 1 is protected, but the venue SUM tie rows are not protected at all, and the Nationality/Years_working tie rows are only protected if they fall in the first two indices). More importantly, NULLs on `Years_working` and `Event_Attendance` break the `>= 0` semantic rules only for non-NULL operands (acceptable per interface), but NULLs on `Nationality`/`Venue`/`Age`/`Name` destroy the required group-size and tie structures because `_protected_rows` does not cover the venue SUM-tie rows and the shape protection is computed on the *pre-dedupe* index space while `_dedupe_pk`/`_dedupe_unique` may drop rows afterwards, shifting indices.",
+     "requested_revision": "Either (a) exclude the shaped/tie columns (`journalist.Nationality`, `journalist.Years_working`, `event.Event_Attendance`, `event.Venue`, `journalist.Age`, `journalist.Name`) from NULL planting entirely, or (b) extend `_protected_rows` to protect the venue SUM-tie rows and the rank-2 attendance tie row, and apply NULL planting *after* dedupe so protected indices remain valid. The spec should also state explicitly which shaped columns are exempt from NULL planting, since the current `null_planting` note only covers Nationality."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_venue_sum_tie` in instance.py sets `att[i] = per1` for all rows of venue v1 and `per2` for v2, then adjusts only the last row of one group to fix rounding. This makes all rows within a venue group share the same attendance value, so the `rows_with_different_values` target for `event.Event_Attendance` ('>= 2 per group with different values') is not realized for the venue groups. Also, `_boundary_int_sequence` for `Event_Attendance` uses `_INT_RANGES = (1, 10000)` and `_BOUNDARY = [0,1,2]`, but the spec's `int_quantity` rule says 'Integer in [1, 10000]; include boundary values around any listed literal' \u2014 the literal 0 is outside [1,10000] and the spec's `Event_Attendance >= 0` formula permits 0, but the range rule says [1,10000]. The code emits 0 via `_BOUNDARY`, contradicting the stated range.",
+     "requested_revision": "In `_apply_venue_sum_tie`, vary attendance values within each venue group (e.g. per1, per1+1, ...) while keeping the group sum equal, so `rows_with_different_values` holds. Reconcile the `Event_Attendance` range: either change `_INT_RANGES` to (0, 10000) in the spec, or drop 0 from `_BOUNDARY`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_enum_sequence` for `journalist.Nationality` builds `out` from `_GROUP_SHAPES[('journalist','Nationality')] = [1,1,2,3,4]` (total 11) then truncates to n=11. But `_dedupe_pk`/`_dedupe_unique` run afterwards and may drop rows, and `_plant_nulls` may NULL some of the shaped rows (see issue 1). The spec requires group sizes '1, 2 and >= 3' to survive. Additionally, `_enum_sequence` applies the case-variant substitution (`out[rng.randrange(len(out))] = rng.choice(variants)`) *after* truncation, which can overwrite a shaped row and change its group membership, breaking the intended group sizes. The spec's `enum` target lists `['England','Wales','Northern Ireland']` and `boundary_values` includes `'england','wales'`; the code does include these, but the placement is uncontrolled.",
+     "requested_revision": "Apply case-variant substitution only to rows outside the shaped groups (or to the duplicate-share filler rows), and ensure shaped rows are not overwritten. Also ensure `_dedupe_unique` does not drop shaped rows for Nationality (it is not UNIQUE, so this is fine, but the interaction with `_plant_nulls` must be fixed per issue 1)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `per_column_exceptions` for `journalist.Years_working` lists `boundary_values: [2,3,4,9,10,11]` and `aggregate_values: [9,10,11]`, and the `uncertainty` note says negative literals (-8,-7,-6) are dropped to respect `Years_working >= 0`. This is consistent with the semantic rule. However, the spec's `int_years` generic rule says 'Integer in [0, 40]', while the atomic ops include `PRED(journalist.years_working > -7)` and `PRED(journalist.years_working < 3)` with boundary values -8,-7,-6. The spec resolves this by dropping negatives, which is defensible, but the spec does not state whether the `> -7` predicate is expected to be exercised (it would be trivially true for all non-NULL values in [0,40]). This is an unresolved check, not a blocking error.",
+     "requested_revision": "Clarify in the spec whether the `> -7` boundary is intentionally unexercised (trivially true) or whether the range should be widened. No code change required if the intent is to keep Years_working >= 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_fresh_int_key` for `journalist.journalist_ID` and `event.Event_ID` uses `_INT_RANGES.get((t,col), (start, start+n+5))` \u2014 for PK columns not in `_INT_RANGES`, it draws from `[start, start+n+5]`, which is fine for uniqueness but does not respect the spec's `int_primary_key` rule 'Sequential integers starting at 1; unique; never NULL'. The code starts at `max(used)+1` (correct for appending to compact rows) but then draws *random* values in a range rather than sequential ones. This is a minor deviation: the spec says 'sequential', the code says 'random in a window above max'. The execution feedback shows no PK duplicates, so integrity holds, but the spec's stated rule is not implemented literally.",
+     "requested_revision": "Either change `_fresh_int_key` to emit strictly sequential integers (`start, start+1, ...`) for PK columns, or relax the spec's `int_primary_key` wording to 'unique integers above the compact max'. The current behavior is safe but not spec-literal."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_fill_single_fk` gives nullable FKs ~10% NULL, but both `news_report.journalist_ID` and `news_report.Event_ID` are declared NOT NULL in the schema (`PRIMARY KEY (journalist_ID, Event_ID)` and FK columns). The spec's `null_targets` is empty and the `uncertainty` note says 'Both FK columns are declared NOT NULL, so null_targets is empty and generation must keep them non-NULL.' The code's `_fill_single_fk` checks `cm.notnull`, so it will not NULL them \u2014 correct. However, `_plant_nulls` also skips FK columns via `(t, cm.name) in schema.fks`, so this is consistent. No issue here; noted as verified.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_dedupe_pk` for `news_report` dedupes on the composite PK `(journalist_ID, Event_ID)`. Since `_fill_single_fk` draws FK values randomly from parent keys, collisions on the composite PK are likely and rows are dropped. The spec's `table_sizes_per_instance` says `news_report: 7`, but the execution feedback shows `rows_added` per instance ranging 7\u201318 (summing across tables), and the `news_report` generated count is not separately reported. The spec's `uncertainty` note flags the composite PK uniqueness concern. The code handles it by dropping duplicates, which is correct for integrity but means the realized `news_report` size may be below 7. This is acceptable per the spec's 'shape must fit' philosophy but should be documented.",
+     "requested_revision": "Document in the spec that `news_report` size 7 is a target before PK dedupe, and that realized size may be lower. No code change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the venue SUM-tie and attendance rank-2 tie survive NULL planting and dedupe in all 20 instances (construction_pairs separated 12/61, but per-pair breakdown is empty in feedback).",
+    "Whether `journalist.Nationality` group sizes 1,2,>=3 survive after case-variant substitution and NULL planting.",
+    "Whether the `Years_working > -7` boundary is intentionally unexercised."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` skips any column in `_NULL_EXEMPT` and only plants NULLs on columns not in that set. `_NULL_EXEMPT` includes journalist.Nationality, journalist.Years_working, journalist.Name, journalist.Age, event.Venue, event.Event_Attendance. The spec's per_column_exceptions mark these as `null_exempt: true` with `null_planting: NONE`, so this matches the spec. However, the spec's `null_targets` is empty and the generic rule says 'at least one NULL row per nullable column per instance'. The execution feedback shows only `news_report.Work_Type: generated rows: NULL 15 / 99` \u2014 no NULLs were planted on event.Date, event.Name, or any other nullable column. event.Date and event.Name are declared `null_exempt: false` in the spec, so they are nullable and should receive at least one NULL per instance. The program never plants NULLs on them because `_plant_nulls` computes `k = max(1, int(round(share * n)))` where `share = _compact_null_share(...)`; if the compact share is 0, `k = max(1, 0) = 1`, so it should plant one NULL. But the feedback shows no NULLs on event.Date/event.Name. This indicates either the compact share computation returns 0 and the `k>=n` guard or candidate selection fails, or the columns are being skipped. Either way, the NULL rule for nullable non-exempt columns (event.Date, event.Name) is not being satisfied.",
+     "requested_revision": "Fix `_plant_nulls` so that every nullable, non-exempt column (event.Date, event.Name, news_report.Work_Type) receives at least one NULL row per instance, and verify via execution feedback that the nullable_columns report shows NULL counts for event.Date and event.Name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires `journalist.Nationality` comparison_boundary values including 'England', 'england', 'Wales', 'wales' and the predicate `journalist.nationality <= 'England' OR journalist.nationality = 'Wales'` vs `IN ('England','Wales')`. The program's `_enum_sequence` applies case-variant substitution only with probability 0.10 on a single filler row (`if variants and n > shaped_len and rng.random() < 0.10`). With journalist size 11 and shaped_len = 1+1+2+3+4 = 11, `n > shaped_len` is false (11 > 11 is false), so case variants are NEVER applied. The boundary values 'england' and 'wales' are therefore never generated, and the comparison_boundary separation for Nationality cannot be realized. Execution feedback confirms only 1 of 61 construction pairs separated.",
+     "requested_revision": "Ensure the shaped prefix length is strictly less than the table size so filler rows exist for case-variant substitution, or reduce the group shape (e.g. [1,1,2,3] = 7) so that n=11 leaves filler rows. Also raise the variant probability or guarantee at least one case-variant row per instance for Nationality."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires `journalist.Years_working` boundary values [2,3,4,9,10,11] and the aggregate_boundary `HAVING(SUM(journalist.years_working) > 10)` with values [9,10,11]. The program's `_boundary_int_sequence` uses `_GROUP_SHAPES[('journalist','Years_working')] = [1,1,2,3,4]` (sum 11) and then fills with random bounds. However, `_TIE_COLUMNS` does not include Years_working, so the tie_at_rank [1,1000] target is not constructed. The spec lists `ties_for_order_limit` with `tie_at_rank: [1, 1000]` for Years_working. The program never forces a tie at rank 1 or rank 1000 for Years_working. Execution feedback shows only 1 separated pair out of 61, consistent with missing tie construction.",
+     "requested_revision": "Add ('journalist','Years_working') to `_TIE_COLUMNS` (or a dedicated tie handler) so that at least two rows share the maximum Years_working value (rank-1 tie) and, if the table is large enough, a rank-1000 tie. Since table size is 11, the rank-1000 tie is vacuous, but the rank-1 tie must be constructed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires `event.Event_Attendance` `ties_for_order_limit` with `tie_at_rank: [2]` over DESC ordering, and `rows_with_different_values` with `>= 2 per group with different values`. The program's `_apply_venue_sum_tie` sets attendance values as `per1 + (k % 2)` alternating, which creates different values within a venue group, but it does not guarantee a tie at rank 2 in the global DESC ordering. The `_TIE_COLUMNS` set includes ('event','Event_Attendance'), and `_boundary_int_sequence` forces `out[0] = out[1] = tie`, but `_apply_venue_sum_tie` then overwrites these values for the two venue groups, potentially destroying the rank-2 tie. Execution feedback shows only 1 separated pair, suggesting the rank-2 tie is not reliably present.",
+     "requested_revision": "After `_apply_venue_sum_tie`, verify that the second-highest attendance value appears at least twice (rank-2 tie) and adjust values if needed, or construct the tie explicitly before the venue-sum adjustment and preserve it."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` section states 'Years_working negatives (-8,-7,-6) dropped to respect Years_working >= 0; the > -7 predicate is intentionally trivially true over [0,40]'. The atomic operations list `set:PRED(journalist.years_working > -7)` with boundary values [-8,-7,-6]. By dropping negatives, the boundary at -7 cannot be tested. This is a deliberate design choice but means the comparison_boundary for Years_working is only partially realized (values 2,3,4,9,10,11 but not -8,-7,-6). The semantic rule `Years_working >= 0` is supported by evidence (rows 10,5,6,21,3,7,12,8 all >= 0), so dropping negatives is defensible, but the spec should explicitly note that the `> -7` boundary is not realizable and remove it from the target list to avoid confusion.",
+     "requested_revision": "Update the spec to remove -8,-7,-6 from the Years_working comparison_boundary targets (or mark them as unrealizable due to the >= 0 semantic rule), so the program is not expected to generate them."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires `news_report` size 7 with composite PK dedupe. Execution feedback shows rows_added per instance ranging from 3 to 7 (e.g., unit 0001 added 3, unit 0002 added 7). The spec's `uncertainty` notes 'news_report size 7 is a pre-dedupe target; realized count may be lower'. This is acknowledged, but the realized counts as low as 3 mean the `aggregate_boundary` targets for news_report.Event_ID (`HAVING(COUNT(DISTINCT news_report.event_id) > 1)` with values [0,1,2]) may not be satisfiable when only 3 rows are added. The program does not attempt to ensure the post-dedupe count is at least large enough to realize the aggregate boundary targets.",
+     "requested_revision": "Increase the pre-dedupe news_report target size (e.g., to 10-12) so that after composite-PK dedupe the realized count is reliably >= 7, allowing the aggregate_boundary and group-size targets to be realized."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 1 separated construction pair out of 61 is due to the specific issues above or additional missing constructions; a full per-pair separation report would clarify.",
+    "Whether event.Date and event.Name NULL planting is failing due to compact share = 0 and the `k >= n` guard, or due to candidate selection; needs inspection of actual generated instances.",
+    "Whether the venue SUM-tie and attendance rank-2 tie survive NULL planting and dedupe in all instances; execution feedback does not report per-instance tie verification."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added = {event: 0, journalist: 0, news_report: 92}, rows_skipped = {event: 100, journalist: 220, news_report: 123}. Every generated event and journalist row was rejected by the writer (100% skip), so no new parent rows exist. The spec requires table_sizes_per_instance {event: 5, journalist: 11, news_report: 12} and per-column shapes on journalist (Nationality [1,1,2,3], Years_working [1,1,2,3,4], Name/Age [1,1,2,3,4]) and event (Venue [1,1,3], Event_Attendance rank-2 tie, venue SUM tie). None of these can be realized because zero event/journalist rows are added. The 'valid' flag only checks that some rows were added and no integrity failure occurred; it does not verify the shaped targets.",
+     "requested_revision": "Diagnose why every event and journalist row is skipped. Likely causes: (a) _fresh_int_key starts above the compact max, but the compact DB already contains rows with those IDs, so PK collisions occur on insert (writer._check_row_ok does not catch this; SQLite rejects them and they are counted as skipped); (b) _plant_nulls sets NULL on NOT NULL columns because _NULL_EXEMPT is consulted but cm.notnull is checked first \u2014 verify the actual column metadata; (c) _apply_venue_sum_tie or _boundary_int_sequence produces values outside the declared range. Fix the generator so that the specified per-table sizes and group shapes are actually realized (rows_added for event and journalist should be > 0 and match the spec shapes), and add a post-write assertion that the shaped targets hold."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` skips columns in `_NULL_EXEMPT`, which includes journalist.Nationality, journalist.Years_working, journalist.Name, journalist.Age, event.Venue, event.Event_Attendance. The generation specification's per_column_exceptions mark these columns `null_exempt: false` and explicitly require NULL planting on a filler row (e.g. 'NULL on the singleton filler row only'). The program therefore never plants NULLs on these columns, contradicting the spec. The spec's `null_targets` list includes event.Date, event.Name, event.Venue, event.Event_Attendance, journalist.Nationality, journalist.Name, journalist.Age, journalist.Years_working, news_report.Work_Type.",
+     "requested_revision": "Either (a) remove these columns from `_NULL_EXEMPT` and plant NULLs on filler rows as the spec requires, or (b) update the specification to mark them `null_exempt: true` and remove them from `null_targets`. The two must agree. Given the spec text ('null_exempt: false ... NULL on the singleton filler row only'), the program should be changed to plant NULLs on filler rows for these columns while preserving the shaped groups."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enum_sequence` builds the shaped prefix from `_GROUP_SHAPES` and then fills remaining rows. For journalist.Nationality the shape is [1,1,2,3] = 7 rows, leaving 4 filler rows. The spec requires 'at least one row carries england and one carries wales' with probability >= 0.5. The code guarantees only one variant (`out[i] = rng.choice(variants)`) and adds a second only with probability 0.5. This means in ~50% of instances only one of 'england'/'wales' appears, so the comparison_boundary target (values England, england, Wales, wales) is not reliably realized. The spec says 'case-variant substitution applied to the remaining filler rows with probability >= 0.5 so that at least one row carries england and one carries wales' \u2014 the 'so that' clause requires both to appear.",
+     "requested_revision": "Guarantee both 'england' and 'wales' appear in every instance (e.g. assign out[i]='england' and out[j]='wales' deterministically on two distinct filler rows), rather than relying on a 0.5 probability for the second variant."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_boundary_int_sequence` for journalist.Years_working uses `_GROUP_SHAPES[('journalist','Years_working')] = [1,1,2,3,4]` and `_TIE_COLUMNS` includes it, so out[0]=out[1]=tie. But the shape [1,1,2,3,4] already assigns distinct group values to positions 0 and 1 (each group size 1). Overwriting both with the same tie value merges the two singleton groups into one group of size 2, destroying the required '1, 2 and >= 3' group-size target (the two size-1 groups become one size-2 group). The same issue applies to journalist.Age and journalist.Nationality (both in _TIE_COLUMNS with shapes starting [1,1,...]).",
+     "requested_revision": "Apply the rank-1 tie without collapsing the singleton groups: e.g. set the tie on two rows that are already in the same group (a group of size >= 2), or add the tie rows as extra filler rows beyond the shaped prefix. Verify post-generation that the group-size multiset still contains 1, 2 and >= 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_venue_sum_tie` sets `att[idx1[0]] = att[idx1[1]] = top` to 'preserve the global rank-2 tie', but this overwrites the per-group varying values (per1, per1+1) and changes the group sum, breaking the venue SUM tie it just established. The function does not recompute the sum after this adjustment. Also, the rank-2 tie on Event_Attendance DESC requires the two largest values to be equal; setting two values in idx1 to `top` may or may not achieve that depending on other values, and it invalidates the sum equality.",
+     "requested_revision": "Construct the rank-2 tie and the venue SUM tie jointly: choose attendance values so that (i) two venue groups have equal sums, (ii) within each group values differ, and (iii) the two globally largest values are equal. Recompute and assert both the SUM equality and the rank-2 tie after all adjustments."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `int_years` rule says 'Integer in [0, 40]; include boundary values 2,3,4,9,10,11 (negatives -8,-7,-6 are unrealizable under the >= 0 rule and are not generated)'. The extracted atomic operations include `set:PRED(journalist.years_working > -7)` and boundary values -8,-7,-6. The spec correctly notes these are unrealizable, but the `comparison_boundary` target for Years_working still lists -8,-7,-6 as target values. This is internally inconsistent: the target cannot be met.",
+     "requested_revision": "Remove -8,-7,-6 from the comparison_boundary target values for journalist.Years_working (or explicitly mark them as unrealizable and excluded from the target), so the target matches what the program can generate."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_share` rule says 'For every nullable column ... plant a NULL at the compact per-column NULL fraction, and at least one NULL row per nullable column per instance'. But the per_column_exceptions for journalist.Nationality, journalist.Years_working, journalist.Name, journalist.Age, event.Venue, event.Event_Attendance say 'null_exempt: false' and 'NULL on the singleton filler row only'. The program's `_NULL_EXEMPT` set treats these as exempt. The spec text is ambiguous: 'null_exempt: false' suggests they should NOT be exempt, but the program treats them as exempt. The execution feedback shows only news_report.Work_Type received NULLs (16/149), confirming the other nullable columns got no NULLs.",
+     "requested_revision": "Clarify the specification: either these columns are null_exempt (and the program is correct) or they are not (and the program must plant NULLs on filler rows). Make the spec and program consistent. If they are not exempt, the program must be fixed to plant NULLs on filler rows without breaking the shaped groups."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows only 1 of 61 eligible pairs separated, with no per-group breakdown. It is unclear whether the shaped targets (group sizes, ties, boundary values) are actually realized in the generated instances, because event and journalist rows are all skipped. A post-generation verification of the shaped targets is needed once the skip issue is fixed.",
+    "The compact database's actual NULL shares per column are not shown; the program uses `_compact_null_share` but the execution feedback only reports news_report.Work_Type NULLs. It is unclear whether the compact NULL shares for event.Date, event.Name, journalist.Nationality, etc. are zero (in which case the program's 'at least one NULL' rule would apply) or non-zero.",
+    "The exact reason for 100% skip of event and journalist rows is not confirmed from the feedback; the diagnosis above is inferred from the code. The engineer should confirm by inspecting a failed insert."
+   ]
+  }
+ ]
 }

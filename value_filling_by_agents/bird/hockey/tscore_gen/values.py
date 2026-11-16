@@ -3,9 +3,24 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _near_variant(v: str, rng) -> str:
+    """5% near-variant: case flip, trailing space, or one-char edit."""
+    if not v:
+        return v
+    u = rng.random()
+    if u < 0.4:
+        return v.swapcase() if rng.random() < 0.5 else v.upper()
+    if u < 0.7:
+        return v + ' '
+    i = rng.randrange(len(v))
+    return v[:i] + rng.choice(string.ascii_letters) + v[i + 1:]
 
 
 class ColumnSampler:
@@ -39,22 +54,40 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
-        self.list_min = min(self.elements) if self.elements else self.min
-        self.list_max = min(self.max, _MAX)
+        hi_ = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_, hi_)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
+        if self.min > self.max:
+            self.min, self.max = self.max, self.min
+        raw_min = min(self.elements) if self.elements else self.min
+        raw_max = max(self.elements) if self.elements else self.max
+        self.list_min = max(self.min, min(raw_min, self.max))
+        self.list_max = max(self.list_min, min(raw_max, self.max))
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
+
+    def _clamp(self, v):
+        if v < self.min:
+            return self.min
+        if v > self.max:
+            return self.max
+        return v
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
+            if lo > hi:
+                lo, hi = hi, lo
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
@@ -67,7 +100,22 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._cast(self._clamp(v))
+
+
+class HeightSampler(NumberSampler):
+    """Height in [60,90]; occasionally emits '<tens>/<ones>' so REPLACE is exercised."""
+
+    def __init__(self, elements, p, max_l0, rng, lo=spec.HEIGHT_MIN, hi=spec.HEIGHT_MAX):
+        super().__init__(elements, p, max_l0, rng, is_int=True, lo=lo, hi=hi)
+
+    def sample(self):
+        v = super().sample()
+        if self.rng.random() < 0.10:
+            s = str(int(v))
+            if len(s) == 2:
+                return s[0] + '/' + s[1]
+        return str(int(v))
 
 
 class StringSampler(ColumnSampler):
@@ -105,6 +153,114 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Small enum pool; 5% near-variant, 2% '' when nullable."""
+
+    def __init__(self, pool, p, max_l0, rng, nullable=True):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.nullable = nullable
+
+    def sample(self):
+        r = self.rng
+        v = r.choice(self.elements) if self.elements else ''
+        u = r.random()
+        if u < 0.05:
+            v = _near_variant(v, r)
+        elif u < 0.07 and self.nullable:
+            v = ''
+        return v
+
+
+class NameSampler(ColumnSampler):
+    """Person/place names; 5% near-variant, 2% '' when nullable."""
+
+    def __init__(self, pool, p, max_l0, rng, nullable=True):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.nullable = nullable
+
+    def sample(self):
+        r = self.rng
+        v = r.choice(self.elements) if self.elements else ''
+        u = r.random()
+        if u < 0.05:
+            v = _near_variant(v, r)
+        elif u < 0.07 and self.nullable:
+            v = ''
+        return v
+
+
+class IdSampler(ColumnSampler):
+    """Identifier strings (lowercase letters + digits); 5% near-variant, 2% '' when nullable."""
+
+    def __init__(self, pool, p, max_l0, rng, nullable=True):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.nullable = nullable
+
+    def _fresh(self):
+        r = self.rng
+        n = r.randint(8, 10)
+        return ''.join(r.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+    def sample(self):
+        r = self.rng
+        if not self.elements or r.random() < self.p:
+            v = self._fresh_or_reuse(self._fresh)
+        else:
+            v = r.choice(self.elements)
+        u = r.random()
+        if u < 0.05:
+            v = _near_variant(v, r)
+        elif u < 0.07 and self.nullable:
+            v = ''
+        return v
+
+
+class NoteSampler(ColumnSampler):
+    """Small note pool; 90% NULL when nullable, else a pool value."""
+
+    def __init__(self, pool, p, max_l0, rng, nullable=True):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.nullable = nullable
+
+    def sample(self):
+        r = self.rng
+        if self.nullable and r.random() < 0.9:
+            return None
+        return r.choice(self.elements) if self.elements else None
+
+
+class NumericTextSampler(ColumnSampler):
+    """Numeric value rendered as TEXT, uniform integer in [0, 400]; 5% NULL when nullable."""
+
+    def __init__(self, elements, p, max_l0, rng, nullable=True, lo=spec.NUMERIC_TEXT_MIN,
+                 hi=spec.NUMERIC_TEXT_MAX):
+        super().__init__([str(e) for e in elements if e is not None], p, max_l0, rng)
+        self.nullable = nullable
+        self.lo, self.hi = lo, hi
+
+    def sample(self):
+        r = self.rng
+        if self.nullable and r.random() < 0.05:
+            return None
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return str(r.randint(self.lo, self.hi))
+
+
+class FlagSampler(ColumnSampler):
+    """One of a small enum pool; 5% NULL when nullable."""
+
+    def __init__(self, pool, p, max_l0, rng, nullable=True):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.nullable = nullable
+
+    def sample(self):
+        r = self.rng
+        if self.nullable and r.random() < 0.05:
+            return None
+        return r.choice(self.elements) if self.elements else None
 
 
 def _parse_date(s: str):

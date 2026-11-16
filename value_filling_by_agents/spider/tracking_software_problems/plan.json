@@ -1,53 +1,459 @@
 {
  "db": "tracking_software_problems",
- "operator_io_quirks": [
-  "All identifiers are backtick-quoted in DDL; generated SQL must double-quote them; table names are mixed-case (Problem_Log, Problem_Category_Codes) and must be preserved verbatim.",
-  "Tiny DB: every table has 2-15 rows; original_values lists are complete, so no rowid sampling needed but read_schema must still handle max_rows_per_table.",
-  "DATETIME columns store TEXT like '2011-03-13 13:11:57' (space separator, no T, no fractional seconds); storage class text contradicts declared DATETIME.",
-  "DATETIME columns dispatch to 'Date|Number(int elements)' \u2014 first element '2011-03-13 13:11:57' does NOT parse as int, so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "All VARCHAR columns store short text; several hold single letters ('t','a','b') and one holds a typo 'Datatabase' \u2014 literal pool will be tiny and noisy.",
-  "Problem_Log has 4 FKs to 4 different parents (Problem_Category_Codes, Problem_Status_Codes, Staff, Problems); Problems has 2 FKs to Staff (closure_authorised_by_staff_id, reported_by_staff_id) \u2014 same parent, two child columns.",
-  "FK graph: Staff, Product, Problem_Category_Codes, Problem_Status_Codes are level-0; Problems depends on Staff+Product; Problem_Log depends on all four \u2014 no cycles, no self-FKs.",
-  "All FKs point to existing parents with single-column INTEGER/VARCHAR PKs; no dangling FKs, no composite keys, no non-unique parents.",
-  "NOT NULL on FK columns (assigned_to_staff_id, problem_id, problem_category_code, problem_status_code, product_id, closure_authorised_by_staff_id, reported_by_staff_id, date_problem_reported) \u2014 TS does not enforce NOT NULL in Python, so NULL FK draws will fail at insert and be skipped.",
-  "PKs are single-column INTEGER (autoincrement-like) or VARCHAR(20); no composite PKs, no UNIQUE constraints beyond PK.",
-  "No CHECK constraints, no views, no triggers, no indexes beyond PK in DDL.",
-  "date_problem_closed is nullable but null_rate 0.0 in original \u2014 TS may still emit NULLs there (Date fuzzer with p>0 returns elements, not NULLs, so likely fine)."
- ],
- "operator_ts_expectations": [
-  "String fuzzer on VARCHAR(20/80/255) columns: fresh random strings over a-zA-Z 0-9() of length 0-20 (or 0-255 for VARCHAR(255) via args[0]) plus 5 sampled originals + literal-pool values; contaminate 50% of the time \u2014 produces implausible names like 'xq3()' for staff_first_name.",
-  "Date fuzzer on DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max of parsed originals (1973-2013), p=0.2 means 20% element reuse, 80% fresh uniform dates \u2014 plausible format but random years.",
-  "Number fuzzer on INTEGER PKs: range [-10^0, 10^0] = [-1,1] for scale 0 (INTEGER has no args \u2192 scale 0), so PKs are tiny ints perturbed by \u00b11/\u00b12 \u2014 collides heavily, sample_fresh_primary_keys drops duplicates, shrinking tables.",
-  "Number fuzzer on INTEGER FK columns: same tiny range, but FK fill draws from parent's already-generated values with replacement \u2014 so FK values are valid but heavily duplicated (distinct 9-11 in original, TS will produce fewer).",
-  "FK fill: Problem_Log.problem_id draws from Problems.problem_id AFTER Problems PK dedup \u2014 if Problems shrinks to 1-2 rows, Problem_Log FK has almost no variety.",
-  "String fuzzer on VARCHAR PKs (problem_category_code, problem_status_code): fresh random strings + 5 originals + pool; PK dedup drops most, leaving ~3-5 rows \u2014 matches original cardinality by luck.",
-  "Literal pool from train SQL: tiny DB, few queries, pool will be sparse; most columns fall back to 5 originals + fresh draws.",
-  "Likely FN driver: String fuzzer produces implausible values (random chars) for name/description columns, so queries filtering on real names ('Lacey') return empty in TS instances \u2192 gold non-empty, TS empty \u2192 FN.",
-  "Likely FP driver: Number fuzzer's tiny range [-1,1] on INTEGER columns makes many rows share values, so COUNT/aggregate queries may coincidentally match gold on degenerate instances \u2192 FP.",
-  "Date fuzzer's 80% fresh uniform dates over 1973-2013 range means date-range predicates (BETWEEN) will often match by chance \u2192 possible FP on date filters.",
-  "No CHECK/NOT NULL enforcement in Python: NULL FK draws (when parent empty) fail insert and are skipped, silently shrinking Problem_Log/Problems \u2014 TS may produce empty child tables."
- ],
- "challenger_refs": [
-  "G4",
-  "gc9b3a9da",
-  "G1",
-  "g573a79f9",
-  "G2",
-  "G5",
-  "g8fde42a8",
-  "g8fde42a8",
-  "G3",
-  "ga13c724d",
-  "ga13c724d",
-  "ga13c724d",
-  "g4c0501d8",
-  "g4c0501d8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; no duplicates (PK uniqueness is a hard constraint).",
+   "integer_fk": "Uniformly sampled from the parent table's generated primary-key values; never NULL unless the column is nullable.",
+   "varchar_short": "Random lowercase alphabetic strings of length 1-12; 20-50% of rows reuse an existing value to create duplicates for DISTINCT; near-variants (case flips, one-character edits) of any listed literal are included.",
+   "varchar_name": "Random capitalized alphabetic strings of length 3-12 (first character uppercase, remaining lowercase); 20-50% duplicate share for DISTINCT columns; near-variants of listed literals included.",
+   "varchar_long": "Random lowercase alphabetic strings of length 1-20; 20-50% duplicate share for DISTINCT columns.",
+   "datetime": "Random timestamps between 1970-01-01 00:00:00 and 2015-12-31 23:59:59 in exact format %Y-%m-%d %H:%M:%S (zero-padded); distinct per row unless a tie is required.",
+   "nullable_columns": "Each nullable column gets at least one NULL row per instance. When the compact database's observed NULL share is 0%, use a small share (5-10%) to guarantee at least one NULL; otherwise follow the compact share. NOT NULL and primary-key columns never get NULL.",
+   "boundary_values": "For each listed equality literal, include the literal itself, its case-flipped variant, and one-character near-variants; for numeric boundaries include literal-1, literal, literal+1.",
+   "tie_creation": "For ORDER columns, ensure at least three rows share the same aggregate value at the listed rank (both ASC and DESC where listed).",
+   "group_sizes": "For GROUP columns, construct at least one group of size 1, one of size 2, and one of size >= 3."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Product.product_name"
+    ],
+    "targets": {
+     "values": [
+      "voluptatem",
+      "VOLUPTATEM",
+      "pta",
+      "PTA",
+      "up",
+      "UP",
+      "volup",
+      "VOLUP"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Product.product_name"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "Product.product_name"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      3
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(problems.problem_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "Product.product_name"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Staff.staff_last_name"
+    ],
+    "targets": {
+     "values": [
+      "Berge",
+      "berge",
+      "Medhurst",
+      "medhurst",
+      "Bosco",
+      "bosco",
+      "Turcotte",
+      "turcotte"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Staff.staff_last_name"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Staff.staff_first_name"
+    ],
+    "targets": {
+     "values": [
+      "Christop",
+      "christop",
+      "Ashley",
+      "ashley",
+      "Lysanne",
+      "lysanne"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Staff.staff_first_name"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "columns": [
+     "Problems.problem_id"
+    ],
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "Product.product_id"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      3
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(problems.problem_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "Product.product_id"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Problems.problem_description"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "Problems.problem_description"
+    ],
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "Problems.product_id"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "columns": [
+     "Problem_Log.log_entry_date"
+    ],
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "Problem_Log.problem_id"
+    ],
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "Problems.reported_by_staff_id",
+     "Staff.staff_id"
+    ],
+    "targets": {
+     "joins_with": [
+      "Staff.staff_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "Product.product_details"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Problem_Log",
+    "child_column": "problem_category_code",
+    "parent_table": "Problem_Category_Codes",
+    "parent_column": "problem_category_code",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problem_Log",
+    "child_column": "assigned_to_staff_id",
+    "parent_table": "Staff",
+    "parent_column": "staff_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problem_Log",
+    "child_column": "problem_id",
+    "parent_table": "Problems",
+    "parent_column": "problem_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problem_Log",
+    "child_column": "problem_status_code",
+    "parent_table": "Problem_Status_Codes",
+    "parent_column": "problem_status_code",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problems",
+    "child_column": "closure_authorised_by_staff_id",
+    "parent_table": "Staff",
+    "parent_column": "staff_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problems",
+    "child_column": "product_id",
+    "parent_table": "Product",
+    "parent_column": "product_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Problems",
+    "child_column": "reported_by_staff_id",
+    "parent_table": "Staff",
+    "parent_column": "staff_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Problem_Category_Codes",
+    "column": "problem_category_code",
+    "formula": "problem_category_code IN ('Datatabase','GUI','Middleware')"
+   },
+   {
+    "table": "Problem_Status_Codes",
+    "column": "problem_status_code",
+    "formula": "problem_status_code IN ('Reported','Solved')"
+   },
+   {
+    "table": "Problem_Log",
+    "column": "problem_category_code",
+    "formula": "problem_category_code IN ('Datatabase','GUI','Middleware')"
+   },
+   {
+    "table": "Problem_Log",
+    "column": "problem_status_code",
+    "formula": "problem_status_code IN ('Reported','Solved')"
+   },
+   {
+    "table": "Problems",
+    "column": "date_problem_closed",
+    "formula": "date_problem_closed IS NULL OR date_problem_closed >= date_problem_reported",
+    "condition": "date_problem_closed IS NOT NULL",
+    "evidence": "Soft/uncertain: row 2 (reported 1988-11-07, closed 1973-06-07) contradicts; enforced only as a soft preference, not a universal rule."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Problem_Category_Codes": 0,
+   "Problem_Status_Codes": 0,
+   "Staff": 15,
+   "Product": 15,
+   "Problems": 15,
+   "Problem_Log": 15
+  },
+  "null_targets": [
+   "Problem_Log.log_entry_date",
+   "Problem_Log.log_entry_description",
+   "Problem_Log.log_entry_fix",
+   "Problem_Log.other_log_details",
+   "Problems.date_problem_closed",
+   "Problems.problem_description",
+   "Problems.other_problem_details",
+   "Product.product_name",
+   "Product.product_details",
+   "Staff.staff_first_name",
+   "Staff.staff_last_name",
+   "Staff.other_staff_details",
+   "Problem_Category_Codes.problem_category_description",
+   "Problem_Status_Codes.problem_status_description"
+  ],
+  "supporting_evidence": {
+   "enum category": "Problem_Category_Codes rows: Datatabase, GUI, Middleware.",
+   "enum status": "Problem_Status_Codes rows: Reported, Solved.",
+   "date_problem_closed >= date_problem_reported": "Rows 1,3,4 satisfy; row 2 (reported 1988-11-07, closed 1973-06-07) contradicts, so rule is soft/conditional only.",
+   "log_entry_date lower bound": "Not verified in sample; dropped from semantic rules."
+  },
+  "uncertainty": "The date order rule for Problems.date_problem_closed vs date_problem_reported is contradicted by row 2, so it is kept only as a soft/conditional rule. The log_entry_date lower-bound rule is unsupported and removed. Enum values for category and status codes are certain from the sample. Compact NULL shares are 0%; a small 5-10% share is used to guarantee at least one NULL per nullable column. Problem_Category_Codes and Problem_Status_Codes are set to 0 generated rows because the compact DB already contains all enum values and new rows would collide on the primary key."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` sets NULLs on every nullable column in `_NULL_TARGETS` with share 5-10%, but the spec's `nullable_columns` rule says the NULL share should follow the compact database's share (0% observed). The execution feedback shows NULL shares of ~12-16% (e.g. Problem_Log.log_entry_date 40/260, Staff.staff_last_name 49/300), well above the 5-10% target and far above the compact 0%. More importantly, the spec's own `uncertainty` note says 'NULL shares are 0% in the sample; a small share is used to satisfy the NULL generation requirement', so the program's behavior is consistent with the spec text, but the spec's generic rule ('NULL share follows the compact database share') is contradicted by the per-instance 5-10% instruction. This is a spec inconsistency, not a program bug.",
+     "requested_revision": "Designer: reconcile the `nullable_columns` generic rule with the `uncertainty` note. Either state explicitly that when the compact share is 0% a small share (5-10%) is used to guarantee at least one NULL, or drop the 'follows compact share' clause. The program already implements the 5-10% interpretation; no code change needed if the spec is clarified."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec lists `duplicates_for_distinct` for `Problems.problem_id` with target '20-50 %', but `Problems.problem_id` is the INTEGER PRIMARY KEY. The program correctly generates fresh sequential PKs (`_fresh_int_pk`) and the execution feedback shows `pk_duplicates: 0`. A 20-50% duplicate share on a primary key is impossible without violating the PK constraint. The atomic-operation extraction likely mis-attributed a DISTINCT pattern to the PK column.",
+     "requested_revision": "Designer: remove the `duplicates_for_distinct` exception for `Problems.problem_id` (and any other PK column), since PK uniqueness is a hard integrity constraint. The program's behavior (unique PKs) is correct; the spec entry is erroneous."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `supporting_evidence` for `date_problem_closed >= date_problem_reported` explicitly states row 2 contradicts the rule (closed 1973-06-07 before reported 1988-11-07) and concludes 'Remove or mark as uncertain.' Yet the `semantic_rules_and_formulas` still lists `date_problem_closed IS NULL OR date_problem_closed >= date_problem_reported` as a rule, and the program enforces it (`_apply_date_rules` moves closed forward). The evidence does not support the rule as universal; it is at best a conditional/uncertain pattern.",
+     "requested_revision": "Designer: either remove the date-order rule from `semantic_rules_and_formulas` (since the compact data contradicts it) or explicitly mark it as a soft/uncertain rule that the generator may enforce. If kept, the program's enforcement is acceptable, but the spec should not present it as a supported universal rule given the contradicting evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `log_entry_date` rule (`log_entry_date IS NULL OR log_entry_date >= (SELECT MIN(date_problem_reported) ...)`) is listed in `semantic_rules_and_formulas`, but the `supporting_evidence` says 'Not verified; drop.' The program nonetheless enforces it in `_apply_log_date_rule`. This is a rule the spec itself flags as unsupported, yet the program implements it. Enforcing an unsupported rule can over-constrain generated data and reduce value variation.",
+     "requested_revision": "Designer: remove the `log_entry_date` lower-bound rule from `semantic_rules_and_formulas` (per the spec's own 'drop' note), or provide evidence. Engineer: if the rule is removed from the spec, remove `_apply_log_date_rule` from instance.py."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `tie_creation` rule requires 'at least three rows share the same aggregate value at the listed rank' for ORDER columns (Product.product_name, Product.product_id with COUNT(problems.problem_id)/COUNT(*)). The program does not implement any tie-creation logic: `build_random_instance` samples FK `Problems.product_id` uniformly from parent values, and there is no code ensuring a rank-3 tie in the COUNT aggregate. The execution feedback's `construction_pairs` shows only 19/48 separated, and `construction_pairs_by_group` is empty, suggesting tie/order patterns are not being exercised. The `ties_for_order_limit` exceptions are in the spec but have no corresponding implementation.",
+     "requested_revision": "Engineer: implement tie creation for the `ties_for_order_limit` patterns \u2014 e.g. after generating `Problems.product_id`, adjust the distribution so that at least three products share the same COUNT(problems.problem_id) at rank 3 (both ASC and DESC for product_id). Alternatively, if ties are not required for correctness, the designer should remove the `tie_creation` rule and the `ties_for_order_limit` exceptions from the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` rule requires group sizes '1, 2 and >= 3' for Product.product_name, Product.product_id, and Product.product_details. The program does not implement any group-size control: `Product` rows are generated with random names/details and `Problems.product_id` is sampled uniformly, so group sizes are whatever falls out. With 15 products and 15 problems, uniform sampling gives mostly size-0/1 groups; there is no guarantee of a size-2 and a size->=3 group. The execution feedback does not report group-size verification, and `construction_pairs_by_group` is empty.",
+     "requested_revision": "Engineer: add explicit group-size construction for the `group_sizes` patterns (e.g. assign `Problems.product_id` so that at least one product has 1 problem, one has 2, and one has >=3; similarly for product_name/product_details grouping). Or designer: remove the `group_sizes` exceptions if not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` rule requires including the literal, its case-flipped variant, and one-character near-variants for each listed equality literal (e.g. 'voluptatem', 'VOLUPTATEM', 'pta', 'PTA', 'up', 'UP', 'volup', 'VOLUP' for Product.product_name; 'Berge'/'berge' etc. for Staff.staff_last_name). The program's `_boundary_variants` in values.py generates case-flips and one-char edits from the literal pool, but the literal pool is seeded from query SQLs (`seed_literal_pool_from_queries`), not from the spec's explicit `targets.values` lists. If the query pool does not contain these exact literals, the boundary variants will not be generated. The spec's `per_column_exceptions` lists the exact target values, but the program never reads them \u2014 it only uses `literal_pool` derived from `--pool-sqls`. There is no code path that injects the spec's `targets.values` into the sampler.",
+     "requested_revision": "Engineer: inject the spec's `per_column_exceptions` target values (the `targets.values` lists) into the literal pool for the corresponding columns, so that `_boundary_variants` produces the required case-flips and near-variants. Currently the program relies solely on query-derived literals, which may not include 'voluptatem', 'Berge', etc."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` rule for `Problems.reported_by_staff_id` / `Staff.staff_id` requires `parent_rows_without_children: true` (some Staff rows have no Problems referencing them) and `child_rows_with_null_fk: false`. The program's `fill_foreign_keys_consistently` samples FK values uniformly from parent values, which with 15 Staff and 15 Problems will typically leave some Staff unreferenced (satisfying parent_rows_without_children) and never produces NULL FKs (satisfying child_rows_with_null_fk: false). However, this is not guaranteed \u2014 uniform sampling could in principle reference all 15 staff. There is no explicit construction ensuring at least one unreferenced Staff row. The execution feedback does not verify this pattern.",
+     "requested_revision": "Engineer: add explicit construction to guarantee at least one Staff row with no referencing Problems row (e.g. reserve one staff_id and exclude it from the FK sampling pool for reported_by_staff_id). Or designer: confirm that probabilistic satisfaction is acceptable for this pattern."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `rows_with_different_values` rule for `Problem_Log.log_entry_date` requires '>= 2 per group with different values' (grouped by problem_id). The program's `_apply_log_date_rule` only enforces a lower bound; it does not ensure that at least two log entries per problem have different dates. With 15 Problem_Log rows and 15 Problems, most problems have 0-1 log entries, so the '>= 2 per group' condition is rarely met. The execution feedback does not report this pattern.",
+     "requested_revision": "Engineer: construct Problem_Log rows so that at least one problem_id has >= 2 log entries with different log_entry_date values (e.g. duplicate a problem_id in Problem_Log and assign distinct dates). Or designer: relax the rule if not required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `table_sizes_per_instance` sets Problem_Category_Codes=3 and Problem_Status_Codes=2, but the execution feedback shows `rows_added: {Problem_Category_Codes: 0, Problem_Status_Codes: 0}`. The program's `_apply_enum_domains` overwrites the PK columns with random choices from the enum lists, then `sample_fresh_primary_keys` drops rows whose PK collides with compact rows. Since the compact DB already contains all 3 category codes and both status codes, every generated row collides and is dropped. The spec's enum domains (`IN ('Datatabase','GUI','Middleware')` and `IN ('Reported','Solved')`) are fully covered by the compact rows, so generating 3/2 additional rows is impossible without PK collisions. The spec's table sizes are therefore inconsistent with the enum domains and the compact data.",
+     "requested_revision": "Designer: either remove Problem_Category_Codes and Problem_Status_Codes from `table_sizes_per_instance` (since the compact DB already contains all enum values and no new rows can be added), or expand the enum domains to allow additional distinct codes. The program's behavior (0 added rows) is a correct consequence of the spec's own constraints, but the spec's table sizes are misleading."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `varchar_name` rule says 'Random capitalized alphabetic strings of length 3-12'. The program's `StringSampler` with `kind='name'` uses `self.alpha = _UPPER + _LOWER` and generates strings of length 3-12, but the first character is not forced to be uppercase \u2014 it is a random choice from upper+lower. So generated names may start with lowercase, violating 'capitalized'. Similarly, `varchar_short` and `varchar_long` use lowercase-only alphabets, which is correct, but the 'name' kind does not enforce capitalization.",
+     "requested_revision": "Engineer: in `StringSampler._rand` for `kind='name'`, force the first character to be uppercase (e.g. `self.rng.choice(_UPPER) + ''.join(self.rng.choice(_LOWER) for _ in range(k-1))`)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `datetime` rule says 'Random timestamps between 1970-01-01 00:00:00 and 2015-12-31 23:59:59 in format %Y-%m-%d %H:%M:%S; distinct per row unless a tie is required.' The program's `DateSampler._draw` uses `self.template` derived from the first parseable original value, and `self.strip0` may strip leading zeros (e.g. '1978-6-26' instead of '1978-06-26'). The spec requires the exact format `%Y-%m-%d %H:%M:%S`, but the program may produce non-zero-padded dates. Also, `_fresh_or_reuse` may reuse values once `max_l0` is exceeded, so 'distinct per row' is not guaranteed.",
+     "requested_revision": "Engineer: for DATETIME columns, force `self.template = '%Y-%m-%d %H:%M:%S'` and `self.strip0 = False` so the output format matches the spec exactly. Also ensure distinctness per row (e.g. track used timestamps) unless a tie is explicitly required."
+    }
+   ],
+   "unresolved_checks": [
+    "The `construction_pairs` feedback shows 19/48 separated with an empty `construction_pairs_by_group`, so it is not possible to confirm which specific patterns (ties, group sizes, boundaries) are actually exercised. The missing separation may be due to unimplemented tie/group-size construction (issues above) rather than query equivalence.",
+    "The `unmatched_join_rows` and `rows_with_different_values` patterns are not verified by the execution feedback; their satisfaction is probabilistic, not guaranteed.",
+    "The `comparison_boundary` target values are not confirmed to be present in the generated data because the program does not inject the spec's explicit target lists into the literal pool.",
+    "The `duplicates_for_distinct` 20-50% share is not verified per column in the feedback; only aggregate NULL shares are reported."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Semantic rule 'date_problem_closed >= date_problem_reported' is explicitly marked soft/uncertain in the spec (row 2 contradicts it: reported 1988-11-07, closed 1973-06-07). The spec correctly downgrades it to a soft preference and the program (instance.py `_apply_date_rules`) enforces it only as a soft preference, leaving NULL operands untouched. Enum domains for Problem_Category_Codes/Problem_Status_Codes are supported by the sample and implemented by construction (`_apply_enum_domains`). The 'log_entry_date lower bound' rule was correctly dropped as unsupported.",
+     "requested_revision": "None required; the uncertain rule is handled as a soft preference, consistent with the evidence. Optionally document that the soft rule is not a hard constraint so downstream checks do not treat it as a violation."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Execution feedback shows all nullable columns have at least one NULL and a non-trivial NULL share (e.g. Problem_Log.log_entry_date NULL 37/260, Problems.date_problem_closed NULL 45/300). No nullable column reports 'NULL 0 / n'. NOT NULL/PK columns have no NULLs (not_null_violations=0, pk_duplicates=0).",
+     "requested_revision": "None; NULL rule satisfied."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Integrity feedback: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0 across 20 instances; rows_added matches spec table sizes (Staff/Product/Problems/Problem_Log = 15 each, code tables 0), rows_skipped all 0. Generation is reproducible (reproducible=true). Compact rows are preserved by copying the original DB and appending (`write_instance_sqlite` uses shutil.copyfile then INSERT).",
+     "requested_revision": "None; integrity, dependency consistency, compact-row preservation, and reproducibility all hold."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Value domains implemented by construction: varchar_short/name/long lengths and duplicate share in values.py StringSampler; datetime range 1970-01-01..2015-12-31 with exact %Y-%m-%d %H:%M:%S format in DateSampler; boundary variants (literal, case-flip, one-char edits) via `_boundary_variants` and injected spec literals via `_inject_spec_literals`. Structural patterns (ties_for_order_limit, group_sizes, rows_with_different_values, unmatched_join_rows) are constructed in instance.py. construction_pairs: 20/48 separated, 0 unknown executions \u2014 separation is partial but a missing separation alone does not prove a generation error.",
+     "requested_revision": "None blocking. Note: only 20 of 48 construction pairs separated; this is acceptable per instructions but the engineer may wish to strengthen tie/group construction (e.g. `_assign_problem_product_ids` plan [1,2,3,3,3] plus extras may not guarantee a rank-3 tie under both ASC and DESC for COUNT(*) vs COUNT(problem_id) simultaneously) if higher separation is desired."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "`_assign_problem_product_ids` builds a count plan [1,2,3,3,3] then appends 'extra' rows cycling product_ids, which can inflate some products' counts and potentially break the intended rank-3 tie at count 3. Similarly `_reserve_unmatched_staff` reserves one staff for reported_by_staff_id but that staff may still appear as closure_authorised_by_staff_id, so the 'parent_rows_without_children' target is only guaranteed on the reported_by edge. These are construction-strength observations, not integrity errors (fk_violations=0).",
+     "requested_revision": "Optional: make the count plan deterministic (e.g. cap extras so no product exceeds the tie count, or explicitly reserve products for the tie) and reserve the unmatched staff from all Problems staff references if a fully unmatched Staff row is required. Not blocking."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the rank-3 tie for COUNT(problems.product_id)/COUNT(*) holds under both ASC and DESC given the 'extra' cycling in `_assign_problem_product_ids` was not directly verified from execution output (construction_pairs_by_group is empty).",
+    "Whether a Staff row is fully unmatched on all Problems edges (reported_by and closure_authorised_by) was not verified; only the reported_by edge is reserved."
+   ]
+  }
+ ]
 }

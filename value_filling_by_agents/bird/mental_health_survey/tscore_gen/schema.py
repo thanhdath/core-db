@@ -1,5 +1,7 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + specification loading."""
+import json
 import math
+import os
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +36,9 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    spec: dict = field(default_factory=dict)
+    null_share: dict = field(default_factory=dict)
+    coded_pk: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +63,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +78,58 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def load_specification(orig_path: str) -> dict:
+    """Read tscore_gen/specification.json next to the package (written by the pipeline)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, 'specification.json'),
+                 os.path.join(os.path.dirname(here), 'tscore_gen', 'specification.json')):
+        if os.path.exists(cand):
+            try:
+                with open(cand) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+    return {}
+
+
+def _detect_coded_pks(schema: 'Schema') -> dict:
+    """Find single-column integer PKs whose compact values are a small coded set."""
+    out: dict = {}
+    exc = (schema.spec or {}).get('per_column_exceptions') or []
+    for t, tm in schema.tables.items():
+        if len(tm.primary_key) != 1:
+            continue
+        pk = tm.primary_key[0]
+        col = next((c for c in tm.columns if c.name == pk), None)
+        if col is None or 'int' not in (col.type_str or '').lower():
+            continue
+        ov = [v for v in schema.original_values.get((t, pk), []) if v is not None]
+        try:
+            ivs = sorted({int(v) for v in ov})
+        except (TypeError, ValueError):
+            continue
+        if len(ivs) < 2:
+            continue
+        span = ivs[-1] - ivs[0]
+        coded = len(ivs) <= 25 and span <= 4 * max(1, len(ivs))
+        boundaries: list = []
+        for e in exc:
+            if e.get('column') != '%s.%s' % (t, pk):
+                continue
+            if e.get('pattern') == 'comparison_boundary':
+                for v in (e.get('targets') or {}).get('values') or []:
+                    try:
+                        boundaries.append(int(v))
+                    except (TypeError, ValueError):
+                        pass
+        if coded or boundaries:
+            lo = min(ivs + boundaries) if boundaries else ivs[0]
+            hi = max(ivs + boundaries) if boundaries else ivs[-1]
+            pool = list(range(lo - 1, hi + 2))
+            out[(t, pk)] = pool
+    return out
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -122,7 +179,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, null_share = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +193,15 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                col_vals = [r[j] for r in rows]
+                ov[(t, c.name)] = col_vals
+                if col_vals:
+                    null_share[(t, c.name)] = sum(1 for v in col_vals if v is None) / float(len(col_vals))
+                else:
+                    null_share[(t, c.name)] = 0.0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    spec = load_specification(orig_path)
+    sch = Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, spec, null_share)
+    sch.coded_pk = _detect_coded_pks(sch)
+    return sch

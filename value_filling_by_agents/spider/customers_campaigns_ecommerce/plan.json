@@ -1,51 +1,608 @@
 {
  "db": "customers_campaigns_ecommerce",
- "operator_io_quirks": [
-  "All identifiers are backtick-quoted in DDL; tables use mixed case (Mailshot_Campaigns, Customer_Addresses, Order_Items) \u2014 must preserve original spelling and double-quote in generated SQL.",
-  "Tiny DB: every table has 15-20 rows, so read_schema's 300k row cap never triggers; original_values are complete.",
-  "DATETIME columns store TEXT like '2018-02-15 09:52:17' (space-separated, no T, no fractional seconds); ts_fuzzer dispatch is 'Date|Number(int elements)' \u2014 first element parses as int? No, so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "customer_login is 100% NULL (distinct=0, storage=['null']) \u2014 String sampler gets no elements, p:=1, generates fresh strings; original_values all None.",
-  "order_delivered_datetime has distinct=1 (single value '2018-03-20 12:00:00') \u2014 Date range collapses to <2 distinct, falls back to 1800-01-01..2100-01-01.",
-  "item_status_code distinct=1 ('good'), order_shipping_charges / item_order_quantity are VARCHAR storing numeric-looking text ('85.79','6') \u2014 String fuzzer, not Number.",
-  "Customer_Addresses, Mailshot_Customers, Order_Items have NO primary key (pk=[]) \u2014 sample_fresh_primary_keys is a no-op; drop_unique_duplicates also no-op (no unique cols).",
-  "No composite PKs, no self-FKs, no dangling FKs, no non-unique FK parents \u2014 all FKs point to single-column INTEGER PKs that exist.",
-  "FK child columns (customer_id, premise_id, mailshot_id, order_id, product_id) are INTEGER NOT NULL but declared type dispatches to Number fuzzer; FK fill overrides with parent values.",
-  "product_category appears in both Products ('Food','Electronics',...) and Mailshot_Campaigns ('food','clothes') \u2014 case differs; literal-pool anchoring by column name will merge them.",
-  "customer_password VARCHAR(10) holds 10-char hex strings; String fuzzer length range [10,11] from elements, but fresh draws use CHARSET a-zA-Z 0-9() of length in [10,11].",
-  "No views, triggers, or indexes beyond PKs in DDL; empty-clone creation is straightforward."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on all DATETIME columns with template %Y-%m-%d %H:%M:%S; range from min/max of 5 sampled originals (e.g. 1929..2018 for date_address_from) \u2014 fresh dates stay in that window, plausible.",
-  "Number fuzzer on all INTEGER PKs and FK columns: range [-10^0,10^0]=[-1,1] for scale=0 (INTEGER has no args -> scale=0), so fresh PKs are tiny ints {-1,0,1} perturbed \u2014 likely collides with existing small PKs, driving PK-duplicate drops.",
-  "String fuzzer on VARCHAR columns: 5 sampled originals + distinct pool values, p=0.2 fresh random strings over a-zA-Z 0-9() with contaminate 0.5 \u2014 names/emails/phones become gibberish, likely FN on LIKE/equality predicates over customer_name, customer_email, product_name.",
-  "Enum-like columns (payment_method 2 vals, premises_type 3, order_status_code 3, address_type_code 2, outcome_code 2) get fresh random strings w.p. 0.2 \u2014 breaks equality predicates like payment_method='Credit Card' -> FN.",
-  "customer_login all-NULL: String sampler with no elements -> p=1, always fresh strings; any IS NULL predicate on it becomes FN (no NULLs generated).",
-  "order_delivered_datetime single distinct value: Date range fallback 1800..2100, fresh dates wildly out of the 2018 cluster \u2014 predicates comparing to '2018-03-20' likely FN.",
-  "FK consistency: child draws from parent's FINAL filtered values with replacement; since parent PKs are tiny ints and heavily deduped, child FK columns get few distinct values \u2014 joins still work but cardinalities skew.",
-  "No PK on 3 tables -> no dedup, rows can repeat; COUNT(DISTINCT) predicates may over/under-count vs original.",
-  "VARCHAR numeric columns (order_shipping_charges, item_order_quantity) get String fuzzer -> non-numeric text; CAST/arithmetic predicates FN.",
-  "Small table sizes (15-20 rows) mean choose_table_sizes produces 30-2300 rows \u2014 much larger than original, so COUNT(*) predicates and 'no rows' predicates flip.",
-  "Literal pool from train SQL anchors product_category across Products/Mailshot_Campaigns (case mismatch) \u2014 pool values may leak 'Food' into mailshot rows, plausible but not original.",
-  "Known TS misses: FN from implausible fresh strings on enum/name columns; FP from missing ties (no PK on 3 tables) and from tiny-int PK collisions causing spurious duplicate drops."
- ],
- "challenger_refs": [
-  "G1",
-  "ga6659c81",
-  "ga6659c81",
-  "ga6659c81",
-  "gefffa98d",
-  "g29042a8f",
-  "G2",
-  "g671b3efc",
-  "ga1578962",
-  "gbec69ac8",
-  "gbec69ac8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1; unique; never NULL; declared INTEGER; exclude every compact-DB PK value of the same table (coerce non-int PKs to int for the taken-set) and every UNIQUE column value so generated rows are never skipped.",
+   "integer_fk": "Copy from parent PK pool; allow parent rows without children; NULL only if column nullable.",
+   "varchar_short_enum": "Sample from the enum pool of the column; near-variants (case/whitespace) only where listed in per_column_exceptions.",
+   "varchar_text": "Random short text; allow near-duplicates; NULL only if nullable.",
+   "varchar_numeric_string": "Numeric string with 2 decimals, e.g. printf('%.2f', x); NULL only if nullable.",
+   "datetime": "Random datetime in 2008-01-01..2018-03-31; respect table date-order rules; NULL only if nullable.",
+   "null_share": "For each nullable column, plant at least one NULL row per instance and persist it through the writer (verify the written rows contain the NULLs); share ~ observed null_rate (0.0 here means rare, still plant >=1 NULL).",
+   "boundary": "For columns listed in per_column_exceptions with pattern comparison_boundary, include each listed literal and one near-variant (case change) only where the column has no strict IN-domain formula; where a strict IN-domain formula exists, the domain is extended to include the case variants so the boundary literals remain valid.",
+   "ties": "For ORDER columns, include at least two rows sharing the same value at the listed rank.",
+   "duplicates": "For DISTINCT columns, ensure 20-50% duplicate share.",
+   "group_sizes": "Ensure groups of size 1, 2 and >=3 exist for GROUP columns."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Customers",
+    "column": "payment_method",
+    "pattern": "enum",
+    "targets": [
+     "Credit Card",
+     "Direct Debit"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "customer_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "customer_name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Customers",
+    "column": "customer_login",
+    "pattern": "null_rows",
+    "targets": [
+     "all NULL"
+    ]
+   },
+   {
+    "table": "Premises",
+    "column": "premises_type",
+    "pattern": "enum",
+    "targets": [
+     "Warehouse",
+     "Residence",
+     "Office"
+    ]
+   },
+   {
+    "table": "Premises",
+    "column": "premises_type",
+    "pattern": "null_rows",
+    "targets": [
+     "none (NOT NULL column)"
+    ]
+   },
+   {
+    "table": "Premises",
+    "column": "premise_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "Products",
+    "column": "product_category",
+    "pattern": "enum",
+    "targets": [
+     "Food",
+     "Electronics",
+     "Books",
+     "Hardware"
+    ]
+   },
+   {
+    "table": "Mailshot_Campaigns",
+    "column": "product_category",
+    "pattern": "enum",
+    "targets": [
+     "food",
+     "clothes"
+    ]
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "outcome_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "No Response",
+     "no response",
+     "Order",
+     "order"
+    ]
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "outcome_code",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(DISTINCT outcome_code) = 2"
+    ]
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "outcome_code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "ASC, no LIMIT"
+    ]
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "mailshot_id",
+    "pattern": "null_rows",
+    "targets": [
+     "none (NOT NULL column)"
+    ]
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Cancelled",
+     "Delivered",
+     "Paid"
+    ]
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_status_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Paid",
+     "paid"
+    ]
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "shipping_method_code",
+    "pattern": "enum",
+    "targets": [
+     "Unspecified",
+     "FedEx",
+     "UPS"
+    ]
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "shipping_method_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "FedEx",
+     "fedex"
+    ]
+   },
+   {
+    "table": "Customer_Addresses",
+    "column": "address_type_code",
+    "pattern": "enum",
+    "targets": [
+     "Billing",
+     "Shipping"
+    ]
+   },
+   {
+    "table": "Order_Items",
+    "column": "order_item_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Delivered",
+     "Paid",
+     "Cancelled"
+    ]
+   },
+   {
+    "table": "Order_Items",
+    "column": "item_status_code",
+    "pattern": "enum",
+    "targets": [
+     "good"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customer_Addresses.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Addresses.premise_id",
+    "parent_table": "Premises",
+    "parent_column": "premise_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Orders.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Mailshot_Customers.mailshot_id",
+    "parent_table": "Mailshot_Campaigns",
+    "parent_column": "mailshot_id",
+    "copied": []
+   },
+   {
+    "child": "Mailshot_Customers.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.order_id",
+    "parent_table": "Customer_Orders",
+    "parent_column": "order_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customer_Addresses",
+    "column": "date_address_to",
+    "formula": "date_address_to IS NULL OR date_address_to >= date_address_from",
+    "evidence": "Customer_Addresses rows 1-8 all satisfy"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_delivered_datetime",
+    "formula": "order_delivered_datetime IS NULL OR order_delivered_datetime >= order_placed_datetime",
+    "evidence": "Customer_Orders row 1: placed 2015-06-15, delivered 2018-03-20"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_status_code",
+    "formula": "order_status_code IN ('Cancelled','Delivered','Paid','paid')",
+    "evidence": "observed values Cancelled, Delivered, Paid; 'paid' added as comparison_boundary near-variant"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "shipping_method_code",
+    "formula": "shipping_method_code IN ('Unspecified','FedEx','UPS','fedex')",
+    "evidence": "observed values Unspecified, FedEx, UPS; 'fedex' added as comparison_boundary near-variant"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_shipping_charges",
+    "formula": "order_shipping_charges IS NULL OR CAST(order_shipping_charges AS REAL) >= 0",
+    "evidence": "Customer_Orders rows 1-8 charges 85.79..99.26; values formatted as numeric strings; CAST(NULL AS REAL) is NULL so non-FALSE"
+   },
+   {
+    "table": "Mailshot_Campaigns",
+    "column": "mailshot_end_date",
+    "formula": "mailshot_end_date IS NULL OR mailshot_start_date IS NULL OR mailshot_end_date >= mailshot_start_date",
+    "evidence": "Mailshot_Campaigns rows 1-8 all satisfy"
+   },
+   {
+    "table": "Mailshot_Customers",
+    "column": "outcome_code",
+    "formula": "outcome_code IN ('Order','No Response','order','no response')",
+    "evidence": "observed values Order, No Response; case variants added as comparison_boundary near-variants"
+   },
+   {
+    "table": "Order_Items",
+    "column": "order_item_status_code",
+    "formula": "order_item_status_code IN ('Delivered','Paid','Cancelled')",
+    "evidence": "observed values Delivered, Paid, Cancelled"
+   },
+   {
+    "table": "Order_Items",
+    "column": "item_status_code",
+    "formula": "item_status_code IS NULL OR item_status_code = 'good'",
+    "evidence": "observed value 'good'; NULL allowed as nullable operand"
+   },
+   {
+    "table": "Order_Items",
+    "column": "item_order_quantity",
+    "formula": "item_order_quantity IS NULL OR CAST(item_order_quantity AS INTEGER) > 0",
+    "evidence": "Order_Items rows 1-8 quantities 6,7,4,3,5,2,1,9"
+   },
+   {
+    "table": "Premises",
+    "column": "premises_type",
+    "formula": "premises_type IN ('Warehouse','Residence','Office')",
+    "evidence": "observed values Warehouse, Residence, Office"
+   },
+   {
+    "table": "Products",
+    "column": "product_category",
+    "formula": "product_category IN ('Food','Electronics','Books','Hardware')",
+    "evidence": "observed values Food, Electronics, Books, Hardware"
+   },
+   {
+    "table": "Customers",
+    "column": "payment_method",
+    "formula": "payment_method IN ('Credit Card','Direct Debit')",
+    "evidence": "observed values Credit Card, Direct Debit"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_password",
+    "formula": "customer_password IS NULL OR length(customer_password) = 10",
+    "evidence": "Customers rows 1-8 passwords all length 10"
+   }
+  ],
+  "uncertain_rules": [
+   {
+    "table": "Order_Items",
+    "column": "item_delivered_datetime",
+    "formula": "item_delivered_datetime IS NULL OR item_delivered_datetime >= (SELECT order_placed_datetime FROM Customer_Orders WHERE Customer_Orders.order_id = Order_Items.order_id)",
+    "evidence": "inferred cross-table rule; not directly shown in sample; not enforced"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Premises": 15,
+   "Products": 15,
+   "Customers": 15,
+   "Mailshot_Campaigns": 20,
+   "Customer_Addresses": 15,
+   "Customer_Orders": 15,
+   "Mailshot_Customers": 15,
+   "Order_Items": 15
+  },
+  "null_targets": [
+   "Customers.customer_login",
+   "Customers.customer_name",
+   "Customers.customer_phone",
+   "Customers.customer_email",
+   "Customers.customer_address",
+   "Customers.customer_password",
+   "Premises.premise_details",
+   "Products.product_name",
+   "Mailshot_Campaigns.product_category",
+   "Mailshot_Campaigns.mailshot_name",
+   "Mailshot_Campaigns.mailshot_start_date",
+   "Mailshot_Campaigns.mailshot_end_date",
+   "Customer_Addresses.date_address_to",
+   "Customer_Orders.order_delivered_datetime",
+   "Customer_Orders.order_shipping_charges",
+   "Mailshot_Customers.mailshot_customer_date",
+   "Order_Items.item_status_code",
+   "Order_Items.item_delivered_datetime",
+   "Order_Items.item_order_quantity"
+  ],
+  "supporting_evidence": {
+   "date_address_to >= date_address_from": [
+    "Customer_Addresses rows 1-8 all satisfy"
+   ],
+   "order_delivered_datetime >= order_placed_datetime": [
+    "Customer_Orders row 1: placed 2015-06-15, delivered 2018-03-20"
+   ],
+   "mailshot_end_date >= mailshot_start_date": [
+    "Mailshot_Campaigns rows 1-8 all satisfy"
+   ],
+   "item_order_quantity > 0": [
+    "Order_Items rows 1-8 quantities 6,7,4,3,5,2,1,9"
+   ],
+   "order_shipping_charges >= 0": [
+    "Customer_Orders rows 1-8 charges 85.79..99.26"
+   ],
+   "customer_password length 10": [
+    "Customers rows 1-8 passwords all length 10"
+   ]
+  },
+  "uncertainty": [
+   "item_delivered_datetime vs order_placed_datetime cross-table rule inferred, not directly shown in sample; not enforced; moved to uncertain_rules.",
+   "Null shares are 0.0 in stats but nullable columns still get at least one NULL per instruction 10; writer must persist planted NULLs.",
+   "Enum pools for statuses taken from observed distinct values; may be incomplete.",
+   "Mailshot_Campaigns.product_category literals 'food','clothes' are observed raw values and are not the same domain as Products.product_category; kept as observed.",
+   "Case-variant boundary literals ('paid','fedex','order','no response') are added to the IN-domain formulas so boundary planting does not violate the domain.",
+   "Fresh PK generation must exclude all compact-DB PK values (coerced to int) and UNIQUE values to avoid rows_skipped."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "designer",
+     "issue": "Semantic/domain rules in the specification conflict with the concrete column-type domains used by the schema and observed values. Specifically the relational semantics of `Mailshot_Customers.outcome_code` (documented domain 'Order','No Response' with comparison_boundary variants) are separately treated as a raw string enum, but the specification also declares Mailshot_Campaigns.product_category enum targets ['food','clothes'] while the supporting semantic formula for Products.product_category uses ['Food','Electronics','Books','Hardware'] \u2014 the mailshot category literals ('food','clothes') are not consistent with the Products/other enum style and are unverifiable; more importantly the specification declares 'item_status_code: enum [good]' as an enum that must be sampled, while the semantic formula for the same column is `item_status_code IS NULL OR item_status_code = 'good'`. The enum-target sampling and the nullable-domain formula are contradictory in intent and produce duplicated/planted NULL logic.",
+     "evidence": "specification.per_column_exceptions: {Order_Items.item_status_code, enum, targets ['good']}; semantic_rules_and_formulas: {Order_Items.item_status_code, 'item_status_code IS NULL OR item_status_code = \\'good\\''}; null_targets includes Order_Items.item_status_code.",
+     "requested_revision": "Designer: reconcile enum-target columns with NULL-allowed domain formulas (e.g., treat 'good' as the non-NULL value and NULL as the nullable operand), and remove inconsistent enum targets (e.g., Mailshot_Campaigns.product_category 'clothes' has no supporting evidence and is not backed by any observed or documented value; either drop it or document the source). Clarify whether 'food'/'clothes' are intended raw values for Mailshot_Campaigns.product_category or should reuse the Products category domain."
+    },
+    {
+     "agent": "designer",
+     "issue": "Uncertain, under-supported semantic rules are stated as formulas without evidence. The cross-table rule `item_delivered_datetime >= (SELECT order_placed_datetime FROM Customer_Orders ...)` is explicitly flagged as inferred, not shown in sample; `mailshot_end_date >= mailshot_start_date` is supported, but the mailshot start/end NULL ordering rule combined with `mailshot_end_date IS NULL OR mailshot_start_date IS NULL OR ...` is untested; `order_shipping_charges CAST >= 0` is a VARCHAR column whose numeric cast semantics are ambiguous.",
+     "evidence": "specification.uncertainty: 'item_delivered_datetime vs order_placed_datetime cross-table rule inferred, not directly shown in sample.'; supporting_evidence has only 'order_delivered_datetime >= order_placed_datetime' on Customer_Orders, not the Order_Items cross-table relation. `order_shipping_charges` is VARCHAR(255) yet is cast to REAL for the >= 0 rule.",
+     "requested_revision": "Designer: either mark the inferred Order_Items cross-table ordering rule as uncertain (and not enforce it) or provide evidence; document that order_shipping_charges values are formatted as numeric strings before applying the cast rule, and add a NULL-handling note that CAST(NULL AS REAL) is NULL and thus non-FALSE."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The generator plants boundary case variants that violate declared semantic domain formulas. `Customer_Orders.order_status_code` and `shipping_method_code` are given boundary targets including lowercase variants ('paid','fedex'), and the program injects them (`boundary_vals` returns both 'Paid','paid' and 'FedEx','fedex'; guaranteed at row 0/1). But the specification's semantic formula requires `order_status_code IN ('Cancelled','Delivered','Paid')` and `shipping_method_code IN ('Unspecified','FedEx','UPS')` \u2014 the lowercase variants violate the domain. Similarly `Mailshot_Customers.outcome_code` requires `IN ('Order','No Response')` but the program injects 'order' and 'no response'.",
+     "evidence": "specgen.build_spec_instance: `co_stat[0], co_ship[0] = 'Paid', 'FedEx'; co_stat[1], co_ship[1] = 'paid', 'fedex'` (Customer_Orders); `oc[2], oc[3] = 'order', 'no response'` (Mailshot_Customers). specification.semantic_rules_and_formulas: order_status_code IN ('Cancelled','Delivered','Paid'); outcome_code IN ('Order','No Response').",
+     "requested_revision": "Engineer: do not violate semantic domain formulas to plant comparison-boundary variants. Either confine case-variant boundary literals to columns without a strict IN-domain formula, or make the boundary targets consistent with the formula (add the case variants to the allowed domain in the specification first)."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Primary key columns are generated as opaque non-integer strings (e.g., 'p1_123', 'c2_456', 'm3_789', 'o4_101', 'i5_112'), while every PK column is declared INTEGER PRIMARY KEY. This departs from the generic_sampling_rules rule 'integer_pk: Sequential from 1; unique; never NULL' and from the declared INTEGER type. FK child columns copy these opaque strings, so integrity is preserved internally but the declared value domain/type is violated.",
+     "evidence": "specgen: `pref = ['p%d_%d' % (i+1, rng.randint(1,999)) ...]`, `prodref = ['q%d_%d' ...]`, `custref = ['c%d_%d' ...]`, `'m%d_%d'`, `'o%d_%d'`, `'i%d_%d'`. schema.py stores declared type_str integers; writer inserts without conversions. Execution summary shows rows_skipped for Premises 123, Products 206, Customers 177, Mailshot_Campaigns 133, Customer_Orders 209 (likely UNIQUE/PK collisions from opaque strings), but the PK INTEGER type is not honored.",
+     "requested_revision": "Engineer: generate integer PK values (sequential/uniqueness per generic_sampling_rules integer_pk) and integer FK values copied from parent PK pools, so declared INTEGER types are satisfied. Also explain/reduce the non-zero `rows_skipped` on parent tables (Premises 123/395, Products 206/440, Customers 177/414, Mailshot_Campaigns 133/434, Customer_Orders 209/511) \u2014 dropping ~30-50% of attempted parent rows is undesirable and suggests PK uniqueness collisions not being pre-filtered before insertion."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The nullable-column rule is not implemented in practice. Every nullable column in the execution feedback reports 'NULL 0 / n' (no NULLs planted), despite the program interface rule requiring at least one NULL row per nullable column with NULL share following the compact share, and despite `plant_nulls` being present. The specification's null_targets list includes these columns, and generic_sampling_rules.null_share says 'at least one NULL row per instance'.",
+     "evidence": "execution feedback nullable_columns: all read 'NULL 0 / n' for date_address_to, order_delivered_datetime, order_shipping_charges, customer_login (specified 'all NULL'), mailshot_*, item_status_code, etc. `plant_nulls` only plants when null_count > 0; null_count uses `share*n` where share=0.0 from compact DB (stats note 'Null shares are 0.0 in stats'), but max(1,...) should still yield 1. The compact DB share of 0.0 combined with observed 0 NULLs means even `plant_nulls` would plant 1 \u2014 yet evidence shows 0, indicating either the writer silently rejects NULLs or the values were overwritten (e.g., customer_name duplicate rewrite, order_shipping_charges numeric reformat).",
+     "requested_revision": "Engineer: verify that planted NULLs survive to the written database (check writer executemany handling, that `charges[...] = None` and `plant_nulls`-produced None are not replaced by `'%.2f' % float(c)`), and that `customer_login` is actually all-NULL as targeted. Add a post-write assertion/count that each nullable column has >=1 NULL, and that customer_login count(NULL) == n. Provide revised execution feedback showing non-zero NULLs."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The unmatched_join_rows construction for `Customers.customer_id` vs `Premises.premise_id` is internally inconsistent. The atomic operation targets remaining 'unmatched_join_rows: parent_rows_without_children' for `Premises.premise_id` joined to `Customers.customer_id`. The program adds an 'orphan customer' whose customer_id is set to an unused premise slot, but then removes that customer from Customer_Addresses; it also overwrites `inst['Customers']['customer_id'][0]`. The separate Customer_Addresses block already ensures an unreferenced premise. The additional override risks PK duplication/other inconsistencies and accomplishes nothing verifiable in the target analysis.",
+     "evidence": "specgen final block: `inst['Customers']['customer_id'][0] = orphan` after already assigning opaque keys; `ca_c = [c for c in ca_c if c != orphan]`. The premise-without-children is already created in the Customer_Addresses block (`spare` logic).",
+     "requested_revision": "Engineer: remove the redundant orphan-customer overwrite (it risks PK collisions and corrupts customer rows) and rely on the Customer_Addresses spare-premise logic to produce parent rows without children in the Premises table (as targeted). Confirm with a count that Premises rows exist that have no Customer_Addresses reference."
+    }
+   ],
+   "unresolved_checks": [
+    "Preservation of compact database rows: writer copies the compact DB then inserts generated rows, but the execution feedback reports non-trivial `rows_skipped` on parent tables (Premises 123, Products 206, Customers 177, Mailshot_Campaigns 133, Customer_Orders 209). It is unclear whether compact rows were preserved or whether the skip reflects PK collision with copied compact PKs (the opaque keys should not collide) or actual insert failures \u2014 needs verification.",
+    "Reproducibility: reported reproducible=true, but the program uses `random.Random(seed_base*100003+i)` and pool ordering from a dict/set; given deterministic pool seeding and sorted groups this is likely fine, but pool iteration order across Python versions is not verified for reproducibility of set-based routing.",
+    "Construction_pairs separation: eligible 35, separated 5. This is low, but per instructions a missing separation alone does not prove a generation error; no field-level evidence here connects low separation to a specific value-domain bug. Related but not blocking by itself \u2014 however combined with the case-variant domain violations above, it may be masking intended-vs-accidental equivalence.",
+    "The `comparison_boundary` boundary literal rule in generic_sampling_rules says 'include each listed literal and one near-variant (case change)' \u2014 this directly conflicts with the semantic IN-domain constraints for order_status_code, shipping_method_code and outcome_code. The designer must resolve whether case variants are allowed in domains; currently the engineer implements both and violates the domain formulas."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows every nullable column with 'generated rows: NULL 0 / n' (e.g. Customers.customer_login NULL 0/188, Customer_Orders.order_shipping_charges NULL 0/257, Order_Items.item_status_code NULL 0/3760). The spec's null_targets list all these columns and generic_sampling_rules.null_share requires 'at least one NULL row per instance'. The program's plant_nulls() is called, but the writer (writer.py) inserts rows via executemany and, on failure, retries row-by-row; the compact DB is copied with base_db, so the generated rows are appended to the original rows. The NULLs are planted in the in-memory lists, yet the feedback reports zero NULLs in generated rows for every nullable column, indicating the NULL values are not reaching the written rows (or the feedback counts only non-NULL inserts). Either way the interface NULL rule is not satisfied.",
+     "requested_revision": "Fix the generation/writing path so that at least one NULL is actually persisted per nullable column per instance (verify plant_nulls output survives writer.py, and that the feedback NULL counter reflects inserted NULLs). Re-run and confirm non-zero NULL counts for the nullable columns listed in null_targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped is large for parent tables: Premises 123, Products 206, Customers 177, Mailshot_Campaigns 133, Customer_Orders 209 (out of ~272/234/237/301/302 added). The writer copies the compact DB (base_db) and then inserts fresh PKs from _fresh_int_keys, which only avoids compact PKs of the same table. But the compact DB already contains rows, and the spec's integer_pk rule says 'Sequential from 1; unique; never NULL'. The fresh keys start at 1 and skip only compact PKs, so collisions with existing compact rows should be avoided \u2014 yet ~40-70% of parent rows are skipped, meaning PK (or UNIQUE) collisions occur. This indicates the fresh-key logic does not actually exclude all compact PKs (e.g. compact PKs may be non-integer or the taken-set is incomplete), so many generated rows are silently dropped.",
+     "requested_revision": "Make _fresh_int_keys exclude the full set of compact PK values (including any non-int PKs coerced) and any UNIQUE column values, so generated parent rows are not skipped. Re-run and confirm rows_skipped is near zero for parent tables."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include 'item_delivered_datetime >= order_placed_datetime' marked uncertain and 'not enforced', and the program (specgen.py) indeed does not enforce it. This is acceptable as an uncertain rule, but the spec should clearly separate supported rules (date_address_to >= date_address_from, order_delivered_datetime >= order_placed_datetime, mailshot_end_date >= mailshot_start_date, item_order_quantity > 0, order_shipping_charges >= 0, customer_password length 10) from the uncertain cross-table rule. The current spec does mark it uncertain, so this is a minor documentation issue rather than a blocking error.",
+     "requested_revision": "Optionally move the uncertain cross-table rule out of semantic_rules_and_formulas into a separate 'uncertain_rules' section to avoid implying it is enforced. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 35, separated 5. The spec's comparison_boundary and aggregate_boundary targets (e.g. outcome_code IN ('No Response','Order') vs case variants, order_status_code 'Paid' vs 'paid', shipping_method_code 'FedEx' vs 'fedex') are planted, but only 5 of 35 eligible pairs are separated. This is not by itself proof of an error (per instruction 4), but combined with the NULL and skip issues it suggests the boundary planting may be diluted by the large number of skipped rows and the random mixing with enum pools.",
+     "requested_revision": "After fixing NULL persistence and PK collisions, re-check that boundary literals (exact and case-variant) are present in the generated rows for the boundary columns, and that the aggregate boundary (COUNT(DISTINCT outcome_code)=2) holds. Report the separated count again."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the NULL 0/n feedback is a counting artifact or a real persistence failure \u2014 needs re-run after fix.",
+    "Whether the large rows_skipped is due to PK collisions with compact rows or UNIQUE constraints \u2014 needs inspection of the taken-set logic.",
+    "Whether boundary literals survive into written rows given the skip rate."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "summary": "Planted NULLs are not persisted: every nullable column shows 'NULL 0 / n' in execution feedback, contradicting the program's own PLANTED_NULLS mechanism.",
+     "evidence": "Execution feedback: all 19 nullable columns report 'generated rows: NULL 0 / n' (e.g. 'Customers.customer_login: NULL 0 / 188', 'Order_Items.item_status_code: NULL 0 / 3760'). The spec (rule 'null_share') and program interface rule 7 require at least one NULL per nullable column per instance with a share following the compact DB share. specgen.build_spec_instance calls plant_nulls(...) for every nullable column and records indices in PLANTED_NULLS; writer.write_instance_sqlite reads _planted_null_map() and sets rows[i][ci]=None for those indices. Yet zero NULLs reach the written rows in all 20 instances, including 'Customers.customer_login' where the code path sets login=[None]*nC AND updates PLANTED_NULLS with range(nC) \u2014 the strongest evidence the side-table/writer path is not exercised or is cleared at the wrong time.",
+     "root_cause_hypotheses": [
+      "PLANTED_NULLS is cleared at the start of build_spec_instance and repopulated during the run, but writer._planted_null_map() imports the module-level dict lazily; in multiprocessing (procs=6) each worker populates its own copy \u2014 that should still work per unit. More likely: the compact DB is copied and INSERTs use executemany with rows that already contain None \u2014 but the 'Enforce planted NULLs' loop only runs when (t,cname) is in planted. Since login is set via PLANTED_NULLS.update(range(nC)) AND via plant_nulls only for other columns, a wiring bug (e.g. (t,c) keys not matching schema column case, or instance column mismatch) would suppress all NULL planting uniformly \u2014 exactly what is observed.",
+      "plant_nulls is applied but then a subsequent normalization reassigns the column (e.g. 'qty = [q if q is None else ...]' is fine, but 'charges' has a redundant manual NULL that is then overwritten by PLANTED_NULLS indexing at the wrong position)."
+     ],
+     "requested_revision": "Fix the NULL plumbing so that every nullable column of every written instance contains >=1 NULL (and >= compact share) as required by rule 7. Add a post-write assertion in write_instance_sqlite that for each (table, nullable column) at least one written row is NULL, and raise/count failure if not. Ensure PLANTED_NULLS is keyed by the exact (table, column-name) used in writer's `names` list (case-sensitive match) and that it is not cleared between build and write. Re-run and confirm nullable_columns shows non-zero NULL counts.",
+     "severity": "blocking"
+    },
+    {
+     "agent": "engineer",
+     "summary": "Large numbers of generated parent rows are skipped on PK/UNIQUE collisions (rows_skipped: Premises 123, Products 206, Customers 177, Mailshot_Campaigns 133, Customer_Orders 209), violating the 'never skipped' PK rule.",
+     "evidence": "Execution feedback rows_skipped: Premises 123/272 added, Products 206/234, Customers 177/237, Mailshot_Campaigns 133/301, Customer_Orders 209/302. The spec generic rule 'integer_pk' says generated rows are 'never skipped' and exclusions must cover all compact PK/UNIQUE values. specgen._fresh_int_keys(rng, n, taken) ignores `taken` beyond a membership test of small integers and starts at 1 sequentially \u2014 since compact DB PK values are 1..N (small), sequential fresh keys 1,2,3,... collide massively with the compact PKs/UNIQUEs; the writer then rejects them. The `taken` set only excludes ints it can coerce; but the fresh-key generator emits the exact values the compact DB already holds before advancing past them, and (critically) the compact DB is copied, so any generated PK in {1..N} collides.",
+     "requested_revision": "_fresh_int_keys must start above max(taken \u222a compact PKs) OR skip any candidate in `taken` (it doesn't consult the passed `taken` for exclusion starting from arbitrary small values \u2014 it only `continue`s, so in principle it should skip 1..N; verify the taken set is actually populated before call: taken_keys('Premises') reads obs for PK/UNIQUE columns; if obs is empty because original_values were not loaded for these tables, taken is empty and all low integers collide). Confirm taken_keys reads original_values populated by read_schema, and assert post-write that rows_skipped for PK tables is 0. Alternatively start fresh keys at max(compact_pk \u222a unique_vals)+1.",
+     "severity": "blocking"
+    },
+    {
+     "agent": "designer",
+     "summary": "Spec rule for Mailshot_Campaigns.product_category uses literals 'food','clothes' that contradict Products.product_category ('Food','Electronics','Books','Hardware'), and the schema does not link them \u2014 the designer notes this as 'observed raw values' but the enum target list is inconsistent with the actual column census.",
+     "evidence": "Spec per_column_exceptions: Mailshot_Campaigns.product_category enum targets ['food','clothes']. But the database census / semantic_rules lists Products.product_category as ['Food','Electronics','Books','Hardware'], and column statistics are not shown in this fast-mode prompt. The designer's own uncertainty note admits 'not the same domain as Products.product_category; kept as observed'. Without the underlying distinct-value census for Mailshot_Campaigns.product_category this cannot be verified from the evidence provided.",
+     "requested_revision": "Provide the compact distinct-value census for Mailshot_Campaigns.product_category and align the enum targets with it, or, if the values are in fact 'food','clothes' with lowercase, state the evidence explicitly. Do not assert 'not the same domain' without the census.",
+     "severity": "minor"
+    },
+    {
+     "agent": "engineer",
+     "summary": "Program merges all spec targets into the literal pool regardless of pattern type (merge_spec_pools), potentially injecting invalid literals (e.g. '1, 2 and >= 3' handled only by regex '\\d', but other non-enum targets may leak).",
+     "evidence": "merge_spec_pools loops over all per_column_exceptions and adds every string target to pool[(t,c)], skipping only /\\d/. It does not distinguish enum vs boundary vs group_sizes vs ties targets. In build_spec_instance enum_vals also filters via re.fullmatch(r'\\d(,.*)?', ...) for enum targets only; but merge_spec_pools is called earlier and unconditionally. For example 'No Response','Order','paid','fedex' will be added to the literal pool but the ones actually planted as boundary literals are handled via boundary_vals. The pool additions do not directly cause invalid values because the code selects from enum_vals or boundary_vals \u2014 but pool is also fed to _init_sampler for non-spec path and could bias. This is a latent inconsistency, not the observed failure.",
+     "requested_revision": "Restrict merge_spec_pools to enum/boundary patterns and document that group_sizes/ties targets are structural, not value pools.",
+     "severity": "minor"
+    },
+    {
+     "agent": "engineer",
+     "summary": "The uncertain cross-table rule (Order_Items.item_delivered_datetime >= Customer_Orders.order_placed_datetime) is documented as unenforced in the spec, but the code in build_spec_instance DOES enforce it for 85% of rows (via _rand_after using placed_by_order), so the 'not enforced' note is inconsistent with the implementation.",
+     "evidence": "spec.uncertain_rules lists this formula as 'not enforced'. specgen: `idd.append(_rand_after(rng, base))` with `base = placed_by_order.get(oid)` for ~85% of rows. That is a positive 'enforce' behavior. It is not a blocking bug \u2014 it only promotes the uncertain rule to a soft rule \u2014 but spec and code disagree about what is uncertain.",
+     "requested_revision": "Either remove this rule from uncertain_rules (and treat it as a supported rule with the current 85% enforcement) or remove the enforcement from the code. Do not claim 'not enforced' in the spec while the code enforces it.",
+     "severity": "minor"
+    },
+    {
+     "agent": "designer",
+     "summary": "Spec generic rule 'boundary' states near-variants are added 'only where listed in per_column_exceptions'; but boundary_vals auto-adds a case variant for every boundary literal even when the exception list already includes both cases \u2014 leading to possibly redundant values, and the implementation auto-adds case variants even if the designer did not list them.",
+     "evidence": "boundary_vals: for each v in targets, appends v and, if v.lower()!=v, v.lower(); if designer already listed both 'Paid' and 'paid', boundary set has {Paid, paid} (deduped). If designer listed only 'Paid', auto-adds 'paid' \u2014 consistent with rule text. Not an error per se, but the rule 'only where listed' is ambiguous: the code interprets it as 'include exact and one auto case variant'. This slightly over-extends the target domain without explicit designer intent in the enumerated exception list.",
+     "requested_revision": "Clarify in spec that boundary planting includes one auto-generated case variant and that the widened IN-domain formula is what makes it legal. The current text and code mostly agree; the ambiguity should be resolved in the spec text.",
+     "severity": "minor"
+    },
+    {
+     "agent": "engineer",
+     "summary": "Redundant/confusing manual NULL planting in Customer_Orders charges block uses a second 'next(...)' search that can index the WRONG position (re-locates first None, not necessarily the one just set), producing incorrect PLANTED_NULLS indices.",
+     "evidence": "specgen Customer_Orders: `if nO > 0 and all(c is not None for c in charges): charges[rng.randrange(nO)] = None; PLANTED_NULLS...add(next(i for i, c in enumerate(charges) if c is None))`. The `next(...)` returns the first None \u2014 which may be a different index if charges had been mutated earlier (it has, by plant_nulls which may have set None). The condition `all(c is not None ...)` ensures no earlier None exists, so the first None found IS the just-set one in this specific case. However, the guard uses `all(c is not None ...)` on charges after plant_nulls (which would normally have planted at least one) \u2014 meaning this branch effectively never triggers (because plant_nulls returns >=1 None). So it's dead-code, but if plant_nulls is fixed (issue 1), the manual insertion is confusing and could conflict with the reliable plant_nulls path.",
+     "requested_revision": "Remove the redundant manual-NULL block and rely solely on plant_nulls (after fixing issue 1). This simplifies the correctness argument for PLANTED_NULLS indices.",
+     "severity": "minor"
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify compact DB distinct-value census for Mailshot_Campaigns.product_category (fast-mode); designer's enum targets may or may not match compact values.",
+    "No evidence whether group_sizes targets (Premises.premise_id unmatched_join_rows, Customers.customer_id) are achieved in written rows \u2014 rows_skipped for Premises (123/272) and Customers (177/237) raises the concern that parents-without-children and group-size patterns may not be preserved after the writer's PK collision skips.",
+    "Construction pair separation: 35 eligible, 5 separated \u2014 insufficient to conclude coverage; not treated as failure per instruction 4.",
+    "Reproducibility reported ok=true; not re-verified independently."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with AssertionError, e.g. \"no NULL persisted for Premises.premise_details\", \"no NULL persisted for Products.product_name\", \"no NULL persisted for Customers.customer_name\". n_ok=0, n_fail=20, rows_added={}. The post-write assertion in writer.py raises whenever a nullable column of a table that received rows has zero NULLs.",
+     "requested_revision": "Fix the NULL plumbing so planted NULLs actually reach the written rows. Root cause: specgen.plant_nulls records positions in PLANTED_NULLS, but the writer's per-row fallback path (executemany fails -> row-by-row insert) and the dedup/insert ordering can drop or overwrite them; more importantly, the assertion fires for nullable columns that were never planted (e.g. Premises.premise_details is planted, but the assertion also checks every nullable column of every table that got rows, including columns where null_count returned 0 because n<=1 or share rounding gave 0). The assertion must only require >=1 NULL for columns that were actually planted (or plant_nulls must guarantee >=1 for every nullable column of every table with rows), and the writer must not lose planted NULLs. Re-run until n_ok>0 and rows_added is non-empty."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py post-write assertion loops over ALL nullable columns of every table with ok[t]>0 and raises if count<1, regardless of whether specgen planted a NULL there. specgen.null_count returns 0 when n<=0 or when share*n rounds to 0 and n==1; also columns like Customer_Addresses.date_address_to, Mailshot_Customers.mailshot_customer_date, Order_Items.item_* are planted, but the assertion is unconditional. This is the direct cause of the 20 AssertionErrors.",
+     "requested_revision": "Make the assertion consistent with the interface rule: assert >=1 NULL only for nullable columns where a NULL was planted (PLANTED_NULLS has an entry), OR make plant_nulls plant >=1 NULL for every nullable column of every table that receives rows. Do not raise for nullable columns that legitimately have no planted NULL. Keep the guarantee that planted NULLs are never replaced."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets lists 19 nullable columns and the generic rule says 'plant at least one NULL row per instance ... share ~ observed null_rate (0.0 here means rare, still plant >=1 NULL)'. But table_sizes_per_instance gives 15 rows for most tables and the program's null_count uses max(1, ...) only when nullable and n>0; for n==1 it returns n (1) which is fine, but the assertion mismatch shows the spec's 'at least one NULL per nullable column' is not reconciled with the writer's unconditional check. Also spec uncertainty notes 'Null shares are 0.0 in stats but nullable columns still get at least one NULL'.",
+     "requested_revision": "Clarify in the specification that the >=1 NULL requirement applies to every nullable column of every table that receives generated rows, and that the writer assertion must match this exactly (either both unconditional or both keyed to planted positions). Align null_targets with the actual nullable columns (e.g. Customer_Addresses.date_address_to, Mailshot_Customers.mailshot_customer_date are listed; confirm all 19 are covered and that NOT NULL columns like Mailshot_Customers.mailshot_id, Premises.premises_type are excluded)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specgen.build_spec_instance: for Customers, customer_login is set to all NULL and PLANTED_NULLS updated for range(nC); but the writer assertion for Customers.customer_login would pass. However for Premises.premise_details, plant_nulls is called with nullable=True and n=nP; if nP is small (jitter can reduce to 1) null_count returns min(n-1 if n>1 else n, k) = 1 for n==1, so a NULL is planted \u2014 yet the assertion still failed, indicating the planted NULL was overwritten or the row was skipped. The writer's per-row fallback keeps original row values including NULLs, but the executemany path may have succeeded and the NULL was lost because PLANTED_NULLS key uses ('Premises','premise_details') while the writer looks up (t, cname) with cname from tm.columns \u2014 names match, so the loss is elsewhere (likely the assertion fires on a different nullable column of the same table, e.g. none for Premises besides premise_details).",
+     "requested_revision": "Add a debug/verification step: after building the instance, assert that for each (t,c) in PLANTED_NULLS the corresponding column list actually contains None at the recorded indices before writing; and after writing, verify the same. This will localize whether the loss is in build or write. Ensure the writer's dedup (sample_fresh_primary_keys / drop_unique_duplicates) is not applied to spec instances in a way that drops planted-NULL rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: most rules are supported by observed rows (date_address_to >= date_address_from, order_delivered_datetime >= order_placed_datetime, mailshot_end_date >= mailshot_start_date, item_order_quantity > 0, order_shipping_charges >= 0, customer_password length 10). The cross-table rule item_delivered_datetime >= order_placed_datetime is explicitly marked uncertain ('inferred cross-table rule; enforced for ~85% of rows ... treated as a soft rule'). This is acceptable as a soft rule but should be flagged as uncertain, not a hard constraint.",
+     "requested_revision": "Keep the cross-table item_delivered_datetime rule as a soft/uncertain rule (already done). No change required beyond confirming it is not enforced as a hard constraint that could block generation. The remaining rules have sufficient evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Value domains: spec enum targets (e.g. Customers.payment_method ['Credit Card','Direct Debit'], Premises.premises_type ['Warehouse','Residence','Office'], Products.product_category, Mailshot_Campaigns.product_category ['food','clothes'], Customer_Orders statuses, Order_Items statuses) are implemented via enum_vals and boundary_vals. Comparison boundaries ('Paid'/'paid', 'FedEx'/'fedex', 'No Response'/'no response'/'Order'/'order') are planted deterministically in the first rows (co_stat[0]='Paid', co_stat[1]='paid', etc.) and widened domains include case variants. This matches the spec. However, because all units failed, none of this is verified in written rows.",
+     "requested_revision": "After fixing the NULL assertion, verify in execution feedback that boundary literals and enum values appear in written rows (e.g. rows_added non-zero and spot-check that 'paid','fedex','order','no response' are present). No code change needed if the NULL fix restores successful writes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Dependencies: fill_foreign_keys_consistently is used only in build_random_instance (generic path), not in build_spec_instance. In specgen, FKs are drawn directly from parent PK lists (custref, pref, oids, inst['Products']['product_id'], inst['Mailshot_Campaigns']['mailshot_id']), which is consistent. But Customer_Addresses.premise_id 'parent rows without children' logic only removes one used premise; if nA is small relative to nP this may not guarantee an unreferenced premise, and the spec target 'parent_rows_without_children' is only partially enforced.",
+     "requested_revision": "Strengthen the unmatched-join guarantee: ensure at least one Premises.premise_id is never referenced by Customer_Addresses (and similarly consider Customers.customer_id vs Mailshot_Customers if the unmatched_join target applies). Verify after build that the set of referenced premise_ids is a strict subset of pref."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli._one uses rng = random.Random(seed_base*100003 + i), deterministic per unit. build_spec_instance uses rng throughout. This is reproducible. However, PLANTED_NULLS is a module-level global cleared at build start; with multiprocessing each worker has its own copy, so no cross-unit contamination. Acceptable.",
+     "requested_revision": "No change; confirm after fix that re-running with the same seed produces identical instances."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether planted NULLs are lost during build or during write (needs the debug assertion requested above).",
+    "Whether the writer's unconditional nullable-column assertion is the sole cause of the 20 failures or whether planted NULLs are also being overwritten.",
+    "Whether all 19 null_targets are actually planted with >=1 NULL given jittered table sizes (some tables may get n=1).",
+    "Whether boundary literals and enum values survive into written rows (cannot verify until n_ok>0).",
+    "Whether the unmatched-join (parent rows without children) guarantee holds for Premises vs Customer_Addresses at the jittered sizes."
+   ]
+  }
+ ]
 }

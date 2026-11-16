@@ -1,49 +1,392 @@
 {
  "db": "store_product",
- "operator_io_quirks": [
-  "Mixed-case identifiers: 'Store_ID', 'Store_Name', 'Type', 'Area_size', 'Number_of_product_category', 'Ranking', 'District_ID', 'District_name', 'Headquartered_City', 'City_Population', 'City_Area', 'Product_ID' \u2014 must be double-quoted verbatim; column lookup case-insensitive.",
-  "FK DDL uses backtick quoting (`Store_ID`) while CREATE TABLE uses double quotes; pragma foreign_key_list is authoritative, DDL text is not.",
-  "FK parent column case differs from child: child 'Product_ID' -> parent 'product'.'Product_ID' (parent DDL spells 'product_id'); pragma resolves it, so read_schema must not string-match.",
-  "All tables tiny (product 6, store 5, district 15, store_product 15, store_district 5) \u2014 no rowid sampling needed; original_values fully read.",
-  "No NOT NULL, no CHECK, no UNIQUE indexes anywhere; only PKs. So drop_unique_duplicates is a no-op and NOT NULL insert failures never occur.",
-  "Composite PK on store_product (Store_ID, Product_ID); store_district has single-col PK Store_ID that is also an FK to store \u2014 PK/FK overlap.",
-  "store_district.Store_ID is PK and FK to store.Store_ID: parent values must be unique in the child, so FK draw with replacement then PK dedup will shrink rows.",
-  "product.dpi has distinct=1 (all 600.0) and interface distinct=1 ('USB 2.0') \u2014 Number/String samplers get a single element; list range collapses.",
-  "product.dimensions / max_page_size are text holding '301 x 160 x 158' / '216mm x 356mm' \u2014 String fuzzer will treat as generic text, not parse dimensions.",
-  "store_product.Store_ID distinct=4 (missing 4) and Product_ID distinct=5 (missing 5) \u2014 original FK coverage is partial; not a constraint.",
-  "All declared types are INT/REAL/TEXT \u2014 no Date/Time/Bool/Bit/Year dispatch, no crash-fallback columns, no text-stored dates.",
-  "No self-references, no dangling FKs, no views/triggers/indexes beyond PKs."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INT/REAL columns: scale=0 for INT (range [-1,1] then perturb +-1/+-2), scale=4 for REAL (range [-10^4,10^4]); list range overwritten to full max (upstream quirk) so REAL columns get huge values like 9999.x far from 179.84/94620.",
-  "String fuzzer on product, dimensions, max_page_size, interface, Store_Name, Type, District_name, Headquartered_City: random a-zA-Z0-9() strings length 0..20 with 50% contaminate \u2014 destroys 'Fujitsu fi-6130...', 'City Mall', 'Attock District'.",
-  "String fuzzer adds str(i+1)/str(i-1) for int-like elements only; none of the text columns are int-like, so no numeric variants.",
-  "PK columns (product_id, Store_ID, District_ID) are single-col PKs -> max_l0=inf, so fresh Number draws never reused; PKs stay distinct, dedup rarely fires.",
-  "store_product composite PK members get max_l0=30; FK draws from parent's final PK values with replacement, then PK dedup keeps first occurrence \u2014 child rows collapse toward min(parent_size, n).",
-  "store_district.Store_ID PK+FK: FK draw with replacement from store.Store_ID (5 values) then PK dedup -> at most 5 rows regardless of chosen size.",
-  "choose_table_sizes: w.p. 0.5 flat int(30*u + u2*200) per table, else level sizes (level0 = 1+30u, x4 per level, cap 2500) \u2014 tiny DBs get 1..~2500 rows, wildly larger than originals (5-15).",
-  "No NOT NULL/CHECK/UNIQUE enforcement in Python; only PK dedup and (no-op) unique dedup \u2014 so no insert failures expected, rows_ok == chosen size (minus PK dedup).",
-  "Likely FN drivers: Number fuzzer's full-range overwrite makes REAL predicates (Area_size > 100, City_Population > 500000) trivially true/false; String fuzzer destroys LIKE '%District%' / 'City Mall' matches; dpi/interface single-value columns become random.",
-  "Likely FP drivers: tiny original tables (5-15 rows) mean many gold queries return 0 or 1 row; random instances with 1..2500 rows make COUNT/EXISTS/aggregate predicates differ; missing ties in originals (Ranking 1,2,3,9,10) vs random Ranking values change ORDER BY LIMIT results.",
-  "FK consistency preserved (parent final values), so join-cardinality queries (store JOIN store_product) keep referential integrity but with random multiplicities."
- ],
- "challenger_refs": [
-  "G5",
-  "g09f107d3",
-  "G2",
-  "G7",
-  "G9",
-  "G10",
-  "G1",
-  "G4",
-  "G3",
-  "G8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_pk": "Sequential integers starting at 1, unique per table; never NULL. For a PK column that is also a FK, the parent key is drawn first and the PK value is that copied key (never duplicated).",
+   "int_fk": "Copy an existing parent key value; allow NULL only where the column is nullable. For each FK, reserve at least one parent key that no child references (guaranteed parent-without-children) and, where the child FK is nullable, plant at least one NULL child FK. Never duplicate a parent key across a child row that is a composite-PK member.",
+   "text_generic": "Short synthetic strings from a small pool of near-variants (case, spacing, suffix) so DISTINCT and GROUP produce 1, 2 and >=3 sized groups; NULL only if nullable.",
+   "real_generic": "Uniform real values within the observed min/max envelope, with at least one value at each boundary and one step on each side; NULL only if nullable.",
+   "numeric_boundary": "For each listed literal L, generate L-1, L, L+1 (step-scaled) so comparison boundaries are exercised.",
+   "tie_and_limit": "For ORDER/LIMIT columns, plant ties at the listed ranks by repeating the ordering value across rows. When direction is 'ASC and DESC', plant both directions. When a tie rank exceeds the table size, scale the table to the smallest size that reaches the rank or record the rank as unreachable in the target; never silently drop it.",
+   "shaping": "All shaping (group sizes, duplicates, ties, unmatched rows, NULL planting) is length-preserving: every column of a table has the same length at every step. Shaping runs before PK/unique deduplication; PK/unique columns are never shaped to create duplicates. After shaping, re-run length alignment and PK/unique deduplication before writing.",
+   "null_share": "For nullable columns, ~10% NULL rows per instance, at least one NULL row per nullable column; a planted NULL is never replaced to satisfy a rule.",
+   "fresh_values": "~30% of text values are fresh near-variants not present in the original pool."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "product.max_page_size"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "product.max_page_size"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "columns": [
+     "product.max_page_size"
+    ],
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "district.District_name",
+     "product.product"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "columns": [
+     "district.District_name",
+     "district.Headquartered_City",
+     "district.District_ID",
+     "product.dimensions",
+     "product.interface"
+    ],
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "district.Headquartered_City"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(district.district_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "district.City_Area"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      3,
+      4,
+      100
+     ],
+     "direction": "ASC and DESC",
+     "note": "rank 100 unreachable at district size 15; record as unreachable"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "store.Store_ID",
+     "store_product.Store_ID",
+     "store_district.Store_ID",
+     "product.product_id",
+     "store_product.Product_ID",
+     "store_district.District_ID"
+    ],
+    "targets": {
+     "parent_rows_without_children": "guaranteed per instance",
+     "child_rows_with_null_fk": "only where nullable (store_district.District_ID)"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "store.Type"
+    ],
+    "targets": {
+     "values": [
+      "City Mall",
+      "city mall",
+      "Village Store",
+      "village store"
+     ],
+     "note": "all four values must appear in the string pool across instances"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "product.dpi"
+    ],
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "store.Number_of_product_category"
+    ],
+    "targets": {
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "columns": [
+     "district.City_Population"
+    ],
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "store_product.Store_ID",
+    "parent_table": "store",
+    "parent_column": "Store_ID",
+    "copied": []
+   },
+   {
+    "child": "store_product.Product_ID",
+    "parent_table": "product",
+    "parent_column": "product_id",
+    "copied": []
+   },
+   {
+    "child": "store_district.Store_ID",
+    "parent_table": "store",
+    "parent_column": "Store_ID",
+    "copied": []
+   },
+   {
+    "child": "store_district.District_ID",
+    "parent_table": "district",
+    "parent_column": "District_ID",
+    "copied": []
+   },
+   {
+    "unique": "store_product(Store_ID, Product_ID)"
+   },
+   {
+    "unique": "store_district(Store_ID)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "product",
+    "column": "dpi",
+    "formula": "dpi > 0 OR dpi IS NULL",
+    "evidence": "compact rows: dpi=600"
+   },
+   {
+    "table": "product",
+    "column": "pages_per_minute_color",
+    "formula": "pages_per_minute_color > 0 OR pages_per_minute_color IS NULL",
+    "evidence": "compact rows: 30,28,4,3,10,36"
+   },
+   {
+    "table": "product",
+    "column": "max_page_size",
+    "formula": "max_page_size IS NULL OR max_page_size IN ('A4','216mm x 356mm','216mm x 355mm')",
+    "evidence": "compact rows: A4, 216mm x 356mm, 216mm x 355mm; enum observed in compact data"
+   },
+   {
+    "table": "product",
+    "column": "interface",
+    "formula": "interface IS NULL OR interface = 'USB 2.0'",
+    "evidence": "compact rows: USB 2.0"
+   },
+   {
+    "table": "store",
+    "column": "Type",
+    "formula": "Type IS NULL OR Type IN ('City Mall','Village Store')",
+    "evidence": "compact rows: City Mall, Village Store"
+   },
+   {
+    "table": "store",
+    "column": "Area_size",
+    "formula": "Area_size IS NULL OR Area_size > 0",
+    "evidence": "compact rows: 179.84, 26.69, 7.23, 21.73, 28.74"
+   },
+   {
+    "table": "store",
+    "column": "Number_of_product_category",
+    "formula": "Number_of_product_category IS NULL OR Number_of_product_category > 0",
+    "evidence": "compact rows: 17811, 1678, 1170, 990, 793"
+   },
+   {
+    "table": "store",
+    "column": "Ranking",
+    "formula": "Ranking IS NULL OR Ranking > 0",
+    "evidence": "compact rows: 2, 3, 1, 10, 9"
+   },
+   {
+    "table": "district",
+    "column": "City_Population",
+    "formula": "City_Population IS NULL OR City_Population > 0",
+    "evidence": "compact rows: 94620..2793721"
+   },
+   {
+    "table": "district",
+    "column": "City_Area",
+    "formula": "City_Area IS NULL OR City_Area > 0",
+    "evidence": "compact rows: 10..147"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "district": 15,
+   "product": 6,
+   "store": 5,
+   "store_product": 15,
+   "store_district": 5
+  },
+  "null_targets": [
+   "district.District_name",
+   "district.Headquartered_City",
+   "district.City_Population",
+   "district.City_Area",
+   "product.product",
+   "product.dimensions",
+   "product.dpi",
+   "product.pages_per_minute_color",
+   "product.max_page_size",
+   "product.interface",
+   "store.Store_Name",
+   "store.Type",
+   "store.Area_size",
+   "store.Number_of_product_category",
+   "store.Ranking",
+   "store_district.District_ID"
+  ],
+  "supporting_evidence": {
+   "product.dpi > 0": "compact rows: dpi=600",
+   "product.pages_per_minute_color > 0": "compact rows: 30,28,4,3,10,36",
+   "product.max_page_size enum": "compact rows: A4, 216mm x 356mm, 216mm x 355mm",
+   "product.interface enum": "compact rows: USB 2.0",
+   "store.Type enum": "compact rows: City Mall, Village Store",
+   "store.Area_size > 0": "compact rows: 179.84,26.69,7.23,21.73,28.74",
+   "store.Number_of_product_category > 0": "compact rows: 17811,1678,1170,990,793",
+   "store.Ranking > 0": "compact rows: 2,3,1,10,9",
+   "district.City_Population > 0": "compact rows: 94620..2793721",
+   "district.City_Area > 0": "compact rows: 10..147"
+  },
+  "uncertainty": "No calculated columns or date pairs exist; no formula beyond range/enum rules is supported. store_district.District_ID is the only nullable FK; other FKs are NOT NULL. Original row counts are small, so table sizes mirror original sizes. 'parent_rows_without_children' is guaranteed per instance. 'ASC and DESC' tie targets are planted in both directions; district.City_Area rank 100 is unreachable at table size 15 and is recorded as unreachable. Text comparison values for store.Type (including case variants) are planted in the string pool. The generator must enforce column-length consistency and FK integrity (PRAGMA foreign_keys=ON) before writing."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with IndexError('list index out of range'); n_ok=0, n_instances=0. The failure occurs in build_random_instance before any rows are written. In instance.py, build_random_instance builds `cols` for non-FK columns, then calls `fill_foreign_keys_consistently`, then does `cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})`. For tables whose primary key column is itself a foreign key (e.g. store_district.Store_ID is PK and FK to store.Store_ID; store_product.Store_ID/Product_ID are PK and FK), the PK column is skipped in the sampler loop (`if (t, cm.name) in schema.fks: continue`), so it is absent from `cols` until fill_foreign_keys_consistently adds it. That part is fine, but the subsequent `_shape_group_sizes`/`_shape_duplicates`/`_shape_ties` and `_apply_null_rule` iterate `tm.columns` and index `cols[cm.name]`; more importantly `_shape_group_sizes` appends to `out` (changing length) while other columns keep the original length, and `_shape_duplicates`/`_shape_ties` operate per-column independently, so column lengths diverge. The writer then does `n = len(cols.get(names[0], []))` and indexes `cols[c][i]` for every column, raising IndexError when a shaped column is longer/shorter than the first column. This is a hard crash: no instance is produced.",
+     "requested_revision": "Make column shaping length-preserving and consistent across all columns of a table. `_shape_group_sizes` must not append rows (it currently does `out.append(...)`), or if it does, all other columns must be extended in lockstep. Ensure every column in `inst[t]` has identical length before returning, and have the writer validate/align lengths (or assert) so a mismatch is reported as a clear error rather than IndexError. Re-run generation and confirm n_ok>0 and rows_added populated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after fixing lengths, `_shape_group_sizes` appends rows to a single column, which would desynchronize the table. Also `_shape_unmatched` and `_apply_null_rule` mutate `cols` after `sample_fresh_primary_keys`/`drop_unique_duplicates` have already deduplicated PKs and unique tuples; `_shape_group_sizes`/`_shape_duplicates` can reintroduce duplicate primary-key or unique values (e.g. store_district.Store_ID is PK; duplicating it violates the PK, and the writer's row-by-row fallback would silently drop those rows, reducing the intended group-size profile).",
+     "requested_revision": "Apply shaping before PK/unique deduplication, or re-run deduplication after shaping, and never shape PK/unique columns in a way that creates duplicates. Keep all columns of a table the same length at every step."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists `store_district.District_ID` as the only nullable FK and includes it in null_targets, but the schema DDL declares `store_district.District_ID int` with no NOT NULL and a FOREIGN KEY; SQLite allows NULL there, so this is consistent. However the spec's `dependencies` entry for store_district.District_ID says `copied: []` and the generic rule says 'include at least one parent row without children and, where nullable, at least one NULL child FK'. The program's `fill_foreign_keys_consistently` plants NULLs for nullable FKs, but `_apply_null_rule` skips FK columns (`if (table, cm.name) not in null_targets and (table, cm.name) in schema.fks: continue`) \u2014 for store_district.District_ID it IS in null_targets so it is not skipped, but the FK NULL is already planted by fill_foreign_keys_consistently, so this is acceptable. The real gap: the spec's `unmatched_join_rows` target for store.Store_ID/store_product.Store_ID/store_district.Store_ID/product.product_id/store_product.Product_ID requires 'parent_rows_without_children: true', but the program's `_shape_unmatched` only frees a parent when all parents are used, and it remaps children to another parent \u2014 it does not guarantee a parent without children when the child table is small (store_product has 15 rows, store has 5; with random FK draws some parent may be unused, but it is not guaranteed).",
+     "requested_revision": "Designer: clarify whether 'parent_rows_without_children' must be guaranteed per instance or is a probabilistic target. Engineer: if guaranteed, explicitly reserve at least one parent key that no child references (and for store_district, at least one NULL District_ID child) in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification `ties_for_order_limit` for district.City_Area lists tie_at_rank [3,4,100] with direction 'ASC and DESC'. The program's `_shape_ties` only plants ties at ranks <= len(vals) and uses a single direction from `info['direction']`; 'ASC and DESC' is passed as a string and `str(info.get('direction','ASC')).upper().startswith('DESC')` is False, so only ASC ties are planted. Rank 100 is never reachable with district size 15, so that target is silently ignored. Similarly product.max_page_size tie_at_rank [1] with 'ASC and DESC' only plants ASC ties.",
+     "requested_revision": "Handle 'ASC and DESC' by planting ties in both orderings (or document that only one direction is exercised). For ranks exceeding table size, either scale the table or record that the target is unreachable; do not silently drop it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification `comparison_boundary` for store.Type requires values ['City Mall','city mall','Village Store','village store'] and semantic rule `Type IN ('City Mall','Village Store')`. The program routes this to `spec['boundaries']` (via load_specification) and to `spec['enums']` (via semantic_rules_and_formulas). In `make_column_sampler`, StringSampler uses `enum` with 70% probability and otherwise draws from elements/fresh variants; the boundary values are passed as `boundaries` only to NumberSampler, not StringSampler, so the case-variant boundaries ('city mall','village store') are never guaranteed to appear. The enum path only emits the exact-case values.",
+     "requested_revision": "For text comparison_boundary targets, feed the listed values (including case variants) into the StringSampler's element pool or a dedicated boundary cycle, so all four listed values appear across instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification `rows_with_different_values` for product.max_page_size requires '>= 2 per group with different values' and `group_sizes` 1,2,>=3. The program's `_shape_group_sizes` picks 3 random anchors and repeats them, but does not ensure that within a group of size >=3 there are at least two *different* values (it repeats the same value). Also product.max_page_size has a semantic rule `max_page_size IN ('A4','216mm x 356mm','216mm x 355mm')` routed to enums, but the spec's per_column_exceptions do not list max_page_size under comparison_boundary, so the enum is applied via semantic_rules_and_formulas \u2014 this is fine, but the 'different values per group' target is not implemented.",
+     "requested_revision": "Add shaping that, for columns with rows_with_different_values, ensures each qualifying group contains at least two distinct values (e.g. within a repeated group, vary one member)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: `product.dpi > 0` supported (all shown 600); `pages_per_minute_color > 0` supported; `store.Type` enum supported; `district.City_Population > 0` and `City_Area > 0` supported. But `product.max_page_size IN ('A4','216mm x 356mm','216mm x 355mm')` and `product.interface = 'USB 2.0'` are asserted as formulas with no supporting_evidence entry (the supporting_evidence dict omits them), and the atomic operations show `PRED(product.max_page_size = 'A4')` was *removed* in an example, suggesting the original data may not actually satisfy the enum. Similarly `store.Area_size > 0`, `Number_of_product_category > 0`, `Ranking > 0` have no supporting evidence.",
+     "requested_revision": "Designer: either supply supporting evidence for the max_page_size/interface/Area_size/Number_of_product_category/Ranking formulas, or downgrade them to uncertain patterns. Do not enforce an enum that the compact data may violate, since the program copies compact rows unchanged and the rule would then be false on the compact portion."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program copies the compact database and appends rows (`_copy_compact`, `write_instance_sqlite` with `orig`). Compact rows are preserved (good). But `write_instance_sqlite` sets `pragma foreign_keys = OFF`, so FK violations in generated rows are not detected; combined with the row-by-row fallback that silently counts failures, integrity of generated FKs is not verified. Also `_apply_null_rule` can set NULL on a column that is part of a composite PK (it checks `cm.pk_pos > 0` so PK columns are skipped \u2014 OK), but it can set NULL on store_district.District_ID which is fine, yet it can also set NULL on non-FK nullable columns that a semantic rule constrains (e.g. product.dpi > 0): a NULL dpi is allowed by three-valued logic, which matches the stated NULL rule, so this is acceptable.",
+     "requested_revision": "Enable `pragma foreign_keys = ON` (or validate FKs in Python before writing) so generated FK integrity is actually checked, and report FK failures distinctly from other constraint failures."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was produced (n_ok=0), so integrity-constraint execution, dependent-value consistency, compact-row preservation, and reproducibility could not be observed on generated data.",
+    "Whether the compact database itself satisfies the asserted enum/range formulas (max_page_size, interface, Area_size, Number_of_product_category, Ranking) is unverified; the spec provides no supporting evidence for these.",
+    "Whether 'parent_rows_without_children' is guaranteed per instance or probabilistic is ambiguous in the specification."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas lists product.dpi formula 'dpi > 0 OR dpi IS NULL' with evidence 'compact rows: dpi=600', but the per_column_exceptions for comparison_boundary on product.dpi require values [-1, 0, 1]. The program (values.py NumberSampler with boundaries) will emit -1 and 0 for dpi, which violate the stated 'dpi > 0' rule. The spec's own uncertainty note does not reconcile this: the boundary values are explicitly requested while the range rule forbids them.",
+     "requested_revision": "Designer should reconcile the dpi rule: either drop the 'dpi > 0' formula (treat dpi as unconstrained) or change the comparison_boundary values to positive literals (e.g. [0, 1, 2] with the boundary at 0). The current spec is internally inconsistent for product.dpi."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _shape_group_sizes forces group sizes 1, 2, >=3 by overwriting values, but it does not guarantee the '>=3' group actually has size >=3 after later dedup/shaping; more importantly, _shape_different (used for product.max_page_size rows_with_different_values) picks the most common value and replaces one row with another existing value, which can undo the group-size shaping. Also _shape_ties for product.max_page_size with tie_on COUNT(*) is not actually implemented: _shape_ties only repeats the ordering column value, it does not create ties on COUNT(*) of groups. The spec target 'tie_on: [COUNT(*)]' for product.max_page_size is therefore not constructed.",
+     "requested_revision": "Engineer should either implement COUNT(*)-based tie planting for product.max_page_size (repeat a group so two groups share the same count at the listed rank) or record in the spec that this target is approximated by value ties. As written, the tie_on COUNT(*) target is silently unmet."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped is large relative to rows_added (e.g. product 75 skipped vs 20 added, district 135 skipped vs 66 added, store_product 123 skipped vs 125 added). The writer falls back to row-by-row insert and counts failures, but the high skip rate indicates many generated rows violate constraints (likely PK/unique collisions after shaping, or NOT NULL on PK columns). The spec's shaping rule says 'PK/unique columns are never shaped to create duplicates' and dedup runs after shaping, yet skips remain high.",
+     "requested_revision": "Engineer should investigate why so many rows are skipped (likely PK collisions from sample_fresh_primary_keys interacting with FK-copied PKs, or unique dedup dropping rows) and reduce skips so generated rows are actually written. This is a quality issue, not a blocking integrity failure (fk_violations=0, pk_duplicates=0), but the skip rate undermines the intended value variation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification ties_for_order_limit for district.City_Area lists tie_at_rank [3,4,100] with direction 'ASC and DESC' and note 'rank 100 unreachable at district size 15; record as unreachable'. The program's _shape_ties filters ranks to 1<=r<=n, so rank 100 is silently dropped rather than recorded as unreachable. The spec's own note says it should be recorded, but the program does not emit any record.",
+     "requested_revision": "Designer/engineer should either remove rank 100 from the target (since it is unreachable) or have the program record unreachable ranks in the counts sidecar. The current silent drop contradicts the spec's 'never silently drop it' rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires 'all four values must appear in the string pool across instances' for store.Type (City Mall, city mall, Village Store, village store). values.py StringSampler adds boundaries to the element pool and samples them with probability 0.25, but there is no guarantee all four appear across instances; it is probabilistic. Execution feedback does not report store.Type value coverage, so this is unverified.",
+     "requested_revision": "Engineer should add a deterministic guarantee (e.g. cycle through all boundary values) or the reviewer should verify coverage from the generated instances. Currently unverified."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether all four store.Type case variants appear across the 20 instances (not reported in feedback).",
+    "Whether product.max_page_size group sizes 1,2,>=3 and rows_with_different_values both hold simultaneously after shaping (shaping order may conflict).",
+    "Whether district.Headquartered_City tie_at_rank [1,3] on COUNT(district.district_id) and COUNT(*) is actually constructed (program only ties the ordering value, not the count).",
+    "Whether the high rows_skipped rate is due to PK collisions or NOT NULL violations; not broken down in feedback."
+   ]
+  }
+ ]
 }

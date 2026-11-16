@@ -1,7 +1,9 @@
-"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224; fuzz/{base,number,string,date,time,bool}.py)."""
+"""Per-type value generators, adapted to the generation specification."""
 import datetime as dt
 import re
 import string
+
+from . import spec
 
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
@@ -182,6 +184,456 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Draw from a fixed enum pool; 5% case variants for text enums."""
+
+    def __init__(self, pool: list, rng, case_variants: bool = True):
+        super().__init__(pool, 0.0, float('inf'), rng)
+        self.case_variants = case_variants
+
+    def sample(self):
+        v = self.rng.choice(self.elements)
+        if self.case_variants and isinstance(v, str) and self.rng.random() < 0.05:
+            return spec.case_variant(self.rng, v)
+        return v
+
+
+class BoundarySampler(ColumnSampler):
+    """Mix of boundary targets, observed values and fresh values inside the rule range."""
+
+    def __init__(self, targets: list, observed: list, rng, rule=None, kind='short'):
+        super().__init__(targets + observed, 0.0, float('inf'), rng)
+        self.targets = list(targets)
+        self.observed = [o for o in observed if o is not None]
+        self.rule = rule
+        self.kind = kind
+
+    def _fresh(self):
+        r = self.rng
+        rule = self.rule
+        if rule and rule[0] == 'range':
+            lo, hi = rule[1], rule[2]
+            if isinstance(lo, int) and isinstance(hi, int):
+                return r.randint(lo, hi)
+            return round(r.uniform(lo, hi), 1)
+        if rule and rule[0] == 'min':
+            return r.randint(rule[1], rule[1] + 5000)
+        if self.kind in ('year',):
+            return r.randint(2002, 2013)
+        if self.kind in ('percentile',):
+            return r.randint(0, 100)
+        if self.kind in ('rate',):
+            return round(r.uniform(0.0, 100.0), 1)
+        if self.kind in ('quantity', 'count'):
+            return r.randint(0, 5000)
+        if self.kind in ('grad_count',):
+            return str(r.randint(0, 2000))
+        if self.kind in ('grad_rate',):
+            return '%.1f' % r.uniform(0.0, 100.0)
+        if self.kind in ('grad_cohort',):
+            return str(r.randint(0, 5000))
+        if self.kind in ('numeric',):
+            return str(r.randint(0, 9999))
+        if self.kind in ('rank',):
+            return str(r.randint(1, 52))
+        if self.kind in ('coord_x',):
+            return round(r.uniform(-180.0, -60.0), 6)
+        if self.kind in ('coord_y',):
+            return round(r.uniform(15.0, 72.0), 6)
+        return ''.join(r.choice(CHARSET) for _ in range(r.randint(3, 12)))
+
+    def sample(self):
+        r = self.rng
+        u = r.random()
+        if self.targets and u < 0.35:
+            v = r.choice(self.targets)
+        elif self.observed and u < 0.6:
+            v = r.choice(self.observed)
+        else:
+            v = self._fresh()
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and r.random() < 0.2:
+            d = 1 if isinstance(v, int) else 0.1
+            v = v + r.choice([-2 * d, -d, d, 2 * d])
+            if self.rule and self.rule[0] == 'range':
+                lo, hi = self.rule[1], self.rule[2]
+                v = max(lo, min(hi, v))
+            if isinstance(v, float):
+                v = round(v, 1)
+        elif isinstance(v, str) and v and r.random() < 0.15:
+            u2 = r.random()
+            if u2 < 0.3:
+                v = v + ''.join(r.choice(CHARSET) for _ in range(3))
+            elif u2 < 0.6:
+                v = ''.join(r.choice(CHARSET) for _ in range(3)) + v
+            elif len(v) > 1:
+                v = v[:-1]
+        return v
+
+
+class NameSampler(ColumnSampler):
+    """Capitalized words; 5% case variants; small pool for duplicate share."""
+
+    _WORDS = ['University', 'College', 'State', 'Central', 'Northern', 'Southern', 'Eastern', 'Western',
+              'Institute', 'Technology', 'Community', 'Technical', 'Auburn', 'Alabama', 'Boston', 'Chicago',
+              'Harvard', 'Brown', 'Columbia', 'Cornell', 'Dartmouth', 'Princeton', 'Yale', 'Pennsylvania']
+
+    def __init__(self, targets: list, observed: list, rng, dup: bool = False):
+        super().__init__(targets + observed, 0.0, float('inf'), rng)
+        self.targets = list(targets)
+        self.observed = [o for o in observed if o is not None]
+        self.dup = dup
+        self.pool: list = []
+
+    def _fresh(self):
+        r = self.rng
+        k = r.randint(1, 3)
+        return ' '.join(r.choice(self._WORDS) for _ in range(k))
+
+    def sample(self):
+        r = self.rng
+        if self.dup and self.pool and r.random() < 0.4:
+            v = r.choice(self.pool)
+        elif self.targets and r.random() < 0.3:
+            v = r.choice(self.targets)
+        elif self.observed and r.random() < 0.3:
+            v = r.choice(self.observed)
+        else:
+            v = self._fresh()
+        if self.dup:
+            self.pool.append(v)
+            if len(self.pool) > 20:
+                self.pool.pop(0)
+        if isinstance(v, str) and r.random() < 0.05:
+            v = spec.case_variant(r, v)
+        return v
+
+
+class UrlSampler(ColumnSampler):
+    """www.<token>.edu; 5% duplicate values."""
+
+    def __init__(self, observed: list, rng):
+        super().__init__(observed, 0.0, float('inf'), rng)
+        self.observed = [o for o in observed if o is not None]
+        self.pool: list = []
+
+    def _fresh(self):
+        r = self.rng
+        tok = ''.join(r.choice(string.ascii_lowercase) for _ in range(r.randint(3, 10)))
+        return 'www.%s.edu' % tok
+
+    def sample(self):
+        r = self.rng
+        if self.pool and r.random() < 0.05:
+            v = r.choice(self.pool)
+        elif self.observed and r.random() < 0.3:
+            v = r.choice(self.observed)
+        else:
+            v = self._fresh()
+        self.pool.append(v)
+        if len(self.pool) > 40:
+            self.pool.pop(0)
+        return v
+
+
+class PipeListSampler(ColumnSampler):
+    """Pipe-joined list of 5-20 random integers."""
+
+    def sample(self):
+        r = self.rng
+        k = r.randint(5, 20)
+        return '|'.join(str(r.randint(1, 999999)) for _ in range(k))
+
+
+class FlagSampler(ColumnSampler):
+    """Choice from ['X', None] with 10% NULL."""
+
+    def sample(self):
+        return None if self.rng.random() < 0.1 else 'X'
+
+
+class EmptyOrXSampler(ColumnSampler):
+    """Choice from ['', 'x', None] with 5% NULL."""
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.05:
+            return None
+        return r.choice(['', 'x'])
+
+
+class StateSampler(ColumnSampler):
+    """52 US state names; 5% case variants; boundary targets included."""
+
+    def __init__(self, targets: list, rng):
+        super().__init__(spec.STATES + list(targets), 0.0, float('inf'), rng)
+        self.targets = list(targets)
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            v = r.choice(self.targets)
+        else:
+            v = r.choice(spec.STATES)
+        if r.random() < 0.05:
+            v = spec.case_variant(r, v)
+        return v
+
+
+class StateAbbrSampler(ColumnSampler):
+    """52 two-letter abbreviations; 5% case variants; boundary targets included."""
+
+    def __init__(self, targets: list, rng):
+        super().__init__(spec.STATE_ABBR + list(targets), 0.0, float('inf'), rng)
+        self.targets = list(targets)
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            v = r.choice(self.targets)
+        else:
+            v = r.choice(spec.STATE_ABBR)
+        if r.random() < 0.05:
+            v = spec.case_variant(r, v)
+        return v
+
+
+class StatePostSampler(ColumnSampler):
+    """52 postal abbreviations."""
+
+    def sample(self):
+        return self.rng.choice(spec.STATE_POST)
+
+
+class RankSampler(ColumnSampler):
+    """Numeric string in [1, 52]."""
+
+    def sample(self):
+        return str(self.rng.randint(1, 52))
+
+
+class NumericStringSampler(ColumnSampler):
+    """Numeric string with 1-4 digits and optional one decimal."""
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.5:
+            return str(r.randint(0, 9999))
+        return '%.1f' % r.uniform(0.0, 9999.0)
+
+
+class GradCountSampler(ColumnSampler):
+    """Numeric string in [0, 2000]; boundary targets included."""
+
+    def __init__(self, targets: list, rng):
+        super().__init__(list(targets), 0.0, float('inf'), rng)
+        self.targets = list(targets)
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            return r.choice(self.targets)
+        return str(r.randint(0, 2000))
+
+
+class GradRateSampler(ColumnSampler):
+    """Numeric string in [0.0, 100.0] with 1 decimal."""
+
+    def sample(self):
+        return '%.1f' % self.rng.uniform(0.0, 100.0)
+
+
+class GradCohortSampler(ColumnSampler):
+    """Numeric string in [0, 5000]; small pool for ties / group sizes."""
+
+    def __init__(self, rng, small_pool: bool = False):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.small_pool = small_pool
+        self.pool: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.small_pool and self.pool and r.random() < 0.5:
+            return r.choice(self.pool)
+        v = str(r.randint(0, 5000))
+        if self.small_pool:
+            self.pool.append(v)
+            if len(self.pool) > 6:
+                self.pool.pop(0)
+        return v
+
+
+class YearSampler(ColumnSampler):
+    """Uniform choice from [2002..2013]; boundary targets included."""
+
+    def __init__(self, targets: list, rng):
+        super().__init__(list(targets), 0.0, float('inf'), rng)
+        self.targets = list(targets)
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            return r.choice(self.targets)
+        return r.randint(2002, 2013)
+
+
+class PercentileSampler(ColumnSampler):
+    """Uniform integer in [0, 100]."""
+
+    def sample(self):
+        return self.rng.randint(0, 100)
+
+
+class RateSampler(ColumnSampler):
+    """Uniform real in [0.0, 100.0] rounded to 1 decimal."""
+
+    def sample(self):
+        return round(self.rng.uniform(0.0, 100.0), 1)
+
+
+class QuantitySampler(ColumnSampler):
+    """Uniform integer in [1, 5000]; boundary targets included."""
+
+    def __init__(self, rng, targets: list = None):
+        super().__init__(list(targets or []), 0.0, float('inf'), rng)
+        self.targets = list(targets or [])
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            return r.choice(self.targets)
+        return r.randint(1, 5000)
+
+
+class CountSampler(ColumnSampler):
+    """Uniform integer in [0, 500]; small pool for ties / different values."""
+
+    def __init__(self, rng, small_pool: bool = False, targets: list = None):
+        super().__init__(list(targets or []), 0.0, float('inf'), rng)
+        self.small_pool = small_pool
+        self.targets = list(targets or [])
+        self.pool: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.targets and r.random() < 0.3:
+            return r.choice(self.targets)
+        if self.small_pool and self.pool and r.random() < 0.5:
+            return r.choice(self.pool)
+        v = r.randint(0, 500)
+        if self.small_pool:
+            self.pool.append(v)
+            if len(self.pool) > 6:
+                self.pool.pop(0)
+        return v
+
+
+class CoordSampler(ColumnSampler):
+    """long_x in [-180.0, -60.0], lat_y in [15.0, 72.0]."""
+
+    def __init__(self, rng, axis: str):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.axis = axis
+
+    def sample(self):
+        r = self.rng
+        if self.axis == 'x':
+            return round(r.uniform(-180.0, -60.0), 6)
+        return round(r.uniform(15.0, 72.0), 6)
+
+
+class ShortTokenSampler(ColumnSampler):
+    """Random token of 3-12 letters; 5% near-duplicate case variants."""
+
+    def sample(self):
+        r = self.rng
+        v = ''.join(r.choice(string.ascii_letters) for _ in range(r.randint(3, 12)))
+        if r.random() < 0.05:
+            v = spec.case_variant(r, v)
+        return v
+
+
+def make_spec_sampler(table: str, column: str, column_meta, literal_pool: list,
+                      original_values: list, rng) -> ColumnSampler:
+    """Build the sampler for one column from the specification."""
+    kind = spec.kind_for(table, column)
+    targets = spec.boundary_values(table, column)
+    observed = [v for v in original_values if v is not None]
+    pool = [str(v) for v in literal_pool]
+    rule = spec.rule_for(table, column)
+
+    if kind == 'int_pk':
+        return None
+    if kind == 'int_fk':
+        return None
+    if kind == 'name':
+        return NameSampler(targets, observed, rng, dup=spec.is_dup_column(table, column))
+    if kind == 'url':
+        return UrlSampler(observed, rng)
+    if kind == 'pipe':
+        return PipeListSampler([], 0.0, float('inf'), rng)
+    if kind == 'flag':
+        return FlagSampler([], 0.0, float('inf'), rng)
+    if kind == 'empty_or_x':
+        return EmptyOrXSampler([], 0.0, float('inf'), rng)
+    if kind == 'state':
+        return StateSampler(targets, rng)
+    if kind == 'state_abbr':
+        return StateAbbrSampler(targets, rng)
+    if kind == 'state_post':
+        return StatePostSampler([], 0.0, float('inf'), rng)
+    if kind == 'rank':
+        return RankSampler([], 0.0, float('inf'), rng)
+    if kind == 'numeric':
+        return NumericStringSampler([], 0.0, float('inf'), rng)
+    if kind == 'grad_count':
+        return GradCountSampler(targets, rng)
+    if kind == 'grad_rate':
+        return GradRateSampler([], 0.0, float('inf'), rng)
+    if kind == 'grad_cohort':
+        return GradCohortSampler(rng, small_pool=spec.is_tie_column(table, column)
+                                 or spec.is_group_size_column(table, column))
+    if kind == 'year':
+        return YearSampler(targets, rng)
+    if kind == 'percentile':
+        return PercentileSampler([], 0.0, float('inf'), rng)
+    if kind == 'rate':
+        return RateSampler([], 0.0, float('inf'), rng)
+    if kind == 'quantity':
+        return QuantitySampler(rng, targets=targets)
+    if kind == 'count':
+        return CountSampler(rng, small_pool=spec.is_tie_column(table, column)
+                            or spec.is_diff_column(table, column), targets=targets)
+    if kind == 'coord_x':
+        return CoordSampler(rng, 'x')
+    if kind == 'coord_y':
+        return CoordSampler(rng, 'y')
+    if kind == 'race':
+        return EnumSampler(spec.RACES + [t for t in targets if t not in spec.RACES], rng)
+    if kind == 'gender':
+        return EnumSampler(spec.GENDERS + [t for t in targets if t not in spec.GENDERS], rng)
+    if kind == 'cohort':
+        return EnumSampler(spec.COHORTS + [t for t in targets if t not in spec.COHORTS], rng)
+    if kind == 'control':
+        return EnumSampler(spec.CONTROLS + [t for t in targets if t not in spec.CONTROLS], rng)
+    if kind == 'level':
+        return EnumSampler(spec.LEVELS + [t for t in targets if t not in spec.LEVELS], rng)
+    return BoundarySampler(targets, observed + pool, rng, rule=rule, kind=kind)
+
+
+def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
+                  max_l0: float = float('inf')) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (kept for compatibility)."""
+    ov = list(original_values)
+    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    if column.checked:
+        p = 0.0
+    if max_l0 == float('inf') and rng.random() < 0.5:
+        max_l0 = rng.random() * 30
+        if column.pk_pos > 0:
+            max_l0 = float('inf') if n_pk == 1 else 30
+    return make_column_sampler(column, els, p, max_l0, rng)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -209,23 +661,9 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
         return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
-    if any(k in t for k in ('char', 'text', 'blob')):
+    if any(k in char for char in ('char', 'text', 'blob') for k in [char]):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)
-
-
-def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
-    ov = list(original_values)
-    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
-    if column.checked:
-        p = 0.0
-    if max_l0 == float('inf') and rng.random() < 0.5:
-        max_l0 = rng.random() * 30
-        if column.pk_pos > 0:
-            max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

@@ -3,9 +3,46 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _case_variants(s: str) -> list:
+    return [s.lower(), s.upper(), s.title(), s.capitalize()]
+
+
+def _one_char_edits(s: str) -> list:
+    out = []
+    if len(s) >= 2:
+        out.append(s[:-1])
+        out.append(s[1:])
+        mid = len(s) // 2
+        out.append(s[:mid] + s[mid + 1:])
+    if s:
+        out.append(s + s[-1])
+    return out
+
+
+def near_variants(s: str, k: int = 3) -> list:
+    """Case change, one-character edit, truncation variants of a pool value."""
+    cand = _case_variants(s) + _one_char_edits(s)
+    seen, out = {s}, []
+    for c in cand:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:k]
+
+
+def like_variants(pattern: str) -> list:
+    """Literal and 2-3 near-variants of a LIKE pattern (without '%')."""
+    body = pattern.replace('%', '')
+    out = [body]
+    out += near_variants(body, 3)
+    return out
 
 
 class ColumnSampler:
@@ -233,3 +270,46 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_pool(table: str, column: str) -> list:
+    """Base realistic pool for a column, from the specification."""
+    key = (table.upper(), column.upper())
+    if key in (('GEOGRAPHIC', 'CITY_NAME'), ('RESTAURANT', 'CITY_NAME'), ('LOCATION', 'CITY_NAME')):
+        return list(spec.CITY_POOL)
+    if key == ('GEOGRAPHIC', 'COUNTY'):
+        return list(spec.COUNTY_POOL)
+    if key == ('GEOGRAPHIC', 'REGION'):
+        return list(spec.REGION_POOL)
+    if key == ('RESTAURANT', 'FOOD_TYPE'):
+        return list(spec.FOOD_POOL)
+    if key == ('RESTAURANT', 'NAME'):
+        return list(spec.NAME_POOL)
+    if key == ('LOCATION', 'STREET_NAME'):
+        return list(spec.STREET_POOL)
+    return []
+
+
+def spec_elements(table: str, column: str, literal_pool: list) -> list:
+    """Pool + boundary literals + LIKE near-variants + near-variants of pool values."""
+    key = (table.upper(), column.upper())
+    els = list(spec_pool(table, column))
+    els += [str(v) for v in literal_pool]
+    els += list(spec.BOUNDARY.get(key, []))
+    for pat in spec.LIKE_PATTERNS.get(key, []):
+        els += like_variants(pat)
+    base = list(dict.fromkeys(els))
+    for v in base:
+        if isinstance(v, str) and v:
+            els += near_variants(v, 2)
+    return list(dict.fromkeys(els))
+
+
+def spec_numeric_range(table: str, column: str):
+    """(lo, hi, is_int, precision) for numeric columns with a semantic formula."""
+    key = (table.upper(), column.upper())
+    if key == ('RESTAURANT', 'RATING'):
+        return 0.0, 5.0, False, 1
+    if key == ('LOCATION', 'HOUSE_NUMBER'):
+        return 1, 9999, True, 0
+    return None

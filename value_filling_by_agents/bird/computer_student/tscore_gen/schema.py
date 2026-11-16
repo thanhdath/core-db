@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    composite_fks: list = field(default_factory=list)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -108,18 +109,37 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             tables[t] = TableMeta(t, cols, pk)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
+        composite: list = []
         for t in tnames:
-            for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
-                pt = tlow.get(str(r[2]).lower())
-                child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
-                pc = None
-                if pt is not None:
-                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
-                if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
+            raw = con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall()
+            by_id: dict = {}
+            for r in raw:
+                by_id.setdefault(r[0], []).append(r)
+            for fid, rows in by_id.items():
+                rows = sorted(rows, key=lambda r: r[1])
+                pt = tlow.get(str(rows[0][2]).lower())
+                if pt is None:
+                    warnings.warn('dropping dangling FK %s -> %s' % (t, rows[0][2]))
                     continue
-                fks[(t, child)] = (pt, pc)
+                child_cols, parent_cols = [], []
+                ok = True
+                for r in rows:
+                    child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
+                    pcol_name = r[4] if r[4] is not None else r[3]
+                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
+                    if child is None or pc is None:
+                        ok = False
+                        break
+                    child_cols.append(child)
+                    parent_cols.append(pc)
+                if not ok:
+                    warnings.warn('dropping dangling FK %s -> %s' % (t, rows[0][2]))
+                    continue
+                for cc, pc in zip(child_cols, parent_cols):
+                    fks[(t, cc)] = (pt, pc)
+                if len(child_cols) > 1:
+                    composite.append({'child_table': t, 'child_cols': child_cols,
+                                      'parent_table': pt, 'parent_cols': parent_cols})
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
@@ -139,4 +159,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, composite)

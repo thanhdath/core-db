@@ -1,5 +1,6 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + specification-derived helpers."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -140,3 +141,50 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     finally:
         con.close()
     return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+
+
+def is_int_type(t: str) -> bool:
+    return 'int' in (t or '').lower()
+
+
+def is_real_type(t: str) -> bool:
+    return any(k in (t or '').lower() for k in ('real', 'float', 'double', 'decimal', 'numeric'))
+
+
+def is_text_type(t: str) -> bool:
+    t = (t or '').lower()
+    return t == '' or 'text' in t or 'char' in t or 'clob' in t
+
+
+def is_date_type(t: str) -> bool:
+    return 'date' in (t or '').lower()
+
+
+def is_time_type(t: str) -> bool:
+    return (t or '').strip().lower() == 'time'
+
+
+def is_bool_type(t: str) -> bool:
+    return 'bool' in (t or '').lower() or 'bit' in (t or '').lower()
+
+
+def is_int_like(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    if isinstance(v, float):
+        return v.is_integer()
+    if isinstance(v, str):
+        return bool(re.fullmatch(r'-?\d+', v.strip()))
+    return False
+
+
+def is_real_like(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, str):
+        return bool(re.fullmatch(r'-?\d+(\.\d+)?', v.strip()))
+    return False

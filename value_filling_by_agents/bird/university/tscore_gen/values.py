@@ -3,9 +3,19 @@ import datetime as dt
 import re
 import string
 
+from . import specification as S
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _clamp(v, lo, hi):
+    if lo is not None and v is not None and v < lo:
+        return lo
+    if hi is not None and v is not None and v > hi:
+        return hi
+    return v
 
 
 class ColumnSampler:
@@ -39,23 +49,41 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None, boundaries=()):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        self.floor = float(lo) if lo is not None else None
+        self.ceil = float(hi) if hi is not None else None
+        self.boundaries = [float(b) for b in boundaries]
+        base_hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-base_hi, base_hi)
+        if self.floor is not None:
+            self.min = max(self.min, self.floor)
+        if self.ceil is not None:
+            self.max = min(self.max, self.ceil)
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
+    def _draw(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.25:
+            b = r.choice(self.boundaries)
+            if r.random() < 0.5:
+                return b
+            return b + (r.choice((-1, 1)))
+        full = r.random() < self.p or len(self.elements) <= 1
+        lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
+        v = r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi)
+        return v
+
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
-            full = r.random() < self.p or len(self.elements) <= 1
-            lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
+            v = self._fresh_or_reuse(self._draw)
         else:
             v = r.choice(self.elements)
         d = 1 if self.is_int else 0.01
@@ -67,15 +95,25 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
+        v = self._cast(v)
+        if self.is_int:
+            v = _clamp(int(v), int(self.floor) if self.floor is not None else None,
+                       int(self.ceil) if self.ceil is not None else None)
+        else:
+            v = _clamp(float(v), self.floor, self.ceil)
         return self._cast(v)
 
 
 class StringSampler(ColumnSampler):
     """fuzz/string.py (allow_none dropped)."""
 
-    def __init__(self, elements, p, max_l0, rng, length=20):
+    def __init__(self, elements, p, max_l0, rng, length=20, case_variants=()):
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
+        for e in list(els):
+            extra += [e.lower(), e.upper(), e.swapcase(), e.title()]
+        for e in list(case_variants):
+            extra += [e, e.lower(), e.upper(), e.swapcase(), e.title()]
         for e in els:
             if re.fullmatch(r'-?\d+', e):
                 extra += [str(int(e) + 1), str(int(e) - 1)]
@@ -182,11 +220,34 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+def _domain_for(column):
+    """(lo, hi, is_int) domain for a (table, column) pair, or (None, None, False)."""
+    key = (column.table, column.name)
+    if key in (('university_year', 'year'), ('university_ranking_year', 'year')):
+        return S.YEAR_LO, S.YEAR_HI, True
+    if key == ('university_year', 'num_students'):
+        return S.NUM_STUDENTS_LO, S.NUM_STUDENTS_HI, True
+    if key in (('university_year', 'pct_international_students'), ('university_year', 'pct_female_students')):
+        return S.PCT_LO, S.PCT_HI, True
+    if key == ('university_ranking_year', 'score'):
+        return S.SCORE_LO, S.SCORE_HI, True
+    if key == ('university_year', 'student_staff_ratio'):
+        return S.RATIO_LO, S.RATIO_HI, False
+    return None, None, False
+
+
+def _boundaries_for(column):
+    key = (column.table, column.name)
+    return S.BOUNDARY_VALUES.get(key, ())
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    dlo, dhi, dint = _domain_for(column)
+    bounds = _boundaries_for(column)
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
@@ -201,16 +262,22 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
-        return NumberSampler(els, p, max_l0, rng, scale=4)
-    if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
-        is_int = 'int' in t
+        return NumberSampler(els, p, max_l0, rng, scale=4, is_int=True,
+                             lo=S.YEAR_LO, hi=S.YEAR_HI, boundaries=bounds)
+    is_numeric = any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real'))
+    if is_numeric or dlo is not None or dhi is not None:
+        is_int = dint if (dlo is not None or dhi is not None) else ('int' in t)
         scale, prec = 10, (0 if is_int else 4)
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        if (column.table, column.name) == ('university_year', 'student_staff_ratio'):
+            prec = S.RATIO_PRECISION
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, lo=dlo, hi=dhi, boundaries=bounds)
     if any(k in t for k in ('char', 'text', 'blob')):
-        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
+        cv = S.BOUNDARY_TEXT.get((column.table, column.name), ())
+        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20, case_variants=cv)
     return StringSampler(els, p, max_l0, rng)
 
 

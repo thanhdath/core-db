@@ -7,6 +7,17 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+_extra_elements: dict = {}
+
+
+def set_extra_elements(column_meta, extra) -> None:
+    """Register spec/extra pool values for a column; consumed by _init_sampler."""
+    key = (column_meta.table, column_meta.name)
+    have = _extra_elements.setdefault(key, [])
+    for x in extra:
+        if x is not None and x not in have:
+            have.append(x)
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -216,9 +227,11 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (plus set_extra_elements)."""
     ov = list(original_values)
+    extra = _extra_elements.get((column.table, column.name), [])
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    els += [v for v in extra if v not in els]
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:

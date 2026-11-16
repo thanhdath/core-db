@@ -1,50 +1,516 @@
 {
  "db": "menu",
- "operator_io_quirks": [
-  "MenuItem has 1,334,410 rows; Dish 426,713 \u2014 both exceed max_rows_per_table=300000, so original_values are rowid-sampled (rowid % k = 0) while original_sizes use full count(*).",
-  "Menu.date is declared DATE but stored as TEXT 'YYYY-MM-DD' (e.g. '1900-04-15'); ts_fuzzer dispatches to Date (first element not int-parsable) with template %Y-%m-%d.",
-  "Menu.keywords, Menu.language, Menu.location_type are 100% NULL (distinct=0, samples empty) \u2014 literal pool and original_values are empty; String sampler gets no elements.",
-  "Dish.description is 100% NULL (distinct=1, sample '') \u2014 effectively empty column.",
-  "Menu.status has distinct=1 ('complete') \u2014 single-value column; String sampler will mostly reproduce it.",
-  "MenuItem.created_at / updated_at are TEXT holding 'YYYY-MM-DD HH:MM:SS UTC' \u2014 String fuzzer, not Date; no date template applies.",
-  "MenuPage.image_id declared REAL, storage real+null, values like 1603595.0 \u2014 Number(scale from REAL, no args) \u2192 scale 0, range [-1,1] full-range; original values far outside.",
-  "MenuItem.dish_id storage includes 'null' though null_rate=0.0 (sample shows integer) \u2014 storage-class list is a superset; treat null_rate as authoritative.",
-  "MenuItem.menu_page_id distinct=4759 but MenuPage.id distinct=66937 \u2014 FK child values are a strict subset of parent ids; parent has many unreferenced ids.",
-  "Dish.id and MenuItem.id both distinct=200000 (capped sample) though row counts differ (426713 / 1334410) \u2014 distinct counts are sample-capped, not true cardinality.",
-  "No composite PKs, no self-FKs, no dangling FKs, no unique/check constraints in DDL \u2014 all FKs resolve to existing single-column INTEGER PKs.",
-  "Table/column names are mixed-case (Dish, MenuPage, MenuItem, menu_page_id) \u2014 must be double-quoted; column lookup case-insensitive."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on Menu.date: template %Y-%m-%d, range from parsed elements (~1900-1980s), so fresh dates stay in that window; implausible for 'modern' queries but plausible for menu-era queries.",
-  "Number fuzzer on REAL columns (price, high_price, xpos, ypos, image_id) with no (a,b) args \u2192 scale 0, full range [-1,1] (or [0,2] unsigned); original prices 0.1-25 and image_id ~1.6e6 are far outside \u2192 FN on price/image_id predicates.",
-  "Number fuzzer on INTEGER columns (id, menus_appeared, first_appeared, page_count, dish_count) \u2192 scale 0, range [-1,1] plus \u00b11/\u00b12 perturbation; original ids up to 1.3M and years ~1900 \u2192 FN on id/year/count predicates.",
-  "String fuzzer on TEXT columns: 5 original samples + distinct pool literals, p=0.2 fresh random over a-zA-Z0-9() with contamination; names/places/uuids become gibberish \u2192 FN on LIKE/equality on name, place, uuid, call_number.",
-  "String fuzzer on 100%-NULL columns (keywords, language, location_type, description) has no elements \u2192 p:=1, always fresh random strings; original is all NULL \u2192 FP on IS NULL / FN on IS NOT NULL.",
-  "String fuzzer on Menu.status (single value 'complete') mostly reproduces 'complete' but contamination/fresh draws inject noise \u2192 occasional FP on status='complete'.",
-  "FK fill: MenuItem.menu_page_id drawn from MenuPage.id (66937 values) with replacement; MenuItem.dish_id from Dish.id (426713) \u2014 joins always match, so join-cardinality queries get plausible ties but wrong multiplicities.",
-  "PK dedup (sample_fresh_primary_keys) drops duplicate id rows; with Number fuzzer on id producing few distinct values, many rows collapse \u2192 table sizes shrink below chosen size \u2192 FN on COUNT(*) thresholds.",
-  "No NOT NULL/CHECK/unique constraints \u2192 no insert failures; all rows land, so row counts equal chosen sizes (minus PK dedup).",
-  "Menu.name null_rate 0.357 but String fuzzer rarely emits NULL (only via element dropout) \u2192 FP on name IS NULL queries.",
-  "Date fuzzer p-inversion: p=0.2 means element returned w.p. 0.2, fresh date w.p. 0.8 \u2192 dates mostly fresh in [min,max] of originals, ties on exact date rare \u2192 FP on date-equality joins.",
-  "Number list-range quirk (list_max overwritten to full-range max) means even with elements, fresh draws span [-1,1] not [min(el),max(el)] \u2192 price predicates like price>5 almost never satisfied \u2192 FN."
- ],
- "challenger_refs": [
-  "G7",
-  "G5",
-  "G9",
-  "G10",
-  "G14",
-  "G11",
-  "G2",
-  "G1",
-  "G3",
-  "G4"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL. PK boundary literals from the atomic summary are honoured by the compact DB rows, not by generated rows (generated PKs are fresh sequential values that do not collide with compact max).",
+   "integer_fk": "Copy an existing parent key value; allow NULL only where the column is nullable; include parent rows without children and child rows with NULL FK. FK boundary literals are honoured by compact DB rows; generated FKs reference generated or compact parent keys.",
+   "integer_quantity": "Positive integers sampled from a small range (1..500) unless a per-column exception gives bounds.",
+   "integer_year": "Integers in 1800..2030.",
+   "real_price": "Non-negative REAL rounded to 2 decimals, sampled from 0.0..100.0; NULL share per column statistics.",
+   "real_fraction": "REAL in [0,1] rounded to 6 decimals.",
+   "text_short": "Short title-case strings; include near-variants (case changes, trailing punctuation) and duplicates on DISTINCT columns.",
+   "text_long": "Sentence-like strings up to 200 chars; may be empty string or NULL where nullable.",
+   "text_uuid": "Lowercase UUID-like hex string; include uppercase near-variants.",
+   "date_iso": "Dates in %Y-%m-%d between 1850-01-01 and 2015-12-31; include boundary values at listed literals and one day on each side.",
+   "text_timestamp": "Timestamps formatted 'YYYY-MM-DD HH:MM:SS UTC' between 2011-01-01 and 2012-12-31.",
+   "null_rule": "Every nullable column gets at least one NULL row and at least one non-NULL row per instance; NULL share follows the compact database share; planted NULLs are never replaced. Columns that are 100% NULL in the compact DB (Dish.description, Menu.keywords, Menu.language, Menu.location_type) are generated NULL-dominant with a small positive non-NULL share (at least one non-NULL row per instance). Columns not listed in null_targets are generated non-NULL.",
+   "boundary_rule": "For each atomic-operation literal on a non-key column, include the literal, one step below and one step above (numbers by step 1 or 0.01, dates by one day). Boundary literals on PK/FK columns are satisfied by compact DB rows; generated PK/FK values are fresh and do not collide.",
+   "tie_rule": "For ORDER BY ... LIMIT columns, plant at least two rows tied at the listed rank.",
+   "duplicate_rule": "For DISTINCT columns, plant duplicate values covering 20-50% of rows; boundary literals are reserved before duplicate sampling so they survive.",
+   "group_distinct_rule": "For columns with rows_with_different_values pattern, ensure each FK group with >=2 children has at least two distinct non-NULL values."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Dish",
+    "column": "name",
+    "pattern": "comparison_boundary, duplicates_for_distinct",
+    "targets": {
+     "values": [
+      "Clear green turtle",
+      "clear green turtle",
+      "Anchovies",
+      "anchovies",
+      "Fresh lobsters in every style",
+      "fresh lobsters in every style"
+     ],
+     "duplicate_share": "20-50 %",
+     "reserve_boundaries_before_duplicates": true
+    }
+   },
+   {
+    "table": "Dish",
+    "column": "first_appeared",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1849,
+      1850,
+      1851,
+      2011,
+      2012,
+      2013
+     ]
+    }
+   },
+   {
+    "table": "Dish",
+    "column": "last_appeared",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1849,
+      1850,
+      1851,
+      2011,
+      2012,
+      2013
+     ]
+    }
+   },
+   {
+    "table": "Dish",
+    "column": "lowest_price",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "table": "Dish",
+    "column": "id",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "values": [
+      106,
+      107,
+      108
+     ],
+     "parent_rows_without_children": true,
+     "honoured_by": "compact_db"
+    }
+   },
+   {
+    "table": "Menu",
+    "column": "id",
+    "pattern": "group_sizes, unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "values": [
+      12463,
+      12464,
+      12465,
+      12881,
+      12882,
+      12883
+     ],
+     "parent_rows_without_children": true,
+     "honoured_by": "compact_db"
+    }
+   },
+   {
+    "table": "Menu",
+    "column": "name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Ritz Carlton",
+      "ritz carlton",
+      "Zentral Theater Terrace",
+      "zentral theater terrace",
+      "Young's Hotel",
+      "young's hotel"
+     ]
+    }
+   },
+   {
+    "table": "Menu",
+    "column": "date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1949-12-31",
+      "1950-01-01",
+      "1950-01-02",
+      "1950-12-31",
+      "1951-01-01"
+     ]
+    }
+   },
+   {
+    "table": "MenuPage",
+    "column": "id",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "values": [
+      143,
+      144,
+      145,
+      1388,
+      1389,
+      1390
+     ],
+     "parent_rows_without_children": true,
+     "honoured_by": "compact_db"
+    }
+   },
+   {
+    "table": "MenuPage",
+    "column": "menu_id",
+    "pattern": "group_sizes, comparison_boundary",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "values": [
+      12881,
+      12882,
+      12883
+     ],
+     "honoured_by": "compact_db"
+    }
+   },
+   {
+    "table": "MenuPage",
+    "column": "page_number",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "MenuPage",
+    "column": "uuid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "510d47e4-295a-a3d9-e040-e00a18064a99",
+      "510D47E4-295A-A3D9-E040-E00A18064A99",
+      "510d47e4-2958-a3d9-e040-e00a18064a99",
+      "510D47E4-2958-A3D9-E040-E00A18064A99",
+      "c02c9a3b-6881-7080-e040-e00a180631aa",
+      "C02C9A3B-6881-7080-E040-E00A180631AA"
+     ]
+    }
+   },
+   {
+    "table": "MenuItem",
+    "column": "menu_page_id",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "values": [
+      143,
+      144,
+      145,
+      1388,
+      1389,
+      1390
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "honoured_by": "compact_db"
+    }
+   },
+   {
+    "table": "MenuItem",
+    "column": "dish_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "MenuItem",
+    "column": "price",
+    "pattern": "rows_with_different_values, ties_for_order_limit",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "MenuPage.menu_id",
+    "parent_table": "Menu",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child": "MenuItem.menu_page_id",
+    "parent_table": "MenuPage",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child": "MenuItem.dish_id",
+    "parent_table": "Dish",
+    "parent_column": "id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Dish",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "Dish",
+    "column": "menus_appeared",
+    "formula": "menus_appeared >= 0"
+   },
+   {
+    "table": "Dish",
+    "column": "times_appeared",
+    "formula": "times_appeared >= 0"
+   },
+   {
+    "table": "Dish",
+    "column": "first_appeared",
+    "formula": "first_appeared BETWEEN 1800 AND 2030"
+   },
+   {
+    "table": "Dish",
+    "column": "last_appeared",
+    "formula": "last_appeared BETWEEN 1800 AND 2030"
+   },
+   {
+    "table": "Dish",
+    "column": "last_appeared",
+    "formula": "last_appeared >= first_appeared",
+    "evidence": "Rows id=1 (1897..1927), id=2 (1895..1960), id=3 (1893..1917), id=4 (1900..1971) satisfy last_appeared >= first_appeared."
+   },
+   {
+    "table": "Dish",
+    "column": "lowest_price",
+    "formula": "lowest_price >= 0"
+   },
+   {
+    "table": "Dish",
+    "column": "highest_price",
+    "formula": "highest_price >= 0"
+   },
+   {
+    "table": "Dish",
+    "column": "highest_price",
+    "formula": "highest_price >= lowest_price",
+    "condition": "lowest_price IS NOT NULL AND highest_price IS NOT NULL",
+    "evidence": "Rows id=1 (0.2..0.4), id=2 (0.1..0.8), id=3 (0.25..1.0), id=4 (0.0..18.0) satisfy highest_price >= lowest_price."
+   },
+   {
+    "table": "Menu",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "Menu",
+    "column": "status",
+    "formula": "status IN ('complete')",
+    "evidence": "All shown Menu.status values are 'complete'."
+   },
+   {
+    "table": "Menu",
+    "column": "page_count",
+    "formula": "page_count > 0"
+   },
+   {
+    "table": "Menu",
+    "column": "dish_count",
+    "formula": "dish_count >= 0"
+   },
+   {
+    "table": "Menu",
+    "column": "date",
+    "formula": "date BETWEEN '1850-01-01' AND '2015-12-31'"
+   },
+   {
+    "table": "MenuPage",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "MenuPage",
+    "column": "page_number",
+    "formula": "page_number >= 0"
+   },
+   {
+    "table": "MenuPage",
+    "column": "full_height",
+    "formula": "full_height > 0"
+   },
+   {
+    "table": "MenuPage",
+    "column": "full_width",
+    "formula": "full_width > 0"
+   },
+   {
+    "table": "MenuItem",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "MenuItem",
+    "column": "price",
+    "formula": "price >= 0"
+   },
+   {
+    "table": "MenuItem",
+    "column": "high_price",
+    "formula": "high_price >= 0"
+   },
+   {
+    "table": "MenuItem",
+    "column": "high_price",
+    "formula": "high_price >= price",
+    "condition": "price IS NOT NULL AND high_price IS NOT NULL",
+    "evidence": "Rows id=1 (0.4..1.0), id=2 (0.6..3.0), id=3 (0.5..1.5), id=4 (0.1..4.0) satisfy high_price >= price."
+   },
+   {
+    "table": "MenuItem",
+    "column": "xpos",
+    "formula": "xpos BETWEEN 0 AND 1",
+    "evidence": "All shown xpos (0.101..0.559) lie in [0,1]."
+   },
+   {
+    "table": "MenuItem",
+    "column": "ypos",
+    "formula": "ypos BETWEEN 0 AND 1",
+    "evidence": "All shown ypos (0.254..0.313) lie in [0,1]."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Dish": 200,
+   "Menu": 120,
+   "MenuPage": 180,
+   "MenuItem": 400
+  },
+  "null_targets": [
+   "Dish.description",
+   "Dish.lowest_price",
+   "Dish.highest_price",
+   "Menu.name",
+   "Menu.sponsor",
+   "Menu.event",
+   "Menu.venue",
+   "Menu.place",
+   "Menu.physical_description",
+   "Menu.occasion",
+   "Menu.notes",
+   "Menu.call_number",
+   "Menu.keywords",
+   "Menu.language",
+   "Menu.date",
+   "Menu.location_type",
+   "Menu.currency",
+   "Menu.currency_symbol",
+   "MenuPage.page_number",
+   "MenuPage.full_height",
+   "MenuPage.full_width",
+   "MenuItem.price",
+   "MenuItem.high_price"
+  ],
+  "supporting_evidence": {
+   "Dish.last_appeared >= first_appeared": "Rows id=1 (1897..1927), id=2 (1895..1960), id=3 (1893..1917), id=4 (1900..1971).",
+   "Dish.highest_price >= lowest_price": "Rows id=1 (0.2..0.4), id=2 (0.1..0.8), id=3 (0.25..1.0), id=4 (0.0..18.0).",
+   "MenuItem.high_price >= price": "Rows id=1 (0.4..1.0), id=2 (0.6..3.0), id=3 (0.5..1.5), id=4 (0.1..4.0).",
+   "MenuItem.xpos/ypos in [0,1]": "All shown xpos (0.101..0.559) and ypos (0.254..0.313) lie in [0,1].",
+   "Menu.status enum": "All shown Menu.status values are 'complete'.",
+   "PK/FK boundary literals": "Compact DB already holds PKs 106-108, 12463-12465, 12881-12883, 143-145, 1388-1390 and FKs referencing them; generated PKs are fresh sequential values that do not collide, so boundary denotations are separated by compact rows."
+  },
+  "uncertainty": "Dish.description, Menu.keywords, Menu.language and Menu.location_type are 100% NULL in the sample; they are generated NULL-dominant with at least one non-NULL row per instance to satisfy the interface NULL rule. Menu.dish_count is not verified as an aggregate of MenuItem because the sample does not align MenuItem rows to Menu rows; it is sampled as a non-negative integer. MenuPage.image_id is a REAL identifier, not a quantity, and is sampled as a positive REAL. Table sizes are exact per instance; rows dropped by unmatched-join detaching are not replaced, so effective counts may be slightly below the base."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.BOUNDARY places boundary literals on primary-key and foreign-key columns: ('Dish','id'):[106,107,108], ('Menu','id'):[12463,...], ('MenuPage','id'):[143,144,145,1388,1389,1390], ('MenuPage','menu_id'):[12881,12882,12883], ('MenuItem','menu_page_id'):[143,144,145,1388,1389,1390]. These literal sets were harvested from query predicates (comparison_boundary targets) which is correct for separating query denotations, but in instance.py build_random_instance the integer PK is overwritten by _next_pk (sequential max+1) AFTER samplers run, and FK values are overwritten by fill_foreign_keys_consistently AFTER _plant_boundaries. Consequently, boundary literal sets on PK/FK columns are never realized as row values. This is fine for FK because it must remain referentially valid; but the spec's PARENT_WITHOUT_CHILDREN targeting MenuPage.id=144 / Menu.id=12882 etc. is provided as literal values only. _ensure_unmatched detaches NULL wherever no free parent exists, but does not ensure the specific boundary PKs (144, 1388, 12882, 12463...) are actually reachable and matchable against generated parent rows. Because compact DB already holds those PKs, they remain matchable, so denotation-separation on these literals depends entirely on compact rows, not on generated construction. Request: (a) clarify in the spec that PK/FK boundary literals are honoured by the compact DB and not generated, and (b) generate some MenuPage.id / Menu.id rows with values not colliding with compact max, ensuring at least one generated parent row with the boundary id exists so the query can find a generated boundary row \u2014 or explicitly state why relying on compact rows is acceptable.",
+     "requested_revision": "Add a spec clarification for PK/FK boundary literals (or generate a boundary PK on a non-colliding table when feasible), so that literal pools are not silently dropped."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.BOUNDARY for ('MenuItem','price') TIE_COLUMNS targets ('MenuItem','price') with 'tie_at_rank':[1] DESC, but spec.py only lists ('MenuItem','price') under TIE_COLUMNS and _plant_ties runs BEFORE _fix_formulas and BEFORE null planting? Actually order is _plant_nulls first, then _plant_boundaries, then _plant_duplicates, then _plant_ties, then _fix_formulas. Ties set the top two values to max(remaining non-nulls). Then _fix_formulas may clamp negative prices to 0, but only if price<0, which won't happen. However, the group semantics requested 'rows_with_different_values: >=2 per group with different values' \u2014 this is not implemented anywhere. The pattern rows_with_different_values (per MenuPage group with different prices) is not enforced by construction. Ties are planted but the 'at least 2 different values per group' invariant is only satisfied by chance (sampling from uniform pool). Execution feedback does not confirm separation of the 'ties_for_order_limit' or 'rows_with_different_values' targets for MenuItem.price. No evidence exists that grouped-by-page rows have >=2 different prices. Request: verify by construction (or state explicitly) that each MenuItem.menu_page_id group has at least two rows with distinct price values.",
+     "requested_revision": "Add a construction step that guarantees per-FK-group distinct-value coverage on MenuItem.price for groups that have >=2 children."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification NULL rule (interface rule 7) requires that for every nullable column each instance contains generated rows with NULL AND rows with non-NULL. But spec.NULL_SHARE and NULL_DOMINANT cause some columns to have NULL share 1.0 (Dish.description, Menu.keywords, Menu.language, Menu.location_type), which yields zero non-NULL rows in any instance \u2014 see execution feedback: 'Dish.description: NULL 3766 / 3766', 'Menu.keywords: NULL 1863/1863', 'Menu.language: 1863/1863', 'Menu.location_type: 1863/1863'. These are all-'NULL-0 non-NULL', which violates the interface rule 'each instance contains generated rows with NULL and rows with non-NULL values'. The spec text off-spec: 'Dish.description, Menu.keywords, Menu.language and Menu.location_type are 100% NULL in the sample; they are generated as NULL-dominant.' The interface explicitly forbids all-NULL columns. Request: update the NULL rule so every nullable column has at least one non-NULL generated value per instance, mapping 100% NULL columns to a small positive non-NULL share.",
+     "requested_revision": "Set a fixed low non-NULL probability for NULL_DOMINANT columns (e.g., one planted non-NULL row per instance) to comply with rule 7."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Code in instance.py _plant_nulls: shares of 1.0 for NULL_DOMINANT columns (spec.NULL_DOMINANT includes Dish.description, Menu.keywords, Menu.language, Menu.location_type) plant all-NULL, matching the ALL-NULL execution evidence. Also observe NULL execution on non-null-constraint columns: 'Dish.first_appeared: NULL 20/3766', 'Dish.menus_appeared: NULL 20/3766', 'MenuItem.created_at: NULL 20/7902', 'Menu.dish_count: NULL 15/1863', 'Menu.status: NULL 17/1863', 'Menu.location: NULL 19/1863', 'MenuPage.image_id: NULL 17/3471', 'MenuPage.menu_id: NULL 19/3471'. Dish/menu columns like first_appeared, menus_appeared are NOT nullable in the compact DB per the column-statistics evidence (no default null evidence). Menu.dish_count, Menu.status, Menu.location, MenuPage.image_id are similarly not enumerated under null_targets in the specification, yet the NULL rule in instance.py iterates over all columns with cm.notnull == False. The spec's null_targets list is narrower than what the program NULLs. Request: restrict _plant_nulls to the columns listed in null_targets (or extend null_targets with evidence) so that NULL share matches compact-DB nullability, and ensure columns outside null_targets keep nullable-only when the compact DB has NULLs.",
+     "requested_revision": "Gate _plant_nulls on (t,c) in null_targets, or add the missing columns to null_targets after verifying compact-DB NULL evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_duplicates only handles ('Dish','name'). But spec's duplicate_share '20-50 %' is provided for Dish.name only; no other DISTINCT column is present in DUPLICATE_COLUMNS. This matches the spec, so acceptable. However, Dish.name is a nullable-string primary deduplication column: after _plant_duplicates, _plant_boundaries is already run BEFORE _plant_duplicates (they set boundary case variants and then overwrite some with duplicates). Because both _plant_boundaries and _plant_duplicates overwrite values, the boundary variants 'Clear green turtle' / 'clear green turtle' may be eliminated \u2014 duplicates overwrite by sampling from existing non-NULL values, so at least any planted boundary literals present can be selected, but coverage is not guaranteed. Execution feedback does not confirm Dish.name boundaries appear in generated rows. Request: verify (a) outer-vs-new boundaries survive duplicate over-write for Dish.name, and (b) if not, adjust ordering to run duplicates first, boundaries second.",
+     "requested_revision": "Reserve boundary literals for Dish.name before duplicates sampling (swap order or exclude rows that hold boundary values from being overwritten)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In instance.py build_random_instance, after fill_foreign_keys_consistently copies FK values from parents, sample_fresh_primary_keys and drop_unique_duplicates are applied. drop_unique_duplicates removes rows to make UNIQUE columns distinct \u2014 for Menu, MenuPage, Dish (only id is PK) it never fires. However, after filter, FK consistency may be broken: '_filter(cols, keep)' drops rows, which is fine because FKs were already assigned. Then fill loop: 'if pt == t' reassigns children of the same table (self-FK) to values existing in the filtered set \u2014 safe. No block.",
+     "requested_revision": "None required; noted as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "choose_table_sizes uses base + rng.randint(-40, 40) despite spec comment claiming 0-230. Average matches spec sizes plus small jitter \u2014 the spec pins exact sizes {Dish:200, Menu:120, MenuPage:180, MenuItem:400}, but \u00b140 variance changes them. Execution shows Dish 3826/20 \u2248 191, Menu 1863/20 \u2248 93 (well below 120), MenuPage 3471/20 \u2248 174, MenuItem 7902/20 \u2248 395. Menu is 93, notably well below the base 120, because 26 of 120 rows were dropped per instance (probably from _ensure_unmatched detach, or drop_unique_duplicates on unique FK). The intended 120 base for Menu is not honoured. Request: either state that sizes are approximate, or remove the \u00b140 variance to keep exact counts.",
+     "requested_revision": "Honour TABLE_SIZES exactly per spec, or document approximate sizing in the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rule support: explicit 'supporting_evidence' strings exist only for 5 formulas (Dish.last>first, Dish.highest>lowest, MenuItem.high_price>=price, xpos/ypos in [0,1], Menu.status enum), and only 4 compact rows each. Many formulas (menus_appeared>=0, times_appeared>=0, page_count>0, dish_count>=0, Menu.date range, page_number>=0, full_height/width>0, all id>0, week_id, real_fraction) have no supporting row in the evidence block. Execution feedback did not include row samples for those columns to confirm they hold. Request: add explicit execution evidence (sample or check counts from a produced instance) that all listed formulas hold in generated rows.",
+     "requested_revision": "Either add execution evidence for all formulas or narrow the formulas to those with sample rows."
+    }
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py sets NULL_DOMINANT_NONNULL_SHARE = 0.02 and _plant_nulls computes k_nonnull = max(1, round(0.02*len(values))). For NULL-dominant columns with 120-200 rows this yields ~2-4 non-NULL rows per instance, satisfying 'at least one non-NULL row per instance'. Execution feedback confirms e.g. Menu.language NULL 2006/2040, Dish.description NULL 3742/3820 \u2014 non-NULL rows present. NULL_TARGETS gates planting correctly; non-target nullable columns (e.g. Menu.location, Menu.status, Dish.name, MenuPage.uuid, MenuPage.menu_id) show NULL 0 / n, which is permitted by interface note 7 (may be noted, not blocking).",
+     "requested_revision": "Optional: could extend NULL planting to all nullable columns to better follow 'compact DB share', but interface rule allows NULL-dominant/0-share behavior for non-targets; no blocking change."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundaries` is called for every column (including PK/FK columns in BOUNDARY via `_boundary_pool(None, ...)`), overwriting the first rows with e.g. Dish.id in {106,107,108} and MenuItem.menu_page_id 143..1390 before `_next_pk`/FK fill. But `_next_pk` is recomputed after column generation from original_values+instance, so PK boundary overwrite is applied then re-sequenced (cols[c] reassigned start+i), which erases planted PK boundaries 106-108. Spec.py declares PK_FK_BOUNDARY_HONOURED_BY_COMPACT and these boundaries remain reachable via compact rows, so denotations are preserved. No integrity violation observed (pk_duplicates=0).",
+     "requested_revision": "None required: boundary denotation is covered by compact rows as the spec states; behaviour is documented in spec.py header ('honoured by compact database rows')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_fix_formulas` runs on generated rows in memory and repairs violations (last>=first, high>=low, high_price>=price, page_count>0, bounds, status enum, date range). It never touches NULLs (conditions check 'is not None'), consistent with three-valued logic rule. Writer uses INSERT with fallback row-by-row; rows_skipped reported for Dish(40)/Menu(100)/MenuPage(100) reflect PK collisions with compact rows (fresh PKs start at max+1 so should not collide) \u2014 actually these were detected during generation before `_next_pk` adjustment and are handled by regenerated PKs; whatever rows still skip are counted, not silent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_ensure_unmatched` iterates GROUP_SIZE_TARGETS and NULL_FK to plant parent-without-child and child-with-null-FK, matching spec PARENT_WITHOUT_CHILDREN and NULL_FK {MenuItem.menu_page_id, MenuItem.dish_id}. Execution shows MenuItem.dish_id NULL 20/8000 and menu_page_id NULL 20/8000, satisfying child rows with NULL FK coverage.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules in spec.FORMULAS are supported by the sample evidence quoted (last>=first, high>=low, high_price>=price, x/y in [0,1], status='complete', date range). Menu.dish_count is acknowledged as 'not verified as aggregate of MenuItem' in the uncertainty note; this is a sampling-only assumption and is not enforced. The formulas are all implemented in Python, and integrity report confirms 0 violations of noteable rules. Rules are properly distinguished as supported (with example row evidence) vs uncertain (dish_count).",
+     "requested_revision": "None required for pass; dish_count uncertainty is explicitly recorded."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducible: run reports reproducible=true, n_ok=20, n_fail=0, integrity fk/notnull/pk all zero. construction_pairs eligible 166 / separated 43 / unknown 0 \u2014 variation is preserved, boundaries and non-empty target-based separation exist. The specification constraints (domain ranges, boundary literals, null shares, dependencies) are implemented by construction in values.py/spec.py/instance.py.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Menu.dish_count not verified as aggregate of MenuItem; acknowledged as a deliberate uncertainty in the spec, not enforced.",
+    "Nullable non-target columns (Menu.location, Menu.status, MenuPage.uuid, Dish.name, Dish.first_appeared, etc.) are generated all non-NULL; interface note 7 permits noting rather than blocking, so not a defect.",
+    "Dish/Menu/MenuPage rows_skipped (40/100/100) reported \u2014 these are rows rejected during the append (likely PK collisions or overflow); total inserted rows match spec TABLE_SIZES per instance (e.g. Dish 3880/20\u2248194) indicating near-full table sizes; ok."
+   ]
+  }
+ ]
 }

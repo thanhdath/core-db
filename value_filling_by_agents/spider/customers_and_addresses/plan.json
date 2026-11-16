@@ -1,49 +1,516 @@
 {
  "db": "customers_and_addresses",
- "operator_io_quirks": [
-  "Mixed-case table names (Addresses, Customer_Addresses, Order_Items) and mixed-case columns; must double-quote with original spelling.",
-  "DDL uses backtick quoting; sqlite_master DDL must be replayed verbatim into the empty clone.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional seconds); declared type contains 'date' -> Date fuzzer, but ts_fuzzer note says 'Date|Number(int elements)' because first element is not int.",
-  "All DATETIME columns are text storage, contradicting nothing but the Date template must be %Y-%m-%d %H:%M:%S to match samples.",
-  "Customer_Addresses, Customer_Contact_Channels, Order_Items have NO primary key (pk=[]); composite-key logic must handle empty PK (no PK-duplicate drop).",
-  "FKs all resolve to existing parents (parent_exists true); no dangling FKs, no self-references, no non-unique parents (all parents are INTEGER PRIMARY KEY).",
-  "Tiny tables: Addresses 15, Products 3, Customers 15, Customer_Addresses 15, Customer_Contact_Channels 20, Customer_Orders 15, Order_Items 15 rows; choose_table_sizes will massively oversize vs original.",
-  "order_quantity is VARCHAR(15) but stores integer-looking strings ('5','9','2'); String fuzzer will add str(i+1)/str(i-1) neighbours.",
-  "zip_postcode VARCHAR(20) stores short numeric strings ('416','721'); String fuzzer, not Number.",
-  "country has distinct=1 ('USA'); state_province_county distinct=12 with no spaces ('SouthCarolina'); other_address_details and other_customer_details are mostly/all NULL (null_rate 1.0 / 0.867).",
-  "contact_number VARCHAR(50) stores phone-like strings with dots/dashes/parens/x; String fuzzer charset a-zA-Z 0-9() will not reproduce punctuation.",
-  "payment_method, address_type, channel_code, order_status are small enums (2-5 distinct) stored as VARCHAR; String fuzzer will generate random strings, not enum members."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all *_id INTEGER PKs: uniform in [-10^0,10^0] with int perturbation +-1/+-2; will produce ids far outside 1..15/1..3 and negatives.",
-  "Date fuzzer on all DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max of 5 sampled originals (e.g. 2018-02..2018-03 for Customers), so fresh dates cluster in a narrow 2018 window; other tables (Customer_Addresses 1972..2010) get wide ranges.",
-  "String fuzzer on VARCHAR columns: random strings over a-zA-Z 0-9() of length up to declared length, plus 50% contaminate; will not match enum values (Cash/Cheque/Credit Card, Billing/Residential, Email/Cell/...), phone formats, or 'USA'.",
-  "FK columns (customer_id, address_id, order_id, product_id) draw from parent's FINAL filtered values with replacement -> duplicates and ties in child tables; parent PKs are unique so FK values are valid but heavily repeated.",
-  "No PK on Customer_Addresses/Customer_Contact_Channels/Order_Items -> no PK-duplicate drop; rows can be fully duplicated, driving FP on DISTINCT/COUNT queries.",
-  "Tiny original tables (3-20 rows) vs choose_table_sizes (30..2500) -> generated instances are 10-100x larger; queries with COUNT/aggregate thresholds will behave very differently.",
-  "NOT NULL columns (payment_method, date_address_from, address_type, channel_code, active_from_date, contact_number, order_status, all FK cols) are not enforced in Python; String/Date fuzzers can emit NULL only via element dropout, so most inserts succeed but some rows fail at insert and are skipped.",
-  "order_quantity VARCHAR storing ints: String fuzzer adds str(i+1)/str(i-1) so numeric-looking values survive; comparisons like order_quantity > '5' may flip.",
-  "other_address_details / other_customer_details / order_details mostly NULL: String sampler with 5 originals (mostly None) drops None -> may have few elements, p may be 1 -> mostly fresh random strings, losing the NULL-heavy distribution.",
-  "Date fuzzer p-inversion: p=0.2 means element returned w.p. 0.2, fresh date w.p. 0.8 -> most dates are fresh uniform in the narrow original range, few exact originals; ties on date equality rare.",
-  "Enum columns (payment_method, address_type, channel_code, order_status) with 2-5 distinct: String fuzzer generates random strings, so WHERE payment_method='Cash' returns 0 rows in generated instances -> FN on enum-filter queries."
- ],
- "challenger_refs": [
-  "G11",
-  "G9",
-  "G4",
-  "G10",
-  "G12",
-  "G2",
-  "G5",
-  "G6",
-  "G1",
-  "G8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential integers starting at 1; unique per table; never NULL. When appending to a non-empty compact database, offset generated PKs by max(compact PK) so appended rows never collide with compact rows.",
+   "integer_foreign_key": "Copy an existing parent primary-key value; allow parent rows without children; NULL only when the column is nullable.",
+   "varchar_short": "Random title-case words or realistic short strings within the declared length; allow near-duplicates and case variants when no constraint forbids them.",
+   "varchar_long": "Random sentence-like text within the declared length; allow NULL when nullable.",
+   "datetime": "Random timestamp within the table's plausible window; format '%Y-%m-%d %H:%M:%S'; allow NULL only when nullable.",
+   "numeric_quantity": "Positive integer quantity > 0.",
+   "enum_short": "Pick uniformly from the table's declared enum list.",
+   "null_share": "For each nullable column, generate at least one NULL row per instance and non-NULL rows; NULL share follows the compact database's observed share; never replace a planted NULL. Only columns listed in null_targets receive NULLs; all other columns are treated as NOT NULL for generation.",
+   "boundary_and_near_variant": "For columns named in per_column_exceptions, include each listed literal, one step on each side (numbers by step, dates by one day), and near-variants of LIKE/equality literals. LIKE patterns are matched against unwrapped bodies; the wrapped literal '%A%' is also emitted as a distinct element so the pattern is exercisable.",
+   "duplicates_and_ties": "For DISTINCT columns named in per_column_exceptions, repeat values so duplicate share is 20-50%; for ORDER columns named there, create ties at the listed rank. Single-valued enum columns (Addresses.country) trivially satisfy duplicate_share because all rows share the same value; _plant_duplicates is a no-op there."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "columns": [
+      "Customers.customer_id",
+      "Order_Items.product_id",
+      "Products.product_id",
+      "Customer_Addresses.customer_id",
+      "Customer_Orders.customer_id",
+      "Customer_Orders.order_id",
+      "Order_Items.order_id"
+     ],
+     "rule": "Parent rows without children exist; child foreign keys never NULL where NOT NULL; no child rows with NULL FK. Order_Items has no PK, so its unmatched-join plant is a no-op and may be omitted."
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "columns": [
+      "Customers.customer_name",
+      "Products.product_details",
+      "Addresses.city",
+      "Addresses.country",
+      "Customer_Addresses.address_id",
+      "Order_Items.product_id"
+     ],
+     "duplicate_share": "20-50 %",
+     "note": "Customers.customer_id is a PK and is excluded from duplication; Addresses.country is single-valued so duplicate_share is trivially satisfied."
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "columns": [
+      "Customers.customer_name",
+      "Customers.payment_method",
+      "Customer_Contact_Channels.active_to_date",
+      "Addresses.city",
+      "Addresses.country",
+      "Order_Items.product_id",
+      "Products.product_id",
+      "Customer_Orders.customer_id"
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "columns": [
+      "Products.product_details",
+      "Addresses.city",
+      "Addresses.country",
+      "Customers.payment_method"
+     ],
+     "literals": [
+      "Latte",
+      "latte",
+      "Americano",
+      "americano",
+      "USA"
+     ],
+     "city_literals": [
+      "Lucasville",
+      "New Sabryna",
+      "Reingertown",
+      "Gleasonmouth",
+      "Stantonville",
+      "South Meghanview",
+      "Lake Walterton",
+      "South Bellaland"
+     ]
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "columns": [
+      "Products.product_details",
+      "Addresses.country",
+      "Addresses.address_id"
+     ],
+     "aggregate_values": [
+      3,
+      4,
+      5
+     ],
+     "ops": [
+      "HAVING(COUNT(*) > 4)",
+      "HAVING(COUNT(DISTINCT products.product_details) = 2)"
+     ],
+     "plant": "Products: exactly 2 distinct product_details values among 3 rows. Addresses.address_id: table size 15 > 4 satisfies COUNT > 4. Addresses.country 4/5-row group plant is dropped because country is a single-valued enum ['USA'] and cannot form distinct groups without violating country IN ('USA')."
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "columns": [
+      "Products.product_details"
+     ],
+     "literals": [
+      "%Latte%",
+      "%Americano%",
+      "%A%",
+      "Americano",
+      "Latte"
+     ],
+     "variants": [
+      "Lattf",
+      "Latte x",
+      "latte",
+      "Americanp",
+      "Americano x",
+      "americano"
+     ],
+     "note": "Wrapped literals are emitted as distinct elements; LIKE matching is also performed against unwrapped bodies."
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "columns": [
+      "Customers.payment_method",
+      "Addresses.city",
+      "Customer_Contact_Channels.active_to_date"
+     ],
+     "rule": "Nullable columns contain NULL and non-NULL rows; NOT NULL columns never NULL. Customer_Orders.customer_id is NOT NULL per DDL and is excluded. Addresses.country is NOT NULL / enum-only and is excluded from NULL generation."
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "columns": [
+      "Customer_Contact_Channels.active_to_date"
+     ],
+     "rule": "Exercise COUNT(col) vs COUNT(*) via a genuinely nullable column; PK columns are never NULL."
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "columns": [
+      "Customer_Contact_Channels.active_to_date"
+     ],
+     "rule": "Generate distinct timestamps across rows; _ensure_distinct must preserve DATETIME format (no non-parseable suffix fallback)."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customer_Addresses.customer_id",
+    "parent": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Customer_Addresses.address_id",
+    "parent": "Addresses",
+    "parent_column": "address_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Customer_Contact_Channels.customer_id",
+    "parent": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Customer_Orders.customer_id",
+    "parent": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Order_Items.order_id",
+    "parent": "Customer_Orders",
+    "parent_column": "order_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Order_Items.product_id",
+    "parent": "Products",
+    "parent_column": "product_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Addresses",
+    "column": "address_id",
+    "formula": "address_id > 0"
+   },
+   {
+    "table": "Addresses",
+    "column": "country",
+    "formula": "country IN ('USA')"
+   },
+   {
+    "table": "Products",
+    "column": "product_id",
+    "formula": "product_id > 0"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "formula": "customer_id > 0"
+   },
+   {
+    "table": "Customers",
+    "column": "payment_method",
+    "formula": "payment_method IN ('Cash', 'Cheque', 'Credit Card')"
+   },
+   {
+    "table": "Customer_Addresses",
+    "column": "address_type",
+    "formula": "address_type IN ('Billing', 'Residential')"
+   },
+   {
+    "table": "Customer_Addresses",
+    "column": "date_address_to",
+    "formula": "date_address_to IS NULL OR date_address_to >= date_address_from"
+   },
+   {
+    "table": "Customer_Contact_Channels",
+    "column": "active_to_date",
+    "formula": "active_to_date IS NULL OR active_to_date >= active_from_date"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_status",
+    "formula": "order_status IN ('Cancelled', 'Delivered')"
+   },
+   {
+    "table": "Order_Items",
+    "column": "order_quantity",
+    "formula": "CAST(order_quantity AS INTEGER) > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 15,
+   "Products": 3,
+   "Customers": 15,
+   "Customer_Addresses": 15,
+   "Customer_Contact_Channels": 20,
+   "Customer_Orders": 15,
+   "Order_Items": 15
+  },
+  "null_targets": [
+   "Addresses.other_address_details",
+   "Customer_Addresses.date_address_to",
+   "Customer_Contact_Channels.active_to_date",
+   "Customer_Orders.order_date",
+   "Customer_Orders.order_details",
+   "Customers.customer_name",
+   "Customers.date_became_customer",
+   "Customers.other_customer_details",
+   "Order_Items.order_quantity"
+  ],
+  "supporting_evidence": [
+   "Addresses.country: all shown rows are 'USA'.",
+   "Customers.payment_method: shown values are Cash, Cheque, Credit Card.",
+   "Customer_Addresses.address_type: shown values are Billing and Residential.",
+   "Customer_Orders.order_status: shown values are Cancelled and Delivered.",
+   "Order_Items.order_quantity: shown values are positive integers 2,5,7,8,9.",
+   "Customer_Addresses.date_address_to >= date_address_from: sample rows 1985-03-29 to 1993-02-17, 2010-08-25 to 2010-11-10.",
+   "Customer_Contact_Channels.active_to_date >= active_from_date: sample rows 2017-12-07 to 2018-03-23, 2017-04-07 to 2018-03-23."
+  ],
+  "uncertainty": [
+   "Original row counts differ from statistics for Addresses, Customer_Addresses, Customer_Contact_Channels, Customer_Orders and Order_Items; table sizes use the statistics row counts.",
+   "Order_Items has no declared primary key; duplicate (order_id, product_id) pairs are allowed.",
+   "Some atomic-operation targets reference columns not present in the shown sample rows; those targets are covered by generic rules.",
+   "Customer_Orders.customer_id is NOT NULL per DDL; the null_rows pattern from the atomic-operation summary is unsatisfiable for this column and is excluded.",
+   "Customers.customer_id is INTEGER PRIMARY KEY (NOT NULL); the null_in_count_column pattern is redirected to a genuinely nullable column.",
+   "Addresses.country is single-valued enum ['USA']; the aggregate_boundary 4/5-row group plant is dropped because it cannot be satisfied without violating country IN ('USA').",
+   "PK sampler must offset generated PKs by max(compact PK) when appending to a non-empty compact database; otherwise ~35% of generated rows are silently skipped and effective table sizes fall below table_sizes_per_instance.",
+   "Addresses.city comparison_boundary literals are provided from observed city values; near-variants are generated by the generic boundary rule.",
+   "LIKE patterns '%A%', '%Latte%', '%Americano%' are emitted as distinct elements and also matched against unwrapped bodies."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with KeyError('orig') (n_ok=0, n_fail=20, rows_added all 0). In cli.py, _one() calls write_instance_sqlite(..., compact_path=a['orig']), but the args dict built in main() is {'root','ds','db','tag','seed_base'} and never includes 'orig'. The worker initializer _init(orig, pool, args) receives orig but does not store it into args, so a['orig'] raises KeyError in every unit.",
+     "requested_revision": "Add 'orig' to the args dict passed to workers (e.g. args = {..., 'orig': a.orig}) or store it in _G and reference it in _one(). Re-run generation and confirm n_ok>0 with non-zero rows_added and no KeyError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE_COLUMNS and NULL_SHARE omit Customer_Orders.customer_id, yet the atomic-operation extraction lists Customer_Orders.customer_id with a null_rows pattern (PRED(customer_orders.customer_id IS NULL)) and the spec's null_rows exception targets include Customer_Orders.customer_id. The schema declares it NOT NULL, so the spec's own null_rows target contradicts the DDL; the program correctly treats it as NOT NULL via is_nullable() fallback, but the specification is internally inconsistent.",
+     "requested_revision": "Designer: remove Customer_Orders.customer_id from the null_rows target list (it is NOT NULL per DDL) or explicitly document that the null_rows pattern is unsatisfiable for this column. Engineer: no code change needed once the spec is corrected, but confirm is_nullable() never plants NULL there."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions 'null_in_count_column' targets Customers.customer_id with rule 'Include NULLs in COUNT(col) columns where nullable', but Customers.customer_id is INTEGER PRIMARY KEY (NOT NULL). The program's is_nullable() returns False for PK columns, so no NULL is planted \u2014 consistent with the interface NULL rule, but the spec entry is misleading/unsupported.",
+     "requested_revision": "Designer: drop or reword the null_in_count_column exception for Customers.customer_id to reflect that PK columns are never NULL; the COUNT(col) vs COUNT(*) distinction can be exercised via a genuinely nullable column instead."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec aggregate_boundary targets Addresses.address_id with ops HAVING(COUNT(addresses.address_id) > 4) and values [3,4,5], and Addresses.country with HAVING(COUNT(*) > 4). The program implements aggregate boundaries only implicitly via table sizes (Addresses=15) and duplicate plants; there is no explicit mechanism ensuring a group count lands exactly at 3/4/5 boundaries. This is a coverage gap, not a hard error, but the spec claims boundary coverage the program does not guarantee.",
+     "requested_revision": "Designer: either mark aggregate_boundary as best-effort (satisfied by table size 15 > 4) or specify a concrete plant (e.g., a country group with exactly 4 rows). Engineer: if a concrete plant is specified, add it to instance.py."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_unmatched trims child FK pools to leave a parent unmatched, but fill_foreign_keys_consistently draws with replacement from the full parent pool before _plant_unmatched runs; _plant_unmatched then rewrites child columns by filtering out the victim and padding with rng.choice(nv). This can change row counts of child columns relative to other columns in the same table (it pads to len(ccvals)), which is length-preserving, but it may also break the FK-consistency guarantee if nv is empty (guarded) \u2014 acceptable. However, the unmatched plant runs after PK de-dup, so it can reintroduce duplicate PK tuples in child tables (e.g., Customer_Addresses has no PK, but Order_Items has none either; Customer_Orders.order_id is PK and is a parent, not rewritten). Low risk but worth verifying.",
+     "requested_revision": "Engineer: after _plant_unmatched, re-run sample_fresh_primary_keys on affected tables, or confirm no PK column is ever rewritten by _plant_unmatched (it only rewrites FK child columns, which are non-PK in this schema). Add an assertion/test."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py _init_sampler: for PK columns, max_l0 is set to inf only when n_pk==1, else 30. In instance.py, _init_sampler is called with n_pk = len(tm.primary_key) if 0 else 0 \u2014 the expression `n_pk if 0 else 0` always evaluates to 0, so n_pk is always 0. This means PK columns get max_l0 possibly capped at 30 (via the rng.random()<0.5 branch), which can cause PK value reuse and dropped rows in the writer. This is a latent bug that will reduce generated row counts for PK tables.",
+     "requested_revision": "Engineer: fix the call to pass the actual number of PK columns, e.g. n_pk = len(tm.primary_key). Verify generated PK tables reach the target table size (15) after de-dup."
+    }
+   ],
+   "unresolved_checks": [
+    "Generation could not be validated end-to-end because all units failed with KeyError('orig'); integrity, dependent-value consistency, compact-row preservation, and reproducibility could not be confirmed from execution evidence.",
+    "Whether the fixed n_pk bug and unmatched-plant ordering preserve target table sizes and FK consistency after the KeyError fix is unverified.",
+    "Aggregate boundary coverage (HAVING COUNT > 4, COUNT(DISTINCT)=2) is not explicitly planted; only implied by table sizes."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE_COLUMNS lists only 9 columns and omits several nullable columns that the DDL declares nullable: Addresses.address_content, Addresses.city, Addresses.zip_postcode, Addresses.state_province_county, Addresses.country, Products.product_details. The execution feedback confirms these are being generated with NULLs (e.g. 'Addresses.city: generated rows: NULL 16 / 231', 'Products.product_details: generated rows: NULL 22 / 51'), but they are not in the spec's nullable set. Spec.is_nullable() falls back to `not cm.notnull and not cm.pk_pos`, so the program still plants NULLs, but the specification itself is inconsistent with the DDL and with the program's actual behavior. The spec's null_targets list also omits these columns.",
+     "requested_revision": "Add all DDL-nullable columns to the specification's null_targets / NULLABLE_COLUMNS (Addresses.address_content, city, zip_postcode, state_province_county, country, other_address_details; Products.product_details; plus the already-listed ones), and align NULL_SHARE entries so the spec matches the DDL and the program's fallback behavior. Alternatively, if the intent is to restrict NULLs to the listed subset, the program must be changed to not plant NULLs in the omitted columns \u2014 but that would contradict the DDL, so extending the spec is preferred."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's aggregate_boundary plant requires 'Addresses: one country group with exactly 4 rows and one with exactly 5 rows'. But semantic_rules_and_formulas also declares `Addresses.country IN ('USA')`, so all 15 Addresses rows have country='USA' and no 4/5 split is possible. The program's _plant_aggregate_boundaries explicitly acknowledges this: 'Keep all USA (enum domain) but vary a secondary grouping is impossible ... leave values as sampled.' The spec is internally contradictory: the aggregate plant cannot be satisfied while the enum domain holds.",
+     "requested_revision": "Either drop the 'one country group with exactly 4 rows and one with exactly 5 rows' plant from the specification (since country is a single-valued enum), or relax the country enum to allow multiple countries so the group-size plant is realizable. The program's no-op branch should then be removed or made to actually plant the boundary."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's aggregate_boundary plant for Products requires 'exactly 2 distinct product_details values among 3 rows'. The program's _plant_aggregate_boundaries only applies this when `len(pcols['product_details']) == 3`, but choose_table_sizes() varies Products size per instance (0, base=3, base\u00b11, base+1..10). In instances where Products size != 3 the plant is silently skipped, so the aggregate boundary is not guaranteed. Execution feedback shows Products rows_added=51 over 20 instances (avg ~2.55), confirming sizes vary and the plant is often not applied.",
+     "requested_revision": "Make the Products distinct-count plant robust to variable table size (e.g. force exactly 2 distinct values whenever size >= 2, or pin Products size to 3 in the spec), and document the intended behavior when size < 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's like_near_variant and comparison_boundary targets include literals 'Latte', 'latte', 'Americano', 'americano', 'Lattf', 'Latte x', 'Americanp', 'Americano x', and LIKE patterns '%Latte%', '%Americano%', '%A%'. The program's BOUNDARY_STRINGS for Products.product_details includes these, but StringSampler applies random perturbations (prefix/suffix/drop) to sampled values with probability 0.5, and _plant_duplicates/_plant_ties overwrite values. There is no guarantee that the exact boundary literals survive into the generated rows; the spec's 'include each listed literal' rule is not enforced. Execution feedback does not show per-literal presence, so this is unverified but structurally at risk.",
+     "requested_revision": "Add an explicit plant that guarantees each listed boundary/near-variant literal appears at least once in Products.product_details (and the other boundary columns), applied after duplicate/tie plants, or make the samplers deterministic for boundary columns. Document the guarantee in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's ties_for_order_limit targets include Customers.customer_id, Order_Items.product_id, Products.product_id, Customer_Orders.customer_id, but the program's TIE_COLUMNS set omits these (it lists only Addresses.city, Addresses.country, Customers.customer_name, Customers.payment_method, Products.product_details, Customer_Contact_Channels.active_to_date). Additionally, _plant_ties is skipped for PK columns (`not cm.pk_pos`) and for FK columns (`(t, cm.name) not in schema.fks`), so ties on Customers.customer_id, Order_Items.product_id, Products.product_id, Customer_Orders.customer_id are never planted. The spec and program disagree on which columns get tie plants.",
+     "requested_revision": "Reconcile TIE_COLUMNS with the spec's ties_for_order_limit list, and either implement tie plants for the PK/FK columns (e.g. via duplicate FK references or by allowing duplicate non-PK grouping keys) or remove those columns from the spec's tie targets with justification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's duplicates_for_distinct targets include Customers.customer_id and Order_Items.product_id, but the program's DUPLICATE_COLUMNS omits both, and _plant_duplicates is skipped for PK columns and FK columns. Customers.customer_id is a PK (cannot duplicate), and Order_Items.product_id is an FK (duplicates are allowed by DDL since Order_Items has no PK, but the program does not plant them). The spec's duplicate_share 20-50% for these columns is therefore not implemented.",
+     "requested_revision": "Remove Customers.customer_id from the spec's duplicates_for_distinct targets (PK cannot duplicate) and either implement duplicate FK plants for Order_Items.product_id or remove it from the spec. Align DUPLICATE_COLUMNS with the corrected spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_rows pattern lists Customers.payment_method as a nullable column to receive NULLs, but the DDL declares `payment_method VARCHAR(15) NOT NULL`. The program correctly excludes it (NULLABLE_COLUMNS does not include it, and is_nullable falls back to DDL), and the spec's own uncertainty note says 'NOT NULL columns never NULL'. However, the null_rows targets list still names Customers.payment_method, creating an internal inconsistency in the spec.",
+     "requested_revision": "Remove Customers.payment_method from the null_rows targets in the specification (it is NOT NULL per DDL), consistent with the program's behavior and the spec's own uncertainty note."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's comparison_boundary targets include Addresses.city and Addresses.country with literals ['Latte','latte','Americano','americano','USA'], but BOUNDARY_STRINGS for Addresses.city is empty and for Addresses.country is ['USA','USA ']. The 'Latte'/'Americano' literals are irrelevant to city/country and are not planted there. The spec's boundary literals are not column-appropriate.",
+     "requested_revision": "Correct the comparison_boundary literals per column in the specification (e.g. city gets city-like literals, country gets 'USA' variants only), and ensure the program's BOUNDARY_STRINGS matches."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's aggregate_boundary for Addresses.address_id requires 'table size 15 > 4 satisfies COUNT > 4', but choose_table_sizes() varies Addresses size (0, 15, 15\u00b15, 15+1..10). In instances where Addresses size <= 4 the HAVING(COUNT(address_id) > 4) boundary is not satisfied. Execution feedback shows Addresses rows_added=181 over 20 instances (avg ~9), confirming sizes vary and the boundary is often not met.",
+     "requested_revision": "Pin Addresses size to >= 5 in the spec (or make the aggregate plant conditional and documented), so the COUNT > 4 boundary is reliably exercised."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's rows_with_different_values rule for Customer_Contact_Channels.active_to_date requires distinct timestamps, but the program's _ensure_distinct is applied only to active_to_date and uses a fragile minute-perturbation that can produce invalid timestamps (e.g. '%s:%02d:00' % (k[:13], ...) assumes a specific format). Additionally, _plant_nulls is applied before _ensure_distinct, and _ensure_distinct preserves NULLs, so the distinctness guarantee holds only for non-NULL values \u2014 which is acceptable, but the perturbation logic is brittle and may not preserve the >= active_from_date constraint (it runs before _compute_date_pairs, which then fixes ordering, but the distinctness may be broken by the fix).",
+     "requested_revision": "Make _ensure_distinct robust (parse and re-format timestamps properly, re-check distinctness after _compute_date_pairs), and document that distinctness applies to non-NULL values only."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the exact boundary/near-variant literals (Latte, latte, Americano, americano, Lattf, Latte x, Americanp, Americano x) actually appear in generated Products.product_details rows \u2014 not verifiable from the provided execution feedback.",
+    "Whether the aggregate boundary plants (country group sizes 4/5, Products distinct count 2) are actually realized in any instance \u2014 the program's plants are best-effort and size-dependent.",
+    "Whether compact rows are preserved: the writer copies the compact DB and appends, and execution feedback shows 0 FK/not-null/PK violations, but no explicit check that compact row counts are unchanged is reported.",
+    "Whether the 43/119 separated construction pairs reflect intended value variation or missed plants \u2014 the feedback does not break down by pattern group (construction_pairs_by_group is empty)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE_COLUMNS includes 'Addresses.country' and NULL_SHARE sets 'Addresses.country': 0.0, but the generation spec's null_targets list does NOT include Addresses.country. Execution feedback shows 'Addresses.country: generated rows: NULL 21 / 244' \u2014 21 NULLs were generated in a column the spec's semantic rule constrains to country IN ('USA'). The spec's supporting_evidence states 'Addresses.country: all shown rows are USA'. The program's _plant_nulls(vals, spec.null_share_for(...), True, rng) forces at least one NULL per nullable column, so country gets NULLs despite the enum domain being ['USA'].",
+     "requested_revision": "Remove 'Addresses.country' from NULLABLE_COLUMNS (and its NULL_SHARE entry) in spec.py so the country column is treated as NOT NULL / enum-only, matching the spec's null_targets and the country IN ('USA') semantic rule. Alternatively, if NULLs in country are intended, add Addresses.country to the spec's null_targets and document that the country IN ('USA') rule is evaluated under three-valued logic (NULL rows excluded)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE_COLUMNS includes 'Addresses.address_content', 'Addresses.zip_postcode', 'Addresses.state_province_county', 'Products.product_details', 'Customer_Addresses.date_address_to', 'Customer_Orders.order_date', 'Order_Items.order_quantity' etc. The generation spec's null_targets list is: Addresses.other_address_details, Customer_Addresses.date_address_to, Customer_Contact_Channels.active_to_date, Customer_Orders.order_date, Customer_Orders.order_details, Customers.customer_name, Customers.date_became_customer, Customers.other_customer_details, Order_Items.order_quantity. The program's NULLABLE_COLUMNS is a superset that adds Addresses.address_content, Addresses.city, Addresses.zip_postcode, Addresses.state_province_county, Addresses.country, Products.product_details \u2014 none of which are in the spec's null_targets. Execution feedback confirms NULLs in Addresses.city (18/244), Addresses.country (21/244), Addresses.state_province_county (18/244), Addresses.zip_postcode (16/244), Addresses.address_content (13/244), Products.product_details (7/59).",
+     "requested_revision": "Align NULLABLE_COLUMNS in spec.py with the spec's null_targets list. Either restrict NULL generation to the columns named in null_targets, or update the generation specification's null_targets to include these columns and document the change. The current mismatch means the program generates NULLs in columns the spec does not designate as null targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DUPLICATE_COLUMNS includes 'Addresses.country' and 'Products.product_details', and TIE_COLUMNS includes 'Addresses.country' and 'Products.product_details'. The generation spec's duplicates_for_distinct targets are: Customers.customer_name, Products.product_details, Addresses.city, Addresses.country, Customer_Addresses.address_id, Order_Items.product_id, Customers.customer_id. The spec's ties_for_order_limit targets are: Customers.customer_name, Customers.payment_method, Customer_Contact_Channels.active_to_date, Addresses.city, Addresses.country, Order_Items.product_id, Products.product_id, Customer_Orders.customer_id. The program's DUPLICATE_COLUMNS omits Customers.customer_id (correctly, since it is a PK) but the spec lists it; the program's TIE_COLUMNS omits Order_Items.product_id, Products.product_id, Customer_Orders.customer_id (handled via TIE_PLANTS_EXTERNAL) \u2014 this is a reasonable adaptation. However, the program's DUPLICATE_COLUMNS includes 'Products.product_details' and 'Addresses.country' which are also enum/single-valued columns; _plant_duplicates on a single-valued enum column is a no-op (all values already equal), so the duplicate_share 20-50% target for Addresses.country cannot be met by distinct-value duplication.",
+     "requested_revision": "Document in spec.py that Addresses.country is single-valued (enum ['USA']) so duplicate_share is trivially satisfied (all rows share the same value) and _plant_duplicates is a no-op there; or remove Addresses.country from DUPLICATE_COLUMNS to avoid implying a distinct-value duplication plant that cannot execute. Similarly clarify how Products.product_details duplicate_share interacts with the aggregate_boundary plant that collapses to exactly 2 distinct values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's aggregate_boundary plant states: 'Addresses: one country group with exactly 4 rows and one with exactly 5 rows; Products: exactly 2 distinct product_details values among 3 rows'. The program's _plant_aggregate_boundaries only handles Products (collapsing product_details to 2 distinct values); there is no code planting Addresses country groups of exactly 4 and exactly 5 rows. spec.py's comment says 'Addresses.country is a single-valued enum, so the 4/5 row-group plant was dropped' \u2014 but the generation specification still lists this plant as required. Execution feedback does not show country group sizes.",
+     "requested_revision": "Either implement the Addresses country 4/5-row group plant in _plant_aggregate_boundaries (e.g., by partitioning Addresses rows into groups of size 4 and 5 with distinct country values), or update the generation specification's aggregate_boundary plant to drop the Addresses country 4/5 requirement and document why (single-valued country enum makes it impossible without violating country IN ('USA')). The current spec and program disagree on whether this plant is required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's like_near_variant targets include literals '%Latte%', '%Americano%', '%A%', 'Americano', 'Latte' and variants 'Lattf', 'Latte x', 'latte', 'Americanp', 'Americano x', 'americano'. spec.py BOUNDARY_STRINGS['Products.product_details'] includes 'Americano', 'Latte', 'Americano x', 'Latte x', 'Americanp', 'Lattf', 'americano', 'latte' \u2014 but NOT '%A%' or the '%'-wrapped forms. The StringSampler strips '%' via like_body() when adding boundary literals to the element pool, so the literal '%A%' is never emitted as a value. The spec's like_near_variant requires the '%A%' pattern to be exercisable against generated data.",
+     "requested_revision": "Add '%A%' (and the '%Latte%'/'%Americano%' wrapped forms) to BOUNDARY_STRINGS['Products.product_details'] or to a dedicated LIKE-pattern pool in spec.py so the like_near_variant targets are covered. Note that StringSampler's like_body() strips '%' \u2014 either preserve the wrapped literal as a distinct element or document that LIKE patterns are matched against the unwrapped bodies."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's comparison_boundary targets include literals 'Latte', 'latte', 'Americano', 'americano', 'USA' for columns Products.product_details, Addresses.city, Addresses.country, Customers.payment_method. spec.py BOUNDARY_STRINGS covers Products.product_details and Customers.payment_method and Addresses.country ('USA', 'USA '), but Addresses.city has no boundary literals in BOUNDARY_STRINGS. The spec's comparison_boundary lists Addresses.city as a target column.",
+     "requested_revision": "Add boundary literals for Addresses.city to BOUNDARY_STRINGS in spec.py (e.g., observed city values and near-variants) so the comparison_boundary target for Addresses.city is covered, or remove Addresses.city from the spec's comparison_boundary targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's null_in_count_column target is Customer_Contact_Channels.active_to_date with rule 'Exercise COUNT(col) vs COUNT(*) via a genuinely nullable column'. spec.py NULLABLE_COLUMNS includes 'Customer_Contact_Channels.active_to_date' and NULL_SHARE sets 0.10. Execution feedback shows 'Customer_Contact_Channels.active_to_date: generated rows: NULL 36 / 334' \u2014 NULLs are generated. However, _ensure_distinct is applied to active_to_date AFTER _plant_nulls and AFTER _compute_date_pairs; _ensure_distinct preserves None values (out.append(v) for None), so NULLs survive. This appears consistent. No issue here \u2014 noting as resolved.",
+     "requested_revision": "None; this target is satisfied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's rows_with_different_values target is Customer_Contact_Channels.active_to_date with rule 'Generate distinct timestamps across rows'. _ensure_distinct uses minute_key (truncates to minute) and perturbs duplicates by adding minutes. Execution feedback does not report distinct-count for active_to_date. The _ensure_distinct fallback appends '-%d' suffix to non-parseable values, which would produce non-timestamp strings violating the DATETIME format; but since DateSampler produces parseable timestamps, this fallback is unlikely to trigger. Minor risk.",
+     "requested_revision": "Confirm _ensure_distinct's non-parseable fallback ('%s-%d' % (k, step)) cannot produce values that violate the DATETIME format; if DateSampler always yields parseable timestamps this is safe, but a guard or assertion would make the invariant explicit."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation spec's unmatched_join_rows target for Customers.customer_id lists joins_with Customer_Addresses.customer_id, Customer_Orders.customer_id, Addresses.address_id. The program's _plant_unmatched removes a victim parent PK value from child FK columns and replaces with existing values. However, _plant_unmatched is called AFTER sample_fresh_primary_keys and _external_tie_plants, and then sample_fresh_primary_keys is called again \u2014 which may re-introduce the victim PK value if the PK sampler draws it fresh. The victim is chosen from pvals (existing PK values) and removed from child FKs, but the parent PK row itself remains (correct \u2014 parent without children). The re-run of sample_fresh_primary_keys on the parent table does not remove the victim row. This appears correct for parent-without-children. But _plant_unmatched also targets 'Addresses': {'Customer_Addresses'} and 'Order_Items': set() \u2014 Order_Items has no PK so the loop over cm.pk_pos finds nothing; harmless.",
+     "requested_revision": "None blocking; note that _plant_unmatched for Order_Items is a no-op (no PK) and could be removed from UNMATCHED_PARENTS for clarity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped: Addresses 101, Customers 109, Customer_Orders 122 \u2014 large numbers of generated rows were skipped by the writer due to PK collisions with compact rows. The writer's existing_pk set includes compact PK values; generated PKs start at 1 (sequential) and collide with compact rows. The spec's integer_primary_key rule says 'Sequential integers starting at 1; unique per table'. Since the writer appends to a copy of the compact DB (which already has PKs 1..N), sequential-from-1 PKs collide and are skipped. This means generated instances have far fewer appended rows than table_sizes_per_instance specifies (e.g., Addresses 186 added vs 15 per instance \u00d7 20 = 300 expected; 101 skipped).",
+     "requested_revision": "The PK sampler should start above the compact DB's max PK value (or the writer should offset generated PKs) so appended rows do not collide with compact rows. The spec's 'sequential integers starting at 1' rule conflicts with appending to a non-empty compact DB; clarify whether PKs should be offset by max(compact PK) or whether collisions/skips are acceptable. As written, ~35% of generated Addresses/Customers/Customer_Orders rows are silently dropped, reducing effective table sizes below the spec's table_sizes_per_instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation spec's table_sizes_per_instance lists Addresses 15, Customers 15, Customer_Orders 15, but execution feedback shows rows_added Addresses 186 (\u22489.3/instance), Customers 145 (\u22487.25/instance), Customer_Orders 127 (\u22486.35/instance) after skips. The spec's uncertainty note says 'Original row counts differ from statistics ... table sizes use the statistics row counts.' The spec does not address PK collision with compact rows when appending.",
+     "requested_revision": "Update the generation specification to state how primary keys are assigned when appending to a copy of the compact database (offset by max compact PK, or accept skips), and reconcile table_sizes_per_instance with the effective appended row counts. This is a spec-level gap that the engineer's PK sampler cannot resolve without guidance."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether Addresses.country NULLs (21/244) violate the country IN ('USA') semantic rule under the intended three-valued logic \u2014 the spec's null_targets excludes country but the program generates NULLs there.",
+    "Whether the aggregate_boundary plant for Addresses country groups of exactly 4 and 5 rows is required or was intentionally dropped; spec and program disagree.",
+    "Whether PK collisions with compact rows (101/109/122 skipped) are acceptable or indicate a PK-offset bug; effective table sizes fall below table_sizes_per_instance.",
+    "Whether '%A%' and '%'-wrapped LIKE literals need to be emitted as literal values or only matched as patterns against unwrapped bodies.",
+    "Whether Addresses.city comparison_boundary literals are required; spec lists the column but program provides no boundary pool for it."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's null_targets lists Addresses.other_address_details, Customer_Addresses.date_address_to, Customer_Contact_Channels.active_to_date, Customer_Orders.order_date, Customer_Orders.order_details, Customers.customer_name, Customers.date_became_customer, Customers.other_customer_details, Order_Items.order_quantity. Execution feedback shows NULL 0/n for Addresses.address_content, Addresses.city, Addresses.country, Addresses.state_province_county, Addresses.zip_postcode, Products.product_details \u2014 these are not in null_targets, so treating them as NOT NULL for generation is consistent with the spec's 'Only columns listed in null_targets receive NULLs' rule. No action required, but noted for the engineer.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's aggregate_boundary target for Addresses.country (HAVING COUNT(*) > 4 with values 3,4,5) is dropped because country is a single-valued enum ['USA']. This is documented in the spec's uncertainty section and in spec.py comments. The Addresses.address_id aggregate (COUNT > 4) is satisfied by min_addresses_size=5. Products distinct=2 is planted by _plant_aggregate_boundaries. This is a reasonable, documented resolution.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped: Addresses 101, Products 8, Customers 139, Customer_Orders 87. These are PK collisions with compact rows or duplicate PKs within generated rows. The spec's uncertainty explicitly warns: 'PK sampler must offset generated PKs by max(compact PK) when appending to a non-empty compact database; otherwise ~35% of generated rows are silently skipped and effective table sizes fall below table_sizes_per_instance.' spec.py implements pk_offset and pk_start_for, and values.py NumberSampler accepts start. However, the skip counts (e.g. Customers 139 skipped vs 120 added) suggest the offset is not fully effective \u2014 likely because NumberSampler's _cast clamps to self.min but the fresh_or_reuse path can still produce values below start when reusing from the elements pool (which contains compact PKs). The writer also skips rows whose PK collides with existing compact PKs. Net effect: effective table sizes fall below table_sizes_per_instance (e.g. Customers 15 target but only ~6 added per instance on average).",
+     "requested_revision": "Engineer should ensure generated PKs never collide with compact PKs: either (a) exclude compact PK values from the elements pool for PK columns, or (b) in NumberSampler.sample, when column is a PK with start set, always draw from [start, max] and never reuse elements below start. Also verify that _dedup_tuples on PKs does not silently drop rows that could be re-sampled. This is a quality issue affecting effective table sizes, not an integrity violation (fk_violations=0, pk_duplicates=0, not_null_violations=0, valid=20/20)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification requires 'duplicates_for_distinct' with duplicate_share 20-50% for Customers.customer_name, Products.product_details, Addresses.city, Addresses.country, Customer_Addresses.address_id, Order_Items.product_id. _plant_duplicates is applied only when key in spec.duplicates and not cm.pk_pos and (t, cm.name) not in schema.fks. Customer_Addresses.address_id and Order_Items.product_id are FK columns, so _plant_duplicates is skipped for them; instead _external_tie_plants handles them (placing at most 2 copies). This may not achieve 20-50% duplicate share for those FK columns. However, the spec's per_column_exceptions lists these under duplicates_for_distinct, and the generic rule says 'for DISTINCT columns named in per_column_exceptions, repeat values so duplicate share is 20-50%'. The current implementation only plants ties (2 copies) for FK columns, which may be insufficient for the 20-50% target on larger tables.",
+     "requested_revision": "Engineer should extend _external_tie_plants or add a dedicated FK-duplicate plant to achieve 20-50% duplicate share for Customer_Addresses.address_id and Order_Items.product_id, consistent with the spec's duplicates_for_distinct target. This is a value-variation quality issue, not an integrity blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification requires ties_for_order_limit at rank 1 for Customers.customer_name, Customers.payment_method, Customer_Contact_Channels.active_to_date, Addresses.city, Addresses.country, Order_Items.product_id, Products.product_id, Customer_Orders.customer_id. _plant_ties is applied for non-PK, non-FK columns in spec.ties. Customer_Contact_Channels.active_to_date is in TIE_COLUMNS but is also subject to _ensure_distinct (which forces distinct timestamps). The order of operations in build_random_instance: _plant_ties is applied, then _ensure_distinct is applied to active_to_date, which will undo the tie. This means the tie plant for active_to_date is defeated by the distinct-timestamp requirement. The spec lists both ties_for_order_limit and rows_with_different_values for active_to_date, which are in tension; the spec's rows_with_different_values rule ('Generate distinct timestamps across rows') takes precedence in the current implementation.",
+     "requested_revision": "Designer should clarify whether active_to_date must have a rank-1 tie (ties_for_order_limit) or distinct timestamps (rows_with_different_values) \u2014 these are mutually exclusive for a single column. If distinct is required, remove active_to_date from TIE_COLUMNS. If tie is required, relax _ensure_distinct for that column. Current implementation prioritizes distinct, which is defensible given the explicit rows_with_different_values rule, but the spec is internally inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's like_near_variant requires variants Lattf, Latte x, latte, Americanp, Americano x, americano and patterns %Latte%, %Americano%, %A%. spec.py BOUNDARY_STRINGS includes these variants and LIKE_PATTERNS includes the patterns. StringSampler emits LIKE patterns verbatim and adds unwrapped bodies. However, _force_boundaries only enforces REQUIRED_BOUNDARIES (Americano, Latte for Products.product_details), not the near-variants. The near-variants are in the element pool but not guaranteed to appear. The spec's boundary_and_near_variant rule says 'include each listed literal, one step on each side ... and near-variants of LIKE/equality literals' \u2014 this suggests near-variants should be present, not just possible.",
+     "requested_revision": "Engineer should consider adding the near-variants to REQUIRED_BOUNDARIES for Products.product_details, or document that near-variants are pool-only (possible but not guaranteed). This is a value-variation quality issue, not an integrity blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=119, separated=48. This means 71 of 119 atomic-operation pairs are not separated by the generated instances. The instructions state 'A missing separation alone does not establish a generation error or prove query equivalence.' The separated count of 48/119 is moderate; combined with the PK-skip issue (effective table sizes below target) and the FK-duplicate/tie issues above, some separations may be missed because the intended value variation is not fully realized. However, no integrity violations were found (fk_violations=0, not_null_violations=0, pk_duplicates=0, valid=20/20, reproducible=true).",
+     "requested_revision": "Engineer should address the PK-skip and FK-duplicate issues above to improve effective table sizes and value variation, which may increase separation count. This is a quality improvement, not a blocking error."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the PK offset is fully effective: skip counts (Customers 139 skipped vs 120 added) suggest generated PKs still collide with compact PKs, likely via element-pool reuse in NumberSampler. Needs engineer verification.",
+    "Whether FK duplicate share for Customer_Addresses.address_id and Order_Items.product_id reaches 20-50%: _plant_duplicates is skipped for FK columns; only _external_tie_plants (max 2 copies) applies.",
+    "Whether active_to_date tie vs distinct is intended: spec lists both ties_for_order_limit and rows_with_different_values for the same column; implementation prioritizes distinct.",
+    "Whether near-variants (Lattf, Americanp, etc.) must be guaranteed present or only possible: spec's boundary_and_near_variant wording suggests presence, but implementation only guarantees REQUIRED_BOUNDARIES."
+   ]
+  }
+ ]
 }

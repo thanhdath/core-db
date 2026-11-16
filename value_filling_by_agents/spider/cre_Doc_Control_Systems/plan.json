@@ -1,76 +1,729 @@
 {
  "db": "cre_Doc_Control_Systems",
- "operator_io_quirks": [
-  "All identifiers are mixed-case with underscores (Ref_Document_Types, Document_Drafts); must be double-quoted in generated SQL.",
-  "All tables tiny (3-15 rows); no huge-table sampling path exercised here.",
-  "Declared DATETIME (receipt_date, mailing_date) dispatches to Date fuzzer (contains 'date'); storage is text with format '%Y-%m-%d %H:%M:%S' (datetime, not date-only).",
-  "Date fuzzer template detection: samples like '2008-04-21 20:42:25' parse under a datetime template; leading-zero stripping rule may fire since values contain '-0'.",
-  "CHAR(15) columns dispatch to String(length=15); VARCHAR(255) to String(length=255); both text storage.",
-  "INTEGER columns dispatch to Number(scale=0, is_int=True); storage integer; samples are small ints (0..20).",
-  "Composite PKs: Document_Drafts(document_id,draft_number), Draft_Copies(+copy_number), Circulation_History(+employee_id), Documents_Mailed(document_id,mailed_to_address_id).",
-  "Composite FK: Draft_Copies(document_id,draft_number)->Document_Drafts; Circulation_History(document_id,draft_number,copy_number)->Draft_Copies. Upstream fk dict is per-column, so composite FK is split into independent per-column edges (loses tuple correlation).",
-  "Circulation_History has 3 separate FK edges to Draft_Copies (document_id, draft_number, copy_number) each independently filled -> tuple may not exist in parent.",
-  "Documents.shipping_agent_code is nullable FK (notnull=0) but null_rate 0.0 in original; TS may emit NULLs there.",
-  "All FKs have existing parents; no dangling/self FKs. No unique/check constraints beyond PKs.",
-  "Ref_Document_Types.document_type_code samples include 'Hard Drive' (spaced value) though CHAR(15) code column; description values are single chars ('b','u','f')."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all CHAR/VARCHAR: fresh random strings over a-zA-Z 0-9() with contamination, plus literal-pool values; names/descriptions become gibberish -> FN on queries filtering real names (e.g. shipping_agent_name='UPS').",
-  "Number fuzzer for INTEGER PKs: fresh ints in [-1,1] range (scale 0) perturbed +-1/+-2, plus pool values; document_id/employee_id/address_id become tiny/negative -> joins still work but range predicates (id>N) shift.",
-  "Date fuzzer for DATETIME: template from first parsable sample (datetime '%Y-%m-%d %H:%M:%S'), range from min/max parsed; fresh dates uniform in [1973,2014] -> plausible, but format may drop leading zeros -> string comparisons on dates can FP/FN.",
-  "FK columns filled from parent's final values with replacement -> many-to-one ties preserved; but composite FKs split per-column -> Draft_Copies/Circulation_History tuples may not match parent tuples -> join FN.",
-  "PK dedup keeps first occurrence; composite PKs (document_id,draft_number) dedup on tuple -> draft_number ties across documents preserved.",
-  "Small parent tables (3-5 rows) with replacement -> heavy duplicate FK values, plausible for many-to-one but may over-represent one parent.",
-  "Literal pool from train SQL seeds real codes ('CD','Paper','working','done','UPS') into String samplers -> some queries match; others miss.",
-  "Number PKs fresh-drawn independently of FK children -> child document_id may reference non-existent Documents row (FK not enforced, pragma off) -> join FN.",
-  "String length range from elements: single-char descriptions ('b','u') give length range [1,2] -> very short fresh strings, unlike 255-char VARCHAR intent.",
-  "Date fuzzer p-inversion: p=0.2 means element returned w.p. 0.2, fresh w.p. 0.8 -> mostly fresh dates, few real ones.",
-  "Empty-string / NULL: notnull columns not enforced in Python; insert failures skipped -> some rows dropped silently, shrinking tables.",
-  "Boolean/bit/year fuzzers unused here (no such declared types)."
- ],
- "challenger_refs": [
-  "G1",
-  "g72dbb7d3",
-  "g72dbb7d3",
-  "g72dbb7d3",
-  "g72dbb7d3",
-  "g72dbb7d3",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g501d89f5",
-  "g192d7c24",
-  "gc09e0758",
-  "G2",
-  "g7e595c79",
-  "g7e595c79",
-  "gb79da4e4",
-  "gb79da4e4",
-  "gb79da4e4",
-  "gb79da4e4"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; never overwritten by boundary pools; when appending to a compact database, start after the maximum existing key. For composite PKs, generate the first component sequentially and the remaining components sequentially per first component (e.g. draft_number 0,1,2,... per document_id; copy_number 1,2,3,... per (document_id,draft_number)).",
+   "integer_fk": "Copy an existing parent key value; allow NULL only where the column is nullable; include at least one parent row with no children; never emit dangling child FKs; never mutate FK columns after linkage is built. For composite FKs, sample whole parent tuples jointly (not per-column) so the composite tuple exists in the parent.",
+   "integer_numeric": "Uniform integer in [1, 100] unless a per-column exception gives a tighter range; include boundary values at listed literals and one step on each side.",
+   "char_code": "Pick from the enum pool of the referenced reference table; preserve exact case; include near-variants (lower/upper case) only where a per-column exception lists them. For enum-constrained columns, restrict sampling to the enum pool (plus NULL where nullable) and disable random string mutation.",
+   "varchar_text": "Short lowercase alphabetic token of length 1-3 from string.ascii_lowercase; allow near-duplicate values and case variants where a per-column exception lists them; NULL only if nullable.",
+   "datetime": "Random datetime between 1970-01-01 and 2016-12-31, format 'YYYY-MM-DD HH:MM:SS'; NULL only if nullable.",
+   "null_share": "For each nullable column, at least one NULL row per instance; share follows the compact database share (0.0 observed, so use a small share such as 1 row per instance); apply after all row filtering and after all hint application so at least one NULL survives; verify at least one NULL and one non-NULL per nullable column before writing.",
+   "boundary_and_tie": "For columns listed in per_column_exceptions with pattern comparison_boundary, guarantee at least one occurrence of each listed literal (and one step on each side where numeric) in the generated rows for the targeted non-key columns; for ties_for_order_limit include at least two rows sharing the listed rank value; for duplicates_for_distinct include 20-50% duplicate values; apply only to non-key columns or re-derive child FKs from the final parent key set afterwards.",
+   "table_size_jitter": "Table sizes are base + 0/1 jitter upward so children can leave parents unreferenced; the base values are given in table_sizes_per_instance."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Documents.document_id"
+    ],
+    "values": [
+     0,
+     1,
+     2,
+     6,
+     7,
+     8
+    ],
+    "note": "PK column; boundary literals are used only as query predicates, not as generated PK values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Ref_Shipping_Agents.shipping_agent_name"
+    ],
+    "values": [
+     "USPS",
+     "usps",
+     "UPS",
+     "ups"
+    ],
+    "note": "Non-key column; guarantee at least one occurrence of each literal; disable random mutation for boundary-pool values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Documents.document_status_code"
+    ],
+    "values": [
+     "done",
+     "DONE"
+    ],
+    "note": "Non-key FK column; 'done' is in the enum pool, 'DONE' is a case variant used only as a query predicate; do not materialize 'DONE' as a value (enum rule uses exact case)."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Documents.document_type_code"
+    ],
+    "values": [
+     "Paper",
+     "paper"
+    ],
+    "note": "Non-key FK column; 'Paper' is in the enum pool, 'paper' is a case variant used only as a query predicate; do not materialize 'paper' as a value."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Draft_Copies.document_id"
+    ],
+    "values": [
+     1,
+     2,
+     3
+    ],
+    "note": "FK column; boundary literals are used only as query predicates, not as generated FK values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Document_Drafts.document_id"
+    ],
+    "values": [
+     1,
+     2,
+     3,
+     6,
+     7,
+     8
+    ],
+    "note": "FK column; boundary literals are used only as query predicates, not as generated FK values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Draft_Copies.draft_number"
+    ],
+    "values": [
+     1,
+     2,
+     3
+    ],
+    "note": "FK column; boundary literals are used only as query predicates, not as generated FK values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Documents_Mailed.document_id"
+    ],
+    "values": [
+     6,
+     7,
+     8
+    ],
+    "note": "FK column; boundary literals are used only as query predicates, not as generated FK values."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Ref_Shipping_Agents.shipping_agent_code"
+    ],
+    "values": [
+     "UP",
+     "up"
+    ],
+    "note": "PK column; 'UP' is in the enum pool, 'up' is a case variant used only as a query predicate; do not materialize 'up' as a PK value."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Ref_Document_Types.document_type_code"
+    ],
+    "values": [
+     "Paper",
+     "paper"
+    ],
+    "note": "PK column; 'Paper' is in the enum pool, 'paper' is a case variant used only as a query predicate; do not materialize 'paper' as a PK value."
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "Documents.document_id",
+     "Draft_Copies.document_id",
+     "Circulation_History.document_id",
+     "Documents_Mailed.document_id",
+     "Document_Drafts.document_id"
+    ],
+    "note": "Realized via parent rows with no child rows only; dangling child FKs are never generated because they violate the declared FOREIGN KEY constraints. Reserve at least one Documents row with no children in any child table."
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": [
+     "Documents.document_id",
+     "Document_Drafts.document_id",
+     "Draft_Copies.document_id",
+     "Circulation_History.document_id",
+     "Roles.role_description",
+     "Employees.role_code",
+     "Roles.role_code",
+     "Circulation_History.draft_number",
+     "Circulation_History.copy_number"
+    ],
+    "note": "Ensure groups of size 1, 2 and >=3 exist for the listed grouping columns; for PK/FK grouping columns this is achieved by controlling how many children reference each parent key (FK-valid), not by mutating keys. For Documents.document_id, control child counts across the union of child tables (Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed). Circulation_History size must be at least 6 to realize all three group sizes."
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "Employees.employee_name",
+     "Circulation_History.employee_id",
+     "Documents.document_status_code",
+     "Documents.document_type_code",
+     "Ref_Shipping_Agents.shipping_agent_name",
+     "Roles.role_description"
+    ],
+    "note": "20-50% duplicate share on DISTINCT columns; Ref_Document_Types.document_type_code, Ref_Document_Status.document_status_code, Roles.role_code and Ref_Shipping_Agents.shipping_agent_code are PKs and cannot duplicate, so they are excluded. After applying dup-distinct hints, re-verify at least one Employees row has no Circulation_History children."
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "Documents.document_id",
+     "Draft_Copies.document_id",
+     "Circulation_History.document_id",
+     "Circulation_History.draft_number",
+     "Circulation_History.copy_number"
+    ],
+    "note": "At least two rows tie at the listed LIMIT rank; for key columns this is achieved through child-row counts, not by mutating keys. Ref_Shipping_Agents.shipping_agent_code is a PK and cannot have ties, so it is excluded."
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": [
+     "Employees.employee_id",
+     "Draft_Copies.copy_number"
+    ],
+    "note": "NOT NULL columns; COUNT(col) never sees NULL; no NULL planted."
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "Employees.employee_name",
+     "Roles.role_description",
+     "Employees.role_code",
+     "Roles.role_code"
+    ],
+    "note": "Ensure HAVING COUNT(*) > 1 and COUNT(col) > 1 have both true and false groups. Employees.employee_id is a PK and is excluded because COUNT(employee_id) per group is always 1."
+   },
+   {
+    "pattern": "enum",
+    "targets": [
+     "Documents.document_status_code",
+     "Documents.document_type_code",
+     "Ref_Document_Status.document_status_code",
+     "Ref_Document_Types.document_type_code",
+     "Ref_Shipping_Agents.shipping_agent_code",
+     "Employees.role_code",
+     "Roles.role_code"
+    ],
+    "values": {
+     "Documents.document_status_code": [
+      "done",
+      "overdue",
+      "working"
+     ],
+     "Documents.document_type_code": [
+      "CD",
+      "Hard Drive",
+      "Paper"
+     ],
+     "Ref_Document_Status.document_status_code": [
+      "done",
+      "overdue",
+      "working"
+     ],
+     "Ref_Document_Types.document_type_code": [
+      "CD",
+      "Hard Drive",
+      "Paper"
+     ],
+     "Ref_Shipping_Agents.shipping_agent_code": [
+      "AL",
+      "FE",
+      "SH",
+      "UP",
+      "US"
+     ],
+     "Employees.role_code": [
+      "ED",
+      "MG",
+      "PR",
+      "PT"
+     ],
+     "Roles.role_code": [
+      "ED",
+      "MG",
+      "PR",
+      "PT"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Documents.document_type_code",
+    "parent": "Ref_Document_Types.document_type_code",
+    "copied": []
+   },
+   {
+    "child": "Documents.document_status_code",
+    "parent": "Ref_Document_Status.document_status_code",
+    "copied": []
+   },
+   {
+    "child": "Documents.shipping_agent_code",
+    "parent": "Ref_Shipping_Agents.shipping_agent_code",
+    "copied": []
+   },
+   {
+    "child": "Employees.role_code",
+    "parent": "Roles.role_code",
+    "copied": []
+   },
+   {
+    "child": "Document_Drafts.document_id",
+    "parent": "Documents.document_id",
+    "copied": []
+   },
+   {
+    "child": "Draft_Copies.(document_id,draft_number)",
+    "parent": "Document_Drafts.(document_id,draft_number)",
+    "copied": []
+   },
+   {
+    "child": "Circulation_History.(document_id,draft_number,copy_number)",
+    "parent": "Draft_Copies.(document_id,draft_number,copy_number)",
+    "copied": []
+   },
+   {
+    "child": "Circulation_History.employee_id",
+    "parent": "Employees.employee_id",
+    "copied": []
+   },
+   {
+    "child": "Documents_Mailed.document_id",
+    "parent": "Documents.document_id",
+    "copied": []
+   },
+   {
+    "child": "Documents_Mailed.mailed_to_address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Documents",
+    "column": "document_id",
+    "formula": "document_id > 0"
+   },
+   {
+    "table": "Documents",
+    "column": "document_status_code",
+    "formula": "document_status_code IN ('done','overdue','working')"
+   },
+   {
+    "table": "Documents",
+    "column": "document_type_code",
+    "formula": "document_type_code IN ('CD','Hard Drive','Paper')"
+   },
+   {
+    "table": "Documents",
+    "column": "shipping_agent_code",
+    "formula": "shipping_agent_code IS NULL OR shipping_agent_code IN ('AL','FE','SH','UP','US')"
+   },
+   {
+    "table": "Employees",
+    "column": "employee_id",
+    "formula": "employee_id > 0"
+   },
+   {
+    "table": "Employees",
+    "column": "role_code",
+    "formula": "role_code IN ('ED','MG','PR','PT')"
+   },
+   {
+    "table": "Document_Drafts",
+    "column": "draft_number",
+    "formula": "draft_number >= 0"
+   },
+   {
+    "table": "Draft_Copies",
+    "column": "copy_number",
+    "formula": "copy_number > 0"
+   },
+   {
+    "table": "Circulation_History",
+    "column": "employee_id",
+    "formula": "employee_id > 0"
+   },
+   {
+    "table": "Documents_Mailed",
+    "column": "mailing_date",
+    "formula": "mailing_date IS NULL OR mailing_date >= '1970-01-01 00:00:00'"
+   },
+   {
+    "table": "Ref_Document_Status",
+    "column": "document_status_code",
+    "formula": "document_status_code IN ('done','overdue','working')"
+   },
+   {
+    "table": "Ref_Document_Types",
+    "column": "document_type_code",
+    "formula": "document_type_code IN ('CD','Hard Drive','Paper')"
+   },
+   {
+    "table": "Ref_Shipping_Agents",
+    "column": "shipping_agent_code",
+    "formula": "shipping_agent_code IN ('AL','FE','SH','UP','US')"
+   },
+   {
+    "table": "Roles",
+    "column": "role_code",
+    "formula": "role_code IN ('ED','MG','PR','PT')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 8,
+   "Ref_Document_Types": 3,
+   "Ref_Document_Status": 3,
+   "Ref_Shipping_Agents": 5,
+   "Roles": 4,
+   "Documents": 15,
+   "Employees": 6,
+   "Document_Drafts": 15,
+   "Draft_Copies": 8,
+   "Circulation_History": 6,
+   "Documents_Mailed": 14
+  },
+  "null_targets": [
+   "Documents.shipping_agent_code",
+   "Documents.receipt_date",
+   "Documents.receipt_number",
+   "Documents.other_details",
+   "Employees.employee_name",
+   "Employees.other_details",
+   "Document_Drafts.draft_details",
+   "Documents_Mailed.mailing_date",
+   "Addresses.address_details",
+   "Roles.role_description"
+  ],
+  "supporting_evidence": {
+   "enum_rules": "Ref_Document_Status, Ref_Document_Types, Ref_Shipping_Agents, Roles rows show the listed code pools; Documents and Employees draw from them.",
+   "range_rules": "All PK and FK integer columns are positive in the shown rows; draft_number includes 0 (Document_Drafts row document_id=1, draft_number=0).",
+   "no_formulas": "No calculated column is present in the schema; no offset or rate can be derived from the shown rows.",
+   "fk_integrity": "All child FK values in the shown rows match existing parent keys; no dangling FKs are observed, so unmatched_join_rows is realized via parent-without-child only.",
+   "pk_uniqueness": "Ref_Document_Types.document_type_code, Ref_Document_Status.document_status_code, Roles.role_code and Ref_Shipping_Agents.shipping_agent_code are PRIMARY KEY columns and cannot contain duplicates; duplicates_for_distinct is therefore restricted to non-key columns.",
+   "composite_keys": "Document_Drafts, Draft_Copies and Circulation_History have composite PKs; the non-first components must be generated sequentially per first component and composite FKs must be sampled as whole tuples.",
+   "group_size_feasibility": "Circulation_History size is raised to 6 so that group sizes 1, 2 and >=3 can be realized for its grouping columns."
+  },
+  "uncertainty": "Observed NULL rates are 0.0 for all nullable columns; a minimal NULL share (one row per nullable column per instance) is used to exercise NULL semantics. No date-pair order rule exists because no table has two related dates. No formula is stated because no column is derived from other columns in the shown rows. Group-size and tie patterns on PK/FK columns are realized through child-row counts rather than key mutation, so they may not be forced in every instance. Case-variant boundary literals on enum-constrained columns are predicate-only and are not materialized as values."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 310 across 20 instances, and validity.reasons.new_integrity_failures = 20/20. The schema declares FOREIGN KEY constraints on Documents, Employees, Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed. The writer disables FK enforcement (`con.execute('pragma foreign_keys = OFF')` in writer.py) and the instance builder's `fill_foreign_keys_consistently` docstring explicitly says unmatched FK rows are NOT emitted, yet 310 FK violations appear. The cause is that `_apply_group_size_hints` and `_apply_dup_distinct_hints` reassign values in FK columns (e.g. `Circulation_History.employee_id` is in the dup-distinct targets, and `Employees.role_code`/`Roles.role_code` are in group-size targets) after FK consistency was established, and `INT_SMALL_POOL` overwrites PK/FK integer columns with boundary literals (e.g. Documents.document_id, Draft_Copies.document_id) after the parent/child linkage was built. This breaks referential integrity.",
+     "requested_revision": "Do not mutate FK/PK columns after `fill_foreign_keys_consistently` and `sample_fresh_primary_keys` have run. Either (a) apply group-size/dup-distinct/boundary hints only to non-key columns, or (b) re-derive child FK values from the final parent key set after any hint is applied. Also remove PK/FK integer columns from `INT_SMALL_POOL` boundary overwriting, or re-run FK consistency after it. Verify with `pragma foreign_key_check` that fk_violations == 0 on every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.compact_rows_missing = 20/20. The writer copies the compact DB (`shutil.copyfile(orig_path, part)`) and then appends rows, but `rows_skipped` shows large numbers of skipped inserts (Documents 120, Documents_Mailed 64, Document_Drafts 47, Roles 43). The skipped rows are PK/UNIQUE conflicts against the compact data because generated PKs (e.g. Documents.document_id drawn from `INT_SMALL_POOL` boundary pool [0,1,2,6,7,8]) collide with existing compact PKs. The spec's `integer_pk` rule says 'Sequential integers starting at 1, unique per table', but the program overrides PKs with the boundary pool, causing collisions and skipped rows. The 'compact_rows_missing' reason indicates the compact rows are not preserved as required.",
+     "requested_revision": "Generate PKs that do not collide with existing compact PK values (start after max existing PK, or filter out existing keys). Do not apply `INT_SMALL_POOL` boundary overwriting to primary-key columns. Ensure the copy-and-append preserves all compact rows and that `rows_skipped` for PK/UNIQUE conflicts is zero."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.no_rows_added = 9/20 instances. Combined with the skipped-row counts, many instances add no rows to key tables. The spec's `table_sizes_per_instance` (e.g. Documents: 15, Document_Drafts: 15, Documents_Mailed: 14) is not being met because generated rows are dropped by PK/UNIQUE dedup and integrity failures. The `choose_table_sizes` jitter (\u00b11) is fine, but the effective inserted row counts fall far short of the spec sizes.",
+     "requested_revision": "After fixing PK collisions and FK consistency, verify that each table receives approximately the spec's `table_sizes_per_instance` rows (within jitter) and that no instance has `no_rows_added` for a table with a positive spec size."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` lists `unmatched_join_rows` targets including `Draft_Copies.document_id`, `Circulation_History.document_id`, `Documents_Mailed.document_id`, `Document_Drafts.document_id` with note 'Include parent rows with no child rows and child rows whose FK points to an existing parent; no NULL FKs on NOT NULL join columns.' The program's `fill_foreign_keys_consistently` docstring says unmatched FK rows are NOT emitted and relies on parent-without-child only. This is a partial implementation: the spec's 'child rows whose FK points to an existing parent' is satisfied, but the 'unmatched_join_rows' pattern as described in the atomic operations (pairs with `parent_rows_without_children: true`) is only partially modeled. This is a design ambiguity: the spec should clarify whether 'unmatched join rows' means parent-without-child only (which is FK-valid) or also dangling child FKs (which would violate the declared FK constraints).",
+     "requested_revision": "Designer should clarify that `unmatched_join_rows` is realized via parent-without-child rows only (since dangling FKs violate the schema's FOREIGN KEY constraints), and remove the misleading 'child rows whose FK points to an existing parent' phrasing or explicitly state that dangling child FKs are not generated. Engineer should then ensure parent-without-child is actually achieved (e.g. child table sizes smaller than parent, or some parent keys never referenced)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns: `Document_Drafts.draft_details: generated rows: NULL 0 / 2` and `Documents_Mailed.mailing_date: generated rows: NULL 0 / 2`. The spec's `null_targets` includes both columns and the interface rule requires at least one NULL per nullable column per instance. The `_force_one_null_per_column` is called only for columns in `NULL_TARGETS` and `not cm.notnull and cm.pk_pos == 0`, but the low row counts (2 rows) and the sampler's null_share may not fire. Per instruction 7 this is noted but does not block a pass; however it should be fixed for correctness.",
+     "requested_revision": "Ensure `_force_one_null_per_column` is applied after all row filtering (PK/UNIQUE dedup) so that at least one NULL survives per nullable column, and that the column has at least one row. Verify the feedback line shows NULL >= 1 for every nullable column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` `group_sizes` targets include `Documents.document_id`, `Circulation_History.document_id`, `Circulation_History.draft_number`, `Circulation_History.copy_number`, `Roles.role_description`, `Employees.role_code`, `Roles.role_code`. The program's `_apply_group_size_hints` only handles `{('Employees','role_code'), ('Roles','role_description'), ('Roles','role_code')}` and explicitly skips PK/FK-derived group sizes. The spec's `group_sizes` for `Documents.document_id` and `Circulation_History.*` are not forced. This is a partial implementation of the spec.",
+     "requested_revision": "Either implement group-size forcing for the PK/FK grouping columns (by controlling how many children reference each parent key, which is FK-valid) or update the spec to state that PK/FK group sizes emerge naturally and are not forced. The current mismatch between spec and program should be resolved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` `duplicates_for_distinct` targets include `Ref_Document_Types.document_type_code` and `Ref_Document_Status.document_status_code`, but `_apply_dup_distinct_hints` only handles `Employees.employee_name` and `Circulation_History.employee_id`. The reference-table code columns are PKs (unique by definition), so a 20-50% duplicate share is impossible without violating the PK. This is a spec inconsistency: the atomic operations report `duplicates_for_distinct` for `Ref_Document_Types.document_type_code` and `Ref_Document_Status.document_status_code`, but these are PRIMARY KEY columns and cannot have duplicates.",
+     "requested_revision": "Designer should remove `Ref_Document_Types.document_type_code` and `Ref_Document_Status.document_status_code` from `duplicates_for_distinct` targets (they are PKs and cannot duplicate), or clarify that the pattern applies to the DISTINCT count of a join result rather than the column itself. Engineer should align `_apply_dup_distinct_hints` with the corrected spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `per_column_exceptions` `comparison_boundary` for `Ref_Shipping_Agents.shipping_agent_name` lists values ['USPS','usps','UPS','ups'], but the enum pool for `Ref_Shipping_Agents.shipping_agent_code` is ['AL','FE','SH','UP','US'] and the table has only 5 rows. The `shipping_agent_name` column is VARCHAR(255) NOT NULL and is not in the enum list, so the boundary values are plausible. However, the spec's `enum` rule for `Ref_Shipping_Agents.shipping_agent_code` includes 'UP' and 'US', and the boundary for `shipping_agent_code` is ['UP','up']. The program's `StringSampler` for `shipping_agent_name` uses `boundary_pool` with 20% probability, which is reasonable. This is a minor concern, not blocking.",
+     "requested_revision": "No change required; note that `shipping_agent_name` boundary values are sampled with low probability and may not appear in every instance. If the spec requires the literal to appear, increase the probability or force at least one occurrence."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 32/92 separated construction pairs are due to the FK violations and PK collisions (which would be fixed by the above revisions) or due to genuine value-domain limitations. Re-run construction feedback after fixes to confirm separation improves.",
+    "Whether `Ref_Shipping_Agents.shipping_agent_name` boundary literals ('USPS','usps','UPS','ups') actually appear in generated instances; the feedback does not report per-value presence.",
+    "Whether the `group_sizes` pattern for `Documents.document_id` and `Circulation_History.*` is achievable without violating FK constraints; the designer should confirm the intended realization."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with KeyError('document_status_code') and rows_added_total=0. In instance.py build_random_instance, the loop `for cm in tm.columns: if cm.name in cols: continue; if (t, cm.name) in samplers: cols[cm.name] = ...` only fills columns that have a sampler. FK columns are skipped when building samplers (`if (t, cm.name) in schema.fks: continue`), so they are absent from `cols` at that point. Then `cols.update(fill_foreign_keys_consistently(...))` adds them, but the subsequent line `cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols})` is fine; however the earlier `inst[t] = cols` is set before FK fill, and `fill_foreign_keys_consistently` reads `instance.get(pt, {}).get(pc, [])` for parent keys. For Documents, document_status_code is an FK to Ref_Document_Status; the parent table Ref_Document_Status is processed earlier, but its own document_status_code is a PK (pk_pos>0) so it is skipped in the sampler loop and only set via `_sequential_pk` if integer \u2014 it is CHAR, so it is never populated. Hence `_parent_keys` returns only compact values, but the KeyError arises because `cols[cm.name]` is accessed for a column not in `cols` when building the filtered dict \u2014 specifically `{cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols}` is safe, but the FK fill for Documents.document_status_code calls `_parent_keys(schema, instance, 'Ref_Document_Status', 'document_status_code')` which is fine; the actual KeyError is that `fill_foreign_keys_consistently` returns a dict keyed by FK column name, and `cols.update(...)` merges it, but then `inst[t] = {cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols}` \u2014 this is safe. The real failure: non-integer PK columns (CHAR PKs like Ref_Document_Status.document_status_code, Ref_Document_Types.document_type_code, Ref_Shipping_Agents.shipping_agent_code, Roles.role_code) are never generated because the sampler loop skips `cm.pk_pos > 0` and `_sequential_pk` only handles integer PKs. So those tables have empty `cols`, and when Documents' FK fill calls `_parent_keys`, it gets only compact values \u2014 but the KeyError('document_status_code') indicates `cols[cm.name]` is accessed where the column is missing. Regardless of the exact line, the observable fact is that CHAR primary-key reference tables are never populated, so FK parents are empty and generation crashes.",
+     "requested_revision": "Populate non-integer primary-key columns (CHAR PKs in Ref_Document_Status, Ref_Document_Types, Ref_Shipping_Agents, Roles) from their enum pools in build_random_instance, so parent key sets are non-empty and FK fill succeeds. Ensure the KeyError path is eliminated and all 20 units produce rows_added_total > 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py sets `INT_SMALL_POOL = set()` and `BOUNDARY` for non-key columns is only consulted in values.py via `self.boundary_pool = list(BOUNDARY.get(self.key, [])) if column.pk_pos == 0 else []`. But the spec's per_column_exceptions list comparison_boundary targets including Ref_Shipping_Agents.shipping_agent_name (values USPS/usps/UPS/ups), Documents.document_status_code (done/DONE), Documents.document_type_code (Paper/paper), Ref_Document_Types.document_type_code (Paper/paper), Ref_Shipping_Agents.shipping_agent_code (UP/up). The generic rule says 'include the literal and one step on each side'. The program only probabilistically samples these (0.20\u20130.35 chance) and does not guarantee inclusion of the literal or its neighbors. Also Ref_Shipping_Agents.shipping_agent_code is a PK (CHAR) and is excluded from boundary_pool by `column.pk_pos == 0`, so 'UP'/'up' can never appear there, contradicting the spec's comparison_boundary target for that column.",
+     "requested_revision": "Guarantee at least one occurrence of each listed comparison_boundary literal (and one step on each side where numeric) in the generated rows for the targeted non-key columns, and either justify excluding PK columns from boundary literals or add a mechanism (e.g., a separate non-PK column or documented exception) so the spec's stated targets are honored."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions list comparison_boundary targets on PK/FK columns (Documents.document_id, Draft_Copies.document_id, Document_Drafts.document_id, Draft_Copies.draft_number, Documents_Mailed.document_id) with the note 'boundary literals are used only as query predicates, not as generated PK values'. This is consistent with the program, but the spec also lists Ref_Shipping_Agents.shipping_agent_code (a PK) with values ['UP','up'] and no such note, and Ref_Document_Types.document_type_code (a PK) with ['Paper','paper'] and no such note. These are contradictory: a PK cannot hold both 'UP' and 'up' as distinct rows if the enum pool is ['AL','FE','SH','UP','US'] (case-sensitive CHAR), and 'Paper'/'paper' cannot both be PK values under the stated enum. The spec should clarify whether these are predicate-only or must appear as values.",
+     "requested_revision": "Clarify in the spec whether comparison_boundary literals on PK columns are predicate-only (as for the integer PKs) or must be materialized; if materialized, reconcile with the enum pool and PK uniqueness (e.g., allow case variants in the enum or drop the requirement)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_share rule requires 'at least one NULL row per instance' for every nullable column, and the interface rule (item 7) requires rows with NULL and rows with non-NULL for every nullable column including nullable FKs. In instance.py, `_force_one_null_per_column` is called only for columns in NULL_TARGETS with `cm.pk_pos == 0`. NULL_TARGETS includes Documents.shipping_agent_code (nullable FK) \u2014 good. But the sampler for that column is created with `nullable = (t, cm.name) in NULL_TARGETS and not cm.notnull` and `share = _null_share_for(ov, ...)`. Since observed NULL share is 0.0, `_null_share_for` returns `1.0/max(n,1)`, which for n\u224815 is ~0.067 \u2014 fine. However, `_force_one_null_per_column` runs after `drop_unique_duplicates` and `sample_fresh_primary_keys`, but the FK fill for Documents.shipping_agent_code happens in `fill_foreign_keys_consistently` which is called before `_force_one_null_per_column`; the forced NULL is applied to `inst[t][column]` after `inst[t]` was rebuilt from `cols`. This works only if the column survived filtering. More importantly, `_force_one_null_per_column` is applied to `inst` after `inst[t] = {cm.name: cols[cm.name] ...}`, so it does mutate the final instance \u2014 acceptable. But the writer inserts rows with `cols[c][i] if c in cols else None`, and if a nullable FK column was dropped by `drop_unique_duplicates` (unlikely) it would be None for all rows, violating 'rows with non-NULL values'. This is a latent risk, not observed in execution (execution failed earlier).",
+     "requested_revision": "After all filtering and FK fill, verify for each nullable column (including nullable FKs) that the final instance contains at least one NULL and at least one non-NULL value; if not, adjust (e.g., re-insert a non-NULL value) before writing. Add an assertion or post-check in build_random_instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's group_sizes targets include Documents.document_id, Circulation_History.document_id, Circulation_History.draft_number, Circulation_History.copy_number, Employees.role_code, Roles.role_description, Roles.role_code. The program's `_apply_group_size_hints` only handles {('Employees','role_code'), ('Roles','role_description'), ('Roles','role_code')} and `fill_foreign_keys_consistently` handles GROUP_SIZE for FK columns via `_child_counts_for_group_sizes`, but GROUP_SIZE in spec.py does not include Documents.document_id (it is a PK, not an FK child column in any table's FK list \u2014 Documents is a parent). The spec's note says 'for PK/FK grouping columns this is achieved by controlling how many children reference each parent key'. Documents.document_id is a PK parent; its group sizes are realized by child counts in Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed. The program's `_child_counts_for_group_sizes` is only invoked when `(table, cm.name) in GROUP_SIZE` and the column is an FK in that table. For Document_Drafts.document_id (FK to Documents), GROUP_SIZE does not include it, so child counts are random \u2014 group sizes 1, 2, >=3 are not guaranteed for Documents.document_id. Similarly Circulation_History.document_id is in GROUP_SIZE and is an FK, so it is handled; but Documents.document_id as a parent is not guaranteed to have children of sizes 1, 2, >=3.",
+     "requested_revision": "Add the child FK columns that reference Documents.document_id (Document_Drafts.document_id, Draft_Copies.document_id, Circulation_History.document_id, Documents_Mailed.document_id) to GROUP_SIZE, or otherwise ensure the parent Documents.document_id has children with counts 1, 2, and >=3 across the union of child tables. Document the realization mechanism in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's duplicates_for_distinct targets include Employees.employee_name and Circulation_History.employee_id. `_apply_dup_distinct_hints` sets `dup_count = max(1, int(round(len(colv) * 0.30)))` and overwrites that many slots with `base = non_null[0]`. For Circulation_History.employee_id, this column is an FK to Employees.employee_id; overwriting it with `base` (an existing employee_id) keeps FK validity, but it may destroy the group_sizes realization for Circulation_History.employee_id if that were a target (it is not in GROUP_SIZE, so OK). However, for Employees.employee_name, overwriting 30% with the first non-null value is fine. The issue: `_apply_dup_distinct_hints` runs after `_apply_group_size_hints`, and for Employees.role_code (a GROUP_SIZE target) it is not in DUP_DISTINCT_TARGETS, so no conflict. But `_apply_dup_distinct_hints` for Circulation_History.employee_id may reduce the number of distinct employees referenced, potentially eliminating the 'parent rows with no children' property for Employees if all employees end up referenced \u2014 not a hard violation but weakens the unmatched_join_rows pattern. Minor.",
+     "requested_revision": "After applying dup-distinct hints, re-verify that at least one Employees row has no Circulation_History children (parent-without-child), and that group-size targets for non-key columns still hold. Add a post-check."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence states 'draft_number includes 0 (Document_Drafts row document_id=1, draft_number=0)' and semantic rule 'draft_number >= 0'. The program's `_sequential_pk` only handles single-column integer PKs; Document_Drafts has a composite PK (document_id, draft_number), so draft_number is not generated sequentially. It is an FK? No \u2014 draft_number in Document_Drafts is part of the PK, not an FK. In build_random_instance, `if cm.pk_pos > 0: continue` skips it, and it is not an FK, so it is never populated. This means Document_Drafts rows will have draft_number missing (None) and the writer will insert NULL into a NOT NULL PK column, causing integrity errors or skipped rows. This is a concrete bug.",
+     "requested_revision": "Generate values for composite-PK non-integer or non-first components (e.g., Document_Drafts.draft_number) \u2014 for example, sequential integers starting at 0 per document_id, or from the original values \u2014 so the composite PK is fully populated and NOT NULL."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance gives Draft_Copies=8 and Circulation_History=4, but Draft_Copies has composite PK (document_id, draft_number, copy_number) and FK to Document_Drafts. Circulation_History has composite PK (document_id, draft_number, copy_number, employee_id) and FK to Draft_Copies. The program's `fill_foreign_keys_consistently` fills each FK column independently with `rng.choice(vals)`, which does not preserve the composite FK relationship: Circulation_History.(document_id, draft_number, copy_number) must match an existing Draft_Copies tuple, but independent sampling will almost always produce a dangling composite FK. The writer enables `pragma foreign_keys = ON`, so these rows will fail and be counted as skipped \u2014 meaning Circulation_History will likely have 0 rows added, and the spec's group_sizes/ties targets for Circulation_History cannot be realized. This is a structural bug.",
+     "requested_revision": "For composite FKs, sample whole parent tuples (not per-column) so that (document_id, draft_number, copy_number) in Circulation_History is drawn from the set of existing Draft_Copies tuples, and (document_id, draft_number) in Draft_Copies is drawn from existing Document_Drafts tuples. Add a helper that fills composite FK groups jointly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies list `Draft_Copies.(document_id,draft_number)` -> `Document_Drafts.(document_id,draft_number)` and `Circulation_History.(document_id,draft_number,copy_number)` -> `Draft_Copies.(document_id,draft_number,copy_number)`. The program's `schema.fks` is built from `pragma foreign_key_list`, which returns one row per column of a composite FK. `fill_foreign_keys_consistently` iterates `for cm in schema.tables[table].columns: if key not in schema.fks: continue` and fills each column independently. This does not implement the composite dependency. Combined with the previous issue, this is the root cause of dangling composite FKs.",
+     "requested_revision": "Group FK columns by their parent table and composite key, and fill them jointly from parent tuples. Update `schema.fks` or add a `composite_fks` structure to support this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_targets includes Documents.receipt_date, Documents.receipt_number, Documents.other_details, Employees.employee_name, Employees.other_details, Document_Drafts.draft_details, Documents_Mailed.mailing_date, Addresses.address_details, Roles.role_description. The program's NULL_TARGETS matches. However, `_force_one_null_per_column` is called for each such column, but for Document_Drafts.draft_details, if Document_Drafts rows are not generated (due to the composite-PK bug above), the column list is empty and no NULL is planted. Similarly for Documents_Mailed.mailing_date if Documents_Mailed rows fail FK checks. This is a consequence of the earlier bugs, not an independent issue, but it means the NULL rule cannot be satisfied until the generation bugs are fixed.",
+     "requested_revision": "Fix the composite-PK and composite-FK generation bugs first; then verify each nullable column has at least one NULL and one non-NULL in the written instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic rule for Documents_Mailed.mailing_date is 'mailing_date IS NULL OR mailing_date >= 1970-01-01 00:00:00'. The program's DateSampler uses `self.full = (dt.datetime(1970,1,1), dt.datetime(2016,12,31,23,59,59))` and `self.rng_dates` from parsed originals, so generated dates are >= 1970-01-01 \u2014 consistent. No issue here; noted as supported.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's enum rules for Documents.document_status_code, Documents.document_type_code, Ref_Document_Status.document_status_code, Ref_Document_Types.document_type_code, Ref_Shipping_Agents.shipping_agent_code, Employees.role_code, Roles.role_code are supported by the original rows and the program's ENUMS dict. However, the program's StringSampler also draws from `self.elements` (original values + literal pool) and applies random mutations (`v + self._rand(5)`, `v[:-1]`, etc.) with 30% probability, which can produce values outside the enum pool for enum-constrained columns. For example, Documents.document_status_code could become 'donex' or 'don'. This violates the semantic rule `document_status_code IN ('done','overdue','working')`.",
+     "requested_revision": "For columns with a declared enum (ENUMS), disable random string mutation and restrict sampling to the enum pool (plus NULL where nullable). Add a per-column flag or check in StringSampler."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for char_code says 'Pick from the enum pool of the referenced reference table; preserve exact case; include near-variants (lower/upper case) only where a per-column exception lists them.' The program's StringSampler for enum columns uses `self.enum_pool` with 55% probability and `self.boundary_pool` with 20% probability, but also falls through to `self.elements` and random mutation. For Documents.document_status_code, boundary_pool includes 'DONE' (uppercase), which is a case variant not in the enum pool ['done','overdue','working']. The spec's per_column_exceptions lists 'DONE' as a comparison_boundary target, so this is arguably intended, but the semantic rule `document_status_code IN ('done','overdue','working')` would be violated by 'DONE'. The spec is internally inconsistent: the enum rule and the comparison_boundary target conflict for case variants.",
+     "requested_revision": "Reconcile the spec: either allow case variants in the enum rule (e.g., `LOWER(document_status_code) IN (...)`) or remove case-variant boundary literals from the enum-constrained columns. Document the intended behavior."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for integer_numeric says 'Uniform integer in [1, 100] unless a per-column exception gives a tighter range; include boundary values at listed literals and one step on each side.' The program's NumberSampler uses `self.min, self.max = (0, min(2 * 10 ** scale, _MAX))` with scale=10 for integers, i.e., [0, 2*10^10], not [1,100]. This is a significant deviation from the spec. For non-key integer columns (e.g., Addresses.address_id is a PK, so skipped; but if any non-key integer column existed), values would be far outside [1,100].",
+     "requested_revision": "Set the default integer range to [1,100] for non-key integer columns, and apply per-column exceptions for tighter ranges. Keep PK generation sequential as specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for varchar_text says 'Short lowercase alphabetic token of length 1-3'. The program's StringSampler uses `CHARSET = string.ascii_letters + ' ' + string.digits + '()'` and `self.lo, self.hi = (min(map(len, self.elements)), max(map(len, self.elements)) + 1)` when elements exist, or `(0, length)` with length=20 default. This produces mixed-case, digit-containing, and long strings, not short lowercase alphabetic tokens. For example, Employees.employee_name would get values like 'aB3()' or long strings, violating the spec.",
+     "requested_revision": "For varchar_text columns without a more specific rule, generate short lowercase alphabetic tokens of length 1-3 (e.g., from string.ascii_lowercase). Apply enum/boundary pools where specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for datetime says 'Random datetime between 1970-01-01 and 2016-12-31, format YYYY-MM-DD HH:MM:SS'. The program's DateSampler uses `self.template` derived from original values (e.g., '%Y-%m-%d' if originals are date-only) and `self.strip0` may remove leading zeros. This can produce formats other than 'YYYY-MM-DD HH:MM:SS'. For Documents.receipt_date and Documents_Mailed.mailing_date, the format may not match the spec.",
+     "requested_revision": "For datetime columns, default to format '%Y-%m-%d %H:%M:%S' unless the original values clearly use a different format and the spec allows it. Document the format choice."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for null_share says 'For each nullable column, at least one NULL row per instance; share follows the compact database share (0.0 observed, so use a small share such as 1 row per instance); apply after all row filtering so at least one NULL survives.' The program's `_null_share_for` returns `max(base, 1.0/max(n,1))` where base is the observed share (0.0) \u2014 so share = 1/n, which is correct. But `_force_one_null_per_column` is called after `_apply_group_size_hints` and `_apply_dup_distinct_hints`? No \u2014 it is called inside the per-table loop before those hints. `_apply_dup_distinct_hints` for Employees.employee_name could overwrite the planted NULL with `base` (a non-null value) because it iterates `slots = [i for i, v in enumerate(colv) if v is not None]` \u2014 NULLs are excluded, so the planted NULL survives. `_apply_group_size_hints` for Employees.role_code does not touch employee_name. So the NULL survives. However, `_apply_dup_distinct_hints` for Circulation_History.employee_id (an FK) could overwrite values but not NULLs. OK. The main risk is that `_force_one_null_per_column` is called before `_apply_group_size_hints` and `_apply_dup_distinct_hints`, which could in principle overwrite the NULL if they touched the same column \u2014 they don't for the current targets. Minor.",
+     "requested_revision": "Move `_force_one_null_per_column` to after all hint application, or add a final pass that re-plants NULLs if any were overwritten. Add a post-check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's supporting_evidence says 'All child FK values in the shown rows match existing parent keys; no dangling FKs are observed, so unmatched_join_rows is realized via parent-without-child only.' The program's `fill_foreign_keys_consistently` draws from `_parent_keys` which includes compact + generated parent values, so FK values are valid. However, for composite FKs (Draft_Copies, Circulation_History), independent per-column sampling produces dangling composite FKs (see earlier issue). The writer's `pragma foreign_keys = ON` will reject these rows, so they are skipped \u2014 meaning the instance will have fewer rows than specified and the group_sizes/ties patterns for those tables cannot be realized. This is a blocking issue for the spec's patterns.",
+     "requested_revision": "Fix composite FK sampling as described; then verify that all specified table sizes are achieved (rows_added matches table_sizes_per_instance) and that no rows are skipped due to FK violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance gives Documents=15, Document_Drafts=15, Draft_Copies=8, Circulation_History=4, Documents_Mailed=14. The program's `choose_table_sizes` uses `table_size(t, rng)` which returns `base + rng.randint(0, 1)`, so sizes are 15-16, 15-16, 8-9, 4-5, 14-15. This is a minor deviation (jitter upward by 0/1) but the spec says 'table_sizes_per_instance' as exact values. The jitter is documented in spec.py as intentional ('jittered by 0/1 only upward so children can leave parents unreferenced'). This is acceptable if the spec is updated to reflect the jitter, but currently the spec states exact sizes.",
+     "requested_revision": "Either remove the jitter to match exact spec sizes, or update the spec to state that sizes are base + 0/1 jitter. Document the rationale."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for integer_fk says 'Copy an existing parent key value; allow NULL only where the column is nullable; include at least one parent row with no children; never emit dangling child FKs; never mutate FK columns after linkage is built.' The program's `fill_foreign_keys_consistently` draws from `_parent_keys` (compact + generated), which is correct. But for Documents.shipping_agent_code (nullable FK), the program's `_parent_keys` returns non-NULL values only, and the sampler for that column is created with `nullable=True` and `null_share=1/n`, so some rows get NULL \u2014 good. However, `_force_one_null_per_column` is called for this column, ensuring at least one NULL. The 'at least one parent row with no children' property: for Ref_Shipping_Agents, Documents.shipping_agent_code draws randomly from 5 agents for 15 documents, so likely all 5 agents are referenced \u2014 no parent-without-child. The spec's unmatched_join_rows target for Documents.document_id (parent) is realized via child tables, but for Ref_Shipping_Agents, no unmatched_join_rows target is listed, so this is OK. For Documents.document_id, child tables (Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed) have sizes 15, 8, 4, 14 \u2014 with 15 documents and 15 drafts, random assignment likely references all 15 documents, so no parent-without-child. The spec's unmatched_join_rows target for Documents.document_id requires 'parent_rows_without_children: true'. The program does not guarantee this.",
+     "requested_revision": "Ensure at least one Documents row has no children in any child table (Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed). For example, reserve one document_id and exclude it from all child FK draws. Add a post-check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit targets include Documents.document_id, Draft_Copies.document_id, Circulation_History.document_id, Circulation_History.draft_number, Circulation_History.copy_number, Ref_Shipping_Agents.shipping_agent_code. The program's `_child_counts_for_group_sizes` creates ties for FK columns in GROUP_SIZE, but Documents.document_id (parent) and Ref_Shipping_Agents.shipping_agent_code (PK) are not handled. For Ref_Shipping_Agents.shipping_agent_code, ties would require two rows with the same code \u2014 impossible for a PK. The spec's note says 'for key columns this is achieved through child-row counts, not by mutating keys' \u2014 but Ref_Shipping_Agents.shipping_agent_code has no child table (Documents.shipping_agent_code is a child, but the tie would be on the parent's code, which is unique). This is a spec inconsistency: a PK cannot have ties.",
+     "requested_revision": "Remove Ref_Shipping_Agents.shipping_agent_code from ties_for_order_limit targets, or clarify that ties are on child-row counts (e.g., two agents with the same number of documents). Update the spec accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's aggregate_boundary targets include Employees.employee_id, Employees.employee_name, Roles.role_description, Employees.role_code, Roles.role_code, with ops like HAVING(COUNT(*) > 1) and HAVING(COUNT(employees.employee_id) > 1). The program's `_apply_group_size_hints` handles Employees.role_code, Roles.role_description, Roles.role_code by forcing group sizes 1, 2, 3. For Employees.employee_id (PK), COUNT(employee_id) per group is always 1 (each employee_id unique), so HAVING(COUNT(employee_id) > 1) is always false \u2014 the 'true' case cannot be realized. The spec's note says 'Ensure HAVING COUNT(*) > 1 and COUNT(col) > 1 have both true and false groups.' For a PK column, COUNT(col) > 1 is impossible. This is a spec inconsistency.",
+     "requested_revision": "Remove PK columns (Employees.employee_id) from aggregate_boundary targets where COUNT(col) > 1 is required, or clarify that the aggregate is over a join/grouping that can produce >1. Update the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_in_count_column targets include Employees.employee_id and Draft_Copies.copy_number, both NOT NULL. The note says 'NOT NULL columns; COUNT(col) never sees NULL; no NULL planted.' The program does not plant NULLs in these columns (they are not in NULL_TARGETS, and `_force_one_null_per_column` is only called for NULL_TARGETS). This is consistent. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's supporting_evidence says 'No calculated column is present in the schema; no offset or rate can be derived from the shown rows.' The program does not implement any formulas beyond the semantic rules. Consistent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's uncertainty note says 'Group-size and tie patterns on PK/FK columns are realized through child-row counts rather than key mutation, so they may not be forced in every instance.' The program's `_child_counts_for_group_sizes` requires `n_parents >= 3 and n_children >= 6` to realize all three sizes; otherwise falls back to random. For Circulation_History (4 rows) with 3+ parents, n_children=4 < 6, so group sizes 1, 2, >=3 are not guaranteed. The spec's group_sizes target for Circulation_History.document_id, draft_number, copy_number cannot be realized with only 4 rows and 3+ parents. This is a spec/program mismatch: the spec lists these as targets but the table size (4) is too small to realize all three group sizes.",
+     "requested_revision": "Either increase Circulation_History table size to at least 6 (and ensure 3+ parents), or remove Circulation_History columns from group_sizes targets, or document that these patterns are best-effort. Update the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance gives Circulation_History=4, but the group_sizes target for Circulation_History.document_id, draft_number, copy_number requires groups of size 1, 2, and >=3 \u2014 which needs at least 6 rows (1+2+3). With 4 rows, at most groups of size 1 and 3, or 2 and 2, etc. The program's `_child_counts_for_group_sizes` falls back to random when n_children < 6, so the pattern is not realized. This is a concrete inconsistency between the spec's table size and its group_sizes target.",
+     "requested_revision": "Increase Circulation_History size to at least 6, or remove it from group_sizes targets. Update the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance gives Draft_Copies=8, but the group_sizes target for Draft_Copies.document_id (in per_column_exceptions) requires groups of size 1, 2, >=3. With 8 rows and 3+ parents, `_child_counts_for_group_sizes` can realize this (8 >= 6). However, Draft_Copies.document_id is not in GROUP_SIZE in spec.py, so the program does not apply the group-size logic to it. The spec's per_column_exceptions lists Draft_Copies.document_id under comparison_boundary, not group_sizes \u2014 but the extracted atomic operations show `group_sizes` for Draft_Copies.document_id with targets '1, 2 and >= 3'. The spec's per_column_exceptions does not list Draft_Copies.document_id under group_sizes, so the program correctly does not target it. This is a discrepancy between the extracted atomic operations and the spec \u2014 the spec should be updated to include Draft_Copies.document_id in group_sizes if that pattern is intended.",
+     "requested_revision": "Add Draft_Copies.document_id to the spec's group_sizes targets (and GROUP_SIZE in spec.py) if the extracted pattern is intended; otherwise document why it is excluded."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for group_sizes lists Documents.document_id, Circulation_History.document_id, Roles.role_description, Employees.role_code, Roles.role_code, Circulation_History.draft_number, Circulation_History.copy_number. The program's GROUP_SIZE in spec.py matches this list. However, the extracted atomic operations also show group_sizes for Draft_Copies.document_id and Circulation_History.document_id (already covered). The program's `_apply_group_size_hints` only handles non-FK columns; FK columns are handled in `fill_foreign_keys_consistently` via `_child_counts_for_group_sizes`. For Documents.document_id (a PK parent, not an FK), the program does not handle it \u2014 it is not in any child table's GROUP_SIZE. So the group_sizes target for Documents.document_id is not realized. This is a concrete gap.",
+     "requested_revision": "Add a mechanism to realize group sizes for parent PK columns (Documents.document_id) by controlling child counts across child tables. For example, ensure one document has 1 child, one has 2, one has >=3 across the union of child tables. Update the program and spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for duplicates_for_distinct lists Employees.employee_name and Circulation_History.employee_id. The program's DUP_DISTINCT_TARGETS matches. However, the extracted atomic operations also show duplicates_for_distinct for Ref_Document_Types.document_type_code, Ref_Document_Status.document_status_code, Roles.role_code, Roles.role_description, Documents.document_status_code, Documents.document_type_code, Ref_Shipping_Agents.shipping_agent_name. The spec's note says 'Ref_Document_Types.document_type_code and Ref_Document_Status.document_status_code are PKs and cannot duplicate, so they are excluded.' But Roles.role_code is also a PK and is excluded \u2014 consistent. Documents.document_status_code and Documents.document_type_code are FKs, not PKs, and could have duplicates; the spec does not list them under duplicates_for_distinct, but the extracted operations show duplicates_for_distinct for them. This is a discrepancy between the extracted operations and the spec \u2014 the spec should be updated to include these if the pattern is intended.",
+     "requested_revision": "Add Documents.document_status_code, Documents.document_type_code, Ref_Shipping_Agents.shipping_agent_name, Roles.role_description to duplicates_for_distinct targets if the extracted patterns are intended; otherwise document why they are excluded."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for comparison_boundary lists Ref_Shipping_Agents.shipping_agent_name with values ['USPS','usps','UPS','ups']. The program's BOUNDARY includes this, and StringSampler uses `self.boundary_pool` with 20% probability. However, the spec's generic_sampling_rules for varchar_text says 'Short lowercase alphabetic token of length 1-3' \u2014 'USPS' is length 4 and uppercase, violating the generic rule. The per-column exception overrides the generic rule, which is fine, but the program's StringSampler also applies random mutations to boundary values (e.g., 'USPS' + random chars), which could produce values outside the listed set. The spec says 'include the literal and one step on each side' \u2014 for strings, 'one step' is ambiguous. The program does not guarantee inclusion of all four literals.",
+     "requested_revision": "Guarantee at least one occurrence of each listed string literal in the generated rows for Ref_Shipping_Agents.shipping_agent_name, and disable random mutation for boundary-pool values. Clarify what 'one step on each side' means for strings."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for comparison_boundary lists Documents.document_status_code with values ['done','DONE'] and Documents.document_type_code with ['Paper','paper']. The program's BOUNDARY includes these, and StringSampler uses boundary_pool with 20% probability. However, the enum rule `document_status_code IN ('done','overdue','working')` would be violated by 'DONE' (uppercase). The spec is internally inconsistent: the enum rule and the comparison_boundary target conflict. The program's StringSampler also has `self.enum_pool` with 55% probability, so 'DONE' may or may not appear. This is a spec issue.",
+     "requested_revision": "Reconcile the spec: either allow case variants in the enum rule (e.g., `LOWER(document_status_code) IN (...)`) or remove case-variant boundary literals from enum-constrained columns. Document the intended behavior."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for comparison_boundary lists Ref_Document_Types.document_type_code with values ['Paper','paper']. This is a PK column. The program's BOUNDARY includes it, but StringSampler sets `self.boundary_pool = list(BOUNDARY.get(self.key, [])) if column.pk_pos == 0 else []`, so for a PK column, boundary_pool is empty \u2014 'Paper'/'paper' are never generated as PK values. The spec's note for this column does not say 'predicate only' (unlike the integer PKs), so this is a spec/program mismatch. The enum pool for Ref_Document_Types.document_type_code is ['CD','Hard Drive','Paper'], which includes 'Paper' but not 'paper'. So 'paper' can never appear as a PK value, and 'Paper' appears only via the enum pool (55% probability), not guaranteed.",
+     "requested_revision": "Clarify whether 'Paper'/'paper' must appear as values in Ref_Document_Types.document_type_code. If yes, add 'paper' to the enum pool or allow case variants; if no, mark as predicate-only in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for comparison_boundary lists Ref_Shipping_Agents.shipping_agent_code with values ['UP','up']. This is a PK column. The program's BOUNDARY includes it, but StringSampler sets boundary_pool to empty for PK columns, so 'UP'/'up' are never generated as PK values. The enum pool is ['AL','FE','SH','UP','US'], which includes 'UP' but not 'up'. So 'up' can never appear, and 'UP' appears only via the enum pool (55% probability), not guaranteed. The spec's note for this column does not say 'predicate only', so this is a spec/program mismatch.",
+     "requested_revision": "Clarify whether 'UP'/'up' must appear as values in Ref_Shipping_Agents.shipping_agent_code. If yes, add 'up' to the enum pool or allow case variants; if no, mark as predicate-only in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions for comparison_boundary lists Documents.document_id with values [0,1,2,6,7,8] and note 'PK column; boundary literals are used only as query predicates, not as generated PK values.' The program's `_sequential_pk` starts at `_compact_max + 1`, so generated PKs are > max compact value. If compact max is, say, 8, generated PKs start at 9 \u2014 so 0,1,2,6,7,8 are not generated (they may exist in compact rows). This is consistent with the note. However, the spec's generic_sampling_rules for integer_pk says 'Sequential integers starting at 1, unique per table; never NULL; never overwritten by boundary pools; when appending to a compact database, start after the maximum existing key.' The program starts after compact max, which is correct for append. But if the compact DB is empty (no original rows), `_compact_max` returns 0, so PKs start at 1 \u2014 correct. Consistent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for integer_pk says 'Sequential integers starting at 1, unique per table; never NULL; never overwritten by boundary pools; when appending to a compact database, start after the maximum existing key.' The program's `_sequential_pk` uses `_compact_max(schema, table, column) + 1` where `_compact_max` reads `schema.original_values.get((table, column), [])`. This is correct for single-column integer PKs. For composite PKs (Document_Drafts, Draft_Copies, Circulation_History), the program does not generate sequential values for the non-first components (see earlier issue). This is a gap.",
+     "requested_revision": "Extend sequential PK generation to composite PKs: for each composite PK, generate the first component sequentially and the remaining components sequentially per first component (e.g., draft_number 0,1,2,... per document_id). Update the program."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for integer_fk says 'Copy an existing parent key value; allow NULL only where the column is nullable; include at least one parent row with no children; never emit dangling child FKs; never mutate FK columns after linkage is built.' The program's `fill_foreign_keys_consistently` draws from `_parent_keys` (compact + generated), which is correct for single-column FKs. For composite FKs, it fills each column independently, which can produce dangling composite FKs (see earlier issue). This violates 'never emit dangling child FKs'.",
+     "requested_revision": "Fix composite FK sampling as described; then verify no dangling FKs by checking the writer's rows_skipped for FK violations is 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for char_code says 'Pick from the enum pool of the referenced reference table; preserve exact case; include near-variants (lower/upper case) only where a per-column exception lists them.' The program's StringSampler for enum columns uses `self.enum_pool` with 55% probability, but also falls through to `self.elements` (original values + literal pool) and random mutation. For Documents.document_status_code, the literal pool may contain values from queries (e.g., 'done', 'DONE'), and random mutation could produce 'donex'. This violates 'preserve exact case' and the enum rule.",
+     "requested_revision": "For enum-constrained columns, restrict sampling to the enum pool (plus NULL where nullable) and disable random mutation. Add a per-column flag or check in StringSampler."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for varchar_text says 'Short lowercase alphabetic token of length 1-3; allow near-duplicate values and case variants where a per-column exception lists them; NULL only if nullable.' The program's StringSampler uses `CHARSET = string.ascii_letters + ' ' + string.digits + '()'` and `self.lo, self.hi = (min(map(len, self.elements)), max(map(len, self.elements)) + 1)` when elements exist, or `(0, length)` with length=20 default. This produces mixed-case, digit-containing, and long strings, violating the spec. For example, Employees.employee_name would get values like 'aB3()' or long strings.",
+     "requested_revision": "For varchar_text columns without a more specific rule, generate short lowercase alphabetic tokens of length 1-3 (e.g., from string.ascii_lowercase). Apply enum/boundary pools where specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for datetime says 'Random datetime between 1970-01-01 and 2016-12-31, format YYYY-MM-DD HH:MM:SS'. The program's DateSampler uses `self.template` derived from original values (e.g., '%Y-%m-%d' if originals are date-only) and `self.strip0` may remove leading zeros. This can produce formats other than 'YYYY-MM-DD HH:MM:SS'. For Documents.receipt_date and Documents_Mailed.mailing_date, the format may not match the spec.",
+     "requested_revision": "For datetime columns, default to format '%Y-%m-%d %H:%M:%S' unless the original values clearly use a different format and the spec allows it. Document the format choice."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules for null_share says 'For each nullable column, at least one NULL row per instance; share follows the compact database share (0.0 observed, so use a small share such as 1 row per instance); apply after all row filtering so at least one NULL survives.' The program's `_null_share_for` returns `max(base, 1.0/max(n,1))` where base is the observed share (0.0) \u2014 so share = 1/n, which is correct. But `_force_one_null_per_column` is called inside the per-table loop before `_apply_group_size_hints` and `_apply_dup_distinct_hints`. `_apply_dup_distinct_hints` for Employees.employee_name could overwrite the planted NULL with `base` (a non-null value) because it iterates `slots = [i for i, v in enumerate(colv) if v is not None]` \u2014 NULLs are excluded, so the planted NULL survives. `_apply_group_size_hints` for Employees.role_code does not touch employee_name. So the NULL survives. However, `_apply_dup_distinct_hints` for Circulation_History.employee_id (an FK) could overwrite values but not NULLs. OK. The main risk is that `_force_one_null_per_column` is called before `_apply_group_size_hints` and `_apply_dup_distinct_hints`, which could in principle overwrite the NULL if they touched the same column \u2014 they don't for the current targets. Minor.",
+     "requested_revision": "Move `_force_one_null_per_column` to after all hint application, or add a final pass that re-plants NULLs if any were overwritten. Add a post-check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's supporting_evidence says 'All child FK values in the shown rows match existing parent keys; no dangling FKs are observed, so unmatched_join_rows is realized via parent-without-child only.' The program's `fill_foreign_keys_consistently` draws from `_parent_keys` which includes compact + generated parent values, so FK values are valid. However, for composite FKs (Draft_Copies, Circulation_History), independent per-column sampling produces dangling composite FKs (see earlier issue). The writer's `pragma foreign_keys = ON` will reject these rows, so they are skipped \u2014 meaning the instance will have fewer rows than specified and the group_sizes/ties patterns for those tables cannot be realized. This is a blocking issue for the spec's patterns.",
+     "requested_revision": "Fix composite FK sampling as described; then verify that all specified table sizes are achieved (rows_added matches table_sizes_per_instance) and that no rows are skipped due to FK violations."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database (orig) is non-empty and its max keys are correctly read by _compact_max; execution failed before any rows were written, so this could not be verified.",
+    "Whether the writer's copy-and-append preserves compact rows verbatim; execution produced 0 instances, so preservation could not be observed.",
+    "Whether the generated instances satisfy the NULL rule (at least one NULL and one non-NULL per nullable column) after all filtering; execution failed before writing, so this could not be verified.",
+    "Whether the group_sizes and ties_for_order_limit patterns are realized for all targeted columns; execution failed before writing, so this could not be verified.",
+    "Whether the comparison_boundary literals appear in generated rows; execution failed before writing, so this could not be verified.",
+    "Whether the enum rules are satisfied (no out-of-enum values); the program's StringSampler can produce out-of-enum values via random mutation, but this could not be observed in execution.",
+    "Whether the composite FK relationships are preserved; the program fills composite FK columns independently, which is expected to produce dangling FKs, but this could not be observed in execution.",
+    "Whether the table sizes match the spec exactly (the program jitters by 0/1); this is a documented deviation but the spec states exact sizes.",
+    "Whether the 'parent row with no children' property holds for Documents.document_id and other parents; the program does not guarantee this, but it could not be observed in execution."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions for comparison_boundary on Ref_Shipping_Agents.shipping_agent_name lists values ['USPS','usps','UPS','ups'] and states 'guarantee at least one occurrence of each literal'. However, spec.py GUARANTEED_LITERALS only contains ['USPS'] for that column, and the enum pool for shipping_agent_code is ['AL','FE','SH','UP','US'] \u2014 'UPS'/'ups'/'usps' are not enum values and are not materialized. The spec's own note says 'disable random mutation for boundary-pool values' but does not clarify that 'UPS'/'ups'/'usps' are predicate-only (unlike the explicit predicate-only notes for 'DONE'/'paper'/'up').",
+     "requested_revision": "Clarify in the specification that for Ref_Shipping_Agents.shipping_agent_name only 'USPS' is a materialized literal and 'usps'/'UPS'/'ups' are predicate-only case variants (consistent with the enum rule), or add them to GUARANTEED_LITERALS if they are intended to be materialized. This is a documentation/consistency issue, not a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_guaranteed_literals` overwrites arbitrary positions of non-key columns with guaranteed literals, and `_apply_dup_distinct_hints` then overwrites 30% of non-null slots with a single base value. For Documents.document_status_code and Documents.document_type_code, the guaranteed literal ('done'/'Paper') may be overwritten by the dup-distinct pass (order: guaranteed literals applied first, then dup-distinct). The execution feedback shows no separation failures attributable to this, and the spec's dup-distinct share (20-50%) is satisfied, but the guaranteed-literal guarantee is not strictly preserved after dup-distinct.",
+     "requested_revision": "Apply `_apply_dup_distinct_hints` before `_apply_guaranteed_literals`, or exclude the guaranteed-literal slot from dup-distinct overwriting, so that both the 20-50% duplicate share and the guaranteed literal are simultaneously satisfied. Non-blocking given current execution evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_reserve_parent_without_children` only reserves a Documents row with no children in Document_Drafts/Draft_Copies/Circulation_History/Documents_Mailed. The spec's unmatched_join_rows note also lists Draft_Copies.document_id, Circulation_History.document_id, Documents_Mailed.document_id, Document_Drafts.document_id as targets, and the atomic-operation extraction shows parent_rows_without_children for Draft_Copies.document_id (joins_with Documents.document_id, Document_Drafts.document_id) and Circulation_History.document_id. The program's `_parent_keys_with_group_sizes` and `_fill_foreign_keys` do reserve one parent per FK fill, which partially covers this, but there is no explicit post-check that each listed child table has at least one parent row with no children.",
+     "requested_revision": "Add a post-check (analogous to `_reserve_parent_without_children`) that verifies, for each of Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed, at least one parent key in the referenced parent table has no child rows in that table; adjust child assignments if violated. Non-blocking: the current reservation logic in `_fill_foreign_keys`/`_parent_keys_with_group_sizes` likely satisfies this in practice, and integrity checks pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped for reference tables (Ref_Document_Types 70, Roles 93, Ref_Document_Status 72, Ref_Shipping_Agents 108) and for Document_Drafts (217), Draft_Copies (167), Circulation_History (140), Documents_Mailed (142). These are PK/unique/FK conflicts from the copy-and-append writer, which is expected behavior (compact rows preserved, generated rows that collide are skipped). The spec's table_sizes_per_instance are base sizes; the writer appends on top of compact rows, so total sizes exceed the spec base. This is consistent with the 'start after the maximum existing key' rule for integer PKs and the copy-and-append semantics, but the spec does not explicitly state that generated row counts are additive to compact rows.",
+     "requested_revision": "Document in the specification that table_sizes_per_instance refers to generated rows appended to the compact database (not total table size), and that PK/unique collisions with compact rows are expected and counted as skipped. Non-blocking documentation clarification."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's null_share rule says 'share follows the compact database share (0.0 observed, so use a small share such as 1 row per instance)'. The program's `_null_share_for` uses `max(observed, 1/n)` which yields ~1/n share, and `_force_nulls_and_nonnulls` guarantees at least one NULL and one non-NULL. Execution feedback confirms NULLs present in all nullable columns except none listed as 'NULL 0 / n'. This is consistent. However, the spec's null_targets list includes Documents.shipping_agent_code (a nullable FK) and the program's `_force_nulls_and_nonnulls` handles it via `_parent_keys` for non-null replacement \u2014 consistent with the interface rule that NULL is a value to generate and rules constrain only non-NULL operands.",
+     "requested_revision": "No change required; noting for completeness that the NULL rule is correctly implemented and verified by execution feedback."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the guaranteed literal for Documents.document_status_code ('done') and Documents.document_type_code ('Paper') survives the dup-distinct pass in every instance was not directly verified from execution feedback; the feedback does not report per-literal presence. This is a minor consistency concern, not a blocking error.",
+    "Whether every listed child table (Document_Drafts, Draft_Copies, Circulation_History, Documents_Mailed) has at least one parent row with no children in each instance was not directly verified; the reservation logic is heuristic. Integrity checks pass and no separation failures are reported, so this is non-blocking.",
+    "The construction_pairs feedback reports 92 eligible, 19 separated, 0 unknown executions \u2014 separation is partial but the instructions state a missing separation alone does not establish a generation error. No blocking issue."
+   ]
+  }
+ ]
 }

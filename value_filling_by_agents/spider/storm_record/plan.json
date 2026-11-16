@@ -1,58 +1,46 @@
 {
  "db": "storm_record",
- "operator_io_quirks": [
-  "Mixed quoting in DDL: storm uses double-quoted identifiers, region/affected_region use backticks; sqlite_master text must be replayed verbatim.",
-  "Table/column names are mixed case (Storm_ID, Region_id, Number_city_affected); column lookup must be case-insensitive, output keeps original spelling.",
-  "affected_region has composite PK (Region_id,Storm_ID) and two FKs to region and storm; both parents exist and are unique on their PKs.",
-  "Dates_active is TEXT storing human date ranges like 'May19\u2013May25' with an en-dash (U+2013), not parseable by any of the 7 Date templates; declared TEXT so dispatches to String fuzzer.",
-  "All columns notnull=0 despite being PKs; sqlite PK on non-INTEGER columns is not implicitly NOT NULL, so NULL PK rows can be inserted and will be dropped by sample_fresh_primary_keys.",
-  "Max_speed values ~1000 (hurricane km/h) but declared INT -> Number fuzzer range [-10^0,10^0] default scale 0, so fresh draws are tiny ints, wildly off-scale.",
-  "Damage_millions_USD REAL with values like 0.039, 13.0; Number fuzzer scale 0 gives ints in [-1,1] plus +-1/+-2 perturbation, contradicting real storage.",
-  "Number_Deaths INT with 0 present; Number fuzzer int perturbation can produce negatives, which are implausible for deaths.",
-  "region.Region_code is 2-letter ISO text; String fuzzer will emit random a-zA-Z0-9() strings of length 0..20, not 2-letter codes.",
-  "Tiny tables (10, 13, 6 rows): choose_table_sizes level-0 = 1+30u and x4 per level easily exceeds original sizes; FK child draws from parent's final filtered values with replacement, so affected_region will have many duplicate (Region_id,Storm_ID) pairs before PK dedup.",
-  "No views/triggers/indexes beyond PKs; DDL replay is simple.",
-  "Dates_active en-dash and '\u2013' separator: any downstream LIKE '%May%' style gold queries will match only if String fuzzer happens to emit 'May'."
- ],
- "operator_ts_expectations": [
-  "storm.Storm_ID, region.Region_id: Number fuzzer, single-column PK -> max_l0=inf, fresh ints in [-1,1] perturbed; PK dedup keeps ~10-30 distinct small ints.",
-  "affected_region.Region_id/Storm_ID: FK columns, drawn from parent final values with replacement -> heavy duplication, then composite-PK dedup keeps first occurrence; final size <= min(|region|,|storm|) roughly.",
-  "affected_region.Number_city_affected: Number fuzzer scale 0 -> ints in [-1,1] perturbed, contradicting REAL storage and positive counts.",
-  "storm.Name: String fuzzer, random a-zA-Z 0-9() strings length 0..20 with 50% contaminate; original names 'One','Two' etc. only appear via 5 sampled originals.",
-  "storm.Dates_active: String fuzzer (TEXT), so 'May19\u2013May25' style ranges never regenerated; fresh strings are random gibberish.",
-  "region.Region_code: String fuzzer, random 0..20-char strings, not 2-letter codes.",
-  "region.Region_name: String fuzzer, random strings, not country names.",
-  "storm.Max_speed: Number fuzzer scale 0 -> values near 0/+-1/+-2, not ~1000; gold queries filtering Max_speed > 900 will return empty on generated instances -> FN risk.",
-  "storm.Damage_millions_USD: Number fuzzer scale 0 -> ints, not reals like 0.039; gold queries with fractional thresholds or ORDER BY damage will behave differently.",
-  "storm.Number_Deaths: Number fuzzer can emit negatives; gold queries with Number_Deaths = 0 or > 0 may match spuriously (FP) or miss (FN).",
-  "affected_region.Number_city_affected: Number fuzzer ints, gold queries comparing to 10.0/15.0 etc. will mostly miss -> FN.",
-  "Composite PK dedup on affected_region after FK fill: since both FK columns draw from small parent sets, many rows collapse; final table may be much smaller than gold expects, driving FN on COUNT/aggregate queries."
- ],
- "challenger_refs": [
-  "G3",
-  "g5e25611f",
-  "g5e25611f",
-  "gf96530ff",
-  "G2",
-  "G5",
-  "G1",
-  "G4",
-  "g21c0a498",
-  "g21c0a498",
-  "g21c0a498",
-  "g21c0a498",
-  "gde107b02",
-  "gde107b02",
-  "gde107b02",
-  "gde107b02",
-  "gde107b02",
-  "gde107b02"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
- },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "shipped_round": 1,
+ "generation_specification": {},
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The generation specification is empty ({}). The operative description of required data patterns is therefore the atomic-operation groups in the distillation report (duplicate_share 20-50%, group_sizes 1/2/3, ties_for_order, HAVING thresholds, comparison boundaries, null patterns). The spec.py module documents that it derives its parameters from these groups, but the specification itself does not state these rules explicitly.",
+     "requested_revision": "Optionally record the atomic-operation groups (duplicate shares, group-size targets, comparison/aggregate boundaries, NULL rule) as the explicit specification so the program's parameters are traceable to a stated rule rather than to the report. This is a documentation improvement, not a blocking error, since the program implements the patterns by construction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DUPLICATE_COLUMNS assigns duplicate plans to region.Region_id (0.30) and storm.Dates_active / storm.Max_speed (0.30), but Region_id is a PRIMARY KEY and Max_speed/Dates_active are not flagged as duplicate columns in the atomic-operation groups (only group_sizes patterns). In values.py _init_sampler, dup_share is forced to 0.0 for pk_pos > 0, so the Region_id duplicate plan is silently overridden; the writer also deduplicates PK tuples. The duplicate plan for Max_speed/Dates_active is harmless but not required.",
+     "requested_revision": "No change strictly required: PK uniqueness is correctly preserved (integrity feedback shows pk_duplicates 0), and the extra duplicate plans do not violate any constraint. If desired, remove the Region_id entry from DUPLICATE_COLUMNS to avoid a dead parameter, and confirm Max_speed/Dates_active duplication is intentional."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows every nullable column has generated NULLs (e.g. affected_region.Number_city_affected NULL 20/1343, region.Region_name NULL 18/265, storm.Name NULL 20/294). The NULL rule requires at least one NULL per nullable column and a share following the compact database; _plant_nulls plants max(1, round(share*n)) NULLs per nullable column, and spec.null_share returns 0.0 when the compact share is 0, so a single NULL is planted. This satisfies the interface rule.",
+     "requested_revision": "None. NULL handling is consistent with the stated rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0, valid 20/20. fill_foreign_keys_consistently draws FK values from parent compact+generated values; sample_fresh_primary_keys and _dedup_rows prevent PK/UNIQUE collisions; writer copies the compact DB and appends rows in one transaction. Reproducible: true, returncode 0, n_ok 20, n_fail 0.",
+     "requested_revision": "None. Integrity, dependent-value consistency, compact-row preservation and reproducibility are all evidenced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 59, separated 23, unknown_executions 0. 23 of 59 pairs are separated, meaning the generated instances do distinguish a substantial subset of the atomic-operation pairs (e.g. comparison boundaries via spec.NUMERIC_BOUNDARIES/STRING_BOUNDARIES, aggregate boundaries via SUM_BOUNDARY, duplicate/group-size plans). The remaining 36 pairs are not separated, but per the instructions a missing separation alone does not establish a generation error or prove query equivalence.",
+     "requested_revision": "None blocking. The value variation remains possible and is demonstrated by 23 separated pairs; the unseparated pairs are not evidence of a defect."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli.py reports rows_added/rows_skipped as {} because _G['rows_added'] is never populated (write_instance_sqlite returns a dict that _one discards). This is a reporting gap, not a generation error: the writer still counts ok/bad per table internally.",
+     "requested_revision": "Optional: propagate the write_instance_sqlite return value into the CLI summary so rows_added/rows_skipped are populated. Not blocking."
+    }
+   ],
+   "unresolved_checks": [
+    "The empty specification means the program's parameters are justified only by the distillation report, not by an explicit written spec; traceability is inferred rather than stated.",
+    "36 of 59 construction pairs are not separated; without held-out labels this cannot be resolved, and per instructions it is not treated as a defect."
+   ]
+  }
+ ]
 }

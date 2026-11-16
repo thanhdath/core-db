@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py), plus next free key helpers."""
 import math
 import sqlite3
 import warnings
@@ -58,7 +58,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -76,7 +76,7 @@ def _first_token(line: str) -> str:
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
+    """Read tables, columns, keys, FKs and original values read-only."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
@@ -140,3 +140,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     finally:
         con.close()
     return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+
+
+def max_single_int_pk(schema, table: str) -> int:
+    """Largest existing value of a single integer/real primary-key column (0 if none)."""
+    tm = schema.tables[table]
+    if len(tm.primary_key) != 1:
+        return 0
+    vals = [v for v in schema.original_values.get((table, tm.primary_key[0]), []) if isinstance(v, (int, float))]
+    return int(max(vals)) if vals else 0

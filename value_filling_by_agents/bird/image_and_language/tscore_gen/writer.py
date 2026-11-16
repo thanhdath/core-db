@@ -1,5 +1,6 @@
-"""Unit writing (sql_util/writedb.py:292-369)."""
+"""Unit writing: copy the compact database, then append rows with executemany in one transaction."""
 import os
+import shutil
 import sqlite3
 
 from .schema import q
@@ -11,37 +12,59 @@ def unit_path(root: str, ds: str, db: str, i: int, tag: str = 'gen') -> str:
     return os.path.join(root, ds, name, name + '.sqlite')
 
 
-def write_instance_sqlite(schema, instance: dict, path: str) -> dict:
-    """Empty DDL clone + row-by-row insert, failing rows skipped (writedb.py:292-319); atomic, mode 0644."""
+def append_rows(schema, orig: str, rows: dict, path: str) -> dict:
+    """Copy the compact database to `path`, then append `rows` with executemany inside one transaction."""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     part = path + '.part'
     if os.path.exists(part):
         os.remove(part)
+    shutil.copyfile(orig, part)
+    added: dict = {}
+    skipped: dict = {}
     con = sqlite3.connect(part)
-    ok, bad = {}, {}
     try:
-        con.execute('pragma foreign_keys = OFF')
-        for s in schema.ddl:
-            try:
-                con.execute(s)
-            except sqlite3.Error:
-                pass
+        con.execute('pragma journal_mode = MEMORY')
+        con.execute('pragma synchronous = OFF')
+        con.execute('pragma temp_store = MEMORY')
+        con.execute('pragma foreign_keys = ON')
+        con.isolation_level = None
         con.execute('begin')
-        for t, tm in schema.tables.items():
-            cols = instance.get(t, {})
+        for t in _insert_order(schema):
+            data = rows.get(t) or []
+            tm = schema.tables[t]
             names = [c.name for c in tm.columns]
-            n = len(cols.get(names[0], [])) if names else 0
-            sql = 'INSERT INTO %s VALUES (%s)' % (q(t), ','.join('?' * len(names)))
-            ok[t] = bad[t] = 0
-            for i in range(n):
+            if not data:
+                added[t] = 0
+                skipped[t] = 0
+                continue
+            sql = 'INSERT INTO %s (%s) VALUES (%s)' % (
+                q(t), ', '.join(q(c) for c in names), ', '.join('?' * len(names)))
+            batch_ok = [tuple(r.get(c) for c in names) for r in data]
+            batch_bad = 0
+            if batch_ok:
                 try:
-                    con.execute(sql, [cols[c][i] for c in names])
-                    ok[t] += 1
-                except (sqlite3.Error, OverflowError):
-                    bad[t] += 1
-        con.commit()
+                    con.executemany(sql, batch_ok)
+                    added[t] = len(batch_ok)
+                except sqlite3.Error:
+                    ok = 0
+                    for row in batch_ok:
+                        try:
+                            con.execute(sql, row)
+                            ok += 1
+                        except (sqlite3.Error, OverflowError):
+                            batch_bad += 1
+                    added[t] = ok
+            else:
+                added[t] = 0
+            skipped[t] = batch_bad
+        con.execute('commit')
     finally:
         con.close()
     os.chmod(part, 0o644)
     os.replace(part, path)
-    return {'rows_ok': ok, 'rows_failed': bad}
+    return {'rows_added': added, 'rows_skipped': skipped}
+
+
+def _insert_order(schema) -> list:
+    """Tables in foreign-key topological order (children after parents)."""
+    return [t for lvl in schema.table_order for t in lvl]

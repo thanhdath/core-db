@@ -8,6 +8,29 @@ CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
 
+def near_variants(base: str) -> list:
+    """Case / suffix / whitespace variants around a base literal (varchar_free_text rule)."""
+    b = str(base)
+    out = [b, b.lower(), b.upper(), b.title(), b + ' ', ' ' + b, b + ' Jr.', b + ' Sr.']
+    if len(b) > 1:
+        out += [b[:-1], b[1:], b[0].lower() + b[1:], b[0].upper() + b[1:]]
+    seen, res = set(), []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            res.append(v)
+    return res
+
+
+def like_patterns(base: str) -> list:
+    """LIKE patterns without '%' (prefix / suffix / dropped-character variants)."""
+    b = str(base)
+    out = [b]
+    if len(b) > 1:
+        out += [b[:-1], b[1:], b[0] + b[2:] if len(b) > 2 else b]
+    return out
+
+
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
 
@@ -71,7 +94,7 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped) + near-variant pool."""
 
     def __init__(self, elements, p, max_l0, rng, length=20):
         els = [str(e) for e in elements if e is not None]
@@ -105,6 +128,22 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """CHAR code enum: declared list only, padded/truncated to width, never NULL."""
+
+    def __init__(self, elements, p, max_l0, rng, width=15):
+        super().__init__(elements, 0.0, max_l0, rng)
+        self.width = width
+        self.p = 0.0
+
+    def _fit(self, v):
+        s = str(v)
+        return (s + ' ' * self.width)[:self.width] if self.width else s
+
+    def sample(self):
+        return self._fit(self.rng.choice(self.elements))
 
 
 def _parse_date(s: str):
@@ -215,21 +254,38 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), enum: list = None) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (+ enum / near-variant pools)."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    if enum:
+        return EnumSampler(list(enum), 0.0, max_l0, rng,
+                           width=_char_width(column.type_str))
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    s = make_column_sampler(column, els, p, max_l0, rng)
+    if isinstance(s, StringSampler) and s.elements:
+        bases = list(s.elements)[:8]
+        extra = []
+        for b in bases:
+            extra += near_variants(b)
+            extra += like_patterns(b)
+        s.elements = s.elements + [e for e in extra if e not in s.elements]
+    return s
+
+
+def _char_width(type_str: str) -> int:
+    m = re.search(r'\((\d+)\)', type_str or '')
+    return int(m.group(1)) if m else 0
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), enum: list = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng,
+                      1 if column_meta.pk_pos else 0, max_l0, enum=enum)
     return [s.sample() for _ in range(n)]

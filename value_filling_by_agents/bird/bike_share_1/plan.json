@@ -1,49 +1,539 @@
 {
  "db": "bike_share_1",
- "operator_io_quirks": [
-  "No declared FKs at all (all tables fks=[]), so process_order yields one level; TS will not link station.id<->status.station_id or trip.start/end_station_id<->station.id, so cross-table joins get independent random values.",
-  "status and weather have no PK; sample_fresh_primary_keys is a no-op there, so duplicate rows survive (status has 299936 rows, distinct station_id only 70).",
-  "status is huge (299936 rows) and trip is 658901 rows; read_schema must rowid-sample (max_rows_per_table) or the read dominates wall time; original_sizes still full count.",
-  "trip.id distinct=200000 but rows=658901 -> PK duplicates exist in the original; TS's PK dedup will shrink trip far below its chosen size.",
-  "Text-stored dates in three different formats: station.installation_date '8/6/2013' (M/D/YYYY), trip.start_date/end_date '8/29/2013 9:08' (M/D/YYYY H:MM), status.time '2013/08/29 12:12:01' (YYYY/MM/DD HH:MM:SS), weather.date '8/29/2013'. All declared TEXT -> String fuzzer, not Date.",
-  "weather.precipitation_inches is TEXT holding numeric strings plus 'T' (trace); declared TEXT -> String fuzzer, so numeric comparisons on it are fragile.",
-  "weather.events has empty string '' and mixed case ('Rain' vs 'rain', 'Fog-Rain'); String fuzzer will emit random charset strings, not these tokens.",
-  "weather.max_wind_Speed_mph has mixed-case column name (capital S); identifier quoting must preserve original spelling.",
-  "Nulls present in many weather columns (max_gust_speed_mph 24.5%, dew/humidity 1.5%, trip.zip_code 3.1%); declared notnull=0 everywhere except station.id and trip.id.",
-  "trip.zip_code is INTEGER with nulls; weather.zip_code is TEXT with same-looking values ('94107') -> storage class contradicts across tables, join on zip_code is type-mismatched.",
-  "station.lat/long are REAL with values like 37.33/-121.90; Number fuzzer range is [-10^scale,10^scale] with scale from type args (none) -> will not stay near real coordinates.",
-  "No views/triggers/indexes in DDL; empty clone is just 4 CREATE TABLEs."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns (name, city, installation_date, start_date, end_date, time, date, events, precipitation_inches, subscription_type, zip_code in weather) get String fuzzer: random a-zA-Z0-9() strings length 0-20, so dates/times/enums become garbage -> many implausible values (FN risk on date/enum predicates).",
-  "All INTEGER/REAL columns get Number fuzzer with default scale (no type args) -> range roughly [-10^0,10^0] perturbed by +-1/+-2; lat/long, temperatures, zip codes, bike_id all collapse to tiny integers -> implausible (FN on range predicates like temperature>70, zip_code LIKE '94%').",
-  "No FKs -> fill_foreign_keys_consistently never runs; station_id/start_station_id/end_station_id are independent random ints, so joins station.id=status.station_id almost never match -> join queries return empty or tiny results (FP/FN on join cardinality).",
-  "status/weather have no PK -> no dedup; TS may emit many duplicate rows, but with random ints distinct is still high; ties for GROUP BY/COUNT DISTINCT on low-cardinality columns (subscription_type, city, events) are unlikely to reproduce original 2/5/6 distinct values.",
-  "trip.id PK dedup drops ~70% of drawn rows (200000 distinct of 658901) -> trip ends up much smaller than chosen size, skewing join sizes.",
-  "String fuzzer's int-like-string +1/-1 and % stripping won't help because date/time columns are non-numeric strings; no date template is learned (Date fuzzer never selected).",
-  "Number fuzzer list-range quirk (upper end overwritten to full-range max) means even with literal pool values like 74,78 the fresh draws dominate -> temperatures/zip codes drift to small ints.",
-  "Empty-string and 'T' in precipitation_inches/events are not reproduced by String fuzzer (random charset rarely yields '' or 'T') -> equality predicates on these miss.",
-  "Mixed-case column max_wind_Speed_mph: if quoting is wrong, inserts/queries fail; TS upstream upper-cases columns so it may still work, but our original-spelling path must quote.",
-  "zip_code type mismatch (INTEGER in trip, TEXT in weather) means a join trip.zip_code=weather.zip_code compares int to text -> sqlite affinity may coerce, but random values won't match anyway.",
-  "Overall: TS will produce syntactically valid but semantically implausible instances; known misses are FN from garbage dates/enums/ranges and FP from missing join ties and missing low-cardinality duplicates."
- ],
- "challenger_refs": [
-  "G5",
-  "G19",
-  "G20",
-  "G15",
-  "G4",
-  "G14",
-  "G13",
-  "G2",
-  "G8",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers starting at 1, never NULL; no reuse.",
+   "integer_fk": "Copy an existing parent key; with probability 0.05 emit NULL when the column is nullable; otherwise pick a parent row uniformly. For each join column plant at least one unmatched child row: NULL when nullable, otherwise an out-of-range key (max(parent key)+1).",
+   "integer_quantity": "Uniform integer in [0, 30] for counts; positive quantities in [1, 30]. Applies only to status.bikes_available, status.docks_available, station.dock_count.",
+   "integer_measure": "Uniform integer within the observed min/max of the column, inclusive. Applies to weather temperature, dew point, humidity, visibility, wind, cloud_cover, wind_dir_degrees and trip.duration.",
+   "real_measure": "Uniform real within the observed min/max, rounded to 2 decimals.",
+   "text_name": "Pick from the observed value pool; with probability 0.15 emit a case-variant (upper/lower) of the chosen value.",
+   "text_enum": "Pick uniformly from the listed enum values; with probability 0.1 emit a case-variant.",
+   "text_date": "Uniform date in the observed date range, formatted per the column's date_format; with probability 0.1 emit a near-variant year (one year off) keeping the format.",
+   "text_free": "Pick from the observed value pool; with probability 0.1 emit a near-variant (trailing/leading space or case change).",
+   "null_share": "For every nullable column, use the compact database's observed NULL fraction for that column (schema.original_values); if that fraction is 0, plant at least one NULL row only when the column is listed in null_targets; never plant NULL in NOT NULL / primary-key columns or in station columns not listed in null_targets.",
+   "boundary": "For each listed literal, generate rows at the literal, one step below and one step above. Coerce the literal to the column's declared type before stepping: INTEGER columns step by 1 with integer arithmetic and the returned value is always an int (if the literal is non-numeric, fall back to a numeric draw within the column's range); TEXT columns (including numeric-looking codes such as weather.zip_code) are treated as strings and the 'one step' variants are string near-variants (e.g. last digit +/-1, or case change), never int+str arithmetic. The returned value must match the column's declared type.",
+   "tie": "For ORDER/LIMIT columns, generate at least two rows sharing the same value at the listed rank.",
+   "duplicate": "For DISTINCT columns, generate at least two rows with the same value.",
+   "unmatched_join": "For join columns, generate at least one child row whose FK value has no parent row (when nullable, via NULL; otherwise via an out-of-range key)."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "station.name": [
+      "Adobe on Almaden",
+      "adobe on almaden",
+      "Santa Clara at Almaden",
+      "santa clara at almaden",
+      "Ryland Park",
+      "ryland park"
+     ],
+     "trip.start_station_name": [
+      "Market at 4th",
+      "market at 4th",
+      "Adobe on Almaden",
+      "adobe on almaden",
+      "Santa Clara at Almaden",
+      "santa clara at almaden"
+     ],
+     "trip.end_station_name": [
+      "Ryland Park",
+      "ryland park",
+      "2nd at South Park",
+      "2nd at south park",
+      "California Ave Caltrain Station",
+      "california ave caltrain station"
+     ],
+     "station.city": [
+      "San Francisco",
+      "san francisco",
+      "Mountain View",
+      "mountain view",
+      "Mountain",
+      "mountain"
+     ],
+     "trip.subscription_type": [
+      "Subscriber",
+      "subscriber",
+      "Customer",
+      "customer"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "station.installation_date": [
+      "12/31/2013",
+      "12/31/2014"
+     ],
+     "weather.date": [
+      "8/29/2013",
+      "8/29/2014"
+     ],
+     "weather.zip_code": [
+      "94106",
+      "94107",
+      "94108"
+     ],
+     "weather.max_temperature_f": [
+      79,
+      80,
+      81
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "station.installation_date": [
+      "%2014%",
+      "%2014",
+      "2014",
+      "2015",
+      "2014 x",
+      "x 2014"
+     ],
+     "trip.start_date": [
+      "8/29/2013%",
+      "%2006%",
+      "%2013%",
+      "8%",
+      "8/%/2013%",
+      "%/%/2013%",
+      "8/29/2013",
+      "8/29/2014",
+      "8/29/2013 x",
+      "2006",
+      "2007",
+      "2006 x"
+     ],
+     "trip.end_date": [
+      "8/29/2013%",
+      "8/2%",
+      "%2006%",
+      "2006%",
+      "8/29/2013",
+      "8/29/2014",
+      "8/29/2013 x",
+      "8/2",
+      "8/3",
+      "8/2 x"
+     ],
+     "weather.date": [
+      "%2013%",
+      "%/2013%",
+      "2013",
+      "2014",
+      "2013 x",
+      "/2013",
+      "/2014",
+      "/2013 x"
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "station.name": [
+      "trip.start_station_name",
+      "trip.end_station_name",
+      "trip.end_date"
+     ],
+     "trip.start_station_name": [
+      "station.name",
+      "station.lat"
+     ],
+     "trip.end_station_name": [
+      "station.name"
+     ],
+     "station.id": [
+      "trip.start_station_id",
+      "trip.end_station_id"
+     ],
+     "trip.start_station_id": [
+      "station.id"
+     ]
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "trip.subscription_type": "compact share (~19%)",
+     "trip.duration": "at least one NULL row",
+     "trip.id": "none (NOT NULL column)"
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "weather.max_temperature_f": "compact share (~26%)"
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "trip.duration": [
+      "AVG(trip.duration) > 0"
+     ]
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "trip.duration": ">= 2 per group with different values",
+     "weather.max_temperature_f": ">= 2 per group with different values"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "station.name": 3,
+     "trip.start_station_name": 2,
+     "station.city": 3,
+     "station.installation_date": 1
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "station.name": 2,
+     "trip.start_station_name": 4,
+     "station.id": 1,
+     "trip.start_station_id": 1,
+     "station.city": 2,
+     "station.installation_date": 3,
+     "weather.max_temperature_f": 2
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "station.name": 3,
+     "trip.start_station_name": 4,
+     "station.id": 2,
+     "trip.start_station_id": 1,
+     "station.city": 3,
+     "station.installation_date": 2
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "status.station_id",
+    "parent_table": "station",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "trip.start_station_id",
+    "parent_table": "station",
+    "parent_column": "id",
+    "copied_columns": [
+     "trip.start_station_name"
+    ]
+   },
+   {
+    "child_column": "trip.end_station_id",
+    "parent_table": "station",
+    "parent_column": "id",
+    "copied_columns": [
+     "trip.end_station_name"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "station",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "station",
+    "column": "dock_count",
+    "formula": "dock_count BETWEEN 0 AND 40",
+    "evidence": "uncertain: sample max 27"
+   },
+   {
+    "table": "station",
+    "column": "lat",
+    "formula": "lat BETWEEN 37.0 AND 38.0"
+   },
+   {
+    "table": "station",
+    "column": "long",
+    "formula": "long BETWEEN -122.5 AND -121.5"
+   },
+   {
+    "table": "station",
+    "column": "city",
+    "formula": "city IN ('San Jose','Redwood City','Mountain View','Palo Alto','San Francisco','Mountain')"
+   },
+   {
+    "table": "status",
+    "column": "bikes_available",
+    "formula": "bikes_available >= 0"
+   },
+   {
+    "table": "status",
+    "column": "docks_available",
+    "formula": "docks_available >= 0"
+   },
+   {
+    "table": "trip",
+    "column": "duration",
+    "formula": "duration > 0",
+    "evidence": "uncertain: no upper bound stated"
+   },
+   {
+    "table": "trip",
+    "column": "subscription_type",
+    "formula": "subscription_type IN ('Subscriber','Customer')"
+   },
+   {
+    "table": "trip",
+    "column": "end_date",
+    "formula": "datetime(end_date) >= datetime(start_date)",
+    "evidence": "rows 4069, 4073, 4074: end_date >= start_date"
+   },
+   {
+    "table": "trip",
+    "column": "start_station_name",
+    "formula": "trip.start_station_name = station.name VIA trip.start_station_id"
+   },
+   {
+    "table": "trip",
+    "column": "end_station_name",
+    "formula": "trip.end_station_name = station.name VIA trip.end_station_id"
+   },
+   {
+    "table": "weather",
+    "column": "max_temperature_f",
+    "formula": "max_temperature_f BETWEEN -10 AND 110"
+   },
+   {
+    "table": "weather",
+    "column": "mean_temperature_f",
+    "formula": "mean_temperature_f BETWEEN -10 AND 110"
+   },
+   {
+    "table": "weather",
+    "column": "min_temperature_f",
+    "formula": "min_temperature_f BETWEEN -10 AND 110"
+   },
+   {
+    "table": "weather",
+    "column": "max_humidity",
+    "formula": "max_humidity BETWEEN 0 AND 100"
+   },
+   {
+    "table": "weather",
+    "column": "mean_humidity",
+    "formula": "mean_humidity BETWEEN 0 AND 100"
+   },
+   {
+    "table": "weather",
+    "column": "min_humidity",
+    "formula": "min_humidity BETWEEN 0 AND 100"
+   },
+   {
+    "table": "weather",
+    "column": "cloud_cover",
+    "formula": "cloud_cover BETWEEN 0 AND 8"
+   },
+   {
+    "table": "weather",
+    "column": "wind_dir_degrees",
+    "formula": "wind_dir_degrees BETWEEN 0 AND 360"
+   },
+   {
+    "table": "weather",
+    "column": "events",
+    "formula": "events IN ('','Fog','Rain','Fog-Rain','rain','Rain-Thunderstorm')"
+   },
+   {
+    "table": "weather",
+    "column": "zip_code",
+    "formula": "zip_code IN ('94106','94107','94108','94063','94301','94041','95113')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "station": 70,
+   "status": 2000,
+   "trip": 2000,
+   "weather": 366
+  },
+  "null_targets": [
+   "trip.subscription_type",
+   "trip.duration",
+   "trip.start_station_id",
+   "trip.end_station_id",
+   "trip.zip_code",
+   "weather.max_temperature_f",
+   "weather.mean_temperature_f",
+   "weather.min_temperature_f",
+   "weather.max_dew_point_f",
+   "weather.mean_dew_point_f",
+   "weather.min_dew_point_f",
+   "weather.max_humidity",
+   "weather.mean_humidity",
+   "weather.min_humidity",
+   "weather.max_visibility_miles",
+   "weather.mean_visibility_miles",
+   "weather.min_visibility_miles",
+   "weather.max_gust_speed_mph"
+  ],
+  "supporting_evidence": {
+   "trip.end_date >= trip.start_date": [
+    "4069: 8/29/2013 9:08 -> 8/29/2013 9:11",
+    "4073: 8/29/2013 9:24 -> 8/29/2013 9:42",
+    "4074: 8/29/2013 9:25 -> 8/29/2013 9:43"
+   ],
+   "trip.start_station_name = station.name VIA trip.start_station_id": [
+    "station.id 2 = San Jose Diridon Caltrain Station; trip rows reference station ids 22,27,35,36,41,45,64,66,69,73,75"
+   ],
+   "trip.end_station_name = station.name VIA trip.end_station_id": [
+    "trip 4069 end_station_id 64 -> 2nd at South Park; trip 4073 end_station_id 69 -> San Francisco Caltrain 2 (330 Townsend)"
+   ],
+   "weather.max_temperature_f range": [
+    "74,78,71,75,73,72,85,88 all within -10..110"
+   ],
+   "weather.humidity range": [
+    "93,90,87,84,86,78,77,83 all within 0..100"
+   ],
+   "weather.cloud_cover range": [
+    "4,2,6,3,0,1,5,7 all within 0..8"
+   ],
+   "weather.wind_dir_degrees range": [
+    "286,291,284,277,276,269,270,287 all within 0..360"
+   ]
+  },
+  "uncertainty": {
+   "station.dock_count": "uncertain: observed distinct values 6; range 0-40 chosen from sample max 27.",
+   "trip.duration": "uncertain: no upper bound stated; only positivity enforced.",
+   "weather.precipitation_inches": "uncertain: TEXT with 'T' trace value; treated as free text, no numeric rule.",
+   "status.time": "uncertain: TEXT timestamp; no order rule stated because status rows are independent snapshots.",
+   "trip.zip_code": "Nullable integer; compact null ~1.1%; NULL share follows compact share.",
+   "weather.zip_code": "TEXT column; boundary literals 94106/94107/94108 are strings and are added to the enum so boundary and enum rules agree.",
+   "station.city": "'Mountain' added to the enum to reconcile with comparison_boundary target.",
+   "table_sizes": "Fixed per-instance sizes from the specification; no 0-row tables.",
+   "numeric_domains": "integer_quantity applies only to status.bikes_available, status.docks_available, station.dock_count; integer_measure applies to trip.duration and all weather integer measures; NUM_RANGE bounds in semantic_rules_and_formulas override the generic measure range for those columns."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 13/20 units fail with TypeError(\"unsupported operand type(s) for +: 'int' and 'str'\"). The crash originates in SpecSampler.sample_boundary (instance.py): for a numeric boundary column it does `n = int(lit)` then `return n + (step - 1)`, but for weather.zip_code the boundary literals are stored as strings ('94106','94107','94108') in BOUNDARY_NUM, and for weather.max_temperature_f the pool also mixes string literals from LIKE_VARIANTS/literal pool. When `int(lit)` succeeds on a string it returns an int, but the surrounding code path for zip_code (declared TEXT) also feeds these into a TEXT column; more directly, `_draw_num`/`sample_boundary` mixing int and str causes the TypeError. The failure is deterministic (reproducible=true) and blocks generation for the majority of instances.",
+     "requested_revision": "Fix SpecSampler.sample_boundary so numeric boundary stepping is type-safe: coerce the literal to the column's declared type before arithmetic, and never add an int to a str. For weather.zip_code (TEXT) treat boundary values as strings (no arithmetic); for weather.max_temperature_f (INTEGER) keep integer arithmetic. Ensure the returned value matches the column's declared type. Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Validity feedback: all 7 produced instances are invalid with reasons compact_rows_missing (7) and no_rows_added (4). writer.write_instance_sqlite is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` with orig_path defaulting to None, so the compact database is never copied and the DDL is re-created empty; generated rows are then appended to an empty DB. This violates the stated writer contract ('Each instance starts as a copy of the compact database') and the preservation-of-compact-rows requirement.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the worker args and call write_instance_sqlite(schema, inst, p, orig_path=orig)). Verify compact rows are preserved and generated rows are appended, and that validity reports compact_rows_missing == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable-column feedback shows many columns with NULL 0 / n or NULL shares far above the compact share: e.g. weather.max_temperature_f NULL 921/3559 (~26%), weather.max_humidity 763/3559, trip.subscription_type 152/789 (~19%), trip.zip_code 165/789 (~21%), while the spec's uncertainty note says trip.zip_code observed null ~1.1%. _apply_null_rule uses share = rng.uniform(0.05, 0.30) for every NULL_TARGETS column regardless of the compact database's actual share, and applies 5% to all other nullable columns. This does not follow the interface rule 'NULL share following the compact database's share for that column'. Also station.* columns (name, city, lat, long, dock_count, installation_date) receive NULLs even though the compact station table has no nullable columns in the schema (all station columns are NOT NULL except none declared nullable) \u2014 station.name/city/lat/long/dock_count/installation_date are declared without NOT NULL in the DDL but the compact data has no NULLs; the spec's null_targets list does not include station columns, yet _apply_null_rule plants NULLs in them.",
+     "requested_revision": "Derive per-column NULL share from the compact database's observed NULL fraction (schema.original_values) rather than a fixed 5\u201330% band, and restrict NULL planting to columns that are actually nullable in the compact data / listed in null_targets. Do not plant NULLs in station columns that have no NULLs in the compact DB unless the spec explicitly lists them. Keep at least one NULL row per genuinely nullable column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rules include weather.zip_code IN ('94107','94063','94301','94041','95113') and weather.events IN ('','Fog','Rain','Fog-Rain','rain','Rain-Thunderstorm'), but the atomic-operation extraction for weather.zip_code shows comparison_boundary targets [94106,94107,94108] (numeric) and the program's BOUNDARY_NUM stores them as strings. The spec's zip_code enum and the boundary literals are inconsistent (numeric 94106/94108 are not in the enum). Similarly station.city enum in semantic rules is ('San Jose','Redwood City','Mountain View','Palo Alto','San Francisco') but comparison_boundary targets include 'Mountain' (a truncation) which is not in the enum.",
+     "requested_revision": "Reconcile the specification: either add 94106/94108 to the weather.zip_code enum or drop them from boundary targets; either add 'Mountain' to the city enum or remove it from boundary targets. Ensure boundary literals are members of the declared enum/domain so the program can satisfy both the enum rule and the boundary rule without contradiction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Dependency handling: fill_foreign_keys_consistently copies parent keys uniformly with replacement and never emits NULL for nullable FKs (the spec's integer_fk rule says 'with probability 0.05 emit NULL when the column is nullable'). The unmatched_join rule requires at least one child row whose FK has no parent (via NULL when nullable, otherwise out-of-range key); the program never plants an out-of-range FK for non-nullable FKs and relies only on the generic NULL rule. Also _apply_derived for trip copies start_station_name/end_station_name from station via FK, but after _apply_null_rule sets FK to NULL the name is left as the previously copied value, so name and FK can disagree (name non-NULL while FK NULL), violating the 'trip.start_station_name = station.name VIA trip.start_station_id' rule for non-NULL operands.",
+     "requested_revision": "Implement the integer_fk NULL probability (0.05) for nullable FKs, and plant at least one unmatched child row per join column (NULL for nullable, out-of-range key for non-nullable). After NULL planting, re-derive name columns so that when the FK is NULL the name is also NULL (or vice versa) to keep the FK\u2192name dependency consistent under three-valued logic."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "choose_table_sizes ignores the specification's table_sizes_per_instance (station 70, status 2000, trip 2000, weather 366) and instead samples 0\u2013230 or base\u00d7{1,2,4} up to 2500. This produces instances with 0 rows for some tables (contributing to no_rows_added) and sizes far from the spec. The spec explicitly lists fixed per-instance sizes.",
+     "requested_revision": "Use the specification's table_sizes_per_instance as the base sizes (with any documented per-instance variation), and ensure no table is generated with 0 rows when the spec requires rows. Align choose_table_sizes with the spec or update the spec to state the intended variation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Uncertain/unsupported rules: (a) trip.duration 'duration > 0' is enforced, but the aggregate_boundary target AVG(trip.duration) > 0 is trivially satisfied and not separately planted; (b) weather.precipitation_inches is TEXT with 'T' trace value and is treated as free text with no numeric rule \u2014 the spec acknowledges this as uncertain; (c) status.time has no order rule (acknowledged); (d) station.dock_count range 0\u201340 is chosen from a sample max of 27 (acknowledged uncertainty). These are documented as uncertain and are acceptable, but the spec should mark them explicitly as 'uncertain' rather than as hard rules.",
+     "requested_revision": "Mark the acknowledged-uncertain rules (precipitation_inches, status.time, dock_count upper bound, duration upper bound) as uncertain in the specification so the program is not required to enforce them as hard constraints. No program change required for these beyond documentation."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL shares per column are available to the program (schema.original_values is populated, but _apply_null_rule does not use it) \u2014 needs confirmation after the fix.",
+    "Whether the station table columns are intended to be nullable at all (DDL lacks NOT NULL but compact data has no NULLs); the spec's null_targets omits station columns, so the program's NULL planting in station.* may be unintended.",
+    "The exact intended per-instance table-size variation is not specified beyond the fixed sizes; the program's 0\u2013230 / \u00d74 sampling is not justified by the spec."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"unsupported operand type(s) for +: 'int' and 'str'\"), n_ok=0, n_instances=0. The traceback points into the sampling path. In values.py NumberSampler.sample(), when the column is INTEGER but the element pool contains string literals (e.g. from literal_pool or original_values), `v = r.choice(self.elements)` returns a str, then `v += d` (d=1) raises TypeError. This is reachable for any INTEGER column whose pool mixes strings and numbers, e.g. weather.max_temperature_f (BOUNDARY_NUM ints plus literal-pool strings) or trip.duration. The NumberSampler constructor filters elements through _num(), but SpecSampler._draw_base() calls _init_sampler with `sorted({str(v) for v in literal_pool})` (values.py _init_sampler), which stringifies all literals, so the pool passed to NumberSampler is all strings; _num() converts them, but the boundary/planted values and the `v += d` path can still mix types. Regardless of the exact column, the program crashes on every unit, so no instances are produced.",
+     "requested_revision": "Fix the type handling in the numeric sampling path so INTEGER columns never add an int to a str: coerce chosen elements to int/float before arithmetic (or keep the pool numeric for numeric columns), and ensure boundary/planted values for INTEGER columns are ints. Re-run generation and confirm n_ok>0, n_fail=0, and rows_added populated for all four tables."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit failed, none of the integrity/consistency checks could be exercised: no evidence of FK consistency (trip.start_station_name = station.name via start_station_id), end_date >= start_date, duration > 0, status bikes+docks <= dock_count, NULL planting, boundary/tie/duplicate planting, or preservation of compact rows. The construction_pairs_by_group list is empty.",
+     "requested_revision": "After fixing the crash, provide execution feedback showing successful instance construction and the resulting integrity/consistency checks (FK-name agreement, date ordering, duration positivity, status dock constraint, NULL shares per nullable column, compact-row preservation)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty notes are mostly reasonable (dock_count range, duration upper bound, precipitation_inches TEXT, status.time). However, the spec's generic_sampling_rules 'integer_quantity' says 'Uniform integer in [0,30] for counts; positive quantities in [1,30]', which conflicts with the semantic rule duration > 0 and with NUM_RANGE for dock_count (0,40) and weather measures (-10..110). The program's SpecSampler._draw_num uses NUM_RANGE, so duration is not covered by NUM_RANGE and falls back to the base sampler; combined with the crash this is untested. The spec should state explicitly which columns use integer_quantity vs integer_measure vs NUM_RANGE so the program's domains are unambiguous.",
+     "requested_revision": "Clarify in the specification the value domain for each numeric column (especially trip.duration, station.dock_count, weather temperature/humidity/cloud_cover/wind_dir) and reconcile integer_quantity with the semantic rules. This is a documentation/consistency fix, not a per-query exception."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "SpecSampler.sample_boundary for TEXT columns steps by case change only (correct per spec), but for INTEGER columns it does `n + (step - 1)` where `n = int(lit)`; if a boundary literal for an INTEGER column is a string that is not numeric this returns the raw literal (str) into an INTEGER column, which SQLite will store as text. For weather.max_temperature_f the boundary literals are ints, so this is fine, but the general path is fragile and interacts with the crash above.",
+     "requested_revision": "Ensure sample_boundary always returns a value matching the declared type for INTEGER columns (coerce to int, and if the literal is non-numeric, fall back to a numeric draw rather than returning the string)."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was produced, so FK/dependent-value consistency, NULL planting, boundary/tie/duplicate planting, compact-row preservation, and reproducibility could not be verified from execution evidence.",
+    "Whether the numeric crash originates in NumberSampler.sample() vs SpecSampler.sample_boundary() could not be isolated from the truncated stderr; both paths contain int+str arithmetic risks."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification marks several rules as uncertain: station.dock_count range 0-40 ('uncertain: sample max 27'), trip.duration upper bound ('uncertain: no upper bound stated'), weather.precipitation_inches ('T' trace value, treated as free text), status.time (no order rule). These are explicitly flagged in the 'uncertainty' block, so they are supported as uncertain patterns rather than hard rules.",
+     "requested_revision": "No change required; uncertainty is documented. Optionally tighten trip.duration upper bound if a real bound is known, but the current positive-domain rule is consistent with evidence."
+    },
+    {
+     "agent": "designer",
+     "evidence": "station.city enum includes 'Mountain' and weather.zip_code enum includes boundary literals 94106/94107/94108; both are reconciled in the 'uncertainty' block ('Mountain' added to reconcile with comparison_boundary target; zip boundary literals added to enum). This is a deliberate, documented reconciliation, not an unsupported rule.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows several nullable columns with 'NULL 0 / n' in generated rows: station.city, station.dock_count, station.installation_date, station.lat, station.long, station.name, status.*, trip.bike_id, trip.start_date, trip.end_date, weather.date, weather.events, weather.precipitation_inches, weather.zip_code. Per the NULL-rule interface note, these may be noted but do not block a pass. The program's _apply_null_rule only plants NULLs for columns in NULL_TARGETS or with a positive compact share; station columns are excluded by design ('never plant NULL in ... station columns not listed in null_targets').",
+     "requested_revision": "Optional: if the engineer wants NULL coverage on station/status/weather free-text columns, extend NULL_TARGETS or rely on compact share; not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction pairs: 61/121 separated, 0 unknown executions. Missing separation alone does not prove a generation error (per instructions). The program implements boundary/tie/duplicate/unmatched-join planting (_plant_boundary, _plant_ties, _plant_duplicates, fill_foreign_keys_consistently) and derived columns (_apply_derived for trip name/date/duration and weather min/mean/max ordering).",
+     "requested_revision": "No change required; separation is partial but not evidence of a defect."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0; validity 20/20; reproducible true; rows_added matches table_sizes_per_instance (station 70*25=1750, status 2000*24=48000, trip 2000*28=56000, weather 366*25=9150). Writer copies compact DB and appends (write_instance_sqlite), preserving compact rows. FK planting uses NULL for nullable FKs and out-of-range key otherwise (fill_foreign_keys_consistently).",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "SpecSampler.sample_boundary coerces to declared type: INTEGER columns use int arithmetic with fallback to numeric draw for non-numeric literals; TEXT columns (including weather.zip_code) step by case change, never int+str. NumberSampler coerces elements to float and returns int/float. This matches the 'boundary' generic rule.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 60 unseparated construction pairs reflect genuine query equivalence or insufficient value variation; not resolvable without held-out labels, and per instructions missing separation alone is not a defect."
+   ]
+  }
+ ]
 }

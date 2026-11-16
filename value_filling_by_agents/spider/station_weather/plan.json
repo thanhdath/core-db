@@ -1,50 +1,344 @@
 {
  "db": "station_weather",
- "operator_io_quirks": [
-  "All identifiers are lowercase, no spaces; DDL uses double-quoted names and backtick-quoted `train` in route FK \u2014 sqlite accepts both, keep original DDL verbatim.",
-  "Tiny DB: train=11, station=11, route=18, weekly_weather=16 rows; no huge-table sampling needed, full read is fine.",
-  "All columns notnull=0 (nullable) despite being PKs; PKs are declared via table-level PRIMARY KEY, so pragma notnull=0 \u2014 do not treat as NOT NULL.",
-  "route and weekly_weather have composite PKs (train_id,station_id) and (station_id,day_of_week); composite-PK members get max_l0=30 per spec.",
-  "route.train_id FK -> train.id and route.station_id FK -> station.id; weekly_weather.station_id FK -> station.id; all parents exist and are unique (PK).",
-  "No self-references, no dangling FKs, no missing parents \u2014 clean FK graph: train, station at level 0; route, weekly_weather at level 1.",
-  "Declared types: INT (Number fuzzer), TEXT (String fuzzer), REAL (Number fuzzer, scale from no args -> default). No Date/Time/Bool/Bit dispatch.",
-  "train.time is TEXT storing 'HH:MM' (e.g. '17:15', '4:49', '06:30') \u2014 mixed zero-padding, NOT a declared time type, so TS String fuzzer will not produce time-like values.",
-  "train.interval has distinct=1 ('Daily') \u2014 String sampler with 1 element will mostly return 'Daily' plus contaminated variants.",
-  "weekly_weather.day_of_week TEXT with 7 distinct weekday names \u2014 String fuzzer, no enum awareness.",
-  "precipitation REAL values are round tens (90.0, 20.0, ...) \u2014 Number float fuzzer will perturb by \u00b10.01/\u00b10.02, producing implausible decimals.",
-  "train_number INT values are 5-digit (16724, 16127) \u2014 Number fuzzer range is [-10^scale,10^scale] with default scale, likely far from 5-digit range."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on id/train_number/station_id/train_id: default scale (no args in INT) -> range roughly [-10^0..10^0]? Actually INT with no (a,b) -> scale default; values perturbed \u00b11/\u00b12 \u2014 likely small ints, missing 5-digit train_number and 1..11 id ranges.",
-  "String fuzzer on name/origin/destination/network_name/services/local_authority: random charset strings + contamination, so joins on these text columns rarely match original values -> FN on equality predicates.",
-  "String fuzzer on train.time: produces random strings, not 'HH:MM' \u2014 queries comparing time strings will mostly fail to match -> FN.",
-  "String fuzzer on day_of_week: random strings, not weekday names \u2014 WHERE day_of_week='Monday' returns empty -> FN.",
-  "String fuzzer on interval (1 distinct): sampler with 1 element returns 'Daily' w.h.p. but contamination (0.5) corrupts it -> some FN.",
-  "Number fuzzer on high_temperature/low_temperature/wind_speed_mph: small ints, not 50-70 range -> range predicates (BETWEEN 50 AND 70) may return empty or wrong -> FN.",
-  "Number float fuzzer on precipitation: values near 0 with \u00b10.01 perturbation, not round tens -> equality/range on precipitation misses -> FN.",
-  "Composite PKs (route, weekly_weather): sample_fresh_primary_keys drops duplicate PK tuples; with small sizes and FK draws from small parent sets, many rows dropped -> small instances, possible empty tables -> FN.",
-  "FK child columns draw from parent's final values with replacement; parent id ranges are small ints from Number fuzzer, so route/weekly_weather get small int FKs \u2014 consistent but not matching original id semantics.",
-  "No NOT NULL/CHECK enforcement in Python; rows violating constraints skipped at insert \u2014 here all nullable so few skips, but PK duplicates filtered in Python.",
-  "Missing ties/duplicates: original has distinct counts < row counts (e.g. route.train_id 10 distinct in 18 rows, weekly_weather.station_id 5 in 16) \u2014 TS may produce fewer duplicates -> FP on COUNT(DISTINCT) or GROUP BY queries expecting ties.",
-  "No Date/Time declared types, so Date/Time fuzzers unused; train.time as TEXT means time-format queries rely on String fuzzer which won't match -> systematic FN on time predicates."
- ],
- "challenger_refs": [
-  "G3",
-  "g9494058b",
-  "gd468189a",
-  "G2",
-  "g6755a259",
-  "G1",
-  "g0e8914f0",
-  "G4",
-  "G6",
-  "G7"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL.",
+   "int_foreign_key": "Sample from the parent table's generated primary-key values; include at least one parent row with no children and, where nullable, at least one NULL.",
+   "int_numeric": "Uniform integer within the column's range rule; include boundary values and one step on each side of any listed literal.",
+   "real_numeric": "Uniform real within the column's range rule; include boundary values and one step on each side of any listed literal.",
+   "text_short": "Sample from the column's value pool or enum; include near-variants (case changes, trailing spaces) of listed equality literals.",
+   "text_free": "Short readable strings; allow near-duplicate values when no constraint forbids it.",
+   "text_time": "HH:MM 24-hour format strings.",
+   "text_day_of_week": "One of Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday.",
+   "null_share": "For each nullable column, at least one NULL row per instance; NULL share follows the compact database's observed share (0.0 in the shown statistics, so keep NULLs rare but present)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "route.train_id",
+    "pattern": "group_sizes, ties_for_order_limit, unmatched_join_rows",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT route.station_id)"
+     ],
+     "joins_with": [
+      "train.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "route.station_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "station.id",
+    "pattern": "group_sizes, duplicates_for_distinct",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "station.network_name",
+    "pattern": "comparison_boundary, group_sizes",
+    "targets": {
+     "values": [
+      "Amersham",
+      "amersham"
+     ],
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "station.services",
+    "pattern": "comparison_boundary, group_sizes",
+    "targets": {
+     "values": [
+      "Metropolitan line and Chiltern Railways",
+      "metropolitan line and chiltern railways"
+     ],
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "station.local_authority",
+    "pattern": "duplicates_for_distinct, group_sizes",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "train.id",
+    "pattern": "group_sizes, ties_for_order_limit, unmatched_join_rows",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(DISTINCT route.station_id)",
+      "COUNT(*)"
+     ],
+     "joins_with": [
+      "route.train_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "train.name",
+    "pattern": "group_sizes, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT route.station_id)"
+     ]
+    }
+   },
+   {
+    "column": "weekly_weather.station_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "weekly_weather.precipitation",
+    "pattern": "aggregate_boundary, comparison_boundary",
+    "targets": {
+     "aggregate": [
+      "MAX(weekly_weather.precipitation)"
+     ],
+     "values": [
+      -38,
+      -37,
+      -36,
+      49,
+      50,
+      51
+     ]
+    }
+   },
+   {
+    "column": "weekly_weather.day_of_week",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "MAX(weekly_weather.day_of_week)"
+     ],
+     "values": [
+      49,
+      50,
+      51
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "route.train_id",
+    "parent_table": "train",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child": "route.station_id",
+    "parent_table": "station",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child": "weekly_weather.station_id",
+    "parent_table": "station",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "table": "train",
+    "unique_tuples": [
+     [
+      "id"
+     ]
+    ]
+   },
+   {
+    "table": "station",
+    "unique_tuples": [
+     [
+      "id"
+     ]
+    ]
+   },
+   {
+    "table": "route",
+    "unique_tuples": [
+     [
+      "train_id",
+      "station_id"
+     ]
+    ]
+   },
+   {
+    "table": "weekly_weather",
+    "unique_tuples": [
+     [
+      "station_id",
+      "day_of_week"
+     ]
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "train",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "train",
+    "column": "train_number",
+    "formula": "train_number > 0"
+   },
+   {
+    "table": "train",
+    "column": "time",
+    "formula": "time GLOB '[0-2][0-9]:[0-5][0-9]'"
+   },
+   {
+    "table": "train",
+    "column": "interval",
+    "formula": "interval IN ('Daily')"
+   },
+   {
+    "table": "station",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "route",
+    "column": "train_id",
+    "formula": "train_id > 0"
+   },
+   {
+    "table": "route",
+    "column": "station_id",
+    "formula": "station_id > 0"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "station_id",
+    "formula": "station_id > 0"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "day_of_week",
+    "formula": "day_of_week IN ('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "high_temperature",
+    "formula": "high_temperature BETWEEN -50 AND 130"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "low_temperature",
+    "formula": "low_temperature BETWEEN -50 AND 130"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "low_temperature",
+    "formula": "low_temperature <= high_temperature",
+    "evidence": "all shown rows have low <= high"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "precipitation",
+    "formula": "precipitation >= 0"
+   },
+   {
+    "table": "weekly_weather",
+    "column": "wind_speed_mph",
+    "formula": "wind_speed_mph >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "train": 8,
+   "station": 8,
+   "route": 12,
+   "weekly_weather": 12
+  },
+  "null_targets": [
+   "train.train_number",
+   "train.name",
+   "train.origin",
+   "train.destination",
+   "train.time",
+   "train.interval",
+   "station.network_name",
+   "station.services",
+   "station.local_authority",
+   "weekly_weather.high_temperature",
+   "weekly_weather.low_temperature",
+   "weekly_weather.precipitation",
+   "weekly_weather.wind_speed_mph"
+  ],
+  "supporting_evidence": {
+   "low_temperature <= high_temperature": "weekly_weather sample rows: (59,54),(66,55),(60,52),(55,50),(54,56),(58,46),(57,49) all satisfy low <= high",
+   "interval IN ('Daily')": "train.interval distinct = 1, value 'Daily'",
+   "day_of_week enum": "weekly_weather.day_of_week distinct = 7, values Monday..Sunday",
+   "time format": "train.time values like '17:15','22:10','4:49'"
+  },
+  "uncertainty": "The shown sample has fewer rows than the statistics (e.g. station 8 vs 11, train 8 vs 11, route 8 vs 18, weekly_weather 8 vs 16); generation sizes are kept below original sizes. NULL shares are observed as 0.0 but nullable columns still receive at least one NULL per instruction 10. The aggregate_boundary target on weekly_weather.day_of_week (MAX > 50) is nonsensical for a text day column and is treated as a sampling-domain note only."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions entry for weekly_weather.day_of_week lists pattern 'aggregate_boundary' with targets aggregate MAX(weekly_weather.day_of_week) > 50 and values [49,50,51]. day_of_week is a text column constrained to Monday..Sunday (semantic rule day_of_week IN (...)). The spec's own uncertainty note admits this 'is nonsensical for a text day column and is treated as a sampling-domain note only'. No semantic rule or formula supports a MAX(day_of_week) > 50 predicate.",
+     "requested_revision": "Drop or re-classify the weekly_weather.day_of_week aggregate_boundary exception to an explicit 'ignored / unsupported' note so the specification does not carry an unevidenced constraint. This is a documentation cleanup only and does not affect generated instances (the program already treats it as a domain note and generates the 7-day enum)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec records per-column group-size targets '1, 2 and >= 3' on train.id, train.name, station.id, station.network_name, station.local_authority, weekly_weather.station_id, route.station_id. Only route.train_id / route.station_id / weekly_weather.station_id are FK-group columns where the pattern is naturally realised; for train.id, station.id and the text columns the 'group_sizes' targets refer to grouping parent rows with children, which the program achieves only indirectly (via fresh PKs plus FK group assignment), and no semantic rule pins sizes 1/2/>=3 on those text columns themselves.",
+     "requested_revision": "Either clarify that the group-size targets on parent rows are met through the child-side FK assignment (route.train_id, route.station_id, weekly_weather.station_id), or drop the exceptions on train.id / station.id / text columns. Execution shows no integrity failures, so this is a specification clarity issue rather than a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The semantic rule weekly_weather.low_temperature <= high_temperature is implemented in instance.py: after sampling, low > high is corrected by setting lo[i] = hi[i] - rng.randint(0,5). This 'repairs' the value rather than only constraining sampling. It is consistent with the three-valued-logic rule (only non-NULL operands constrained), so it is not a blocker, but it can slightly shift the low_temperature distribution away from the sampled range and its boundary values.",
+     "requested_revision": "Prefer generating low_temperature within [domain.lo, high_temperature] at draw time (e.g., a dependent sampler bound by the already-chosen high value) so the range/boundary planting of low_temperature is preserved. Document either approach; no blocking change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback: all 13 nullable columns report 'NULL ... / n' (e.g., station.network_name NULL 20/162, train.interval NULL 20/161, weekly_weather.wind_speed_mph NULL 19/186), satisfying the NULL rule (>=1 NULL per instance plus non-NULL rows). NOT NULL / PK columns show no NULL-vs-rule failures. weekly_weather.low_temperature NULL 14/186 vs high_temperature NULL 16/186 are independent, and rows where one side is NULL are not constrained (three-valued logic), which matches the rule.",
+     "requested_revision": "None; noted as compliant. The compact share is ~0.0, and the program plants >=1 NULL per nullable column per instance, so 'rare but present' is met."
+    }
+   ],
+   "unresolved_checks": [
+    "Spec boundary planting for weekly_weather.precipitation lists values [-38,-37,-36,49,50,51], including negatives that violate the semantic rule precipitation >= 0. NumberSampler.numeric() clamps values below domain.lo (0) to 0, so the negative boundary literals -38/-37/-36 will never be planted; only the positive side (49/50/51 around the >50 predicate) can appear. This is a designer/spec tension (compare vs aggregate boundary literals straddle 0 and >50), resolved silently by clamping; it does not break the precipitation >= 0 rule but means the negative literals are unexercised. Recommend the designer reconcile the boundary list with the >= 0 rule.",
+    "Construction feedback reports construction_pairs eligible 37, separated 3, unknown_executions 0. Partial separation (3/37) does not by itself indicate generation failure or query equivalence; the variation is not blocked by the sampler, just not exercised by the sampled query set in this short run. No action requested.",
+    "table_sizes_per_instance (train 8, station 8, route 12, weekly_weather 12) is applied with jitter +-2 (choose_table_sizes), while the compact DB is smaller than the recorded statistics (station 11, train 11, route 18, weekly_weather 16 per spec uncertainty). Generated rows added in the run (train 161/20 units ~ 8/unit) match the intended sizes; the spec's uncertainty note about original sizes is acknowledged, no blocking issue."
+   ]
+  }
+ ]
 }

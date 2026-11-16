@@ -1,58 +1,554 @@
 {
  "db": "customer_complaints",
- "operator_io_quirks": [
-  "Mixed-case table names (Staff, Customers, Products, Complaints) and mixed-case columns; must double-quote with original spelling.",
-  "Complaints has NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there, and drop_unique_duplicates has nothing to drop.",
-  "Complaints.complaint_id is INTEGER NOT NULL but not PK and not unique-declared; distinct=12 on 12 rows, so it looks like a key but TS will not treat it as one.",
-  "Products.parent_product_id is a self-referencing-looking integer (values 3,4,8,9) but there is NO declared FK; TS treats it as a plain Number column, not a self-FK.",
-  "DATETIME columns store text like '1988-09-29 17:54:50' (space-separated, no T, no timezone); Date fuzzer template must match this format.",
-  "DATETIME declared type dispatches to 'Date|Number(int elements)' \u2014 first element '1988-09-29 17:54:50' does not parse as int, so Date fuzzer is chosen; but if a pool literal is an int the dispatch could flip to Number(scale=4).",
-  "product_price DECIMAL(19,4) has mixed storage classes (real and integer: '35' stored as integer); Number fuzzer with scale=19, precision=4 gives a huge range [-10^19,10^19].",
-  "VARCHAR(1) gender stores '0'/'1' (text), not 'M'/'F'; String fuzzer will produce arbitrary 1-char strings.",
-  "complaint_outcome_code has distinct=1 ('OK') \u2014 a constant column; TS String fuzzer will still emit random strings, breaking any '= OK' filter.",
-  "All FK parents exist and are unique PKs (Customers.customer_id, Products.product_id, Staff.staff_id); no dangling FKs, no composite keys.",
-  "Tiny tables (Staff 7, Customers 8, Products 4, Complaints 12) \u2014 choose_table_sizes will inflate them to 30..2500 rows, so FK fan-out and join cardinalities change drastically.",
-  "Complaints.staff_id distinct=6 but Staff has 7 rows \u2014 one staff member has no complaints; FK fill with replacement will not preserve this."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on the four DATETIME columns: template '%Y-%m-%d %H:%M:%S' (first parsable element), range from min/max of 5 sampled originals, fresh draws uniform in that range; p=0.2 means 20% element reuse.",
-  "String fuzzer on all VARCHAR columns: random strings over 'a-zA-Z 0-9()' of length in [min,max+1] of sampled originals, with 50% contamination (suffix/prefix/drop-char) \u2014 emails, phones, state names become garbage.",
-  "Number fuzzer on INTEGER PKs: fresh uniform in [-10^0,10^0] perturbed by \u00b11/\u00b12, so staff_id/customer_id/product_id become small ints that may collide with FK draws only by luck.",
-  "Number fuzzer on product_price DECIMAL(19,4): scale=19 gives range \u00b110^19, so prices become astronomically large or negative \u2014 implausible values drive FN on price filters.",
-  "FK columns (Complaints.product_id/customer_id/staff_id) draw from parent's FINAL filtered values with replacement, so referential integrity holds but distribution is uniform over surviving parents.",
-  "complaint_outcome_code constant 'OK' in original: TS String fuzzer emits random strings, so any gold query filtering '= OK' returns empty on generated units \u2014 likely FN source.",
-  "complaint_status_code (Closed/New/Open) and complaint_type_code (Product Failure/Product Unusable) are small enums; TS String fuzzer ignores them, producing values no gold query matches \u2014 FN source.",
-  "No PK on Complaints: TS will not dedupe rows, so duplicate complaint_id values appear; gold queries with COUNT(DISTINCT complaint_id) vs COUNT(*) diverge \u2014 FP/FN source.",
-  "Tiny original tables inflated to 30..2500 rows: joins that returned 1-2 rows in original return hundreds; aggregate gold answers (AVG price, COUNT complaints) shift \u2014 expected, not a bug.",
-  "Date columns have no ordering constraint (closed before raised possible); TS Date fuzzer draws independently per column, so date_complaint_closed < date_complaint_raised frequently \u2014 implausible, FN on date-range queries.",
-  "parent_product_id values (3,4,8,9) do not match any product_id (117-120) in original \u2014 it is not a real FK; TS Number fuzzer will produce values that may accidentally match product_id, creating spurious self-joins."
- ],
- "challenger_refs": [
-  "G5",
-  "g0d1ffed1",
-  "g0d1ffed1",
-  "g0d1ffed1",
-  "gb72aa589",
-  "G3",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "g490870f5",
-  "G2",
-  "g96547de4",
-  "G4",
-  "g144fac8c",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; unique per table; never NULL. Parent PK sets are dense (1..n) so child multiplicities are constructible.",
+   "integer_fk": "Drawn only from the FINAL parent primary-key set after PK generation; never NULL; child_count per distinct parent value is constructed to yield group sizes 1, 2 and >= 3 where the spec requires it; at least one parent row is left without children for each FK relationship.",
+   "varchar_short": "Random token of 3-12 lowercase letters; near-variants (case/whitespace/one-char edits) for any listed literal.",
+   "varchar_name": "Random capitalized word of 3-10 letters.",
+   "varchar_email": "Random local part + '@example.' + {com,org,net}; a '%wrau%' literal is included whenever Staff.email_address is generated with literals.",
+   "varchar_phone": "Random digits with optional separators, length 10-15.",
+   "varchar_address": "Random number + capitalized word + street suffix.",
+   "varchar_city": "Random capitalized word + suffix (port, berg, haven, bury, ville, stad).",
+   "varchar_state": "Uniform from a fixed list of US state names.",
+   "varchar_code": "Uniform from the enum listed in per_column_exceptions.",
+   "datetime": "Uniform random datetime between 1970-01-01 and 2015-12-31, formatted 'YYYY-MM-DD HH:MM:SS'.",
+   "decimal_price": "Uniform random decimal in [0.01, 200.00] rounded to 4 places; the sampler pool for a decimal column is filtered to numeric values only (non-numeric literals are never routed to numeric/decimal columns).",
+   "null_share": "For nullable columns, plant NULLs with share max(observed compact share, a small planted share of 10%) and force at least one NULL row per nullable column per instance whenever row count >= 1; NULLs are planted LAST, after duplicate/tie/group-size/boundary post-processing; a planted NULL is never replaced to satisfy a rule or formula; NOT NULL and primary-key columns never receive NULL. Nullable detection must be by the schema's NOT NULL flag, not by pk_pos.",
+   "boundary": "For numeric columns with a listed literal, include the literal, literal-1 step, literal+1 step.",
+   "tie": "For ORDER columns, ensure at least two rows share the value at the listed rank; ties must survive any subsequent group-size or PK reindexing step; run tie injection AFTER group-size post-processing for columns that also carry group_sizes.",
+   "duplicate": "For DISTINCT columns, ensure 20-50% of values are duplicates of another row's value. Never apply this rule to a primary-key or UNIQUE column.",
+   "literal_routing": "String literals are never routed to numeric/decimal columns; numeric columns accept only numeric literals. Literal pools are seeded per column from the listed literal_pool_other_columns only (the three literals in this specification); pool SQL extraction does not widen the pool.",
+   "table_size_authority": "table_sizes_per_instance is authoritative: the program must pass these sizes to build_random_instance (not None). Each table's size is at least the minimum required by its group_sizes (6) and tie (2) targets."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Staff.gender",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "0",
+      "1"
+     ]
+    }
+   },
+   {
+    "column": "Staff.email_address",
+    "pattern": "near_variant_literal",
+    "targets": {
+     "literals": [
+      "%wrau%"
+     ]
+    }
+   },
+   {
+    "column": "Customers.customer_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Good Credit Rating",
+      "Defaults on payments"
+     ]
+    }
+   },
+   {
+    "column": "Products.product_category_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Food",
+      "Book",
+      "Hardware"
+     ]
+    }
+   },
+   {
+    "column": "Complaints.complaint_outcome_code",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "OK",
+      "ok"
+     ]
+    }
+   },
+   {
+    "column": "Complaints.complaint_status_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Closed",
+      "New",
+      "Open"
+     ]
+    }
+   },
+   {
+    "column": "Complaints.complaint_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Product Failure",
+      "Product Unusable"
+     ]
+    }
+   },
+   {
+    "column": "Customers.phone_number",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.phone_number",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Customers.email_address",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.address_line_1",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.address_line_2",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.address_line_2",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Customers.town_city",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Products.product_price",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Products.product_price",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Complaints.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Products.product_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Products.product_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Products.product_category_code",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Complaints.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Complaints.staff_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Staff.staff_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Complaints.staff_id",
+    "parent": "Staff.staff_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Complaints.product_id",
+    "parent": "Products.product_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Complaints.customer_id",
+    "parent": "Customers.customer_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Products.parent_product_id",
+    "parent": "Products.product_id",
+    "copied_columns": [],
+    "note": "self-referencing FK; values drawn from the FINAL Products.product_id set after PK generation; nullable"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Staff",
+    "column": "gender",
+    "formula": "gender IN ('0','1')"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_type_code",
+    "formula": "customer_type_code IN ('Good Credit Rating','Defaults on payments')"
+   },
+   {
+    "table": "Products",
+    "column": "product_category_code",
+    "formula": "product_category_code IN ('Food','Book','Hardware')"
+   },
+   {
+    "table": "Products",
+    "column": "product_price",
+    "formula": "product_price >= 0",
+    "evidence": "2.88, 35, 109.99, 23.35 all non-negative; sampler domain [0.01, 200.00] is a stricter superset"
+   },
+   {
+    "table": "Complaints",
+    "column": "complaint_outcome_code",
+    "formula": "complaint_outcome_code IN ('OK','ok')"
+   },
+   {
+    "table": "Complaints",
+    "column": "complaint_status_code",
+    "formula": "complaint_status_code IN ('Closed','New','Open')"
+   },
+   {
+    "table": "Complaints",
+    "column": "complaint_type_code",
+    "formula": "complaint_type_code IN ('Product Failure','Product Unusable')"
+   },
+   {
+    "table": "Complaints",
+    "column": "date_complaint_closed",
+    "formula": "date_complaint_closed IS NULL OR date_complaint_raised IS NULL OR date_complaint_closed >= date_complaint_raised",
+    "evidence": "all shown complaint rows have closed after raised"
+   },
+   {
+    "table": "Products",
+    "column": "date_product_discontinued",
+    "formula": "date_product_discontinued IS NULL OR date_product_first_available IS NULL OR date_product_discontinued >= date_product_first_available",
+    "evidence": "NOT ENFORCED: shown rows contradict (product 117: first 1988-09-29, discontinued 1987-12-20); rule present as NULL-permissive SQL that only holds on rows where it is true; contradictory rows remain allowed"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Staff": 7,
+   "Customers": 8,
+   "Products": 6,
+   "Complaints": 12
+  },
+  "null_targets": [
+   "Customers.address_line_1",
+   "Customers.address_line_2",
+   "Customers.town_city",
+   "Customers.state",
+   "Customers.email_address",
+   "Customers.phone_number",
+   "Products.parent_product_id",
+   "Products.date_product_first_available",
+   "Products.date_product_discontinued",
+   "Products.product_name",
+   "Products.product_description",
+   "Products.product_price",
+   "Complaints.date_complaint_raised",
+   "Complaints.date_complaint_closed",
+   "Staff.gender",
+   "Staff.first_name",
+   "Staff.last_name",
+   "Staff.email_address",
+   "Staff.phone_number"
+  ],
+  "supporting_evidence": {
+   "Products.product_price >= 0": "2.88, 35, 109.99, 23.35",
+   "Complaints.date_complaint_closed >= date_complaint_raised": "all shown complaint rows; treated as NULL-permissive SQL boolean",
+   "Products.date_product_discontinued >= date_product_first_available": "NOT ENFORCED as an absolute rule: product 117 contradicts; kept only as a NULL-permissive SQL row that is not forced on contradictory rows",
+   "Products table size 6": "minimum to satisfy group_sizes 1,2,>=3 on product_id/product_name/parent_product_id; table_sizes_per_instance is authoritative and must be passed to build_random_instance",
+   "NULL planting": "each nullable column must show NULL k / n with k >= 1 per instance; nullable detection by schema NOT NULL flag, not pk_pos"
+  },
+  "uncertainty": "Documented exceptions to the extracted atomic operations: (1) duplicates_for_distinct on primary-key columns (Customers.customer_id, Products.product_id, Staff.staff_id) is unsatisfiable under the PK constraint and is dropped explicitly; (2) group_sizes '1,2,>=3' on Customers.customer_id and Staff.staff_id is unsatisfiable because PKs are distinct by construction and is dropped explicitly; group_sizes on Products.product_id is satisfiable only via the Complaints child counts and is retained through the Complaints.product_id FK distribution. Products table size is 6 (authoritative) so group_sizes 1,2,>=3 on product_name and parent_product_id are satisfiable. Tie injection for COUNT(*) ties runs after group-size post-processing and is verified per instance. Literal pools are restricted to the three listed literals; pool SQL extraction is disabled. NULL planting is applied after all other post-processing, forces at least one NULL per nullable column per instance, and is never replaced. The discontinued-vs-first-available order is deliberately not enforced; the SQL row is NULL-permissive and does not restrict contradictory filings. Self-referencing FK Products.parent_product_id is drawn from the final Products.product_id set after PK generation; _revalidate_fks must not drop rows needed for group_sizes/tie targets."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Price sampler draws non-numeric values, crashing 14/20 instances",
+     "evidence": "Execution feedback: 14 of 20 units fail with ValueError(\"could not convert string to float: 'Chocolate'\") at tscore_gen/instance.py:80 (`cols['product_price'] = [None if v is None else max(0.0, float(v)) ...]`). Root cause: in values.py `make_spec_sampler`, the `'price' in column.name.lower() or 'decimal' in t` branch builds `els = list(ov) + pool` where `pool` contains string literals routed from queries (e.g. 'Chocolate' from a product_name literal that the loose FK-root routing in literals.py assigned to Products.product_price). PriceSampler then returns `r.choice(self.elements)` (a string) with probability `1-p`, so non-numeric strings reach `_enforce_semantic_rules`. The specification's `decimal_price` rule (uniform decimal in [0.01, 200.00]) is therefore not implemented for the sampled values.",
+     "requested_revision": "In `make_spec_sampler` (or `PriceSampler`), filter the element pool to numeric values only (drop non-numeric strings) before constructing the sampler, and/or coerce/validate in `_enforce_semantic_rules` so a non-numeric value cannot reach `float()`. Ensure every generated `product_price` is a decimal in [0.01, 200.00] as the specification requires. Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "title": "Foreign-key violations in 4 of 6 written instances (159 FK violations)",
+     "evidence": "Execution feedback: `fk_violations: 159`; per-instance `new_fk_violations` of 41, 55, 44, 19 on Complaints.product_id, Complaints.staff_id, Complaints.customer_id. The `fill_foreign_keys_consistently` function draws child FK values from `compact_parent` + `instance[pt][pc]`, but the parent's generated PKs are subsequently filtered by `sample_fresh_primary_keys` (and `drop_unique_duplicates`), so child rows can reference parent keys that were dropped. Also, `UNMATCHED_PARENT` post-processing drops child rows but does not re-validate that remaining child FKs still exist. The specification's `dependencies` (Complaints.staff_id -> Staff.staff_id, Complaints.product_id -> Products.product_id, Complaints.customer_id -> Customers.customer_id) are not enforced.",
+     "requested_revision": "Generate parent PKs first, then draw child FKs only from the *final* parent PK set (after fresh-PK filtering and unique-dropping). Re-validate all child FKs after the UNMATCHED_PARENT step and drop or re-point any orphaned child rows. Confirm `fk_violations == 0` in the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule not applied to most nullable columns",
+     "evidence": "Execution feedback `nullable_columns` shows `NULL 0 / n` for Customers.address_line_1/2, email_address, phone_number, state, town_city; Products.parent_product_id, product_description, product_name; Staff.first_name, gender, last_name, phone_number. The specification's `null_targets` lists all of these and the interface rule requires at least one NULL row per nullable column. In `build_random_instance`, `apply_null_rule` is called with `nullable = not cm.notnull and cm.pk_pos == 0`; for these columns the sampler's `max_l0` cap and the `apply_duplicate_share`/`apply_tie`/`apply_group_sizes` post-processing run *after* the NULL rule and overwrite the planted NULLs (e.g. `apply_duplicate_share` copies a non-NULL source value into a NULL slot; `apply_tie`/`apply_group_sizes` overwrite indices). The interface rule states a planted NULL is never replaced.",
+     "requested_revision": "Apply the NULL rule last (after duplicate/tie/group-size/boundary post-processing), or make those post-processors skip NULL slots. Ensure each nullable column has at least one NULL and a share matching the compact database's share. Re-run and confirm the `nullable_columns` lines show NULL > 0 for every listed column."
+    },
+    {
+     "agent": "designer",
+     "title": "Semantic rule for date ordering is stated as uncertain and contradicted by the data",
+     "evidence": "Specification `uncertainty` field: 'The original data shows some discontinued dates before first-available dates (e.g., product 117: first 1988-09-29, discontinued 1987-12-20), so the order rule is stated as conditional on non-NULL values and may be violated in the original; generation enforces it.' The `supporting_evidence` for `Products.date_product_discontinued >= date_product_first_available` cites 'Rows 117-120 show discontinued dates after first-available dates', which contradicts the uncertainty note. The rule is therefore not sufficiently supported by the database; it is an uncertain pattern.",
+     "requested_revision": "Either drop the `date_product_discontinued >= date_product_first_available` rule (and the corresponding enforcement in `_enforce_semantic_rules`) as unsupported, or reclassify it explicitly as an uncertain pattern that generation does not enforce. Do not present contradictory supporting evidence. The `Complaints.date_complaint_closed >= date_complaint_raised` rule is supported by the shown rows and may remain."
+    },
+    {
+     "agent": "designer",
+     "title": "Literal routing assigns unrelated string literals to numeric columns",
+     "evidence": "The crash 'Chocolate' reaching Products.product_price shows that `seed_literal_pool_from_queries` (loose=True) routes a product_name literal to the FK-root of product_price. The specification's `literal_pool_other_columns` lists only `Complaints.complaint_type_code: ['Product Failure']`, `Customers.customer_type_code: ['Good Credit Rating']`, `Staff.email_address: ['%wrau%']`, but the pool actually contains 'Chocolate' for a price column. The specification does not describe this routing behavior or constrain which literals may reach which columns.",
+     "requested_revision": "Document the literal-routing rule in the specification (which literals may seed which columns, and that numeric columns only accept numeric literals), or restrict routing so that string literals are never routed to numeric/decimal columns. This is a specification gap that the engineer's fix must be consistent with."
+    }
+   ],
+   "unresolved_checks": [
+    "Only 6 of 20 instances were written (n_ok 6, n_fail 14); the remaining 14 could not be inspected for integrity or value variation.",
+    "Construction pairs: 18 of 52 separated, 0 unknown executions \u2014 separation is partial but a missing separation alone does not establish a generation error; not treated as a blocking issue.",
+    "The `rows_added`/`rows_skipped` counters in cli.py read `_G['last_added']`/`_G['last_skipped']`, which are never populated by the writer, so the reported `rows_added` of 0 for all tables is unreliable; the per-instance `rows_added` in the feedback (14-110) is the trustworthy figure.",
+    "Whether the `apply_group_sizes` string sentinels ('g1_...', 'g2_...', 'g3_...') are valid for the target column types (e.g. integer PKs like Products.product_id, Staff.staff_id) was not verified; if written to an INTEGER column they would be coerced or fail."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "issue": "The NULL rule is specified but never actually applied to generated instances: every nullable column shows 'generated rows: NULL 0 / n' in the execution feedback, for all 20 instances.",
+     "evidence": "nullable_columns feedback lists 'generated rows: NULL 0 / 399' (Complaints), 'NULL 0 / 144' (Customers), 'NULL 0 / 175' (Products), 'NULL 0 / 178' (Staff) for every column. In values.py, apply_null_rule() computes k = round(n * null_share) and forces k>=1, so at least one NULL should be planted whenever the column is nullable and n>=1. In instance.py the call is apply_null_rule(inst[t][cm.name], rng, schema.null_share.get(key, 0.0), True). apply_null_rule's signature is (values, rng, null_share, nullable) and it does plant NULLs when nullable=True. But then the writer writes rows: `n = len(cols.get(names[0], []))` and `rows.append([cols[c][i] for c in names])`. That is not the bug. The bug is that build_random_instance runs `_revalidate_fks(inst, schema, schema.fks)` BEFORE the NULL loop (so NULLs for FK columns still work), but the NULL loop is applied to `inst[t][cm.name]`. That is fine. However, `apply_null_rule` uses `nullable = (not cm.notnull) and cm.pk_pos == 0`. That is true for nullable columns. So NULLs should appear. Re-read: apply_null_rule shuffles indices and sets values[i]=None. That should work. Unless build_random_instance stores values in `cols` dict and then does `inst[t][cm.name] = apply_null_rule(inst[t][cm.name], rng, schema.null_share.get(key, 0.0), True)`. That reassigns. So NULLs would be planted. Yet the execution feedback shows 0 NULLs. Possible cause: the reported execution of the program run is against the specification's NULL handling \u2014 but the feedback says the run added 0 NULLs. This is a contradiction with the code. Either the reported feedback is from an older run or the code path differs. Regardless, the observable outcome is 0 NULLs on all nullable columns across 20 instances, which violates interface rule 7 ('each instance contains generated rows with NULL ... and at least one NULL row per nullable column').",
+     "requested_revision": "Investigate why no NULLs appear despite apply_null_rule forcing k>=1; reproduce on one instance and confirm at least one NULL per nullable column per instance, matching the compact NULL share (planted small share)."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The literal_routing / numeric-only filtering is specified (string literals must not reach numeric columns; numeric literals only reach numeric columns), and the program claims to implement it in seed_literal_pool_from_queries via `anc = [a for a in anc if _is_numeric_col(a) == vn]`. This is consistent with the spec. But the spec also says 'Literal pools are seeded per column from the listed literal_pool_other_columns only' (generic_sampling_rules.literal_routing). The code seeds from all extracted literals in the pool SQLs, not just the three listed literals.",
+     "evidence": "specification.json generic_sampling_rules.literal_routing: 'Literal pools are seeded per column from the listed literal_pool_other_columns only.' literal_pool_other_columns lists only 3 literals: Complaints.complaint_type_code='Product Failure', Customers.customer_type_code='Good Credit Rating', Staff.email_address='%wrau%'. But seed_literal_pool_from_queries extracts values from 230 pool SQLs (pool_sqls=230, pool_values=65) and routes all of them, producing a pool much larger than the three spec literals.",
+     "requested_revision": "Either restrict literal seeding to the three listed literal_pool_other_columns, or amend the specification to allow seeding from the pool SQLs (and drop the 'only' clause). Choose one; they must be consistent."
+    },
+    {
+     "agent": "designer",
+     "issue": "Several specified patterns have insufficient evidence / ambiguous targets that the program cannot reliably satisfy.",
+     "evidence": "(a) Customers.customer_id has both a 'duplicates_for_distinct' target (20-50%) and a 'group_sizes' target (1,2,>=3) and a 'ties_for_order_limit' target. customer_id is a PRIMARY KEY: 20-50% duplicate share is impossible for a PK. The program's apply_duplicate_share would break the PK (with 8 rows, 20-50% duplicates means ~2 duplicates), which is then filtered by sample_fresh_primary_keys \u2014 so the DISTINCT target on a PK is unsatisfiable by construction. Similar conflict for Products.product_id (PK with group_sizes + tie targets). The spec lists Customers.customer_id duplicates_for_distinct; this is an unsatisfiable pattern on a PK.\n(b) apply_group_sizes requires n>=6 (returns unchanged otherwise) but is specified on Products (n=4) and Staff (n=7). With table_sizes_per_instance Products=4, the group-sizes target on Products.product_id / product_name / parent_product_id cannot be met. The spec says table sizes per instance Products=4; group_sizes requires sizes 1,2,>=3 which needs at least 6 rows. Unsatisfiable.\n(c) Products.product_price rows_with_different_values requires >=2 distinct values; the code fixes that with `vals[0]=0.01; vals[1]=200.0`. But the VALUES sampler PriceSampler caps at [0.01,200.00]. With n=4 satisfying >=2 distinct is fine, but the (a) and (b) conflicts remain.",
+     "requested_revision": "Remove or restate the unsatisfiable patterns: drop duplicates_for_distinct on primary-key columns (Customers.customer_id, Products.product_id, Staff.staff_id) since PKs cannot have duplicate shares; and increase the per-instance table size for Products (or drop the group_sizes target on Products) so group sizes 1,2,>=3 can exist. Do this in the specification, not per query."
+    },
+    {
+     "agent": "designer",
+     "issue": "Uncertainty about Products.date_product_discontinued vs date_product_first_available is correctly documented but the semantic rule referencing discontinued dates is absent while the Complaints date rule is present \u2014 this is fine, but the spec's supporting_evidence says 'All shown complaint rows have closed dates after raised dates' \u2014 but there is no query pair exercising this. That is acceptable; note only.",
+     "evidence": "supporting_evidence field correctly marks the discontinued rule as NOT ENFORCED. Complaints.date_complaint_closed >= date_complaint_raised is enforced by _enforce_semantic_rules. Fine \u2014 informational.",
+     "requested_revision": "None (informational); keep."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Tie targets at rank 1 for COUNT(*) on group columns are not verified: tie injection in apply_tie sets two rows to the same value, but 'tie_at_rank [1] direction ASC and DESC tie_on COUNT(*)' requires that the top-1 and top-1-desc group sizes are tied (i.e., two values share the smallest COUNT(*) and two share the largest COUNT(*)). apply_tie on the raw column values does not control group counts \u2014 it duplicates a cell value, which changes a group count. This is roughly aligned, but for numeric PKs apply_group_sizes overwrites nn[0..5] AFTER apply_tie, potentially destroying the tie.",
+     "evidence": "values.py apply_group_sizes sets values[nn[0..5]] to sentinels g1, g2, g2, g3, g3, g3 \u2014 so at minimum groups of size 1, 2, 3 exist. But if apply_tie ran before, its tie may be among earlier indices and get overwritten by group_sizes (since nn was shuffled inside group_sizes but not coordinatied with tie). Order in instance.py is: duplicate -> tie -> group_sizes. group_sizes' shuffle can overwrite the duplicated pair, breaking the tie-at-rank target. No post-check confirms ties survive.",
+     "requested_revision": "Reorder so apply_tie runs AFTER apply_group_sizes (or have apply_group_sizes preserve existing ties), then verify that the specified rank has the required tie in each instance."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Construction pairs separated 19 of 52, which is low but not, per instruction 4, an error on its own. However, the 0 NULLs means the null-related pairs (null_rows on Complaints.customer_id NOT NULL \u2014 fine, that's NOT NULL so 0 NULL is correct) and the duplicates_for_distinct on customer_id (PK) are structurally unsatisfiable \u2014 a non-bug for the NOT NULL case but a real defect for the PK DISTINCT case (see issue on designer). No further program defect claimed here.",
+     "evidence": "construction_pairs: eligible=52, separated=19. The spec's PK-duplicate-share target is unsatisfiable, so the duplicate-related pairs cannot separate.",
+     "requested_revision": "See designer issue on PK duplicates_for_distinct."
+    }
+   ],
+   "unresolved_checks": [
+    "NULL handling: execution feedback shows 0 NULLs on every nullable column across 20 instances, contradicting interface rule 7 and the code's own apply_null_rule logic; needs verification whether the reported feedback is from the currently reviewed code or an older run.",
+    "Literal pool scope conflicts with the spec's 'seeded per column from the listed literal_pool_other_columns only' clause.",
+    "PK DISTINCT targets (Customers.customer_id, Products.product_id, Staff.staff_id) are unsatisfiable and should be removed from the spec.",
+    "Group-size targets on Products (per-instance size 4) are unsatisfiable given the code's n>=6 requirement; spec size or code must change."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every nullable column reports 'generated rows: NULL 0 / n' (e.g. 'Staff.gender: generated rows: NULL 0 / 268', 'Products.product_price: generated rows: NULL 0 / 158', 'Complaints.date_complaint_raised: generated rows: NULL 0 / 447'). The specification's null_share rule and the program interface require at least one NULL per nullable column per instance. instance.py applies apply_null_rule and then a verification loop that forces a NULL if none exists, so the writer should emit NULLs. Yet the feedback shows zero NULLs across all 20 instances and all nullable columns, which contradicts the code path and indicates the NULL rule is not actually taking effect (e.g. nullable detection via `cm.pk_pos == 0` combined with `not cm.notnull` may be mis-evaluating, or the verification loop is not reached for these columns).",
+     "requested_revision": "Fix the NULL planting so that each nullable column in each instance contains at least one NULL and a NULL share following the compact database share (min 1 row). Verify with the execution feedback that the 'generated rows: NULL k / n' lines show k >= 1 for every nullable column. Note: per instruction 7 this is a note for the engineer and does not by itself block a pass, but combined with the issues below it should be corrected."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py GROUP_SIZE_COLUMNS = {('Products','product_name'), ('Products','parent_product_id')} and DISTINCT_COLUMNS excludes primary keys, but the specification's per_column_exceptions and the extracted atomic operations require group_sizes '1, 2 and >= 3' on Products.product_id, Customers.customer_id, Staff.staff_id, and Products.parent_product_id, plus duplicates_for_distinct on Customers.customer_id. The specification's own 'uncertainty' field acknowledges removing these targets ('Removed unsatisfiable duplicates_for_distinct targets on primary-key columns ... and removed the group_sizes target on Customers.customer_id'). This is a specification-level deviation from the extracted atomic operations, not merely an implementation choice.",
+     "requested_revision": "Designer: reconcile the specification with the extracted atomic operations. Either (a) keep the group_sizes/duplicates targets on PK columns and have the engineer implement them (e.g. by allowing duplicate PK values is impossible under the PK constraint, so the correct resolution is to document why these targets are unsatisfiable and drop them explicitly in the specification with justification), or (b) confirm the removal is intentional and record it as a documented exception. The current specification silently drops targets that the atomic-operation extraction lists, which is a consistency gap."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_semantic_rules` clamps product_price to [0.01, 200.00] and forces date_complaint_closed >= date_complaint_raised, but the specification's semantic_rules_and_formulas lists `product_price >= 0` (not an upper bound of 200) and the decimal_price sampler rule says [0.01, 200.00]. The clamp to 200.00 is consistent with the sampler rule but the specification's formula only states `>= 0`; the two are compatible but the upper bound is an implementation choice not stated in the formula. More importantly, the specification's `date_product_discontinued >= date_product_first_available` rule is explicitly NOT ENFORCED ('NOT ENFORCED: shown rows contradict'), and the program correctly does not enforce it. This is consistent.",
+     "requested_revision": "No change required for the discontinued-date rule (correctly not enforced). For product_price, confirm the [0.01, 200.00] range is the intended domain (it matches decimal_price) and that the `>= 0` formula is a weaker superset; document this in the specification to avoid ambiguity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `apply_group_sizes` requires n >= 6 and len(nn) >= 6 to act, and `apply_tie` requires n >= 2. The specification's table_sizes_per_instance sets Products to 6, which is exactly the minimum for group_sizes. However, instance.py's `choose_table_sizes` (used when size is None) can produce sizes below 6 for Products (e.g. `int(min_c + int(rng.random()*200))` with min_c in [0,30) can yield small values), and the CLI calls `build_random_instance(..., None, rng)` with size=None. In such instances the group_sizes target on Products.product_name/parent_product_id cannot be satisfied, and the tie targets on Products.product_id/product_name/product_price may also be unsatisfiable. The execution feedback shows instances with as few as 2-3 rows added (e.g. unit 0019: 2 rows, unit 0007: 3 rows), confirming small instances where these targets cannot hold.",
+     "requested_revision": "Engineer: ensure that when a column carries group_sizes or tie targets, the generated row count for that table is at least the minimum required (6 for group_sizes, 2 for ties), or make the specification's table_sizes_per_instance authoritative by passing it to build_random_instance instead of None. The current random sizing can produce instances that cannot satisfy the specified targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` draws FK values from `compact_parent` + `instance.get(pt, {}).get(pc)`, but for self-referencing FKs (Products.parent_product_id -> Products.product_id) the parent table is the same table being built, and `instance.get(pt)` is not yet populated when Products is processed (the loop builds Products columns, then FKs, then PKs). The self-referencing FK fix-up loop runs after PK filtering, but `fill_foreign_keys_consistently` for Products.parent_product_id would draw from compact_parent only (since instance['Products'] is not yet set), potentially producing parent_product_id values that are not in the final Products.product_id set. The `_revalidate_fks` step drops child rows whose FK is not in the parent set, which could silently drop rows and reduce the effective row count below the group_sizes minimum.",
+     "requested_revision": "Engineer: handle self-referencing FKs by drawing from the final PK set after PK generation, or ensure _revalidate_fks does not drop rows needed for group_sizes/tie targets. Verify that Products.parent_product_id values are always in the final Products.product_id set and that no rows are silently dropped."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` field states 'Raised Products table size to 6 so that group-size 1,2,>=3 targets on product_id, product_name, parent_product_id can be satisfied' and 'designer review issue (b)'. This is a designer-level acknowledgment that the table size was changed to satisfy targets, but the specification's table_sizes_per_instance is not actually used by the program (CLI passes size=None). The specification and program are inconsistent on whether table_sizes_per_instance is authoritative.",
+     "requested_revision": "Designer: clarify whether table_sizes_per_instance is a hard requirement or a suggestion. If hard, the engineer must pass it to build_random_instance. If a suggestion, remove the claim that it was 'raised to 6 so that ... targets can be satisfied' since the program does not honor it."
+    }
+   ],
+   "unresolved_checks": [
+    "The execution feedback shows 0 NULLs in all nullable columns despite the code's NULL planting and verification loop; the root cause (nullable detection, pk_pos semantics, or writer behavior) is not determinable from the provided code alone and requires runtime inspection.",
+    "The construction_pairs feedback shows 19 of 52 eligible pairs separated, with no per-group breakdown; it is unclear which specific targets (group_sizes, ties, duplicates) are actually satisfied in the generated instances.",
+    "Whether the random table sizing (size=None) ever produces instances large enough to satisfy group_sizes (>= 6 rows) and tie targets for Products is not verified per instance in the feedback."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback 'nullable_columns' shows every nullable column with 'generated rows: NULL 0 / n' (e.g. Customers.phone_number NULL 0/31, Staff.gender NULL 0/34, Products.product_price NULL 0/15). The spec's null_share rule and the program's own invariant in instance.py ('at least one NULL per nullable column per instance; raises if the invariant is broken') both require >=1 NULL per nullable column. Yet 0 NULLs appear in all 20 instances.",
+     "requested_revision": "Fix the NULL planting so each nullable column actually receives >=1 NULL per instance. Root cause candidates: (a) instance.py computes 'nullable = (not cm.notnull) and cm.pk_pos == 0' \u2014 verify cm.notnull is read correctly from PRAGMA table_info (r[3]); (b) the writer inserts rows via 'INSERT INTO t VALUES (...)' with all columns; confirm NULLs survive; (c) verify apply_null_rule is reached for each column (key in inst[t]). Add an assertion/log that fails generation when a nullable column has 0 NULLs, matching the stated invariant."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _revalidate_fks: when invalid FKs exist it re-points them to sorted(pset)[0] AND then does 'rows[ct] = _filter(rows[ct], keep)' where keep excludes the invalid rows \u2014 so the re-pointed values are discarded and rows are dropped anyway. The docstring claims 'Rows needed for group_sizes/tie targets are never dropped', but the code drops them. Also the UNMATCHED_PARENT block drops child rows referencing the last parent, which can reduce Complaints below its size target and break FK/group-size targets.",
+     "requested_revision": "Make _revalidate_fks consistent with its stated contract: either re-point without dropping, or drop without claiming preservation. Ensure the unmatched-parent step does not reduce a child table below its group_sizes/tie minimum (e.g. only drop when child count exceeds the minimum)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py fill_foreign_keys_consistently draws FK values uniformly at random from the parent set; there is no construction of child_count per parent to yield group sizes 1, 2 and >=3 as the spec's integer_fk rule requires ('child_count per distinct parent value is constructed to yield group sizes 1, 2 and >= 3 where the spec requires it'). The spec retains group_sizes on Products.product_id via Complaints.product_id FK distribution (uncertainty note), but the program does not construct this distribution.",
+     "requested_revision": "Construct Complaints.product_id multiplicities explicitly so that per-parent child counts include 1, 2 and >=3 (and leave >=1 parent without children), rather than uniform random draws. This is required for the retained group_sizes target on Products.product_id."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py GROUP_SIZE_COLUMNS = {('Products','product_name'), ('Products','parent_product_id')} \u2014 it omits ('Products','product_id'), which the spec retains via the Complaints FK distribution. Also GROUP_SIZE_COLUMNS includes ('Products','parent_product_id'), a nullable self-FK; apply_group_sizes writes sentinel strings 'g1_...' into a numeric INTEGER column when numeric=False is passed (instance.py passes numeric=_is_numeric_col(cm), so this is avoided for parent_product_id \u2014 but the spec's group_sizes on parent_product_id is not clearly satisfiable given NULL planting last).",
+     "requested_revision": "Align GROUP_SIZE_COLUMNS with the spec's retained targets and document how parent_product_id group sizes survive NULL planting (NULLs are planted last and may destroy the 1/2/>=3 distribution). Either exclude parent_product_id from GROUP_SIZE_COLUMNS or re-verify group sizes after NULL planting."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec's uncertainty note claims 'group_sizes 1,2,>=3 on product_name and parent_product_id are satisfiable' with Products size 6, but NULL planting is applied last and forces >=1 NULL per nullable column. With 6 rows and >=1 NULL, only 5 non-NULL values remain, which cannot realize group sizes 1,2,>=3 (needs >=6 non-NULL rows). The spec is internally inconsistent for parent_product_id.",
+     "requested_revision": "Either raise Products table size to >=7 (so 6 non-NULL rows remain after NULL planting) or drop the group_sizes target on parent_product_id. Update table_sizes_per_instance accordingly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec's semantic_rules_and_formulas lists 'Products.date_product_discontinued >= date_product_first_available' as a rule with evidence 'NOT ENFORCED ... contradictory rows remain allowed'. A rule that is explicitly not enforced and whose evidence contradicts it is not a supported rule; it should be classified as an uncertain/unsupported pattern rather than a semantic rule.",
+     "requested_revision": "Move the discontinued-vs-first-available ordering out of semantic_rules_and_formulas into an explicit 'unsupported/uncertain patterns' section, or remove it. Keep only rules with positive evidence (product_price >= 0; complaint closed >= raised)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py apply_tie for direction 'BOTH' sets values[other] = values[best] where best is the min and other is the max \u2014 this collapses the max to the min, destroying the DESC-side tie and potentially the ASC-side ordering. The spec requires tie_at_rank [1] for both ASC and DESC on product_price, product_id, product_name.",
+     "requested_revision": "Implement BOTH as two independent ties: ensure >=2 rows share the minimum value AND >=2 rows share the maximum value (without overwriting the max with the min)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py apply_duplicate_share: 'target = int(round(n * rng.uniform(0.2,0.5)))' then 'target = max(1, min(target, len(nn)-1))'. For small n (e.g. Customers size 8, ~31 generated rows observed) the duplicate share may fall outside 20-50% of total rows because NULLs are excluded from nn and the cap uses len(nn)-1. The spec requires 20-50% of values to be duplicates.",
+     "requested_revision": "Compute the duplicate count against total row count n (not just non-NULL count) and verify the resulting duplicate share is within [0.2, 0.5] of n; document how NULLs interact with the share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_semantic_rules clamps product_price to [0.01, 200.0] and fixes complaint dates, but the spec's DIFFERENT_VALUE_COLUMNS handling in instance.py sets vals[0]=0.01, vals[1]=200.0 only when <2 distinct non-NULL values exist \u2014 this runs BEFORE _enforce_semantic_rules and before NULL planting, so the MAX/MIN scalar subquery target (>=2 different values per group) may be broken by NULL planting or clamping. Also the spec's rows_with_different_values target is '>= 2 per group with different values' \u2014 the program only ensures 2 distinct values overall, not per group.",
+     "requested_revision": "Ensure >=2 distinct non-NULL product_price values survive NULL planting and clamping, and clarify whether 'per group' means per product category or overall; implement accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli.py _spec_pool seeds pool only for keys present in schema.original_values ('if key not in schema.original_values: continue'). If a literal's column has no compact rows (or key mismatch), the literal is silently dropped. Execution feedback shows pool_values 3 (all three literals seeded), so this specific case works, but the guard is fragile.",
+     "requested_revision": "Seed the pool regardless of whether the column has compact values (the literal should still be routed to its named column), or log a warning when a spec literal is dropped."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py sample_fresh_primary_keys and drop_unique_duplicates run AFTER per-column sampling and post-processing (duplicate/group/tie), so PK/unique filtering can drop rows and reduce table size below the spec's authoritative size (e.g. Products 6, Complaints 12). Execution feedback shows rows_added per instance as low as 3-9 total across all tables (e.g. unit 0017 rows_added 3), far below the sum of spec sizes (7+8+6+12=33), indicating heavy row dropping.",
+     "requested_revision": "Generate PKs/unique values first (or regenerate dropped rows) so the final appended row count per table meets table_sizes_per_instance. The spec states table_sizes_per_instance is authoritative and must be passed to build_random_instance; the program passes it but does not guarantee the resulting row counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback 'construction_pairs': eligible 52, separated 14 \u2014 only 14 of 52 eligible pairs separated. While the instructions note a missing separation alone does not prove an error, combined with the NULL 0/n evidence and row-dropping, the low separation rate is consistent with targets not being realized.",
+     "requested_revision": "After fixing NULL planting and row-dropping, re-run and report separation; investigate pairs that remain unseparated to confirm targets (duplicates, ties, group sizes, boundaries) are actually constructed."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 'nullable' detection in instance.py (not cm.notnull and cm.pk_pos == 0) correctly identifies all nullable columns from PRAGMA table_info; the 0/NULL evidence suggests it may be misreading notnull.",
+    "Whether the writer's INSERT INTO t VALUES (...) with all columns preserves NULLs (it should, but the 0/NULL evidence contradicts the invariant).",
+    "Whether the spec's retained group_sizes on Products.product_id via Complaints FK distribution is actually constructed (no explicit multiplicity construction found).",
+    "Whether the 'BOTH' tie direction is correctly implemented for product_price/product_id/product_name.",
+    "Whether the duplicate share stays within 20-50% for small row counts after NULL exclusion.",
+    "Whether table_sizes_per_instance row counts are actually met after PK/unique filtering and FK revalidation."
+   ]
+  }
+ ]
 }

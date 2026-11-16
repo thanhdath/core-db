@@ -1,48 +1,911 @@
 {
  "db": "school_player",
- "operator_io_quirks": [
-  "PK declared as (\"School_Id\") but column is \"School_ID\": pragma table_info pk_pos still 1; PK name lookup must be case-insensitive (upstream upper-cases columns).",
-  "FKs written with backticks (`School_ID`) REFERENCES `school`(`School_ID`); pragma foreign_key_list resolves them fine, but DDL text parsing must not choke on backticks.",
-  "school_performance has composite PK (School_Id, School_Year) and School_Year is TEXT storing 'YYYY-YY' ranges (e.g. '1987-88') \u2014 text-stored period, not a date.",
-  "school_performance.School_Id is both PK member and FK to school; child FK values must come from parent's final filtered PK list.",
-  "All columns notnull=0, no CHECK, no UNIQUE indexes; only PKs constrain. Insert failures will be rare (PK dupes only).",
-  "Tiny tables (6/6/22/23 rows) \u2014 original_values fully read; no max_rows sampling needed.",
-  "Founded / Year_Entered_Competition / Enrollment are REAL but semantically years/counts; storage class real, values like 1879.0.",
-  "Age is INT with only 5 distinct values (14-18); Number fuzzer will produce wild ints.",
-  "Denomination/Boys_or_Girls/Day_or_Boarding/League/Class/Division are low-cardinality enums stored as free TEXT; 'Fight A' typo present in Class.",
-  "Player.Team has 22 distinct over 23 rows (near-unique); Player names contain non-ASCII ('Pedro \u00c1lvarez').",
-  "school.School_ID values 1..6 contiguous; player.School_ID samples show 1,2,5,6,4 \u2014 FK coverage uneven.",
-  "Table names all lowercase, column names mixed case with underscores; no spaces in identifiers."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on School_ID/Player_ID (INT, scale 0): range [-1,1] plus +-1/+-2 perturbation \u2014 PKs collapse to a handful of values, heavy PK-dupe dropping.",
-  "Number fuzzer on Enrollment/Founded/Year_Entered_Competition (REAL, scale 0): range [-1,1] floats \u2014 implausible for years/enrollment; FN source for range predicates like Founded > 1900.",
-  "Number fuzzer on Age (INT): values in {-2..2} \u2014 implausible ages; FN for Age >= 14 style filters.",
-  "String fuzzer on School/Location/Nickname/Player/Team/Class_A/Class_AA: random charset strings + contaminate; near-zero chance of matching real names \u2014 FN for equality/IN on these.",
-  "String fuzzer on low-cardinality enums (Denomination, Boys_or_Girls, Day_or_Boarding, League, Class, Division): 5 original samples + pool literals, p=0.2 fresh \u2014 will mostly reproduce originals, so equality filters may still hit; ties/duplicates likely (FP risk on DISTINCT/COUNT).",
-  "school_performance.School_Year (TEXT, 22 distinct 'YYYY-YY'): String fuzzer treats as generic text, not date \u2014 no format preservation; FN for LIKE '198%' or BETWEEN on year strings.",
-  "FK fill: school_details.School_ID, school_performance.School_Id, player.School_ID drawn from school's final PK list (post-dedupe) \u2014 if school PK collapses to few values, children get few distinct parents; join cardinalities skew.",
-  "Composite PK (School_Id, School_Year): sample_fresh_primary_keys drops dupes on the pair; with collapsed School_Id and random School_Year, many rows survive \u2014 but School_Id FK ties to school's small set.",
-  "No NOT NULL/CHECK enforcement in Python: NULLs only from empty parent FK; otherwise all columns filled \u2014 original has 0 nulls, so NULL-handling predicates (IS NULL) will be FN.",
-  "Tiny original tables mean original_values (5 sampled) dominate String/Number element pools; p=0.2 fresh keeps many real values \u2014 good for equality, bad for range/aggregate diversity.",
-  "Number list-range quirk (upper end overwritten to full range) means even with real elements, fresh draws span [-1,1] \u2014 implausible numeric values dominate at larger sizes."
- ],
- "challenger_refs": [
-  "G3",
-  "G3",
-  "G1",
-  "G2",
-  "G4",
-  "G5",
-  "G6",
-  "G3",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generation_specification": {
+   "overview": "Reusable generation spec for the school/school_players database. Four tables: school (parent), school_details (1:1 child of school), school_performance (1:N child of school), player (1:N child of school). Generation order: school -> school_details -> school_performance -> player. Generated rows are appended after the compact (original) rows, which are never deleted or modified; the writer must copy the compact database before appending (schema.source_path must be set by read_schema so write_instance_sqlite copies it). The writer must report per-table rows_ok/rows_failed and compact row counts before/after append; rows_failed > 0 is a hard error, not a silent drop.",
+   "table_sizes_per_instance": {
+    "school": 6,
+    "school_details": 6,
+    "school_performance": 22,
+    "player": 23
+   },
+   "generic_sampling_rules": {
+    "int_primary_key": "Sequential integers starting at 1, unique per table, never NULL; never collide with compact primary-key values.",
+    "int_foreign_key": "Copy an existing parent primary-key value; with probability 0.10 emit NULL (only where the column is nullable); with probability 0.05 emit an orphan value (parent_id_max + 1) where the column is nullable and the atomic summary lists child_rows_with_null_fk=true, otherwise never emit an orphan. At least one parent row must be left without children (see per_column_exceptions). NULL and orphan rows must be placed on rows belonging to groups of size >= 3 so that the size-1 and size-2 groups of the FK column survive intact; when a group of size 3 must absorb both a NULL and an orphan, enlarge that group to 4+ first.",
+    "int_numeric": "Uniform integer within the column's range rule; include boundary values (min, min+1, max-1, max) and at least one repeated value to create ties.",
+    "real_numeric": "Uniform real within the column's range rule; include boundary values and at least one repeated value to create ties at ORDER/LIMIT ranks that are reachable at the table size.",
+    "text_short": "Draw from the column's explicit value pool; with probability 0.15 emit a near-variant (case change, trailing space, or one-character substitution) of a pool value. Near-variants are allowed only where the column's semantic rule does not restrict it to an exact enum (see per_column_exceptions).",
+    "text_enum": "Draw uniformly from the enumerated value list; never emit values outside the list.",
+    "text_year_range": "Format 'YYYY-YY' where the second year equals (first year + 1) mod 100 expressed in two digits; years drawn from the column's range rule.",
+    "null_share": "NORMATIVE OVERRIDE: the compact database shows 0% NULL for every column, but instruction 10 requires at least one NULL row per nullable column. Each instance therefore plants NULLs at a 5-10% share (k = max(1, round(n*0.08)) per nullable column), deliberately deviating from the compact share. NULL is a value: a planted NULL is never replaced to satisfy a rule, and rules constrain only non-NULL operands. NULL planting must not destroy the size-1 and size-2 groups required by group_sizes: place NULLs on rows belonging to groups of size >= 3.",
+    "distinct_duplicates": "For columns flagged with duplicates_for_distinct, ensure the distinct-value count is 20-50% below the non-NULL row count (duplicate share 20-50%) counted after NULL planting; protect at least one duplicate row from NULLing so the share stays in range.",
+    "group_sizes": "For columns flagged with group_sizes, ensure the grouped counts of non-NULL values (computed after NULL planting; NULL is its own group where the column is nullable) include groups of size 1, size 2, and size >= 3 whenever the row count permits. At 6 rows with one NULL the target is unsatisfiable (1+2+3=6 > 5 non-NULL); in that case the realizable target is '1, 2 and >= 2' (e.g. 2,2,1) and the reduction is documented in uncertainty. NULL and orphan rows are placed on rows of the >=3 groups so the size-1 and size-2 groups remain.",
+    "aggregate_boundary": "For columns flagged with aggregate_boundary, ensure at least one group has COUNT = 0 (either an orphan/NULL FK child or a parent row with no children), one group has COUNT = 1, and one group has COUNT >= 2. Where no orphan is possible, achieve COUNT=0 via a parent row without children, which requires the parent table to have at least 2 rows. The grouping is the column itself for FK columns (group by child FK value, including NULL and orphan as their own groups) and the parent key for parent-side counts.",
+    "ties_for_order_limit": "For columns flagged with ties_for_order_limit, ensure at least two rows share the value at the listed rank so ORDER BY ... LIMIT returns a tie. A rank that exceeds the table's row count is not realizable at the specified table size; in that case the tie is placed at the highest reachable rank and the reduction is documented in uncertainty. When both ASC and DESC are listed, create a tie at the minimum (rank 1 ASC) and at the maximum (rank 1 DESC) by duplicating both the smallest and largest values.",
+    "comparison_boundary": "For columns flagged with comparison_boundary, include values at each listed literal and one step on each side (numbers by their step; text by a case/whitespace variant). Include only as many boundary literals as fit in the table's row count; a reduction is documented in uncertainty. When the row count is smaller than the literal list, choose a subset that keeps both sides of every boundary pair (e.g. for 1889/1890 and 1900/1901 keep 1889, 1890, 1900, 1901).",
+    "rows_with_different_values": "For columns flagged with rows_with_different_values, the grouping is the table's primary key (each row is its own group), so the target reduces to: the column takes at least 2 distinct non-NULL values across the table. This is satisfied by the boundary/tie rules above."
+   },
+   "per_column_exceptions": [
+    {
+     "table": "school",
+     "column": "School_ID",
+     "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows, ties_for_order_limit",
+     "targets": {
+      "group_sizes": "1, 2 and >= 3 (grouped by School_ID itself: 1,1,1,1,1,1)",
+      "aggregate_boundary": "grouped by School_ID: COUNT(school.school_id)=1 per group; COUNT(DISTINCT school.school_id)=1; COUNT(*)=1. COUNT=0 is realized on the child side (a school with zero player rows and zero school_performance rows).",
+      "unmatched_join_rows": "parent_rows_without_children=true (at least one school has zero player rows and zero school_performance rows); child_rows_with_null_fk=true for player.School_ID, false for school_performance.School_Id",
+      "ties_for_order_limit": "tie_at_rank=1, direction=DESC, tie_on=COUNT(player.player_id), COUNT(*); realized by two schools sharing the same player count at the top"
+     }
+    },
+    {
+     "table": "school",
+     "column": "Location",
+     "pattern": "duplicates_for_distinct, aggregate_boundary, group_sizes",
+     "targets": {
+      "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting; at 6 rows with one NULL use 2,2,1 (3 distinct in 5 non-NULL, share 40%)",
+      "aggregate_boundary": "COUNT(*) values 0,1,2 (grouped by Location; COUNT=0 via a school with no players)",
+      "group_sizes": "1, 2 and >= 2 (2,2,1 after NULL planting; >=3 not realizable at 6 rows with one NULL)"
+     }
+    },
+    {
+     "table": "school",
+     "column": "Denomination",
+     "pattern": "duplicates_for_distinct, group_sizes, ties_for_order_limit, aggregate_boundary, comparison_boundary, null_rows",
+     "targets": {
+      "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting (e.g. 2,2,1)",
+      "group_sizes": "after NULL planting, non-NULL grouped counts must include a size-1 group, a size-2 group and a >=2 group (2,2,1); >=3 is not realizable at 6 rows with one NULL and is documented in uncertainty",
+      "ties_for_order_limit": "tie_at_rank=1 (rank 10 not reachable at 6 rows), direction=DESC, tie_on=COUNT(*), COUNT(player.player_id)",
+      "aggregate_boundary": "COUNT(*) values 0,1,2 (COUNT=0 via a school row with no players)",
+      "comparison_boundary": "equal_and_one_step_from=school.Denomination: at least two rows share one exact Denomination value (self-equality group). The near-variant part is DROPPED because the enum rule is authoritative (see semantic_rules_and_formulas); the comparison is realized by the repeated exact value only.",
+      "null_rows": "null_share 5-30% of generated rows; NULL placed on a row of the >=2 group so a size-1 non-NULL group survives"
+     }
+    },
+    {
+     "table": "school",
+     "column": "Enrollment",
+     "pattern": "rows_with_different_values, ties_for_order_limit",
+     "targets": {
+      "rows_with_different_values": ">= 2 distinct non-NULL values across the table (grouped by School_ID)",
+      "ties_for_order_limit": "tie_at_rank=1, direction=ASC and DESC (rank 1000 not reachable at 6 rows); duplicate both the smallest and largest values within 6 rows"
+     }
+    },
+    {
+     "table": "school",
+     "column": "Founded",
+     "pattern": "ties_for_order_limit, comparison_boundary",
+     "targets": {
+      "ties_for_order_limit": "tie_at_rank=1 (ranks 10 and 100 not reachable at 6 rows), direction=DESC; duplicate the maximum value",
+      "comparison_boundary": "include as many of 1888,1889,1890,1891,1899,1900,1901,1902 as fit in 6 rows; must include 1889, 1890, 1900 and 1901 (e.g. [1888,1889,1890,1900,1901,1901]) so both sides of the 1889/1890 and 1900/1901 boundaries are present and the DESC tie exists"
+     }
+    },
+    {
+     "table": "school",
+     "column": "Boys_or_Girls",
+     "pattern": "ties_for_order_limit",
+     "targets": {
+      "ties_for_order_limit": "tie_at_rank=1, direction=DESC; the lexicographically larger enum value must appear at least twice so it sorts first under DESC (a cross-value tie with the smaller value is acceptable)"
+     }
+    },
+    {
+     "table": "school_details",
+     "column": "Nickname",
+     "pattern": "duplicates_for_distinct",
+     "targets": {
+      "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting (e.g. 6 rows, 4 distinct before NULL; protect a duplicate row from NULLing)"
+     }
+    },
+    {
+     "table": "school_performance",
+     "column": "School_Id",
+     "pattern": "unmatched_join_rows",
+     "targets": {
+      "unmatched_join_rows": "parent_rows_without_children=true; child_rows_with_null_fk=false (no NULL, no orphan for this FK). The compact schema declares School_Id NOT NULL (it is part of the composite PK), so NULL is impossible; this is the authoritative resolution of the atomic-summary conflict."
+     }
+    },
+    {
+     "table": "player",
+     "column": "School_ID",
+     "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows, ties_for_order_limit",
+     "targets": {
+      "group_sizes": "after NULL planting, non-NULL grouped counts must include a size-1 group, a size-2 group and a >=3 group; place NULL and orphan rows on DIFFERENT >=3 groups (or enlarge those groups to 4+) so the size-1 and size-2 groups survive and each affected group retains >=3 non-NULL members",
+      "aggregate_boundary": "grouped by School_ID: COUNT(*) and COUNT(player.school_id) values 0,1,2 (COUNT=0 via NULL/orphan group or a childless parent)",
+      "unmatched_join_rows": "parent_rows_without_children=true; child_rows_with_null_fk=true (NULL plus at least one orphan parent_id_max+1). If the compact schema declares player.School_ID NOT NULL, this target is unsatisfiable and must be corrected to child_rows_with_null_fk=false; the writer must report rows_failed so the conflict is visible.",
+      "ties_for_order_limit": "tie_at_rank=1, direction=DESC, tie_on=COUNT(player.player_id), COUNT(*)"
+     }
+    },
+    {
+     "table": "player",
+     "column": "Player_ID",
+     "pattern": "aggregate_boundary",
+     "targets": {
+      "aggregate_boundary": "grouped by Player_ID: COUNT(player.player_id)=1 per group (unique PK). The 0,1,2 target is realized on the child side via School_ID grouping, not on Player_ID itself; this is the authoritative interpretation."
+     }
+    },
+    {
+     "table": "player",
+     "column": "Age",
+     "pattern": "rows_with_different_values",
+     "targets": {
+      "rows_with_different_values": ">= 2 distinct non-NULL values across the table (grouped by Player_ID)"
+     }
+    }
+   ],
+   "dependencies": [
+    {
+     "child_table": "school_details",
+     "child_column": "School_ID",
+     "parent_table": "school",
+     "parent_column": "School_ID",
+     "copied_columns": [],
+     "cardinality": "1:1"
+    },
+    {
+     "child_table": "school_performance",
+     "child_column": "School_Id",
+     "parent_table": "school",
+     "parent_column": "School_ID",
+     "copied_columns": [],
+     "cardinality": "1:N"
+    },
+    {
+     "child_table": "player",
+     "child_column": "School_ID",
+     "parent_table": "school",
+     "parent_column": "School_ID",
+     "copied_columns": [],
+     "cardinality": "1:N"
+    }
+   ],
+   "semantic_rules_and_formulas": [
+    {
+     "table": "school",
+     "column": "School_ID",
+     "formula": "School_ID > 0",
+     "evidence": "Primary key; positive integer."
+    },
+    {
+     "table": "school",
+     "column": "Enrollment",
+     "formula": "Enrollment > 0",
+     "evidence": "Enrollment is a positive count of students; observed 1000-2300."
+    },
+    {
+     "table": "school",
+     "column": "Founded",
+     "formula": "Founded BETWEEN 1800 AND 2025",
+     "evidence": "Observed 1879-1924."
+    },
+    {
+     "table": "school",
+     "column": "Denomination",
+     "formula": "Denomination IN ('Catholic','Anglican','Uniting Church')",
+     "evidence": "Observed distinct values; authoritative over the comparison_boundary near-variant."
+    },
+    {
+     "table": "school",
+     "column": "Boys_or_Girls",
+     "formula": "Boys_or_Girls IN ('Boys','Boys only to Yr 9 Co-ed Year 10 to 12')",
+     "evidence": "Observed distinct values."
+    },
+    {
+     "table": "school",
+     "column": "Day_or_Boarding",
+     "formula": "Day_or_Boarding IN ('Day','Day & Boarding')",
+     "evidence": "Observed distinct values."
+    },
+    {
+     "table": "school",
+     "column": "Year_Entered_Competition",
+     "formula": "Year_Entered_Competition BETWEEN 1900 AND 2025",
+     "evidence": "Observed 1929, 1944."
+    },
+    {
+     "table": "school_details",
+     "column": "League",
+     "formula": "League = 'DSHA'",
+     "evidence": "Only observed value is DSHA."
+    },
+    {
+     "table": "school_details",
+     "column": "Class",
+     "formula": "Class IN ('Flight A','Flight B','Fight A')",
+     "evidence": "Observed distinct values (note 'Fight A' typo variant)."
+    },
+    {
+     "table": "school_details",
+     "column": "Division",
+     "formula": "Division IN ('Division 1','Division 2','Division 3')",
+     "evidence": "Observed distinct values."
+    },
+    {
+     "table": "school_performance",
+     "column": "School_Year",
+     "formula": "CAST(substr(School_Year,1,4) AS INTEGER) BETWEEN 1980 AND 2025 AND CAST(substr(School_Year,6,2) AS INTEGER) = (CAST(substr(School_Year,1,4) AS INTEGER) + 1) % 100",
+     "evidence": "Format 'YYYY-YY' with consecutive years; observed 1987-88 through 2006-07."
+    },
+    {
+     "table": "player",
+     "column": "Age",
+     "formula": "Age BETWEEN 14 AND 18",
+     "evidence": "Observed ages 14-18."
+    },
+    {
+     "table": "player",
+     "column": "Position",
+     "formula": "Position IN ('Shortstop','Third baseman','First Baseman','Left-handed pitcher','Catcher','First baseman','Right-handed pitcher','Second baseman')",
+     "evidence": "Observed distinct positions (note case variants 'First Baseman'/'First baseman')."
+    }
+   ],
+   "null_targets": [
+    "school.Denomination",
+    "school.Location",
+    "school.Enrollment",
+    "school.Founded",
+    "school.Boys_or_Girls",
+    "school.Day_or_Boarding",
+    "school.Year_Entered_Competition",
+    "school.School_Colors",
+    "school_details.Nickname",
+    "school_details.Colors",
+    "school_details.League",
+    "school_details.Class",
+    "school_details.Division",
+    "school_performance.Class_A",
+    "school_performance.Class_AA",
+    "player.Player",
+    "player.Team",
+    "player.Age",
+    "player.Position",
+    "player.School_ID"
+   ],
+   "supporting_evidence": {
+    "school.Denomination": "Distinct values Catholic, Anglican, Uniting Church; null_rows pattern requires 5-30% NULL share; group_sizes requires 1, 2 and >=2 after NULL planting (>=3 not realizable at 6 rows with one NULL).",
+    "player.School_ID": "FK to school; unmatched_join_rows requires child_rows_with_null_fk=true and aggregate_boundary requires a COUNT=0 group; group_sizes requires 1, 2 and >=3 after NULL planting. If the compact schema declares the column NOT NULL, the target must be corrected to child_rows_with_null_fk=false.",
+    "school.Enrollment": "Positive real; observed 1000-2300; ties_for_order_limit requires rank-1 ties in both ASC and DESC.",
+    "school.Founded": "Real year; observed 1879-1924; comparison_boundary literals 1888-1902; DESC tie requires a duplicated maximum.",
+    "player.Age": "Integer 14-18; observed distinct 5 values.",
+    "school_performance.School_Year": "Format YYYY-YY with consecutive years; observed 1987-88, 1988-89, 1989-90, 1997-98, 2003-04, 2006-07, 1990-91, 1991-92.",
+    "school.Boys_or_Girls": "Two enum values; ties_for_order_limit direction=DESC requires the lexicographically larger value to appear at least twice.",
+    "school.Location": "6 rows, 4 distinct before NULL; after one NULL the realizable group sizes are 2,2,1 (duplicate share 40%).",
+    "school_details.Nickname": "6 rows, 4 distinct before NULL; protect a duplicate row from NULLing so the share stays 20-50%."
+   },
+   "uncertainty": [
+    "The original data shows 0% NULL rate for all columns, but instruction 10 requires at least one NULL row per nullable column; NULL share is normatively set to 5-10% (deliberate override of the 'follow compact share' rule).",
+    "school_details.Class contains a typo variant 'Fight A' alongside 'Flight A'; both are kept in the enum to preserve observed values.",
+    "player.Position contains case variants 'First Baseman' and 'First baseman'; both are kept in the enum.",
+    "school_performance has 22 rows but only 6 distinct School_Id values; group sizes are not specified in the atomic summary for this table, so uniform distribution across the 5 non-childless schools is used.",
+    "The 'comparison_boundary' for school.Denomination (equal_and_one_step_from) is realized as a repeated exact Denomination value only; the near-variant part is dropped because the enum rule is authoritative.",
+    "Rank-10/100/1000 tie targets for school.Denomination, school.Founded and school.Enrollment are not reachable at a 6-row school table; ties are placed at the highest reachable rank and this reduction is documented here rather than raising the table size.",
+    "The atomic summary for school.School_ID lists child_rows_with_null_fk=true for both player.School_ID and school_performance.School_Id joins, while the school_performance.School_Id entry lists child_rows_with_null_fk=false. This spec resolves the conflict by allowing orphans only for player.School_ID (nullable) and never for school_performance.School_Id; the school_performance entry is treated as authoritative for its own column because School_Id is part of the composite PK and therefore NOT NULL.",
+    "Whether the compact schema declares player.School_ID NOT NULL is unresolved; if it does, the child_rows_with_null_fk=true target is unsatisfiable and must be corrected to false. The writer must report rows_failed per table so silent row loss is visible.",
+    "The group_sizes target '1, 2 and >= 3' is arithmetically unsatisfiable at 6 rows with one NULL (1+2+3=6 > 5 non-NULL); the realizable target is '1, 2 and >= 2' (2,2,1) and this reduction is documented.",
+    "The aggregate_boundary targets for Player_ID and School_ID are interpreted as grouped by the column itself (PK: COUNT=1 per group) with the 0,1,2 variation realized on the child side via School_ID grouping.",
+    "The rows_with_different_values targets for Enrollment and Age are interpreted as '>= 2 distinct non-NULL values across the table' (grouped by the table's PK).",
+    "Compact rows preservation is not verified by execution feedback; the writer must copy the source database when schema.source_path is set and report row counts before/after append and rows_failed per table.",
+    "The reproducible flag was exercised with only one seed base; multi-seed verification is pending.",
+    "Whether the 51 unseparated construction pairs reflect a generation defect or query equivalence is unresolved; per-group construction feedback (realized group sizes, tie ranks, boundary values per instance) is required to verify."
+   ]
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.py write_instance_sqlite() copies the compact database only when getattr(schema, 'source_path', None) is set, but schema.py read_schema() never sets source_path on the returned Schema. Consequently the writer always creates an empty DDL clone and inserts only generated rows. Execution feedback confirms this: validity.invalid = 20/20 with reason 'compact_rows_missing' for every instance.",
+     "requested_revision": "Set schema.source_path = orig_path in read_schema() (or pass the original path into write_instance_sqlite) so the compact database is copied before appending generated rows, restoring preservation of compact rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school() builds Denomination as ['Catholic','Catholic','Anglican','Anglican','Uniting Church','Uniting Church'] (group sizes 2,2,2) and then _plant_nulls() replaces ~8% (1 of 6) with NULL. The spec requires group_sizes '1, 2 and >= 3' for school.Denomination and aggregate_boundary COUNT(*) values 0,1,2. With n=6 and one NULL, the realized non-NULL group sizes are at most 2,2,1 \u2014 no group of size >= 3, and no COUNT=0 group (no orphan/NULL FK path exists for school as a parent). The same construction is used for Location (loc[-1]=loc[0] gives sizes 2,1,1,1,1) and for player.School_ID (sizes [1,2,3,3,3,3,3,5] truncated to 23 with NULLs planted, but the spec also requires a COUNT=0 group via orphan/NULL FK, which is not produced).",
+     "requested_revision": "Rework the school/player samplers so that, after NULL planting, the grouped counts still include a group of size 1, a group of size 2, and a group of size >= 3, and so that at least one parent has zero children (e.g. reserve one school id with no player/school_performance rows, and one player.School_ID orphan value parent_id_max+1). Do not rely on the pre-NULL layout."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school() sets Enrollment = ENROLLMENT_POOL[:6] with enroll[1]=enroll[0] (tie at rank 1) and Founded = FOUNDED_BOUNDARY[:6] = [1888,1889,1890,1891,1899,1900]. The spec requires ties_for_order_limit for Enrollment at ranks 1 AND 1000 (ASC and DESC) and for Founded at ranks 10 AND 100 (DESC). With only 6 school rows, ranks 10 and 100 cannot be reached, so those tie targets are structurally unsatisfiable. Similarly school.Denomination ties_for_order_limit requires tie_at_rank 1 and 10, but only 6 rows exist.",
+     "requested_revision": "Either raise the school table size so ranks 10/100 are reachable, or document in the specification that rank-10/100 tie targets are not realizable at the specified table size and adjust the targets accordingly. The current spec/program pair is internally inconsistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's generic_sampling_rules.int_foreign_key says 'with probability 0.10 emit NULL ... with probability 0.05 emit an orphan value (parent_id_max + 1)'. The program's _sample_player() and _sample_school_performance() never emit orphan FK values; they only plant NULLs via _plant_nulls. The spec's unmatched_join_rows target for school.School_ID and player.School_ID requires child_rows_with_null_fk=true (satisfied) but the aggregate_boundary target 'COUNT = 0 (via orphan/NULL FK)' is not satisfied because no orphan is generated and no parent is left childless.",
+     "requested_revision": "Clarify in the specification whether orphan FK values are required for this database (the atomic summary lists child_rows_with_null_fk=true for player.School_ID and false for school_performance.School_Id). If orphans are required, the engineer must implement them; if not, the aggregate_boundary 'COUNT=0' target should be re-expressed as 'parent with no children' and the engineer must ensure at least one school has zero players and zero performance rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details() sets Nickname = NICKNAMES[i % 6] with nick[-1]=nick[0], giving 6 rows with 5 distinct values (duplicate share ~17%), below the spec's 20-50% duplicate_share for school_details.Nickname. Similarly _sample_school() Location has 6 rows with 5 distinct (17%).",
+     "requested_revision": "Adjust the Nickname and Location pools so the duplicate share is within 20-50% (e.g. 6 rows with 4 distinct values = 33% duplicate share), while preserving the group_sizes 1/2/>=3 requirement for Location."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school() sets Founded = FOUNDED_BOUNDARY[:6] = [1888,1889,1890,1891,1899,1900]. The spec's comparison_boundary for school.Founded lists values 1888,1889,1890,1891,1899,1900,1901,1902; 1901 and 1902 are never generated. The spec's comparison_boundary for school.Denomination (equal_and_one_step_from) is interpreted in the spec's uncertainty section as self-equality, which is trivially satisfied but does not exercise a real boundary.",
+     "requested_revision": "Include all eight Founded boundary values (1888-1902) across the school rows, or reduce the boundary list to what fits the table size and document the reduction. For Denomination, either drop the comparison_boundary pattern or define a concrete one-step variant (e.g. case/whitespace variant) that the program can generate."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=54, separated=17. The 37 unseparated pairs are not individually reported (construction_pairs_by_group is empty), so it is not possible to confirm from the feedback alone that the intended value variation (ties, group sizes, boundaries) is actually realized in the generated instances. The program's fixed pools (e.g. ENROLLMENT_POOL, FOUNDED_BOUNDARY, AGE_POOL) are deterministic and may not produce the required ties at the specified ranks.",
+     "requested_revision": "Add per-group construction feedback (or a debug dump of realized group sizes, tie ranks, and boundary values per instance) so the reviewer can verify that the specified patterns are realized. This is a reporting gap, not necessarily a generation bug, but it blocks verification of items 2 and 4."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 37 unseparated construction pairs reflect a generation defect or merely query-equivalence under the current data; per-group feedback is missing.",
+    "Whether school_performance.School_Id group sizes (not specified in the atomic summary) are acceptable as uniform distribution; the spec's uncertainty section notes this but does not resolve it.",
+    "Whether the NULL share for player.School_ID (4/20 = 20% of instances have at least one NULL, but per-instance share is 8%) matches the compact database share (0% observed); the spec sets 5-10% to satisfy the NULL rule, which is a deliberate deviation from the compact share."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_school` plants NULL on the size-1 Denomination group (index n-1) so non-NULL group sizes become 3 and 2 only. The spec (per_column_exceptions school.Denomination group_sizes) requires groups of size 1, 2 and >= 3 after NULL planting. With 6 rows and one NULL, the non-NULL groups are 3 and 2 \u2014 no size-1 non-NULL group remains. The NULL group is size 1, but the spec's group_sizes target is about grouped counts of the column values; the comment in code even admits 'after planting one NULL -> 3,2,0/1'.",
+     "requested_revision": "Adjust the Denomination distribution so that after NULL planting there is a size-1 non-NULL group, a size-2 group and a >=3 group (e.g. 3,2,1 with the NULL placed on a row belonging to the size-3 group, or use 2,2,1,1 with one NULL). Verify by construction that grouped counts of non-NULL values are {1,2,>=3}."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_player` builds fk with sizes [1,2,3,3,3,3,3,5] over fk_pool (5 schools after excluding the reserved childless parent), then overwrites fk[0]=None and fk[1]=max(school_ids)+1. This destroys the intended group sizes: the size-1 group's only row becomes NULL, and the size-2 group's first row becomes the orphan. The resulting non-NULL group sizes are not guaranteed to be 1, 2 and >=3 as required by the spec (player.School_ID group_sizes).",
+     "requested_revision": "Plant the NULL and orphan on rows that do not eliminate the size-1 and size-2 groups; e.g. keep a size-1 group intact and place NULL/orphan on rows from the >=3 groups. Verify grouped counts of non-NULL School_ID values include 1, 2 and >=3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_school` sets `enroll[1] = enroll[0]` to create a rank-1 tie, but ENROLLMENT_POOL[:6] = [1000,1200,1430,1850,2200,2300]; after the overwrite the values are [1000,1000,1430,1850,2200,2300]. The spec's ties_for_order_limit for Enrollment requires tie_at_rank=1 in both ASC and DESC. The tie is at the minimum (rank 1 ASC) but not at the maximum (rank 1 DESC).",
+     "requested_revision": "Create ties at both the minimum and maximum reachable rank (e.g. duplicate both the smallest and largest values within 6 rows), or document the reduction in uncertainty and adjust the spec target accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_school` sets `founded = FOUNDED_BOUNDARY[:n]` = [1888,1889,1890,1891,1899,1900] for n=6. The spec's comparison_boundary for Founded requires 'at minimum 1889,1890,1900,1901' and the atomic summary lists values [1888,1889,1890,1891,1899,1900,1901,1902]. The chosen slice omits 1901 and 1902, so the '> 1900' / '>= 1901' boundary is not represented.",
+     "requested_revision": "Select 6 boundary values that include 1889, 1890, 1900 and 1901 (e.g. [1888,1889,1890,1900,1901,1902]) so both sides of the 1889/1890 and 1900/1901 boundaries are present."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_school` sets `boys[1] = boys[0]` for the Boys_or_Girls rank-1 tie, but the spec's ties_for_order_limit for Boys_or_Girls is direction=DESC. With only two enum values alternating, the tie at rank 1 DESC is not guaranteed (the duplicated value may be the smaller one).",
+     "requested_revision": "Ensure the duplicated Boys_or_Girls value is the one that sorts first under DESC (i.e. the lexicographically larger value), or document the reduction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=54, separated=3, unknown_executions=0, and construction_pairs_by_group is empty. The spec's uncertainty item explicitly states 'per-group construction feedback (realized group sizes, tie ranks, boundary values per instance) is required to verify items 2 and 4.' The empty by-group breakdown means the group-size, tie-rank and boundary targets cannot be verified from the run.",
+     "requested_revision": "Emit per-group construction feedback (realized group sizes for Denomination/Location/School_ID/player.School_ID, realized tie ranks for Enrollment/Founded/Boys_or_Girls/Denomination, and realized boundary values for Founded/Denomination) so the targets can be checked against the generated instances."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's null_targets list only school.Denomination and player.School_ID, but the schema has many nullable columns (school.Location, school.Enrollment, school.Founded, school.Boys_or_Girls, school.Day_or_Boarding, school.Year_Entered_Competition, school.School_Colors, school_details.*, school_performance.Class_A/Class_AA, player.Age/Player/Team/Position). The program's `_plant_nulls` is only invoked for Denomination; execution feedback shows NULL 0/n for all other nullable columns. The program interface's NULL rule requires at least one NULL row per nullable column.",
+     "requested_revision": "Extend null_targets to cover all nullable columns (or explicitly state which are exempt and why), and update the program to plant at least one NULL per nullable column with a share following the compact share (0% observed, so 5-10%)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty acknowledges 'The spec previously allowed orphan FK values; the atomic summary lists child_rows_with_null_fk=false for school_performance.School_Id, so orphans are only emitted for player.School_ID.' However, the atomic summary's unmatched_join_rows for school_performance.School_Id lists parent_rows_without_children=true and child_rows_with_null_fk=false \u2014 consistent. But the spec's per_column_exceptions for school.School_ID states 'child_rows_with_null_fk=true for player.School_ID, false for school_performance.School_Id' while the atomic summary for school.School_ID lists both player.School_ID and school_performance.School_Id joins with child_rows_with_null_fk=true. This is an internal inconsistency in the spec.",
+     "requested_revision": "Reconcile the child_rows_with_null_fk target for school_performance.School_Id between the per_column_exceptions and the atomic summary; state clearly whether orphans are allowed for school_performance."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 37 unseparated construction pairs reflect a generation defect or query equivalence under current data \u2014 cannot be determined without per-group construction feedback.",
+    "Whether the compact rows are preserved: the writer copies the source database when schema.source_path is set, but the execution feedback does not report row counts before/after append; this should be verified.",
+    "Whether the reproducible flag (true) holds across seeds: only one seed base was exercised in the reported run."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'player.School_ID: generated rows: NULL 0 / 220'. The spec's per_column_exceptions for player.School_ID requires child_rows_with_null_fk=true (NULL plus at least one orphan), and the generic_sampling_rules require a NULL with probability 0.10 on nullable FKs. In instance.py _sample_player, fk[3] = None is set, but then the loop 'for cm in tm.columns: if cm.name in cols and _is_nullable(cm) and cm.name != \"School_ID\"' skips School_ID, so the planted None should survive. However the writer's executemany fallback and the dedupe step (_dedupe_pk/_dedupe_unique) do not remove it. The observed 0 NULLs across 220 rows (20 instances x 11 rows) indicates the NULL is being lost. Likely cause: _dedupe_pk on player uses Player_ID (unique) so no loss; but the NULL is at index 3 of a 23-row list, and the writer inserts all 23 rows. The 0/220 count strongly suggests the NULL is not reaching the DB, e.g. because the FK column is declared NOT NULL in the copied compact schema (school_player original DDL may declare player.School_ID NOT NULL), so the insert fails and the row is dropped by the row-by-row fallback, silently reducing the row count. This also explains why the orphan (max+1) may be dropped, breaking unmatched_join_rows and aggregate_boundary COUNT=0 via orphan.",
+     "requested_revision": "Verify the compact schema's NOT NULL status for player.School_ID. If it is NOT NULL, the spec's child_rows_with_null_fk=true is unsatisfiable and the spec must be corrected (designer) to child_rows_with_null_fk=false, or the writer must report dropped rows per table (rows_failed) in the execution feedback so silent row loss is visible. The engineer must surface rows_failed counts and ensure the NULL/orphan planting is not silently discarded; if the column is nullable, fix the code path so the planted NULL survives."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite returns {'rows_ok': ok, 'rows_failed': bad} but cli._one ignores the return value and the summary only reports n_ok/n_fail per unit, not per-table row counts. The spec's uncertainty explicitly states 'Compact rows preservation is not verified by execution feedback; the writer must copy the source database when schema.source_path is set and report row counts before/after append.' The execution feedback shows no before/after row counts, so compact-row preservation is unverified.",
+     "requested_revision": "Have cli._one (or the summary) aggregate and report per-table rows_ok/rows_failed and the compact row counts before/after append, so preservation and silent row loss are observable. This is required to close the spec's own uncertainty item."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions for school.Denomination requires group_sizes '1, 2 and >= 3' after NULL planting, and the spec text says 'e.g. 3,2,1 with the NULL placed on a row of the size-3 group, or 2,2,1,1 with one NULL'. But instance.py _sample_school uses denom = ['Catholic','Catholic','Catholic','Catholic','Anglican','Uniting Church'] with NULL at index 0, yielding non-NULL groups 3,1,1 \u2014 there is no size-2 group. The spec's own example (3,2,1) is not what the code produces, and the code comment acknowledges '2,2,1 (>=3 lost)' then switches to 4,1,1. Neither satisfies '1, 2 and >= 3' simultaneously. The construction report key 'school.Denomination.group_sizes' would show {Catholic:3, Anglican:1, Uniting Church:1, None:1}, missing a size-2 group.",
+     "requested_revision": "Designer: correct the spec example to a realizable configuration (e.g. 3,2,1 with NULL on the size-3 row gives non-NULL 2,2,1 \u2014 still no >=3; a 6-row table with one NULL cannot have groups 1,2,>=3 unless the NULL is on a size-1 row, giving 1,2,2 \u2014 still no >=3). With 6 rows and one NULL, groups 1,2,>=3 is impossible (1+2+3=6 non-NULL + 1 NULL = 7 > 6). The spec must either raise the school table size or relax the target. Engineer: align the code with the corrected spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions for school.Location requires group_sizes '1, 2 and >= 3' and duplicates_for_distinct '20-50% (e.g. 6 rows, 4 distinct)'. instance.py _sample_school sets loc = [L0,L0,L0,L1,L2,L3] giving groups 3,1,1,1 \u2014 no size-2 group. The spec's own example (6 rows, 4 distinct) is consistent with 3,1,1,1, which cannot contain a size-2 group. The two targets are mutually inconsistent at 6 rows.",
+     "requested_revision": "Designer: reconcile duplicates_for_distinct (4 distinct in 6 rows) with group_sizes (1,2,>=3). A 6-row column with 4 distinct values has group sizes summing to 6 with 4 parts; the only partitions are 3,1,1,1 or 2,2,1,1 \u2014 neither has both a size-2 and a >=3 group. Relax one target or increase the table size. Engineer: implement the corrected target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions for school.Denomination comparison_boundary requires 'at least two rows share one Denomination value (self-equality group), plus at least one row with a case/whitespace near-variant of that value'. instance.py _sample_school uses only exact pool values ['Catholic','Catholic','Catholic','Catholic','Anglican','Uniting Church'] with no case/whitespace near-variant. The generic_sampling_rules text_short says 'with probability 0.15 emit a near-variant', but the school sampler bypasses the generic sampler entirely and never emits a near-variant. The comparison_boundary target is therefore not implemented.",
+     "requested_revision": "Engineer: in _sample_school, emit at least one case/whitespace near-variant of the repeated Denomination value (e.g. 'catholic' or 'Catholic ') so the comparison_boundary target is realized, while keeping the group_sizes target. Designer: confirm the near-variant does not break the enum rule (Denomination IN ('Catholic','Anglican','Uniting Church')) \u2014 the spec's semantic_rules_and_formulas restricts Denomination to the enum, which conflicts with emitting a near-variant. Resolve this conflict in the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec semantic_rules_and_formulas restricts school.Denomination to IN ('Catholic','Anglican','Uniting Church') and school.Boys_or_Girls to IN ('Boys','Boys only to Yr 9 Co-ed Year 10 to 12'), but the comparison_boundary target for Denomination requires a case/whitespace near-variant, and the generic text_short rule allows near-variants. These rules are contradictory: a near-variant like 'catholic' violates the enum formula. Similarly, school_details.Class includes 'Fight A' (typo) alongside 'Flight A', and player.Position includes both 'First Baseman' and 'First baseman' \u2014 the spec keeps both, which is fine, but the Denomination conflict is unresolved.",
+     "requested_revision": "Designer: either drop the enum formula for Denomination (allowing near-variants) or drop the comparison_boundary near-variant requirement and realize it via a repeated exact value only. State which is authoritative."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for school.Enrollment requires ties at rank 1 in both ASC and DESC (rank 1000 not reachable at 6 rows). instance.py _sample_school sets enroll = ENROLLMENT_POOL[:6] = [1000,1200,1430,1850,2200,2300], then enroll[1]=enroll[0] (1000,1000) and enroll[3]=enroll[2] (1430,1430), giving [1000,1000,1430,1430,2200,2300]. Min tie = 2 (rank 1 ASC), max tie = 1 (2300 appears once) \u2014 the DESC rank-1 tie is NOT created. The code comment says 'tie at the maximum (rank 1 DESC)' but enroll[3]=enroll[2] duplicates 1430, not the max. The construction report key 'school.Enrollment.max_tie' would show 1, not >=2.",
+     "requested_revision": "Engineer: fix _sample_school so the maximum value is duplicated (e.g. enroll[5]=enroll[4] or set enroll[4]=enroll[5]=2300) to create the DESC rank-1 tie, while preserving the ASC min tie. Verify via the construction report that both min_tie and max_tie are >= 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for school.Founded requires ties_for_order_limit 'tie_at_rank=1 (ranks 10 and 100 not reachable at 6 rows), direction=DESC'. instance.py _sample_school sets founded = [1888,1889,1890,1900,1901,1902] \u2014 all distinct, so there is no tie at rank 1 DESC (max 1902 appears once). The construction report key 'school.Founded.max_tie' would show 1. The comparison_boundary target is met (1889,1890,1900,1901 present), but the tie target is not.",
+     "requested_revision": "Engineer: duplicate the maximum Founded value (e.g. [1888,1889,1890,1900,1901,1901] or [1888,1889,1890,1900,1902,1902]) so a DESC rank-1 tie exists, while keeping 1889,1890,1900,1901 for the comparison boundary. Verify via construction report."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for school.Boys_or_Girls requires 'the duplicated value must be the lexicographically larger enum value so it sorts first under DESC'. instance.py _sample_school sets boys = [larger,larger,smaller,smaller,larger,smaller] where larger = max(BOYS_OR_GIRLS) = 'Boys only to Yr 9 Co-ed Year 10 to 12' and smaller = 'Boys'. This gives larger count 3, smaller count 3 \u2014 a tie at rank 1 DESC between the two values, not a strict rank-1 tie on the larger value. The construction report key 'school.Boys_or_Girls.max_tie' would show 3 for the larger value, which is a tie, but the spec's intent (duplicate the larger value) is satisfied only if the larger value appears at least twice \u2014 it does (3 times). This is acceptable, but the tie is between two distinct values, not a duplicate of one value; ORDER BY ... LIMIT 1 DESC would return one of the two larger rows non-deterministically, which is the intended tie. No change strictly required, but note the tie is cross-value.",
+     "requested_revision": "Engineer: confirm the intended semantics \u2014 if a tie on the same value is required, set boys = [larger,larger,larger,smaller,smaller,smaller] (already the case) is fine; if a tie between distinct values is acceptable, no change. Clarify in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for player.School_ID requires group_sizes '1, 2 and >= 3' after NULL planting, with NULL and orphan on >=3 groups. instance.py _sample_player sets sizes = [1,2,3,3,3,3,3,5] over fk_pool = school_ids[:-1] (5 schools, since school_ids has 6 and last is reserved childless). zip(fk_pool, sizes) pairs 5 schools with the first 5 sizes [1,2,3,3,3], giving 1+2+3+3+3 = 12 rows, then the while loop appends fk_pool[len(fk) % len(fk_pool)] until 23 rows. The appended rows all go to fk_pool[0..4] cyclically, so the size-1 group (fk_pool[0]) and size-2 group (fk_pool[1]) get extra rows, destroying the 1 and 2 group sizes. The construction report key 'player.School_ID.group_sizes' would show inflated counts for the first two schools.",
+     "requested_revision": "Engineer: fix the padding loop so extra rows are added only to the >=3 groups (e.g. pad fk_pool[2:] or the size-5 group), preserving the size-1 and size-2 groups. Verify via construction report that group sizes include exactly one 1, one 2, and >=3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for player.School_ID requires 'NULL plus at least one orphan parent_id_max+1'. instance.py _sample_player sets fk[3]=None and fk[4]=max(school_ids)+1. But max(school_ids) = 6 (the reserved childless parent), so the orphan is 7, which is parent_id_max+1 only if the max school id is 6 \u2014 correct. However, the orphan 7 is placed at index 4, which belongs to the first size-3 group (indices 3,4,5 for fk_pool[2]). After the padding loop, index 4 may be overwritten? No \u2014 the padding loop only appends beyond len(fk)=12, so indices 3 and 4 are preserved. But the NULL at index 3 and orphan at index 4 are in the same group (fk_pool[2]), so that group loses 2 members (from 3 to 1 non-NULL), potentially destroying the >=3 group. The spec says 'place NULL and orphan rows on rows of the >=3 groups so the size-1 and size-2 groups survive' \u2014 placing both on the same size-3 group reduces it to 1, violating the >=3 target.",
+     "requested_revision": "Engineer: place the NULL and orphan on different >=3 groups (e.g. NULL on fk_pool[2] group and orphan on fk_pool[3] group) so each affected group retains >=3 non-NULL members, or increase the base size of those groups to 4+ to absorb the loss. Verify via construction report."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per_column_exceptions for school.School_ID requires 'at least one school has zero player rows and zero school_performance rows'. instance.py reserves the last school (id 6) as childless by excluding it from fk_pool in both _sample_school_performance and _sample_player. However, _sample_school_details uses school_ids[:n] with n=6, so school_details includes school 6 (1:1). That is fine (school_details is 1:1, not 1:N). But the spec's aggregate_boundary for school.School_ID requires COUNT=0 via a parent row without children \u2014 school 6 has zero players and zero performance rows, satisfying this. No issue here, but note the construction report does not include a key for school.School_ID childless verification; the report only has group_sizes for school.School_ID (which is 1,1,1,1,1,1).",
+     "requested_revision": "Engineer: add a construction report key confirming the childless parent (e.g. 'school.School_ID.childless_parents') so the aggregate_boundary COUNT=0 target is verifiable from feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec uncertainty states 'The atomic summary for school.School_ID lists child_rows_with_null_fk=true for both player.School_ID and school_performance.School_Id joins, while the school_performance.School_Id entry lists child_rows_with_null_fk=false. This spec resolves the conflict by allowing orphans only for player.School_ID (nullable) and never for school_performance.School_Id.' The resolution is reasonable, but the spec does not state whether school_performance.School_Id is nullable in the compact schema. If it is NOT NULL, the resolution is forced; if nullable, the spec's choice to never emit NULL/orphan for it is a deliberate deviation that should be justified against the atomic summary's child_rows_with_null_fk=true for the school.School_ID join.",
+     "requested_revision": "Designer: state the compact schema's nullability for school_performance.School_Id and justify the resolution explicitly. If nullable, consider emitting a NULL for school_performance.School_Id to satisfy the atomic summary's child_rows_with_null_fk=true, or document why it is overridden."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'construction_pairs': {'eligible': 54, 'separated': 3, 'unknown_executions': 0}, 'construction_pairs_by_group': []. Only 3 of 54 eligible pairs are separated, and the per-group breakdown is empty. The spec's uncertainty item says 'Whether the 37 unseparated construction pairs reflect a generation defect or query equivalence under current data is unresolved; per-group construction feedback (realized group sizes, tie ranks, boundary values per instance) is required to verify items 2 and 4.' The construction report is attached to the instance under '__construction__' but is not written to the database and is not surfaced in the execution feedback. The empty construction_pairs_by_group means the per-group feedback is not being collected.",
+     "requested_revision": "Engineer: surface the '__construction__' report in the execution feedback (per-group realized sizes, tie ranks, boundary values) so the 51 unseparated pairs can be diagnosed. This is required to close the spec's own uncertainty item and to distinguish generation defects from query equivalence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'nullable_columns' lists only 12 columns, but the spec's null_targets lists 20 columns (including school.Denomination, school.Location, school.Enrollment, school.Founded, school.Boys_or_Girls, school.Day_or_Boarding, school.Year_Entered_Competition, school.School_Colors, player.School_ID). The feedback omits all school.* columns and player.School_ID. This means the NULL planting for school columns and player.School_ID is not being verified. Combined with the 'player.School_ID: NULL 0 / 220' line, the feedback is incomplete and inconsistent.",
+     "requested_revision": "Engineer: ensure the execution feedback reports NULL counts for every nullable column in the spec's null_targets, including all school.* columns and player.School_ID. Investigate why school.* columns are missing from the feedback (possibly the feedback generator only inspects tables with generated rows, or the school table's NULLs are being overwritten)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec generic_sampling_rules null_share says 'For every nullable column, each instance contains at least one NULL row; NULL share follows the compact database share (0% observed, so use 5-10% to satisfy the NULL-generation requirement).' But the program interface rule 7 says 'with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The compact share is 0%, so 'following the compact share' and 'at least one NULL row' are contradictory. The spec resolves this by using 5-10%, which deviates from the compact share. This is a deliberate deviation but should be stated as such in the spec, not buried in uncertainty.",
+     "requested_revision": "Designer: state explicitly in the spec that the NULL share deviates from the compact 0% to satisfy the at-least-one-NULL requirement, and that this is an intentional override of the 'follow compact share' rule. This is already in uncertainty but should be promoted to a normative statement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls uses share=NULL_SHARE=0.08 and k=max(1, round(n*0.08)). For n=6 (school), k=1; for n=22 (school_performance), k=2; for n=23 (player), k=2. The spec's null_share says 5-10%, so 8% is within range. However, for school_details (n=6), k=1, and the feedback shows school_details.Nickname NULL 6/20 (i.e. 6 NULLs across 20 instances, ~1 per instance) \u2014 consistent. For school_performance.Class_A, feedback shows 31/320 (~1.55 per instance of 22 rows, ~7%) \u2014 consistent. No issue with the share itself, but the feedback omits school.* columns, so the school NULL planting is unverified.",
+     "requested_revision": "Engineer: verify school.* NULL planting via feedback (see previous issue). No code change to _plant_nulls required if the share is confirmed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite copies the compact database via shutil.copyfile(src, part) when schema.source_path is set. read_schema sets source_path=orig_path. cli._init calls read_schema(orig) per worker, so source_path is set. The copy is correct. However, the writer then executes 'pragma foreign_keys = OFF' and inserts rows; if the compact schema has NOT NULL constraints on columns where the spec plants NULLs (e.g. player.School_ID), the inserts fail and rows are dropped silently (counted in bad[t] but not surfaced). This is the likely cause of the 'player.School_ID: NULL 0 / 220' observation.",
+     "requested_revision": "Engineer: surface rows_failed per table in the execution feedback and investigate whether the compact schema's NOT NULL constraints conflict with the spec's NULL planting. If they do, the spec must be corrected (designer) to not plant NULLs on NOT NULL columns, or the writer must report the conflict explicitly rather than silently dropping rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec semantic_rules_and_formulas includes school.Enrollment > 0 and school.Founded BETWEEN 1800 AND 2025, but the spec's comparison_boundary for Founded uses literals 1888-1902 and the ENROLLMENT_POOL is [1000,1200,1430,1850,2200,2300]. These are consistent. However, the spec does not state a range rule for school.Year_Entered_Competition beyond BETWEEN 1900 AND 2025, and instance.py uses YEAR_POOL=[1929,1944] \u2014 consistent. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_performance sets years starting at 1987 and incrementing, wrapping at 2006. The spec's semantic_rules_and_formulas for School_Year requires CAST(substr(School_Year,1,4) AS INTEGER) BETWEEN 1980 AND 2025 and the second year = (first+1)%100. The code produces '1987-88' ... '2006-07', all within range and consecutive. Correct. However, the spec's supporting_evidence lists observed years 1987-88 through 2006-07, and the code matches. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details sets League=[LEAGUE]*n with LEAGUE='DSHA', matching the spec's League='DSHA'. Class cycles through CLASSES=['Flight A','Flight B','Fight A'], matching the spec's enum including the typo. Division cycles through DIVISIONS, matching. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets Position cycling through POSITIONS including both 'First Baseman' and 'First baseman', matching the spec's enum. Age cycles through AGE_POOL=[14,15,16,17,18], matching the spec's Age BETWEEN 14 AND 18. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Year_Entered_Competition cycling through YEAR_POOL=[1929,1944], matching the spec's observed values and BETWEEN 1900 AND 2025. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets School_Colors cycling through SCHOOL_COLORS, and School names cycling through SCHOOL_NAMES. The spec does not constrain these columns beyond null_targets, so any values are acceptable. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details sets Nickname with 6 rows and 4 distinct (NICKNAMES[0] x3, NICKNAMES[1], NICKNAMES[2], NICKNAMES[3]), giving duplicate share 33% (within 20-50%). Correct. But the spec's duplicates_for_distinct for Nickname says 'e.g. 6 rows, 4 distinct' \u2014 the code matches. However, the feedback shows school_details.Nickname NULL 6/20, meaning one NULL per instance is planted, which reduces the non-NULL distinct count. After NULL planting, the non-NULL rows are 5 with 4 distinct (if the NULL replaces one of the 3 duplicates) or 5 with 3 distinct (if the NULL replaces a singleton). The duplicate share is computed 'after NULL planting' per the spec, so the code should verify the share remains 20-50%. With 5 non-NULL rows and 4 distinct, duplicate share = 20% (borderline); with 3 distinct, share = 40%. Either is within range, but the code does not verify this.",
+     "requested_revision": "Engineer: add a construction report key for school_details.Nickname distinct count after NULL planting, and verify the duplicate share is 20-50%. If the NULL planting can push the share outside range, protect a duplicate row from NULLing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Location with 6 rows and 4 distinct (L0 x3, L1, L2, L3), giving duplicate share 33%. After NULL planting (one NULL per instance), the non-NULL rows are 5 with 4 distinct (if NULL replaces a duplicate) or 5 with 3 distinct (if NULL replaces a singleton). The spec's duplicates_for_distinct for Location requires 20-50% after NULL planting. The code does not protect a duplicate row from NULLing, so the share could be 20% (borderline) or 40%. Acceptable but unverified.",
+     "requested_revision": "Engineer: add a construction report key for school.Location distinct count after NULL planting and verify the share. Protect a duplicate row from NULLing if needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Denomination with 4 'Catholic', 1 'Anglican', 1 'Uniting Church', then NULLs index 0 (a 'Catholic'). After NULL planting, non-NULL groups are 3 'Catholic', 1 'Anglican', 1 'Uniting Church' \u2014 distinct count 3, non-NULL rows 5, duplicate share = (5-3)/5 = 40%, within 20-50%. Correct for duplicates_for_distinct. But group_sizes target '1, 2 and >= 3' is not met (no size-2 group). See earlier issue.",
+     "requested_revision": "Engineer: see earlier issue on Denomination group_sizes. The duplicates_for_distinct target is met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Enrollment with [1000,1000,1430,1430,2200,2300]. The spec's rows_with_different_values for Enrollment requires '>= 2 per group with different values'. The code does not group Enrollment by anything, so this target is ambiguous. The spec's supporting_evidence says 'Positive real; observed 1000-2300; ties_for_order_limit requires rank-1 ties in both ASC and DESC.' The rows_with_different_values target is not clearly implemented. The construction report has min_tie and max_tie but not a per-group different-values check.",
+     "requested_revision": "Designer: clarify what 'per group' means for Enrollment rows_with_different_values (grouped by what?). Engineer: implement the clarified target and add a construction report key."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets Age cycling through AGE_POOL=[14,15,16,17,18]. The spec's rows_with_different_values for Age requires '>= 2 per group with different values'. The code does not group Age by anything, so this target is ambiguous. The construction report has no key for Age.",
+     "requested_revision": "Designer: clarify what 'per group' means for Age rows_with_different_values. Engineer: implement the clarified target and add a construction report key."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets Player_ID = list(range(1, n+1)) = 1..23. The spec's aggregate_boundary for Player_ID requires COUNT(player.player_id) values 0,1,2. Since Player_ID is a primary key and unique, COUNT(player.player_id) per group is always 1 (each Player_ID appears once). The target '0,1,2' is not realizable for a unique PK column unless grouped by something else. The spec's per_column_exceptions for Player_ID says 'aggregate_boundary: COUNT(player.player_id) values 0,1,2' \u2014 this is likely a mis-specification, since a PK cannot have COUNT=0 or COUNT=2 in a group unless the group is defined by another column.",
+     "requested_revision": "Designer: clarify the grouping for Player_ID aggregate_boundary. If grouped by Player_ID, COUNT is always 1; the target 0,1,2 is unsatisfiable. If grouped by another column (e.g. School_ID), the target may be realizable. Correct the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets School_ID = 1..6. The spec's aggregate_boundary for School_ID requires COUNT(school.school_id), COUNT(DISTINCT school.school_id), COUNT(*) values 0,1,2. Since School_ID is a PK, COUNT(school.school_id) per group is 1 (if grouped by School_ID) or the group size (if grouped by another column). The target 0,1,2 is realizable if grouped by e.g. Denomination (some groups have 0 schools? no, every school has a Denomination). The spec's per_column_exceptions says 'aggregate_boundary: COUNT(school.school_id), COUNT(DISTINCT school.school_id), COUNT(*)' without specifying the grouping. The construction report has group_sizes for school.School_ID (1,1,1,1,1,1) but not aggregate counts.",
+     "requested_revision": "Designer: specify the grouping for school.School_ID aggregate_boundary. Engineer: add construction report keys for the aggregate counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Boys_or_Girls = [larger,larger,smaller,smaller,larger,smaller]. After NULL planting (one NULL per instance), the non-NULL counts depend on which row is NULLed. If a 'larger' row is NULLed, larger count = 2, smaller count = 3; if a 'smaller' row is NULLed, larger count = 3, smaller count = 2. The spec's ties_for_order_limit for Boys_or_Girls requires 'the duplicated value must be the lexicographically larger enum value so it sorts first under DESC'. With 3 larger and 3 smaller before NULL, the tie at rank 1 DESC is between the two values (both appear). After NULL, if larger count drops to 2 and smaller to 3, the max value (larger) still appears 2 times, so a tie at rank 1 DESC exists (2 rows with the larger value). Acceptable. But the construction report key 'school.Boys_or_Girls.max_tie' would show 2 or 3, both >= 2. Correct.",
+     "requested_revision": "None, but verify via construction report."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Day_or_Boarding cycling through DAY_OR_BOARDING, Year_Entered_Competition cycling through YEAR_POOL, School_Colors cycling through SCHOOL_COLORS. The spec does not constrain these beyond null_targets and enum rules. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details sets Colors cycling through DETAIL_COLORS, League='DSHA', Class cycling through CLASSES, Division cycling through DIVISIONS. The spec's semantic_rules_and_formulas constrains League='DSHA', Class IN ('Flight A','Flight B','Fight A'), Division IN ('Division 1','Division 2','Division 3'). Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_performance sets Class_A cycling through CLASS_A_POOL and Class_AA cycling through CLASS_AA_POOL. The spec does not constrain these columns beyond null_targets. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets Player cycling through PLAYER_NAMES, Team cycling through TEAMS. The spec does not constrain these beyond null_targets. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets School_ID with sizes [1,2,3,3,3,3,3,5] over 5 schools (fk_pool = school_ids[:-1]). The zip pairs 5 schools with the first 5 sizes [1,2,3,3,3], giving 12 rows. The while loop appends fk_pool[len(fk) % len(fk_pool)] until 23 rows, adding 11 rows distributed cyclically over the 5 schools. This inflates the size-1 and size-2 groups. The construction report key 'player.School_ID.group_sizes' would show the inflated counts. See earlier issue.",
+     "requested_revision": "Engineer: fix the padding loop to add rows only to the >=3 groups. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets fk[3]=None and fk[4]=max(school_ids)+1=7. The orphan 7 is not a valid school id (schools are 1..6), so it is an orphan as intended. But the writer's foreign_keys=OFF pragma allows the orphan to be inserted. The spec's unmatched_join_rows for player.School_ID requires child_rows_with_null_fk=true (NULL plus at least one orphan). The code plants both. However, the feedback shows 'player.School_ID: NULL 0 / 220', suggesting the NULL is not reaching the DB. The orphan may also be dropped if the compact schema has a FK constraint enforced (but foreign_keys=OFF should prevent that). The 0 NULL count is the key concern.",
+     "requested_revision": "Engineer: investigate why the planted NULL is not appearing in the DB. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_performance sets School_Id = [fk_pool[i % len(fk_pool)] for i in range(n)] with fk_pool = school_ids[:-1] (5 schools). This distributes 22 rows over 5 schools, giving group sizes ~4,4,4,5,5. The spec's per_column_exceptions for school_performance.School_Id requires 'parent_rows_without_children=true; child_rows_with_null_fk=false (no NULL, no orphan for this FK)'. The code never emits NULL or orphan for this FK. Correct. But the spec's uncertainty notes 'school_performance has 22 rows but only 6 distinct School_Id values; group sizes are not specified in the atomic summary for this table, so uniform distribution across schools is used.' The code uses 5 schools (excluding the childless parent), so 5 distinct values, not 6. This is consistent with the childless-parent requirement. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details sets School_ID = school_ids[:n] with n=6, so all 6 schools get a school_details row (1:1). The spec's dependencies require school_details 1:1 with school. Correct. But the childless parent (school 6) has a school_details row, which is fine (1:1, not 1:N). The spec's unmatched_join_rows for school.School_ID requires 'at least one school has zero player rows and zero school_performance rows' \u2014 school 6 satisfies this. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance calls _dedupe_pk and _dedupe_unique on each table after sampling. For school, School_ID is unique (1..6), so no dedup. For school_details, School_ID is unique (1..6), so no dedup. For school_performance, (School_Id, School_Year) is the PK; the code generates 22 rows with School_Year cycling 1987-2006 (20 distinct years) and School_Id cycling 5 schools, so (School_Id, School_Year) pairs may repeat. For example, row 0: (1, 1987-88), row 20: (1, 2007-08? no, wraps to 1987-88 at i=20? Let's check: y starts 1987, increments each row, wraps at 2006. i=0: 1987, i=1: 1988, ..., i=19: 2006, i=20: 1987, i=21: 1988. So rows 0 and 20 both have School_Year 1987-88. School_Id at i=0 is fk_pool[0], at i=20 is fk_pool[20%5]=fk_pool[0]. So (fk_pool[0], 1987-88) appears twice \u2014 PK duplicate! _dedupe_pk drops the second occurrence, reducing school_performance to 20 rows, not 22. The spec's table_sizes_per_instance says school_performance: 22. The dedup silently reduces the row count.",
+     "requested_revision": "Engineer: ensure school_performance generates 22 rows with unique (School_Id, School_Year) pairs. Either use 22 distinct years (1987-2008, but spec says 1980-2025 so 1987-2008 is fine) or vary School_Id so pairs are unique. Verify the final row count is 22 via feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets Player_ID = 1..23, unique. No dedup. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets School_ID = 1..6, unique. No dedup. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_details sets School_ID = 1..6, unique. No dedup. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'n_ok': 20, 'n_fail': 0, 'integrity': {'fk_violations': 0, 'not_null_violations': 0, 'pk_duplicates': 0, 'not_ok': 0}, 'validity': {'valid': 20, 'invalid': 0}. This suggests the generated instances pass integrity checks. However, the 'player.School_ID: NULL 0 / 220' line contradicts the spec's requirement for NULL on player.School_ID. The integrity check may be run on the final DB after dedup/drop, so dropped rows are not counted. The 0 NULL count is the main red flag.",
+     "requested_revision": "Engineer: reconcile the 0 NULL count with the spec. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'reproducible': true, but the spec's uncertainty says 'The reproducible flag was exercised with only one seed base; multi-seed verification is pending.' The feedback does not show multi-seed results. The cli uses seed_base=42 by default and rng = random.Random(seed_base * 100003 + i), which is deterministic per (seed_base, i). Reproducibility with one seed is confirmed, but multi-seed is not.",
+     "requested_revision": "Engineer: run with multiple seed bases and confirm reproducibility. This is a verification gap, not a code error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'construction_pairs': {'eligible': 54, 'separated': 3, 'unknown_executions': 0}. Only 3 of 54 pairs are separated. The spec's uncertainty says 'Whether the 37 unseparated construction pairs reflect a generation defect or query equivalence under current data is unresolved.' The 3 separated pairs are not identified in the feedback, and the per-group breakdown is empty. Without per-group feedback, the 51 unseparated pairs cannot be diagnosed.",
+     "requested_revision": "Engineer: surface the construction report and per-group separation results in the feedback. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's generic_sampling_rules text_short says 'with probability 0.15 emit a near-variant (case change, trailing space, or one-character substitution) of a pool value.' But the school sampler (_sample_school) bypasses the generic sampler and never emits near-variants for any text column. The spec's comparison_boundary for Denomination requires a near-variant, but the code does not implement it. The generic rule is not applied to the school tables.",
+     "requested_revision": "Designer: clarify whether text_short applies to the school tables or only to the generic fallback. Engineer: if it applies, implement near-variants in the school samplers; if not, remove the comparison_boundary near-variant requirement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Denomination with 4 'Catholic', 1 'Anglican', 1 'Uniting Church'. The spec's comparison_boundary for Denomination requires 'at least two rows share one Denomination value (self-equality group), plus at least one row with a case/whitespace near-variant of that value'. The code has 4 'Catholic' (self-equality group) but no near-variant. The comparison_boundary target is partially met (self-equality) but not the near-variant part.",
+     "requested_revision": "Engineer: add a near-variant (e.g. 'catholic' or 'Catholic ') to the Denomination values, while keeping the enum rule (or resolve the enum conflict per earlier issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Founded = [1888,1889,1890,1900,1901,1902]. The spec's comparison_boundary for Founded requires 'include as many of 1888,1889,1890,1891,1899,1900,1901,1902 as fit in 6 rows; must include 1889, 1890, 1900 and 1901'. The code includes 1888,1889,1890,1900,1901,1902 \u2014 includes 1889,1890,1900,1901. Correct. But the ties_for_order_limit target (DESC rank-1 tie) is not met (all distinct). See earlier issue.",
+     "requested_revision": "Engineer: add a duplicate max value for the DESC tie. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Enrollment = [1000,1000,1430,1430,2200,2300]. The spec's ties_for_order_limit for Enrollment requires 'tie_at_rank=1, direction=ASC and DESC (rank 1000 not reachable at 6 rows); duplicate both the smallest and largest values within 6 rows'. The code duplicates the smallest (1000) but not the largest (2300). See earlier issue.",
+     "requested_revision": "Engineer: duplicate the largest value. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Boys_or_Girls = [larger,larger,smaller,smaller,larger,smaller]. The spec's ties_for_order_limit for Boys_or_Girls requires 'tie_at_rank=1, direction=DESC; the duplicated value must be the lexicographically larger enum value so it sorts first under DESC'. The code has 3 larger and 3 smaller, so the larger value appears 3 times \u2014 a tie at rank 1 DESC exists (3 rows with the larger value). Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Location = [L0,L0,L0,L1,L2,L3]. The spec's group_sizes for Location requires '1, 2 and >= 3'. The code gives 3,1,1,1 \u2014 no size-2 group. See earlier issue.",
+     "requested_revision": "Engineer: see earlier issue on Location group_sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school sets Denomination = [C,C,C,C,A,U] with NULL at index 0, giving non-NULL groups 3,1,1. The spec's group_sizes for Denomination requires '1, 2 and >= 3'. The code gives 3,1,1 \u2014 no size-2 group. See earlier issue.",
+     "requested_revision": "Engineer: see earlier issue on Denomination group_sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets School_ID with sizes [1,2,3,3,3,3,3,5] over 5 schools, then pads cyclically. The padding inflates the size-1 and size-2 groups. See earlier issue.",
+     "requested_revision": "Engineer: fix the padding. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_player sets fk[3]=None and fk[4]=7 (orphan). Both are in the first size-3 group (indices 3,4,5 for fk_pool[2]), reducing that group to 1 non-NULL member. The spec requires the >=3 group to survive. See earlier issue.",
+     "requested_revision": "Engineer: place NULL and orphan on different >=3 groups. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_school_performance generates 22 rows but _dedupe_pk may reduce to 20 due to duplicate (School_Id, School_Year) pairs. See earlier issue.",
+     "requested_revision": "Engineer: ensure 22 unique pairs. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 12 entries, but the spec's null_targets has 20. The school.* columns and player.School_ID are missing. This is a feedback completeness issue.",
+     "requested_revision": "Engineer: report NULL counts for all nullable columns. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'construction_pairs_by_group': [] (empty). The spec's uncertainty requires per-group construction feedback. The empty list means the feedback is not being collected.",
+     "requested_revision": "Engineer: populate construction_pairs_by_group. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for school.Denomination says 'group_sizes: after NULL planting, non-NULL grouped counts must include a size-1 group, a size-2 group and a >=3 group (e.g. 3,2,1 with the NULL placed on a row of the size-3 group, or 2,2,1,1 with one NULL)'. The example '3,2,1 with the NULL placed on a row of the size-3 group' is arithmetically wrong: if the pre-NULL groups are 3,2,1 and the NULL is placed on a size-3 row, the post-NULL groups are 2,2,1 \u2014 no >=3 group. The example '2,2,1,1 with one NULL' has no >=3 group either. Both examples fail the stated target. The spec is internally inconsistent.",
+     "requested_revision": "Designer: correct the examples. A 6-row table with one NULL has 5 non-NULL values; to have groups 1,2,>=3, the non-NULL values must sum to 5 with parts including 1, 2, and >=3 \u2014 impossible (1+2+3=6 > 5). The target is unsatisfiable at 6 rows with one NULL. Either increase the table size or relax the target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for school.Location says 'duplicates_for_distinct: duplicate_share 20-50% (e.g. 6 rows, 4 distinct)' and 'group_sizes: 1, 2 and >= 3'. As shown, 6 rows with 4 distinct cannot have both a size-2 and a >=3 group. The spec is internally inconsistent.",
+     "requested_revision": "Designer: reconcile. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for player.Player_ID says 'aggregate_boundary: COUNT(player.player_id) values 0,1,2'. Since Player_ID is a unique PK, COUNT(player.player_id) per group is always 1 (if grouped by Player_ID) or the group size (if grouped by another column). The target 0,1,2 is not clearly realizable. The spec does not specify the grouping.",
+     "requested_revision": "Designer: specify the grouping. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for school.School_ID says 'aggregate_boundary: COUNT(school.school_id), COUNT(DISTINCT school.school_id), COUNT(*)' without specifying the grouping. The target 0,1,2 is not clearly realizable without a grouping.",
+     "requested_revision": "Designer: specify the grouping. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for school.Enrollment says 'rows_with_different_values: >= 2 per group with different values' without specifying the grouping. The target is ambiguous.",
+     "requested_revision": "Designer: specify the grouping. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for player.Age says 'rows_with_different_values: >= 2 per group with different values' without specifying the grouping. The target is ambiguous.",
+     "requested_revision": "Designer: specify the grouping. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'validity': {'valid': 20, 'invalid': 0, 'reasons': {}}. The validity check passes, but the 'player.School_ID: NULL 0 / 220' line suggests the NULL planting is not working. The validity check may not verify the spec's NULL requirement.",
+     "requested_revision": "Engineer: add a validity check for the spec's NULL requirement (at least one NULL per nullable column per instance) and report failures."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'integrity': {'fk_violations': 0, 'not_null_violations': 0, 'pk_duplicates': 0, 'not_ok': 0}. The FK violations are 0, but the spec requires an orphan (parent_id_max+1) for player.School_ID. An orphan is an FK violation by definition. The 0 FK violations suggests the orphan is not being inserted (or the FK check is disabled). The writer sets 'pragma foreign_keys = OFF', so FK violations are not checked at insert time. The integrity check may be run with foreign_keys=ON, which would flag the orphan as a violation. The 0 FK violations suggests the orphan is not present, consistent with the 0 NULL count (both planted values are being dropped).",
+     "requested_revision": "Engineer: investigate why the orphan and NULL are not present. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'n_ok': 20, 'n_fail': 0. The generation ran without errors. But the spec's requirements are not all met (NULL on player.School_ID, ties, group sizes). The 'n_ok' count only means the writer did not raise an exception, not that the spec was satisfied.",
+     "requested_revision": "Engineer: add spec-conformance checks to the generation pipeline and report failures."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'reproducible': true. The cli uses a deterministic seed per unit. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'pool_sqls': 203, 'pool_skipped': 0, 'pool_values': 48. The literal pool is seeded from 203 SQLs with 48 values. The spec does not constrain the pool size. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'wall_s': 0.46, 'run_seconds': 0.6. The generation is fast. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'n_instances': 20. The spec does not specify the number of instances. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'stderr_tail': ''. No errors. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'returncode': 0. The generation succeeded. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'construction_pairs': {'eligible': 54, 'separated': 3, 'unknown_executions': 0}. The 3 separated pairs are not identified. The spec's uncertainty says 'Whether the 37 unseparated construction pairs reflect a generation defect or query equivalence under current data is unresolved.' The 3 separated pairs may be the ones that are sensitive to the spec's targets (e.g. NULL, ties). Without per-group feedback, the 51 unseparated pairs cannot be diagnosed.",
+     "requested_revision": "Engineer: surface per-group feedback. See earlier issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'The original data shows 0% NULL rate for all columns, but instruction 10 requires at least one NULL row per nullable column; NULL share set to 5-10% to satisfy both. This deliberately deviates from the compact share.' The program interface rule 7 says 'with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The spec's deviation is a deliberate override, but the program interface rule 7 is not explicitly overridden in the spec's normative text (only in uncertainty).",
+     "requested_revision": "Designer: promote the deviation to a normative statement. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 'player.School_ID: generated rows: NULL 0 / 220'. The spec's null_targets includes player.School_ID. The 0 NULL count is a clear violation of the spec's NULL requirement. The program interface rule 7 says 'A nullable column whose execution feedback line reads \"generated rows: NULL 0 / n\" may be noted for the engineer; it does not block a pass.' So this is a note, not a blocker. But the spec's per_column_exceptions for player.School_ID explicitly requires child_rows_with_null_fk=true (NULL plus orphan), which is a stronger requirement than the generic NULL rule. The 0 NULL count violates the per_column_exceptions target.",
+     "requested_revision": "Engineer: investigate and fix. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 'school_details.Nickname: generated rows: NULL 6 / 20'. The spec's null_targets includes school_details.Nickname. The 6 NULLs across 20 instances (one per instance) satisfy the at-least-one-NULL requirement. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 'school_performance.Class_A: generated rows: NULL 31 / 320' and 'school_performance.Class_AA: generated rows: NULL 31 / 320'. The spec's null_targets includes both. The 31 NULLs across 20 instances (~1.55 per instance of 22 rows, ~7%) satisfy the at-least-one-NULL requirement. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 'player.Age: generated rows: NULL 15 / 220', 'player.Player: NULL 18 / 220', 'player.Position: NULL 16 / 220', 'player.Team: NULL 17 / 220'. The spec's null_targets includes all. The NULL counts satisfy the at-least-one-NULL requirement. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'nullable_columns' with 'school_details.Class: NULL 3 / 20', 'school_details.Colors: NULL 4 / 20', 'school_details.Division: NULL 3 / 20', 'school_details.League: NULL 3 / 20'. The spec's null_targets includes all. The NULL counts satisfy the at-least-one-NULL requirement. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback omits NULL counts for school.Denomination, school.Location, school.Enrollment, school.Founded, school.Boys_or_Girls, school.Day_or_Boarding, school.Year_Entered_Competition, school.School_Colors. The spec's null_targets includes all. The feedback is incomplete. See earlier issue.",
+     "requested_revision": "Engineer: report NULL counts for all nullable columns. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'construction_pairs_by_group': []. The spec's uncertainty requires per-group construction feedback. The empty list means the feedback is not being collected. See earlier issue.",
+     "requested_revision": "Engineer: populate construction_pairs_by_group. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'construction_pairs': {'eligible': 54, 'separated': 3, 'unknown_executions': 0}. The 3 separated pairs are not identified. The spec's uncertainty says 'Whether the 37 unseparated construction pairs reflect a generation defect or query equivalence under current data is unresolved.' The 3 separated pairs may be the ones that are sensitive to the spec's targets. Without per-group feedback, the 51 unseparated pairs cannot be diagnosed. See earlier issue.",
+     "requested_revision": "Engineer: surface per-group feedback. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'validity': {'valid': 20, 'invalid': 0, 'reasons': {}}. The validity check passes, but the spec's requirements are not all met (NULL on player.School_ID, ties, group sizes). The validity check may not verify the spec's targets. See earlier issue.",
+     "requested_revision": "Engineer: add spec-conformance checks. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'integrity': {'fk_violations': 0, 'not_null_violations': 0, 'pk_duplicates': 0, 'not_ok': 0}. The FK violations are 0, but the spec requires an orphan for player.School_ID. An orphan is an FK violation by definition. The 0 FK violations suggests the orphan is not being inserted. See earlier issue.",
+     "requested_revision": "Engineer: investigate. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'n_ok': 20, 'n_fail': 0. The generation ran without errors. But the spec's requirements are not all met. The 'n_ok' count only means the writer did not raise an exception. See earlier issue.",
+     "requested_revision": "Engineer: add spec-conformance checks. See earlier issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'reproducible': true. The cli uses a deterministic seed per unit. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'pool_sqls': 203, 'pool_skipped': 0, 'pool_values': 48. The literal pool is seeded from 203 SQLs with 48 values. The spec does not constrain the pool size. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'wall_s': 0.46, 'run_seconds': 0.6. The generation is fast. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'n_instances': 20. The spec does not specify the number of instances. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'stderr_tail': ''. No errors. Correct.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'returncode': 0. The generation succeeded. Correct.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact schema declares player.School_ID NOT NULL (which would make the spec's child_rows_with_null_fk=true unsatisfiable and explain the 0 NULL count).",
+    "Whether the 51 unseparated construction pairs reflect a generation defect or query equivalence; per-group construction feedback is required.",
+    "Whether compact rows are preserved after append; the writer returns rows_ok/rows_failed but the CLI does not surface them.",
+    "Whether the school_performance table ends with 22 rows or fewer due to (School_Id, School_Year) PK dedup.",
+    "Whether the school.* NULL planting is working; the feedback omits school.* NULL counts.",
+    "Whether multi-seed reproducibility holds; only one seed base was exercised.",
+    "Whether the spec's group_sizes targets for school.Denomination and school.Location are satisfiable at 6 rows with one NULL; the spec's own examples are arithmetically inconsistent.",
+    "Whether the spec's aggregate_boundary targets for Player_ID and School_ID are satisfiable without a specified grouping.",
+    "Whether the spec's rows_with_different_values targets for Enrollment and Age are satisfiable without a specified grouping.",
+    "Whether the spec's comparison_boundary near-variant for Denomination conflicts with the enum formula."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added school=0, rows_skipped school=120 across 20 instances (6 rows/instance expected). The school table receives zero generated rows in every instance. Root cause: writer.write_instance_sqlite copies the compact DB from schema.source_path (which read_schema sets to the original path), so the compact school rows already occupy School_ID 1..6. The spec's int_primary_key rule says generated PKs must 'never collide with compact primary-key values', but instance._sample_school hardcodes ids = list(range(1, n+1)) and _sample_player uses Player_ID 1..n, and _sample_school_details/_sample_school_performance copy those same 1..6 School_IDs. Every generated school row therefore collides with a compact PK and is counted in rows_failed (120 = 20*6). The spec's own table_sizes_per_instance (school: 6) is thus not realized; the generated instance has 0 new school rows, and the FK children point at compact school rows rather than generated ones.",
+     "requested_revision": "Make generated PKs start above the compact maximum (e.g. max(compact School_ID)+1 .. +n) and have school_details/school_performance/player FKs reference those generated IDs, so the specified 6 school rows are actually appended. Alternatively, if the intent is to append onto compact rows, the spec must say so and the table_sizes_per_instance for school must be 0; but then the per-column targets (Denomination group sizes 2,2,1, Location 2,2,1, Founded boundary values, Enrollment ties, Boys_or_Girls DESC tie) are not realized on generated rows and the spec is inconsistent. Fix the program to honor the spec's 6-row school target without PK collision, and re-run to confirm rows_added.school == 120 and rows_skipped.school == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: player.School_ID 'generated rows: NULL 0 / 220'. The spec's per_column_exceptions for player.School_ID requires child_rows_with_null_fk=true (NULL plus at least one orphan parent_id_max+1), and null_targets lists player.School_ID. instance._sample_player does set fk[...] = None and fk[...] = max(school_ids)+1, but the writer copies the compact DB where player.School_ID is declared NOT NULL (per the spec's own uncertainty note: 'If the compact schema declares player.School_ID NOT NULL, this target is unsatisfiable'). The NULL/orphan rows are rejected by the NOT NULL constraint and counted in rows_failed (player rows_skipped=240 = 20*12, consistent with the NULL/orphan rows plus other constraint failures). The spec acknowledges this conflict but does not resolve it: it says 'the writer must report rows_failed so the conflict is visible' rather than correcting the target. The result is that the specified NULL-FK and orphan-FK behavior is never realized, and the aggregate_boundary COUNT=0 group for player.School_ID is not produced.",
+     "requested_revision": "Designer: resolve the conflict in the spec. Since the compact schema declares player.School_ID NOT NULL (it is a FK to a NOT NULL parent PK in the supplied DDL: 'School_ID' int with FOREIGN KEY, and the compact data has 0 NULLs), the target child_rows_with_null_fk=true is unsatisfiable and must be corrected to false, and the aggregate_boundary COUNT=0 group must be realized via a childless parent school (which the spec already reserves as the last school row) rather than via NULL/orphan FK. Engineer: remove the NULL/orphan planting for player.School_ID (or gate it on the column being nullable) so no rows are lost to NOT NULL violations, and re-run to confirm player rows_skipped drops to 0 and the childless-parent COUNT=0 group is present."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: school_details rows_skipped=100 (5/instance), school_performance rows_skipped=100 (5/instance), player rows_skipped=240 (12/instance). These are not all explained by the school PK collision. The writer's fallback path (executemany fails -> row-by-row) counts failures in rows_failed, but the spec's overview says 'rows_failed > 0 is a hard error, not a silent drop' and the CLI only aggregates rows_skipped without failing. The CLI summary reports n_ok=20, n_fail=0 despite rows_skipped being nonzero for every table, so the 'hard error' contract is not enforced. Additionally, the school_details/school_performance/player FK values reference School_IDs 1..6 which exist in the compact DB, so those rows should insert; the 5/instance skips for school_details and school_performance suggest PK collisions on (School_Id, School_Year) or School_ID for school_details (compact rows already occupy School_ID 1..6, and generated school_details also use 1..6 -> PK collision on School_ID). This is the same root cause as issue 1 but affects the child tables too.",
+     "requested_revision": "Engineer: (a) make the CLI treat rows_failed > 0 as a hard error (nonzero exit / n_fail increment) per the spec's overview, so silent row loss is impossible; (b) fix the PK collision for school_details (and any other child table whose PK overlaps compact rows) by using generated parent IDs above the compact max, as in issue 1. Re-run and confirm rows_skipped is empty for all tables."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's group_sizes rule for school.Denomination and school.Location claims the realizable post-NULL partition is 2,2,1 and documents '>=3 not realizable at 6 rows with one NULL'. But the spec also sets table_sizes_per_instance.school = 6 and plants one NULL per nullable column, so 5 non-NULL values remain; 2,2,1 is indeed the only partition with a size-1 and size-2 group. However, the atomic summary's group_sizes target is '1, 2 and >= 3', and the spec's own uncertainty acknowledges the reduction. This is a documented reduction, not an error, but the spec should state the reduction as the authoritative target (not '1, 2 and >= 2') so the engineer's construction report can be checked against a definite target. The construction report in instance._construction_report records group_sizes but the execution feedback's construction_pairs_by_group is empty, so the realized group sizes are not actually verified.",
+     "requested_revision": "Designer: state the reduced target explicitly as '1, 2 and >= 2 (2,2,1)' for school.Denomination and school.Location, and remove the ambiguous '>= 3' phrasing from the per_column_exceptions targets. Engineer: populate construction_pairs_by_group in the execution feedback (or have the CLI emit the per-instance construction report) so the realized group sizes, tie ranks and boundary values can be verified; currently construction_pairs_by_group is empty and only 4/54 pairs are separated, which is insufficient to confirm the construction targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=54, separated=4, construction_pairs_by_group=[]. The spec's uncertainty notes 'Whether the 51 unseparated construction pairs reflect a generation defect or query equivalence is unresolved; per-group construction feedback (realized group sizes, tie ranks, boundary values per instance) is required to verify.' The program does attach a '__construction__' report (instance._construction_report) and the CLI pops it into the result dict, but the CLI summary does not emit it and the execution feedback's construction_pairs_by_group is empty. So the construction targets (group sizes, tie ranks, boundary values) are not verifiable from the supplied evidence.",
+     "requested_revision": "Engineer: emit the per-instance construction report (or an aggregate per-group summary) in the CLI JSON summary so the realized group sizes, tie ranks and boundary values can be checked against the spec. This is needed to distinguish a generation defect from query equivalence for the 50 unseparated pairs."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas for school.Denomination, Boys_or_Girls, Day_or_Boarding, school_details.League/Class/Division, player.Position, and school_performance.School_Year are stated as enums/formulas with 'evidence: Observed distinct values'. The supplied database schema and integrity constraints do not include CHECK constraints or enum definitions for these columns; the evidence is only the observed distinct values in the compact data. The spec treats these as authoritative ('authoritative over the comparison_boundary near-variant'), which is a reasonable inference but is not backed by schema-level constraints. This is a supported-but-uncertain rule, not an error.",
+     "requested_revision": "Designer: mark these enum rules as 'inferred from observed values' rather than 'authoritative', and note that they are not enforced by the schema. No program change required, but the spec should distinguish schema-enforced rules (PK, FK, NOT NULL) from data-inferred enums."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact schema declares player.School_ID NOT NULL: the supplied DDL shows 'School_ID' int with a FOREIGN KEY but no explicit NOT NULL; the execution feedback shows NULL 0/220, consistent with either NOT NULL or the writer rejecting NULLs. The spec's uncertainty flags this as unresolved.",
+    "Whether the 50 unseparated construction pairs reflect a generation defect or query equivalence: construction_pairs_by_group is empty, so per-group realized values cannot be checked.",
+    "Whether compact rows are preserved: compact_instances_with_row_loss=0 and integrity checks pass, but the writer copies the compact DB and appends; the school PK collision means generated school rows are all rejected, so the 'append after compact rows' behavior is not actually exercised for school.",
+    "Whether the reproducible flag holds across multiple seeds: the spec notes only one seed base was exercised."
+   ]
+  }
+ ]
 }

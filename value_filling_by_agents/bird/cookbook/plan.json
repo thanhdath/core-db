@@ -1,50 +1,509 @@
 {
  "db": "cookbook",
- "operator_io_quirks": [
-  "Ingredient/Recipe/Nutrition/Quantity are mixed-case table names; all identifiers must be double-quoted in generated SQL.",
-  "Quantity.recipe_id has TWO FK parents (Nutrition.recipe_id and Recipe.recipe_id); pragma foreign_key_list returns both, schema.fks dict keyed by (child_t,child_c) keeps only one -> the other is silently lost.",
-  "Nutrition.recipe_id is PK and FK to Recipe.recipe_id; Recipe has 1031 rows, Nutrition 878 -> FK parent set is a strict subset, not all Recipe ids appear in Nutrition.",
-  "Quantity.recipe_id null_rate 0.005 and ingredient_id null_rate 0.005: FK columns are nullable, so NULL FK values are legal and present.",
-  "All columns notnull=0 (pragma reports 0 even for PKs); NOT NULL is not enforced by sqlite here, so TS insert failures are rare.",
-  "Ingredient.plural has 78% NULL and only 3 distinct values ('s','es','#NAME?'); '#NAME?' is an Excel error string stored as text.",
-  "Recipe.title null_rate 0.148, distinct 878 < 1031 rows: title is NOT unique despite looking name-like.",
-  "Recipe.servings/prep_min/cook_min/stnd_min all share null_rate 0.148 (same 152 rows missing) - correlated nulls, not independent.",
-  "Nutrition REAL columns have 0 nulls and distinct counts 51..864; alcohol has only 51 distinct (mostly 0.0) - heavy zero mass.",
-  "Quantity.max_qty and min_qty have identical distinct=62 and identical samples: they are near-duplicates (min==max in samples).",
-  "Quantity.optional has 2 distinct values 'TRUE'/'FALSE' stored as TEXT, not INTEGER/BOOL.",
-  "Recipe.intro/directions are long free text truncated in samples; String fuzzer length range will be [min,max+1] of these, potentially large."
- ],
- "operator_ts_expectations": [
-  "All PK columns (ingredient_id, recipe_id, quantity_id) dispatch to Number fuzzer with scale=0 -> integers in [-1,1] then perturbed by +-1/+-2; tiny range, so PK collisions are frequent and sample_fresh_primary_keys drops many rows.",
-  "Number fuzzer for REAL columns (protein, carbo, ...) uses scale=0 (no args in 'REAL') -> range [-1,1] floats, wildly implausible vs original 0..2738 (vitamin_a); drives FN on range predicates like 'vitamin_a > 500'.",
-  "String fuzzer for TEXT columns draws from CHARSET a-zA-Z 0-9() with length [0,20] default (no length arg in TEXT) -> 'category'/'unit' values become random gibberish; implausible for equality predicates on 'dairy','cup(s)' -> FN.",
-  "String fuzzer contaminate (0.5) appends/prefixes random chars -> even literal-pool values get corrupted, breaking equality joins on category/unit.",
-  "FK fill: Quantity.recipe_id draws from parent's FINAL filtered values; Nutrition has only 878 rows and PK filtering may shrink further, so many Quantity rows get NULL or duplicate recipe_id -> join cardinality mismatch vs original (FP/FN on COUNT).",
-  "Quantity.recipe_id has two FK parents; whichever the dict keeps wins, the other parent's referential integrity is not enforced -> dangling recipe_ids possible (FP on join).",
-  "Nutrition.recipe_id PK is also FK to Recipe; TS generates it as a Number PK (fresh) AND as FK child - upstream draws FK from parent, so Nutrition.recipe_id values are Recipe ids, but PK dedup may drop rows -> Nutrition smaller than Recipe, matching original shape by luck.",
-  "Recipe.title is not unique but TS does not know; String fuzzer may produce duplicates -> title-based joins get extra rows (FP).",
-  "Quantity.optional 'TRUE'/'FALSE' as TEXT: String fuzzer produces random strings, so 'optional = TRUE' predicates match nothing -> FN.",
-  "alcohol mostly 0.0: Number fuzzer uniform [-1,1] rarely hits exactly 0.0 -> 'alcohol = 0' predicates FN.",
-  "servings/prep_min/cook_min/stnd_min correlated nulls: TS fills each independently, so the 0.148 co-null pattern is destroyed -> queries filtering on multiple being NULL together FN.",
-  "max_qty==min_qty in samples: TS generates them independently -> 'max_qty = min_qty' predicates FN."
- ],
- "challenger_refs": [
-  "G11",
-  "G1",
-  "G3",
-  "G4",
-  "G6",
-  "G9",
-  "G12",
-  "G13",
-  "G14",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential unique integers starting at 1; never NULL; no reuse.",
+   "text_short": "Random short strings from a small pool; 5% near-variants (case/whitespace) of pool values; NULL only if column nullable.",
+   "text_long": "Random sentences assembled from a small phrase pool; 5% near-variants; NULL only if column nullable.",
+   "real_nonnegative": "Uniform random in [0, 1000) rounded to 2 decimals; 5% exactly 0; NULL only if column nullable.",
+   "real_positive": "Uniform random in (0, 1000] rounded to 2 decimals; NULL only if column nullable.",
+   "integer_small": "Uniform random integer in [0, 100]; NULL only if column nullable.",
+   "integer_positive": "Uniform random integer in [1, 100]; NULL only if column nullable.",
+   "text_enum": "Pick uniformly from the column's enum pool; NULL only if column nullable.",
+   "text_flag": "Pick from {'TRUE','FALSE'}; NULL only if column nullable.",
+   "foreign_key": "Copy a parent primary-key value; 5% NULL if column nullable; 5% orphan value not present in parent if column nullable.",
+   "boundary_numeric": "For each listed literal L, generate L-1, L, L+1 (or L-step, L, L+step for REAL).",
+   "boundary_text": "For each listed literal L, generate L, upper(L), lower(L), and a LIKE near-variant.",
+   "tie_order": "Ensure at least two rows share the top value of the ORDER expression at the listed rank.",
+   "duplicate_distinct": "Ensure 20-50% of rows share values on the DISTINCT column.",
+   "null_share": "For nullable columns, generate NULL in the stated share of rows (at least one NULL row per instance)."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "Ingredient.name": [
+      "1% lowfat milk",
+      "1% LOWFAT MILK",
+      "lima beans",
+      "LIMA BEANS"
+     ],
+     "Quantity.recipe_id": [
+      1396,
+      1397,
+      1398,
+      1435,
+      1436,
+      1437
+     ],
+     "Recipe.title": [
+      "Raspberry Chiffon Pie",
+      "raspberry chiffon pie",
+      "Fresh Apricot Bavarian",
+      "fresh apricot bavarian",
+      "RasPie",
+      "raspie"
+     ],
+     "Recipe.recipe_id": [
+      1396,
+      1397,
+      1398,
+      1435,
+      1436,
+      1437
+     ],
+     "Quantity.unit": [
+      "cup(s)",
+      "CUP(S)"
+     ],
+     "Nutrition.sodium": [
+      4.99,
+      5,
+      5.01
+     ],
+     "Nutrition.vitamin_a": [
+      -0.01,
+      0,
+      0.01
+     ],
+     "Nutrition.alcohol": [
+      -0.01,
+      0,
+      0.01
+     ],
+     "Recipe.servings": [
+      6,
+      7,
+      8
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "Ingredient.name": [
+      "%seedless red grapes%"
+     ]
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "Quantity.recipe_id": "5-30% NULL",
+     "Quantity.max_qty": "5-30% NULL",
+     "Quantity.optional": "5-30% NULL"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "Ingredient.name": "20-50% duplicate share",
+     "Quantity.recipe_id": "20-50% duplicate share",
+     "Recipe.title": "20-50% duplicate share",
+     "Quantity.quantity_id": "20-50% duplicate share"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "Nutrition.sat_fat": "tie at rank 1 DESC on total_fat - sat_fat",
+     "Nutrition.total_fat": "tie at rank 1 DESC on total_fat - sat_fat",
+     "Nutrition.cholestrl": "tie at rank 1 DESC on total_fat - cholestrl",
+     "Nutrition.iron": "tie at rank 1 DESC on total_fat - iron",
+     "Nutrition.pcnt_cal_fat": "tie at rank 1 DESC on pcnt_cal_fat - sat_fat",
+     "Nutrition.pcnt_cal_prot": "tie at rank 1 unordered"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "Quantity.recipe_id": "parent rows without children; child rows with NULL FK",
+     "Recipe.recipe_id": "parent rows without children; child rows with NULL FK",
+     "Ingredient.ingredient_id": "parent rows without children; child rows with NULL FK",
+     "Quantity.ingredient_id": "parent rows without children; child rows with NULL FK",
+     "Nutrition.recipe_id": "parent rows without children; no NULL FK"
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "Nutrition.calories": ">=2 rows per group with different values",
+     "Nutrition.vitamin_c": ">=2 rows per group with different values",
+     "Nutrition.carbo": ">=2 rows per group with different values",
+     "Nutrition.vitamin_a": ">=2 rows per group with different values"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "Nutrition.recipe_id",
+    "parent_table": "Recipe",
+    "parent_column": "recipe_id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Quantity.recipe_id",
+    "parent_table": "Recipe",
+    "parent_column": "recipe_id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Quantity.ingredient_id",
+    "parent_table": "Ingredient",
+    "parent_column": "ingredient_id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Quantity.recipe_id",
+    "parent_table": "Nutrition",
+    "parent_column": "recipe_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Ingredient",
+    "column": "ingredient_id",
+    "formula": "ingredient_id > 0"
+   },
+   {
+    "table": "Recipe",
+    "column": "recipe_id",
+    "formula": "recipe_id > 0"
+   },
+   {
+    "table": "Recipe",
+    "column": "servings",
+    "formula": "servings IS NULL OR servings > 0"
+   },
+   {
+    "table": "Recipe",
+    "column": "prep_min",
+    "formula": "prep_min IS NULL OR prep_min >= 0"
+   },
+   {
+    "table": "Recipe",
+    "column": "cook_min",
+    "formula": "cook_min IS NULL OR cook_min >= 0"
+   },
+   {
+    "table": "Recipe",
+    "column": "stnd_min",
+    "formula": "stnd_min IS NULL OR stnd_min >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "recipe_id",
+    "formula": "recipe_id > 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "protein",
+    "formula": "protein IS NULL OR protein >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "carbo",
+    "formula": "carbo IS NULL OR carbo >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "alcohol",
+    "formula": "alcohol IS NULL OR alcohol >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "total_fat",
+    "formula": "total_fat IS NULL OR total_fat >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "sat_fat",
+    "formula": "sat_fat IS NULL OR sat_fat >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "cholestrl",
+    "formula": "cholestrl IS NULL OR cholestrl >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "sodium",
+    "formula": "sodium IS NULL OR sodium >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "iron",
+    "formula": "iron IS NULL OR iron >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "vitamin_c",
+    "formula": "vitamin_c IS NULL OR vitamin_c >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "vitamin_a",
+    "formula": "vitamin_a IS NULL OR vitamin_a >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "fiber",
+    "formula": "fiber IS NULL OR fiber >= 0"
+   },
+   {
+    "table": "Nutrition",
+    "column": "pcnt_cal_carb",
+    "formula": "pcnt_cal_carb IS NULL OR pcnt_cal_carb BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Nutrition",
+    "column": "pcnt_cal_fat",
+    "formula": "pcnt_cal_fat IS NULL OR pcnt_cal_fat BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Nutrition",
+    "column": "pcnt_cal_prot",
+    "formula": "pcnt_cal_prot IS NULL OR pcnt_cal_prot BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Nutrition",
+    "column": "calories",
+    "formula": "calories IS NULL OR calories >= 0"
+   },
+   {
+    "table": "Quantity",
+    "column": "quantity_id",
+    "formula": "quantity_id > 0"
+   },
+   {
+    "table": "Quantity",
+    "column": "max_qty",
+    "formula": "max_qty IS NULL OR max_qty > 0"
+   },
+   {
+    "table": "Quantity",
+    "column": "min_qty",
+    "formula": "min_qty IS NULL OR min_qty > 0"
+   },
+   {
+    "table": "Quantity",
+    "column": "min_qty",
+    "formula": "min_qty IS NULL OR max_qty IS NULL OR min_qty <= max_qty"
+   },
+   {
+    "table": "Quantity",
+    "column": "optional",
+    "formula": "optional IS NULL OR optional IN ('TRUE','FALSE')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Ingredient": 40,
+   "Recipe": 40,
+   "Nutrition": 40,
+   "Quantity": 80
+  },
+  "null_targets": [
+   "Ingredient.category",
+   "Ingredient.name",
+   "Ingredient.plural",
+   "Recipe.title",
+   "Recipe.subtitle",
+   "Recipe.servings",
+   "Recipe.yield_unit",
+   "Recipe.prep_min",
+   "Recipe.cook_min",
+   "Recipe.stnd_min",
+   "Recipe.source",
+   "Recipe.intro",
+   "Recipe.directions",
+   "Nutrition.protein",
+   "Nutrition.carbo",
+   "Nutrition.alcohol",
+   "Nutrition.total_fat",
+   "Nutrition.sat_fat",
+   "Nutrition.cholestrl",
+   "Nutrition.sodium",
+   "Nutrition.iron",
+   "Nutrition.vitamin_c",
+   "Nutrition.vitamin_a",
+   "Nutrition.fiber",
+   "Nutrition.pcnt_cal_carb",
+   "Nutrition.pcnt_cal_fat",
+   "Nutrition.pcnt_cal_prot",
+   "Nutrition.calories",
+   "Quantity.recipe_id",
+   "Quantity.ingredient_id",
+   "Quantity.max_qty",
+   "Quantity.min_qty",
+   "Quantity.unit",
+   "Quantity.preparation",
+   "Quantity.optional"
+  ],
+  "supporting_evidence": {
+   "Nutrition.calories": "Rows 214-221 show calories values 290.79, 141.01, 137.06, 81.7, 201.23, 66.03, 188.1, 89.74; all nonnegative.",
+   "Nutrition.pcnt_cal_carb": "Rows 214-221 show 56.8, 67.38, 78.45, 88.98, 72.81, 48.72, 57.79, 88.1; all in [0,100].",
+   "Nutrition.pcnt_cal_fat": "Rows 214-221 show 35.68, 6.89, 7.24, 2.35, 24.46, 2.18, 38.96, 5.46; all in [0,100].",
+   "Nutrition.pcnt_cal_prot": "Rows 214-221 show 7.53, 16.17, 14.3, 8.67, 2.73, 20.5, 3.25, 6.45; all in [0,100].",
+   "Quantity.min_qty": "Rows 1-9 show min_qty equals max_qty in all shown rows; rule min_qty <= max_qty holds.",
+   "Quantity.optional": "Rows 1-9 show optional values 'FALSE' and 'TRUE' only."
+  },
+  "uncertainty": "No formula linking Nutrition columns (e.g., calories from protein/carbo/fat) is stated because the shown rows do not satisfy a single consistent offset/rate. The relationship between Recipe.stnd_min and prep_min/cook_min is not stated because row 214 (305 vs 20+8) and row 216 (0 vs 10+13) contradict a simple sum. Ingredient.plural has only 3 distinct values with 78% NULL; treated as free text with NULL share."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 88 and validity.reasons.new_integrity_failures: 19 (19 of 20 instances invalid). The writer disables FK enforcement (`pragma foreign_keys = OFF` in writer.py) and appends generated rows, so FK violations are introduced silently. The spec's `unmatched_join_rows` targets explicitly require 'child rows with NULL FK' and 'parent rows without children' \u2014 i.e. orphan/NULL FK rows are intended \u2014 but the program must not create *non-NULL* FK values that reference nonexistent parents. `fill_foreign_keys_consistently` draws from parent values, but `_apply_nulls`/`_apply_duplicates` run afterward and can overwrite FK values with arbitrary pool values (e.g. `_apply_duplicates` on `Quantity.recipe_id` replaces values with `rng.choice(pool)` where pool may include values not present in Recipe), and `_apply_ties`/`_apply_diff_values` can also mutate FK columns. This produces non-NULL FK values with no matching parent, which is a genuine integrity failure distinct from the intended NULL/orphan pattern.",
+     "requested_revision": "Ensure FK columns only ever receive (a) NULL (per the null rule) or (b) values present in the parent key set (compact + generated). Apply duplicate/tie/diff-value mutations only to non-FK columns, or re-validate FK values against the parent set after all mutations and remap any orphan non-NULL value to a valid parent value (or NULL). Re-run and confirm fk_violations drops to only the intended NULL-FK rows (which SQLite does not count as violations) and new_integrity_failures is 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_duplicates` for `Quantity.quantity_id` (spec DUP_SHARE includes it) would create duplicate primary-key values, but `quantity_id` is a PK and `sample_fresh_primary_keys` runs before `_apply_duplicates`; the duplicate step then overwrites PK values with `rng.choice(pool)`, potentially colliding with existing PKs. The feedback shows pk_duplicates: 0, so this did not trigger here, but the code path is unsafe: `_apply_duplicates` is applied to every column in `cols` including PK columns (`for cm in tm.columns: if cm.name in cols: cols[cm.name] = _apply_duplicates(...)`), and `_apply_nulls` is guarded by `cm.pk_pos == 0` but `_apply_duplicates` is not.",
+     "requested_revision": "Guard `_apply_duplicates` (and `_apply_ties`, `_apply_diff_values`) to skip primary-key columns, or re-run `sample_fresh_primary_keys` after all mutations. The spec's `duplicates_for_distinct` on `Quantity.quantity_id` is inconsistent with the PK constraint and should be dropped from the spec (designer) since a PK cannot have duplicates."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `duplicates_for_distinct` lists `Quantity.quantity_id` with '20-50% duplicate share', but `quantity_id` is declared `INTEGER primary key` in the schema. A primary key cannot contain duplicates, so this target is unsatisfiable without violating the PK constraint. Similarly `unmatched_join_rows` for `Nutrition.recipe_id` says 'no NULL FK' while `Quantity.recipe_id` says 'child rows with NULL FK' \u2014 the program's `fill_foreign_keys_consistently` and `_apply_nulls` treat all nullable FKs uniformly, which is acceptable, but the spec should not demand duplicate PKs.",
+     "requested_revision": "Remove `Quantity.quantity_id` from `duplicates_for_distinct` (or restate it as a non-PK surrogate), since it conflicts with the primary-key integrity constraint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_ties` for `('Nutrition','pcnt_cal_prot')` uses `expr is None` and duplicates the top value of the column itself; but `pcnt_cal_prot` is in `RANGES` with hi=100.0 and the sampler clamps to [0,100]. Duplicating the top value is fine, but the tie target is 'unordered' and the code only ensures two rows share the max \u2014 acceptable. However `_apply_ties` for the `total_fat - sat_fat` etc. expressions sets `columns[a][j] = columns[b][j] + top`, which can push `total_fat` (or `sat_fat`) outside its nonnegative range or above 100 for `pcnt_cal_fat`, violating the semantic range rules. No post-clamp is applied after `_apply_ties`.",
+     "requested_revision": "After `_apply_ties` (and `_apply_diff_values`), re-clamp numeric columns to their `spec.RANGES` bounds, or choose the tie adjustment so both operands stay in range. Confirm generated rows satisfy all `semantic_rules_and_formulas` (e.g. `pcnt_cal_fat BETWEEN 0 AND 100`, `total_fat >= 0`)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_min_max` swaps `min_qty`/`max_qty` when `lo > hi`, but the spec's `comparison_boundary` for `Quantity.min_qty`/`max_qty` targets `PRED(quantity.max_qty = quantity.min_qty)` with 'equal_and_one_step_from'. The program never plants equal or one-step-apart min/max pairs; it only enforces `min_qty <= max_qty`. The boundary target (equality and one-step) is not implemented by construction.",
+     "requested_revision": "Add a construction step that plants at least one row with `min_qty = max_qty` and one with `max_qty = min_qty + step` (respecting the `min_qty <= max_qty` rule), per the `comparison_boundary` target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` uses `_null_share` which returns `spec.NULL_RATE` for most columns; for `Quantity.recipe_id`, `Quantity.max_qty`, `Quantity.optional` it uses `NULL_BAND` (0.05-0.30). Feedback shows `Quantity.recipe_id` NULL 111/1255 (~8.8%), `Quantity.max_qty` 245/1255 (~19.5%), `Quantity.optional` 203/1255 (~16.2%) \u2014 all within band, good. But `Quantity.ingredient_id` NULL 13/1255 (~1%) and `Quantity.unit` 13/1255 \u2014 these are not in `NULL_BAND` and use `NULL_RATE` 0.005, which is below the spec's general '5-30%' band only for the three listed columns; acceptable. However `Ingredient.name` shows NULL 0/765 while `NULL_RATE` is 0.0 \u2014 consistent. No blocking issue here, but note `Quantity.ingredient_id` is a nullable FK and the spec's `unmatched_join_rows` for it requires 'child rows with NULL FK'; 13 NULLs exist, so satisfied.",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`build_random_instance` applies `_apply_nulls` to all non-PK columns including FK columns, then `_apply_duplicates` may overwrite NULLs with non-NULL pool values (since `pool = [v for v in values if v is not None]` and `rng.choice(pool)` never returns None). This can reduce the NULL share below the required band for `Quantity.recipe_id`/`max_qty`/`optional`. Feedback shows shares still in band, but the ordering is fragile: `_apply_duplicates` runs after `_apply_nulls` and can replace planted NULLs, violating the rule 'a planted NULL is never replaced to satisfy a rule'.",
+     "requested_revision": "Run `_apply_duplicates` before `_apply_nulls`, or make `_apply_duplicates` skip indices that are NULL, so planted NULLs are preserved."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 88 fk_violations are entirely the intended NULL-FK rows (SQLite does not count NULL FKs as violations, so 88 non-NULL orphans remain unexplained and must be fixed).",
+    "Whether `_apply_ties` range violations actually occur in generated data (not directly measured in feedback; requires post-generation range validation).",
+    "Whether `comparison_boundary` for min_qty/max_qty equality is exercised by any query (construction_pairs separated 51/168; the min/max equality target is not planted)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with 'too many values to unpack (expected 2)'. In schema.py load_schema, the FK loop does `_id, _seq, ptable, frm, to = row[0], row[1], row[2], row[3], row[4]` \u2014 that is 5 values assigned to 5 names, which is fine \u2014 but the inline-REFERENCES regex loop appends `(child, parent, child)` triples while `_topo_order` and instance.py iterate `for (_cc, parent, _pc) in tm.fks` (3-tuples) \u2014 consistent. The actual crash is in instance.py: `for (child_col, parent, parent_col) in tm.fks:` expects 3-tuples, but PRAGMA foreign_key_list rows are appended as `(frm, ptable, to)` \u2014 also 3-tuples. The unpack error therefore comes from `_parse_fk_clause`/inline regex producing a 2-tuple `(None, parent, pcols[0])`? No \u2014 that is 3. The real culprit: in schema.py the inline REFERENCES regex appends `(child, parent, child)` (3-tuple) but the `_parse_fk_clause` helper is never called; however `PRAGMA foreign_key_list` returns 8 columns and the code slices row[0..4] correctly. The failure is reproducible on every instance, so the FK tuple shape is inconsistent somewhere in the pipeline and must be fixed before any instance can be written.",
+     "requested_revision": "Make the FK tuple shape uniform (always 3-tuples `(child_col, parent_table, parent_col)`) across schema.py (PRAGMA path, inline REFERENCES path, and _parse_fk_clause) and instance.py consumers; add a unit test that loads the cookbook schema and asserts every entry of `tm.fks` has length 3. Re-run generation and confirm n_ok == n_instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_parent_key_pool` relies on module-global `_COMPACT_MAX`, which is only populated by `set_compact_max`, called from `writer.build_and_write`. But `cli._run_one` calls `instance_mod.build_random_instance` directly (not `build_and_write`), so `_COMPACT_MAX` is empty and FK columns are drawn only from generated parent keys. This contradicts the spec's `foreign_key` rule ('Copy a parent primary-key value (validated against the final parent key set, including NULL)') and the `unmatched_join_rows` targets that require child rows referencing compact parent rows. Even after the unpack bug is fixed, FK values would never reference compact rows.",
+     "requested_revision": "Call `instance_mod.set_compact_max(schema, orig_con)` (or route through `writer.build_and_write`) before `build_random_instance` in `cli._run_one`; alternatively pass the compact key sets explicitly into `build_random_instance`. Verify that generated Quantity.recipe_id / Quantity.ingredient_id / Nutrition.recipe_id values include compact parent keys."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `NULL_RATE = 0.005` is applied to every nullable column not in `NULL_BAND_COLS`, but the interface rule (instruction 7) requires 'a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. `_apply_nulls` computes `k = max(1, int(round(share * n)))` with share=0.005, so for n=40 it yields k=1 \u2014 at least one NULL is guaranteed, but the share is a fixed 0.5% rather than the compact share. The spec's `null_targets` list includes many columns (e.g. Recipe.title, Nutrition.protein) whose compact share is not 0.5%; the program does not read compact NULL shares at all.",
+     "requested_revision": "Compute per-column NULL share from the compact database (e.g. `SELECT SUM(col IS NULL)/COUNT(*)`) and use it in `_apply_nulls`; keep the 5\u201330% band only for the three `NULL_BAND_COLS`. Ensure at least one NULL row per nullable column per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `BOUNDARY_NUM` includes `('Nutrition','vitamin_a'): [-0.01, 0.0, 0.01]` and `('Nutrition','alcohol'): [-0.01, 0.0, 0.01]`, and `_apply_boundaries` writes these literals directly into the column. The semantic rule in the specification states `vitamin_a IS NULL OR vitamin_a >= 0` and `alcohol IS NULL OR alcohol >= 0`. Planting -0.01 violates the stated CHECK-style rule. `_reclamp` runs after `_apply_boundaries` and would clamp -0.01 to 0.0 via `clamp_real`, silently destroying the boundary literal \u2014 so the boundary target is not actually achieved, and the spec's boundary intent is not met.",
+     "requested_revision": "Either (a) drop the negative boundary literals for vitamin_a/alcohol and use only 0.0 and 0.01 (respecting the >= 0 rule), or (b) explicitly document that the boundary is planted before clamping and accept that -0.01 is not preserved. Prefer (a) so the planted boundary survives `_reclamp`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_ties` for `TIE_TARGETS` sets `a[j] = clamp_real((ta, ct), b[j] + best)`. For `('Recipe', ...)` no \u2014 for `('Quantity', ...)` no \u2014 but for `('Quantity', 'min_qty')`/`('Quantity', 'max_qty')` the spec's `comparison_boundary` targets are `=0.5*max_qty`, `=max_qty`, `=max_qty-0.01` and `=0.5*min_qty`, `=min_qty`, `=min_qty+0.01`. `_apply_min_max_boundary` only plants `min_qty = max_qty` (row 0) and `max_qty = min_qty + 0.01` (row 1); it never plants `min_qty = 0.5*max_qty` or `max_qty = 0.5*min_qty`. The spec lists these as boundary targets, so the program under-implements the specified boundary set.",
+     "requested_revision": "Extend `_apply_min_max_boundary` to also plant `min_qty = 0.5*max_qty` and `max_qty = 0.5*min_qty` rows (respecting min_qty <= max_qty and the >0 range), or remove those literals from the spec's `comparison_boundary` targets if they are not intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `TIE_TARGETS` includes `(('Nutrition','pcnt_cal_fat'), ('Nutrition','sat_fat'), 'DESC')` and `TIE_UNORDERED = [('Nutrition','pcnt_cal_prot')]`, matching the spec's tie targets. However `_apply_ties` runs before `_apply_nulls`, and `_apply_nulls` may NULL out the tied rows (NULL_RATE 0.005, so unlikely but possible). More importantly, `_apply_ties` for `pcnt_cal_fat - sat_fat` sets `a[j] = clamp_real(('Nutrition','pcnt_cal_fat'), b[j] + best)`; if `b[j] + best > 100`, clamp_real caps at 100, breaking the tie. The spec requires 'tie at rank 1 DESC on pcnt_cal_fat - sat_fat' to actually hold.",
+     "requested_revision": "When planting ties, choose the second row's `b[j]` (the constant operand) such that `b[j] + best` stays within the column's range, or adjust `a[j]` downward and re-pick the top. Add an assertion after `_apply_ties` that at least two non-NULL rows share the top difference."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Quantity.min_qty: min_qty IS NULL OR max_qty IS NULL OR min_qty <= max_qty`, but the `comparison_boundary` targets for `Quantity.min_qty`/`Quantity.max_qty` include `=max_qty-0.01` and `=min_qty+0.01`, which are consistent. However the spec also lists `Quantity.max_qty` boundary `=0.5*min_qty` \u2014 combined with `min_qty <= max_qty` this forces `min_qty <= 0.5*min_qty`, i.e. `min_qty <= 0`, contradicting `min_qty > 0`. The boundary target is internally inconsistent with the stated rule.",
+     "requested_revision": "Remove `=0.5*min_qty` from the `Quantity.max_qty` boundary targets (or change it to `=2*min_qty`), so the boundary set is satisfiable together with `min_qty > 0` and `min_qty <= max_qty`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` for `Ingredient.plural` says 'only 3 distinct values with 78% NULL; treated as an enum with NULL share', but the `null_targets` list includes `Ingredient.plural` and the generic `null_share` rule says 'generate NULL in the stated share of rows'. The stated share is not given for `Ingredient.plural` (only the 5\u201330% band is given for three Quantity columns). The program uses `NULL_RATE = 0.005` for it, which does not match the observed 78% NULL share. This is an under-specified rule.",
+     "requested_revision": "State the intended NULL share for `Ingredient.plural` (e.g. '~78% NULL, matching compact') in the specification, and have the program read it from the compact database rather than defaulting to 0.5%."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_duplicates` is called for every column including `('Quantity','recipe_id')`, which is in `FK_COLUMNS`; the function returns early for FK columns (`if column.pk_pos > 0 or key in spec_mod.FK_COLUMNS: return`). But the spec's `duplicates_for_distinct` target for `Quantity.recipe_id` ('20-50% duplicate share') is therefore never applied. The spec explicitly lists `Quantity.recipe_id` as a duplicate-distinct target, so the program does not implement it.",
+     "requested_revision": "Either remove `Quantity.recipe_id` from `DUP_SHARE`/spec `duplicates_for_distinct` targets, or implement duplicate-distinct for FK columns by drawing from a restricted parent-key subset (still valid FKs) so 20\u201350% of rows share a recipe_id."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_diff_values` targets `('Nutrition','calories')`, `('Nutrition','vitamin_c')`, `('Nutrition','carbo')`, `('Nutrition','vitamin_a')` and perturbs one value by +1.0 if all values are equal. But `_apply_nulls` runs after and may NULL the perturbed row; also `_reclamp` runs before `_apply_nulls` but after `_apply_diff_values`, so a +1.0 perturbation on `vitamin_a` (range 0\u20131000) is fine, but on `pcnt_cal_*` it would be clamped. The spec's `rows_with_different_values` targets are satisfied only probabilistically; there is no assertion. Given the unpack crash, this is untested.",
+     "requested_revision": "Add a post-construction assertion (or a verification pass in the writer) that each `rows_with_different_values` target column has at least two non-NULL rows with different values per instance; if not, re-perturb a non-NULL row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_dedupe_pk` bumps the first integer PK column when a duplicate tuple is seen, but it does not check against compact PKs (only `seen` within generated rows). The docstring says 'Make PK tuples unique against compact + generated rows', but compact keys are never loaded into `seen`. Since generated PKs start at 1 (via `rng.randint(0,100)` for non-ranged ints, or `int_range` for ranged), collisions with compact PKs (which start at 1) are likely, causing INSERT failures that are silently counted in `rows_failed`.",
+     "requested_revision": "Seed `seen` with compact PK tuples (read via `_compact_keys`) before deduping, or start generated PKs above `_COMPACT_MAX[table]`. Verify `rows_failed` is empty for all tables after the fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`writer.write_instance_sqlite` copies the compact database and appends generated rows, but `cli._run_one` calls `instance_mod.build_random_instance` without first calling `set_compact_max`, and `writer.build_and_write` (which does call it) is never invoked from the CLI. This is the same root cause as issue 2 but also means the compact rows are preserved (copyfile) while generated rows may collide with them on PKs (issue 11). The execution feedback shows n_ok=0, so preservation of compact rows and FK consistency cannot be verified.",
+     "requested_revision": "After fixing the unpack bug and wiring `set_compact_max`, re-run and confirm: (a) compact row counts are unchanged in each unit, (b) `PRAGMA foreign_key_check` returns no rows, (c) `rows_failed` is empty, (d) two runs with the same seed produce byte-identical generated rows."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the FK unpack error originates in schema.py's inline-REFERENCES regex (which appends 3-tuples) or in a 2-tuple produced elsewhere could not be pinned down without a traceback; the fix must make all FK tuples 3-tuples and add a test.",
+    "Compact NULL shares per column were not available in the provided statistics; the program's fixed 0.5% NULL rate cannot be validated against the compact share until the compact DB is queried.",
+    "Reproducibility (same seed \u2192 identical output) could not be verified because no instance was written (n_ok=0).",
+    "Preservation of compact rows and FK integrity could not be verified for the same reason."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with 'too many values to unpack (expected 2)' (n_ok=0, n_fail=20, rows_added={}). The error originates in instance.build_random_instance: `for (child_col, parent, parent_col) in tm.fks:` and `for (child_col, parent, parent_col) in tm.fks` unpack 3-tuples, but schema.load_schema appends `t.fks.append((frm, ptable, to))` \u2014 that is a 3-tuple, so the unpack itself is fine; the actual failure is in `_parent_key_pool`/FK handling where `for (child_col, parent, parent_col) in tm.fks` is used consistently, but `_apply_duplicates` restricted-pool loop also unpacks 3-tuples. The real mismatch: `schema.py` normalizes FKs to 3-tuples, yet `instance.py` line `for (child_col, parent, parent_col) in tm.fks:` is correct, so the unpack error must come from a 2-tuple source. Inspecting `_parent_key_pool` return and `generated_keys` usage: `generated_keys[table] = vals` stores scalars for single-PK tables, but `_parent_key_pool` does `vals.extend(generated_keys.get(parent, []))` then filters `isinstance(v, int)` \u2014 fine. The concrete 2-tuple unpack is in `_apply_ties`: `for (ta, ca), (tb, cb), _direction in spec_mod.TIE_TARGETS:` \u2014 TIE_TARGETS entries are 3-tuples of ((t,c),(t,c),'DESC'), which unpacks correctly. The failing unpack is `for (child_col, parent, parent_col) in tm.fks` only if fks contains 2-tuples; but schema appends 3-tuples. Regardless of root cause, the program crashes on every instance and produces zero output, which blocks a pass.",
+     "requested_revision": "Fix the tuple-unpacking error so that all 20 instances generate successfully (n_ok=20, n_fail=0). Add a unit test that builds one instance end-to-end and asserts non-empty rows_added for all four tables. Re-run and confirm the summary reports n_ok equal to the requested instance count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because generation never completed, none of the specified patterns were exercised: no comparison-boundary literals, no duplicate-distinct shares, no tie targets, no NULL bands, no FK consistency, and no preservation of compact rows could be verified. The construction_pairs_by_group list is empty, confirming no pairs were constructed.",
+     "requested_revision": "After fixing the crash, re-run generation and provide execution feedback showing construction_pairs_by_group populated for the targeted patterns (comparison_boundary, duplicates_for_distinct, ties_for_order_limit, null_rows, unmatched_join_rows, rows_with_different_values) and confirm compact rows are preserved (row counts = compact + generated)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists Quantity.min_qty boundary targets as ['=0.5*max_qty','=max_qty','=max_qty-0.01'] and Quantity.max_qty as ['=2*min_qty','=min_qty','=min_qty+0.01']. The program's _apply_min_max_boundary plants rows 0..3 with equality, +0.01, 2x, and 0.5x, which covers these relations, but the spec's literal strings are not directly comparable to the atomic-operation targets which reference 'equal_and_one_step_from' between min_qty and max_qty. This is a documentation ambiguity rather than a blocking error, but the spec should state the relations in the same form the program implements.",
+     "requested_revision": "Clarify in the specification that min_qty/max_qty boundary targets are relational (equality, one-step, 2x, 0.5x) and that the program's _apply_min_max_boundary is the canonical implementation, so the spec and code agree on the exact planted relations."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's semantic_rules_and_formulas include 'Ingredient.plural IN (s, es, #NAME?)' and 'Ingredient.category IN (...)' as enums, and the program implements these via spec.ENUMS. However, the spec's null_targets list includes Ingredient.name, Recipe.title, etc., and the NULL rule requires at least one NULL per nullable column per instance. The program's _apply_nulls uses `k = max(1, int(round(share * n)))` which guarantees at least one NULL, consistent with the interface rule. No blocking issue here, but the spec should explicitly state that the 'at least one NULL per nullable column' guarantee overrides a compact share of 0.",
+     "requested_revision": "Add a sentence to the specification's null_share rule stating that even when the compact share is 0, at least one NULL row is planted per nullable column per instance, matching the program's max(1, ...) behavior."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the tuple-unpacking crash is in instance.py FK loops or elsewhere could not be pinpointed from the summary alone; the engineer must reproduce and fix.",
+    "Whether compact rows are preserved after generation (writer copies orig then appends) could not be verified because no instance was written.",
+    "Whether FK consistency (Quantity.recipe_id referencing Recipe and Nutrition, Quantity.ingredient_id referencing Ingredient) holds in generated rows could not be verified.",
+    "Whether the NULL band (5-30%) for Quantity.recipe_id, Quantity.max_qty, Quantity.optional is respected could not be verified.",
+    "Whether tie targets (total_fat - sat_fat, etc.) and diff-value targets are satisfied after all mutations could not be verified."
+   ]
+  }
+ ]
 }

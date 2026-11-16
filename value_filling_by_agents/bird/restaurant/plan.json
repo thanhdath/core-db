@@ -1,51 +1,637 @@
 {
  "db": "restaurant",
- "operator_io_quirks": [
-  "All identifiers lowercase, no spaces; still double-quote in generated SQL per spec.",
-  "geographic.city is TEXT PK with 168 distinct values; generalinfo.city/location.city FK to it but only 167/165 distinct -> some parents unreferenced, some children may reference missing parents in original (FK not enforced).",
-  "location has TWO FKs: id_restaurant->generalinfo (1:1-ish, 9539 vs 9590) and city->geographic; both must be filled from parent final columns.",
-  "generalinfo.id_restaurant and location.id_restaurant are INTEGER PKs, distinct=rows -> no PK duplicates in original; TS Number fuzzer will produce duplicates that get dropped.",
-  "review is REAL with only 33 distinct values in [2.3,4.0]; TS Number(scale from 'real' -> no args -> scale default) will draw wide floats, not this range.",
-  "street_num INTEGER with 4.8% NULLs and 3966 distinct; TS Number will not reproduce NULLs (upstream doesn't enforce NOT NULL, but nullable columns still get non-null draws).",
-  "No declared type dispatches to crash fallback; all map to String or Number cleanly.",
-  "No text-stored dates, no composite keys, no self-references, no dangling FKs, no non-unique parents.",
-  "geographic.county/region have 0% NULL but are nullable; TS may emit NULLs there (insert succeeds).",
-  "Small tables (168/9590/9539 rows) -> read_schema full read, no rowid sampling needed.",
-  "label has 7606 distinct of 9590 (near-unique but not declared unique); TS String fuzzer will produce many duplicates -> no unique constraint so all kept.",
-  "food_type 145 distinct, city 167 distinct: low-cardinality strings; TS String fuzzer draws from CHARSET, not these values, unless literal pool supplies them."
- ],
- "operator_ts_expectations": [
-  "geographic.city (TEXT PK, String fuzzer): random a-zA-Z0-9() strings of length 0-20, contaminated 50% -> implausible city names; PK dedup keeps first occurrence.",
-  "generalinfo.city / location.city (FK): drawn with replacement from geographic.city final values -> consistent, but many-to-one ties created (original has 167/165 distinct vs 168 parents).",
-  "location.id_restaurant (FK to generalinfo PK): drawn from generalinfo.id_restaurant final values -> 1:1-ish preserved but duplicates possible; location PK dedup then drops rows.",
-  "generalinfo.id_restaurant / location.id_restaurant (INTEGER PK, Number fuzzer): uniform ints in [-10^scale,10^scale] with +-1/+-2 perturbation -> huge ids, not 1..9590; PK dedup drops collisions.",
-  "review (REAL, Number): wide floats, not [2.3,4.0]; likely FN driver for AVG(review)/range predicates.",
-  "street_num (INTEGER, Number): wide ints, not 100-4000; FN for street_num predicates.",
-  "label/food_type/street_name (String): random charset strings, not real names -> FN for LIKE/equality on these; FP possible when random string accidentally matches a literal.",
-  "county/region (String, low cardinality): random strings, not 'bay area'/'napa county' -> FN for region/county filters.",
-  "Literal pool from train SQL will inject some real values (e.g. 'san francisco', 'afghani') into String samplers via elements, partially mitigating FN.",
-  "No CHECK constraints, no UNIQUE columns -> drop_unique_duplicates is a no-op; only PK dedup filters rows.",
-  "FK consistency means joins generalinfo-location-geographic always match on city/id_restaurant -> join cardinality plausible; misses come from value plausibility, not referential breaks.",
-  "Number fuzzer's list_max overwrite quirk: with literal-pool elements the upper bound resets to full range -> fresh draws ignore observed max, widening review/street_num beyond original."
- ],
- "challenger_refs": [
-  "g9a793329",
-  "gcab87947",
-  "g38399d7e",
-  "g7130c243",
-  "g7e27c40b",
-  "g39420b26",
-  "g0dd13d19",
-  "g160ed78e",
-  "g76e9105a",
-  "g76e9105a",
-  "g13f8fabf"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a small pool of realistic short strings; 5% of rows get a near-variant (case change, truncation, or one-character edit) of a pool value; 2% NULL when nullable.",
+   "text_name": "Sample from a pool of realistic names/labels; allow 20-50% duplicate share on DISTINCT columns; 5% near-variants; 2% NULL when nullable.",
+   "text_city_parent": "Primary-key city pool; generate 40 distinct city names; each instance includes at least one row for every boundary city literal and its case-variant; never NULL.",
+   "text_city_fk": "Copy an existing geographic.city value; never generate a non-NULL value absent from geographic.city; 5% of rows get a case-variant of the copied value; 2% NULL when nullable.",
+   "integer_pk": "Sequential integers starting at 1; never NULL; unique.",
+   "integer_fk": "Copy from parent primary key; 2% NULL when nullable; otherwise pick an existing parent key.",
+   "integer_positive": "Uniform integer in [1, 5000]; 5% NULL when nullable.",
+   "real_review": "Uniform real in [1.0, 5.0] rounded to one decimal; nullable per null_targets (compact share, at least one NULL row).",
+   "real_rate": "Uniform real in [0, 1] rounded to two decimals; 0% NULL.",
+   "enum_text": "Sample uniformly from the listed enum values; 2% NULL when nullable.",
+   "boundary_numeric": "For each listed literal L, include L-1, L, L+1 with equal probability; otherwise uniform in the column range.",
+   "boundary_text": "For each listed literal L, include L and its case-variant; otherwise sample from the pool.",
+   "tie_order": "Ensure at least two rows share the maximum COUNT(*) value for the listed ORDER column; apply after NULL planting and re-verify on final rows.",
+   "null_share": "For columns listed in null_targets, generate NULL rows at the compact database's observed share for that column (clamped to [0, 0.30]) with at least one NULL row per instance; NOT NULL columns never get NULL.",
+   "pk_no_duplicates": "Primary-key and UNIQUE columns never contain duplicate values; duplicates_for_distinct targets on such columns are explicitly ignored.",
+   "unmatched_join": "For each unmatched_join_rows target, leave at least 2 parent rows without children and, where child_rows_with_null_fk is true, generate at least 2 child rows with NULL foreign key; a non-NULL foreign-key value always references an existing parent row; non-NULL dangling FKs are never generated.",
+   "boundary_pk": "For a primary-key column with a comparison_boundary target, reserve the listed literals (and one step on each side) as actual key values before filling the rest of the sequence; child foreign keys referencing that parent use only existing parent key values or NULL.",
+   "unique_child_pk": "When a child table's primary key also references a parent, generate the child key as a unique subset of parent keys drawn up front (rng.sample over a deduplicated parent id set); never draw the same parent key twice as a child PK, never dedup after drawing, and seed boundary PK literals only when already in the parent id set.",
+   "empty_guard": "Every rng.choice/rng.sample/rng.shuffle call is guarded against empty sequences; when a parent id pool is empty, fall back to a fresh sequential range; never call rng.sample with k=0 on an empty list.",
+   "row_count_integrity": "Boundary seeding and dedup preserve uniqueness and FK validity so that per-instance row counts match table_sizes_per_instance; rows_skipped must be 0."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "geographic.city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "san francisco",
+     "SAN FRANCISCO",
+     "dublin",
+     "DUBLIN",
+     "belmont",
+     "BELMONT",
+     "berkeley",
+     "BERKELEY"
+    ]
+   },
+   {
+    "column": "geographic.city",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "location.city",
+      "generalinfo.city",
+      "geographic.city"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "generalinfo.city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "san francisco",
+     "SAN FRANCISCO",
+     "santa cruz",
+     "SANTA CRUZ",
+     "hayward",
+     "HAYWARD",
+     "dublin",
+     "DUBLIN"
+    ]
+   },
+   {
+    "column": "generalinfo.city",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "geographic.city"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "location.city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "san francisco",
+     "SAN FRANCISCO",
+     "santa cruz",
+     "SANTA CRUZ",
+     "hayward",
+     "HAYWARD",
+     "oakland",
+     "OAKLAND"
+    ]
+   },
+   {
+    "column": "location.city",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "geographic.city"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "location.city",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "generalinfo.id_restaurant",
+    "pattern": "comparison_boundary",
+    "targets": [
+     384,
+     385,
+     386
+    ]
+   },
+   {
+    "column": "generalinfo.id_restaurant",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "location.id_restaurant",
+      "generalinfo.id_restaurant"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "location.id_restaurant",
+    "pattern": "comparison_boundary",
+    "targets": [
+     384,
+     385,
+     386
+    ]
+   },
+   {
+    "column": "location.id_restaurant",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "generalinfo.id_restaurant"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "generalinfo.food_type",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "american food",
+     "AMERICAN FOOD",
+     "african",
+     "AFRICAN",
+     "asian",
+     "ASIAN",
+     "mexican",
+     "MEXICAN"
+    ]
+   },
+   {
+    "column": "generalinfo.food_type",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      4
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "geographic.region",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Napa Valley",
+     "napa valley",
+     " Va",
+     " va",
+     "NValley",
+     "nvalley",
+     "Napa Vally",
+     "napa vally"
+    ]
+   },
+   {
+    "column": "geographic.region",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "location.street_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "11th st",
+     "11TH ST",
+     "appian way",
+     "APPIAN WAY",
+     "railroad",
+     "RAILROAD",
+     "alpine rd",
+     "ALPINE RD"
+    ]
+   },
+   {
+    "column": "location.street_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "location.street_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "generalinfo.label",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "bakers square restaurant & pie shop",
+     "BAKERS SQUARE RESTAURANT & PIE SHOP",
+     "akers sq",
+     "AKERS SQ",
+     "bakers square restauant & pie shop",
+     "BAKERS SQUARE RESTAUANT & PIE SHOP",
+     "e restaurant & ",
+     "E RESTAURANT & "
+    ]
+   },
+   {
+    "column": "generalinfo.label",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "geographic.county",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "san mateo county",
+     "SAN MATEO COUNTY",
+     "contra costa county",
+     "CONTRA COSTA COUNTY"
+    ]
+   },
+   {
+    "column": "geographic.county",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "location.street_num",
+    "pattern": "comparison_boundary",
+    "targets": [
+     999,
+     1000,
+     1001,
+     1999,
+     2000,
+     2001
+    ]
+   },
+   {
+    "column": "generalinfo.review",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "generalinfo",
+    "child_column": "city",
+    "parent_table": "geographic",
+    "parent_column": "city",
+    "copied_columns": []
+   },
+   {
+    "child_table": "location",
+    "child_column": "city",
+    "parent_table": "geographic",
+    "parent_column": "city",
+    "copied_columns": []
+   },
+   {
+    "child_table": "location",
+    "child_column": "id_restaurant",
+    "parent_table": "generalinfo",
+    "parent_column": "id_restaurant",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "geographic",
+    "column": "city",
+    "formula": "city IS NOT NULL"
+   },
+   {
+    "table": "generalinfo",
+    "column": "id_restaurant",
+    "formula": "id_restaurant > 0"
+   },
+   {
+    "table": "generalinfo",
+    "column": "review",
+    "formula": "review IS NULL OR review BETWEEN 1.0 AND 5.0"
+   },
+   {
+    "table": "generalinfo",
+    "column": "city",
+    "formula": "city IS NULL OR city IN (SELECT city FROM geographic)"
+   },
+   {
+    "table": "location",
+    "column": "id_restaurant",
+    "formula": "id_restaurant > 0"
+   },
+   {
+    "table": "location",
+    "column": "id_restaurant",
+    "formula": "id_restaurant IN (SELECT id_restaurant FROM generalinfo)"
+   },
+   {
+    "table": "location",
+    "column": "street_num",
+    "formula": "street_num IS NULL OR street_num BETWEEN 1 AND 9999"
+   },
+   {
+    "table": "location",
+    "column": "city",
+    "formula": "city IS NULL OR city IN (SELECT city FROM geographic)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "geographic": 40,
+   "generalinfo": 200,
+   "location": 200
+  },
+  "null_targets": [
+   "geographic.county",
+   "geographic.region",
+   "generalinfo.label",
+   "generalinfo.food_type",
+   "generalinfo.city",
+   "generalinfo.review",
+   "location.street_num",
+   "location.street_name",
+   "location.city"
+  ],
+  "supporting_evidence": {
+   "geographic.city": "Primary key, NOT NULL; sample rows show distinct city names.",
+   "generalinfo.review": "Sample rows: 2.3, 3.8, 4.0, 3.6, 3.7, 2.8, 3.5, 2.7 all within [1.0, 5.0]; nullable per null_targets.",
+   "location.street_num": "Sample rows: 242, 135, 430, 1103, 833, 155, 2118, 3005 all positive integers.",
+   "generalinfo.id_restaurant": "Sample rows: 1-8 sequential; statistics show 9590 distinct values.",
+   "location.id_restaurant": "Sample rows: 1-8 matching generalinfo; statistics show 9539 distinct values.",
+   "fk_integrity": "generalinfo.city and location.city are FK to geographic.city; location.id_restaurant is FK to generalinfo.id_restaurant. Non-NULL FK values always reference existing parent rows; the FK constraints (ON DELETE/UPDATE CASCADE) forbid non-NULL dangling FKs. Childless parents and NULL child FKs are generated per unmatched_join_rows."
+  },
+  "uncertainty": {
+   "geographic.region": "Enum values not fully listed; sample shows 'bay area', 'napa valley', 'unknown', 'monterey', 'los angeles area', 'yosemite and mono lake area', 'sacramento area', 'northern california'. 9 distinct values observed; further values possible.",
+   "generalinfo.food_type": "145 distinct values observed; enum rule not feasible; sample from a pool of ~28 common food types plus boundary literals; generic text_short near-variant rate (5%) applies.",
+   "geographic.county": "20 distinct values observed; sample from a pool of county names.",
+   "location.street_name": "3675 distinct values; sample from a pool of street names.",
+   "generalinfo.label": "7606 distinct values; sample from a pool of restaurant names.",
+   "duplicates_for_distinct_on_pk": "duplicates_for_distinct targets on geographic.city and location.id_restaurant are primary keys and cannot duplicate; explicitly ignored per pk_no_duplicates.",
+   "boundary_pk": "Boundary literals 384/385/386 for id_restaurant are reserved as actual key values in generalinfo before filling the sequence; location.id_restaurant references only existing generalinfo ids or NULL.",
+   "unmatched_join": "unmatched_join_rows is satisfied by parent rows without children and by child rows with NULL FK; non-NULL FK values always reference existing parents.",
+   "location_pk": "location.id_restaurant is primary key; generate as unique subset of generalinfo keys up front, before assigning other columns, so the 200-row target is met without dedup losses.",
+   "null_share": "Each nullable column's NULL share follows the compact database's observed share (clamped to [0, 0.30]) with at least one NULL row per instance; generalinfo.review is nullable per null_targets."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_write` calls `shutil.copyfile(orig_path, part)` but the module imports only `os`, `random`, `sqlite3` (no `import shutil`). Execution feedback: 15/20 units failed with NameError(\"name 'shutil' is not defined\").",
+     "requested_revision": "Add `import shutil` to tscore_gen/instance.py (or replace with an equivalent copy). This is a hard blocker: no instance is ever written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 5/20 units failed with IndexError('Cannot choose from an empty sequence'). Likely sources: `_seed_boundary_unmatched` / `_seed_boundary_pk` calling `rng.choice` on empty lists, or `TextSampler._draw`/`NumberSampler._draw` choosing from an empty pool when observed+literal+spec pools are all empty for a column (e.g. `geographic.region`/`county` when pool SQL yields nothing and `_spec_pool` returns [] for a non-listed column).",
+     "requested_revision": "Guard every `rng.choice`/`rng.sample` against empty sequences (fall back to a spec pool or a safe default), and ensure `make_sampler` never returns a sampler with an empty pool. Re-run and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_geographic` dedups on `city` (PK) and comments 'Keep deduplicated', but the spec's `duplicates_for_distinct` target for `geographic.city` (20-50% duplicate share) is silently dropped. Similarly `_generate_location` dedups `id_restaurant` (PK) while the spec lists a `duplicates_for_distinct` target for `location.id_restaurant` (20-50%). These targets are physically impossible on a PK and should be reconciled in the spec, not silently ignored.",
+     "requested_revision": "Designer: remove or reinterpret the `duplicates_for_distinct` targets on `geographic.city` and `location.id_restaurant` (they are primary keys and cannot duplicate). Engineer: document the resolution in code so the intent is explicit."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_generalinfo` and `_generate_location` set `id_restaurant` to `range(start, start+n)` where `start = max(compact_ids)+1`. The spec's `comparison_boundary` target for `generalinfo.id_restaurant`/`location.id_restaurant` is [384,385,386]; `_seed_boundary_pk` is only applied to `location`, not `generalinfo`, and even for `location` it overwrites sequential values, breaking the FK relationship to `generalinfo` (a location row with id 384 may not exist in generalinfo).",
+     "requested_revision": "Apply boundary seeding for `generalinfo.id_restaurant` too, and ensure any `location.id_restaurant` boundary value references an existing `generalinfo.id_restaurant` (or is NULL). Do not overwrite a location PK with a value absent from the parent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_location` sets `id_restaurant` sequentially and then `_dedup`s on it, but the spec's `unmatched_join_rows` for `location.id_restaurant` requires `parent_rows_without_children: true` and `child_rows_with_null_fk: false`. Sequential ids starting after compact max guarantee every location row has a matching generalinfo parent (since generalinfo also starts after compact max with the same n), so no parent-without-child is produced. Also `_generate_generalinfo`'s `_seed_boundary_unmatched` for `city` uses `share=0.05` but the spec's `unmatched_join_rows` for `generalinfo.city` requires `parent_rows_without_children: true` \u2014 this is only satisfied if some geographic cities have no generalinfo children, which is not enforced.",
+     "requested_revision": "Explicitly construct unmatched-join scenarios: leave some geographic cities without generalinfo/location children, and some generalinfo ids without location children. Verify with a post-generation check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_generalinfo` calls `_seed_boundary_unmatched(cols, 'food_type', spec, rng, parent=None, share=0.06)` which overwrites food_type values with boundary literals like 'american food'/'AMERICAN FOOD'. But `_ensure_groups_different` runs after and may overwrite review values; more importantly the spec's `ties_for_order_limit` for `generalinfo.food_type` (tie_at_rank [1,4], DESC, COUNT(*)) is not implemented anywhere \u2014 no code ensures at least two food_type values share the max count.",
+     "requested_revision": "Implement the `ties_for_order_limit` rule for `generalinfo.food_type` (and `geographic.region`, `location.street_name`, `geographic.county`) by forcing at least two rows to share the maximum COUNT(*) for the ORDER column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_location` sets `city` NULL share via `make_sampler` (spec null_share 0.15) but then the FK-fix loop `if parent_cities and v not in parent_cities: if rng.random() < 0.3: continue` leaves ~30% of non-null unmatched city values, which is fine for `unmatched_join_rows`, but the spec's `null_in_count_column` for `location.city` requires 5-30% NULL \u2014 this is satisfied. However `generalinfo.city` and `location.city` boundary literals like 'SANTA CRUZ'/'santa cruz' are not guaranteed to be in the geographic pool, so `comparison_boundary` queries may not match. The spec's `comparison_boundary` targets for `generalinfo.city` include 'santa cruz'/'SANTA CRUZ'/'hayward'/'HAYWARD' which are not in `S.CITIES` (only 'santa cruz' is; 'hayward' is). Verify these are reachable.",
+     "requested_revision": "Ensure all `comparison_boundary` literals for city columns are present in the generated geographic.city pool (or in generalinfo/location city values) so boundary queries can match. Add a post-generation assertion."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `table_sizes_per_instance` gives geographic=40, generalinfo=200, location=200, but `_target_sizes` varies \u00b120% per instance. The spec's `duplicates_for_distinct` for `geographic.city` (20-50%) is impossible on a 40-row PK with dedup. The spec's `unmatched_join_rows` for `geographic.city` requires `parent_rows_without_children: true` \u2014 with only 40 cities and 200 generalinfo rows, this is achievable but not specified how many.",
+     "requested_revision": "Designer: clarify that `duplicates_for_distinct` on PK columns is not applicable, and specify the intended number/share of parent rows without children for each `unmatched_join_rows` target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_generate_generalinfo` clamps review to [1.0,5.0] and `_ensure_groups_different` adds 0.3 to a review value, but the spec's `rows_with_different_values` for `generalinfo.review` requires '>= 2 per group with different values' \u2014 this is only enforced per food_type group, not per any grouping. Also `RealSampler` for review uses `null_share` from spec (0.02) but the spec's `null_targets` includes `generalinfo.review`; the NULL rule requires at least one NULL row per nullable column per instance \u2014 with 200 rows and 2% share this is likely but not guaranteed.",
+     "requested_revision": "Guarantee at least one NULL row per nullable column per instance (post-generation check + forced NULL). Clarify the grouping for `rows_with_different_values` on review."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_write` sets `PRAGMA foreign_keys = OFF` and inserts generated rows without validating FK integrity. Combined with the boundary-PK overwrite issue above, generated instances may violate the declared FK constraints (location.id_restaurant not in generalinfo, location.city not in geographic). The spec's `dependencies` require FK consistency.",
+     "requested_revision": "After generation, validate FK integrity (or enable foreign_keys=ON and handle failures). Ensure every non-NULL FK value references an existing parent row, except where `unmatched_join_rows` explicitly requires `child_rows_with_null_fk: true` (which means NULL, not dangling)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the `comparison_boundary` literals for `generalinfo.city`/`location.city` (e.g. 'santa cruz', 'hayward', 'oakland') are all present in the generated geographic.city pool \u2014 cannot verify without a successful run.",
+    "Whether `ties_for_order_limit` for `geographic.region`, `location.street_name`, `geographic.county` is achievable given the pool sizes and dedup \u2014 not implemented, so unverified.",
+    "Whether the `null_in_count_column` for `location.city` (5-30%) and `generalinfo.city` (2%) are met per instance \u2014 depends on successful generation.",
+    "Whether `geographic.region`/`county` samplers have non-empty pools when pool SQL yields nothing (IndexError source) \u2014 needs a successful run to confirm.",
+    "Whether compact rows are preserved: `_write` copies the original DB and appends, so compact rows should be preserved, but this is unverified because no instance was written."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 4/20 units failed with IndexError('Cannot choose from an empty sequence') (units 10, 12, 13, 19). The traceback points to a rng.choice on an empty sequence. In instance.py, _generate_location builds `boundary_ids = [L for L in ... if L in parent_ids]` and then does `rng.choice(boundary_ids)` guarded by `elif boundary_ids and ...`, which is safe; but _generate_generalinfo/_generate_location call `rng.choice(city_parents)` / `rng.choice(parent_cities)` only when non-empty. The most likely empty-sequence site is `_force_ties`/`_ensure_groups_different` or `rng.choice(list(S.CITIES))` \u2014 but the reproducible failure is that some units crash outright, so those instances are never produced.",
+     "requested_revision": "Guard every rng.choice against empty sequences (e.g. in _generate_geographic's None-replacement fallback, _force_ties, _ensure_groups_different, and the boundary seeding loops) and re-run so all units succeed. A crash that drops 20% of instances is a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: fk_violations = 71 across the 16 produced instances, and validity reports new_integrity_failures for all 16 instances. The program deliberately leaves boundary city literals unmatched: in _generate_generalinfo and _generate_location, `if v in boundary_city and rng.random() < 0.5: continue  # intentionally unmatched boundary literal`. But generalinfo.city and location.city are declared `foreign key (city) references geographic(city)`, so a non-NULL unmatched city is a real FK violation, not a benign 'unmatched_join_rows' pattern. The spec's unmatched_join_rows target is about parent rows without children and child rows with NULL FK \u2014 not about non-NULL dangling FKs.",
+     "requested_revision": "Do not emit non-NULL city values that are absent from geographic.city. Satisfy unmatched_join_rows only via (a) parent rows with no children and (b) child rows with NULL FK. If boundary city literals must appear, ensure the corresponding city exists in geographic (seed it as a parent key) before referencing it. Re-run and confirm fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped is large: geographic 270, generalinfo 1691, location 973 skipped out of attempted inserts. The _write fallback inserts row-by-row and silently counts failures as 'skipped'. Combined with the FK violations above, many generated rows are being dropped, so the intended table sizes (geographic 40, generalinfo 200, location 200 per instance) and the planted patterns (ties, boundary literals, NULL shares) are not reliably realized. The spec's table_sizes_per_instance is not being met.",
+     "requested_revision": "Fix the root causes of insert failures (FK dangling cities, PK collisions from boundary seeding) so that skipped counts are ~0, and verify per-instance row counts match the specification's table_sizes_per_instance within the intended tolerance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "location.id_restaurant is a primary key in the schema (`id_restaurant INTEGER not null primary key`), but _generate_location first fills it with `rng.choice(parent_ids)` (duplicating parent ids) and only then calls `_dedup(cols, ['id_restaurant'])`. This collapses the row count and, more importantly, the spec's boundary_pk rule requires child FKs to use only existing parent keys or NULL \u2014 which is satisfied \u2014 but the PK dedup after random parent draws means the generated location rows are far fewer than n and the intended street_name/street_num patterns are thinned. Also `_dedup` on location.id_restaurant discards rows, contributing to the size shortfall.",
+     "requested_revision": "Generate location.id_restaurant as a unique key sequence (or unique subset of parent ids) up front, then assign street_num/street_name/city to the surviving rows, so the row count and per-column patterns are preserved."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists `duplicates_for_distinct` targets on geographic.city and location.id_restaurant (duplicate_share 20-50%), but both are primary keys. The spec's own uncertainty note and pk_no_duplicates rule mark these as not applicable. This is internally consistent but the per_column_exceptions still list them, which invites the engineer to attempt impossible duplication.",
+     "requested_revision": "Remove the duplicates_for_distinct exceptions for geographic.city and location.id_restaurant from per_column_exceptions (or explicitly annotate them as ignored) so the program does not attempt PK duplication."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's unmatched_join_rows targets for generalinfo.city and location.city set child_rows_with_null_fk: true, which the program interprets as permission to leave non-NULL boundary city literals unmatched. The schema has ON DELETE/UPDATE CASCADE FKs on city, so non-NULL dangling cities are genuine violations. The spec should clarify that unmatched_join_rows is satisfied only by NULL child FKs and childless parents, never by non-NULL dangling FKs.",
+     "requested_revision": "Clarify in the specification that unmatched_join_rows must be realized via NULL child FKs and parent rows without children only; non-NULL FK values must always reference an existing parent."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact source of the IndexError in units 10/12/13/19 was not pinpointed from the provided code alone; the engineer should reproduce with a traceback to confirm the empty-sequence site.",
+    "Whether the boundary city literals (e.g. 'SAN FRANCISCO', 'DUBLIN') can be seeded as geographic parents without violating the PK dedup and size budget was not verified.",
+    "The construction_pairs feedback shows 59/286 separated with no per-group breakdown; it is unclear whether the remaining unseparated pairs are due to the FK/size shortfalls above or to genuine value-variation limits."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 5 of 20 units failed with IndexError('Cannot choose from an empty sequence') (units 1, 10, 12, 13, 19). The traceback points to random.choice on an empty sequence. In instance.py, _generate_location draws `ids = rng.sample(parent_ids, k)` where `parent_ids = _fk_lookup_values(generalinfo_rows, 'id_restaurant')`; when generalinfo generation produced no non-NULL ids (e.g. after _dedup or when the compact generalinfo table is empty and the generated rows were all dropped), parent_ids is empty and the `if parent_ids:` branch is skipped, but the else branch uses `list(range(start, start + n))` which is fine \u2014 however the failure is more likely in `_generate_generalinfo`/`_generate_geographic` where `_seed_boundary_text` or `_force_ties`/`_force_nulls` call `rng.choice`/`rng.sample` on empty lists, or in `_generate_location` when `parent_ids` is non-empty but `rng.sample(parent_ids, k)` with k=0. Also `_construct_unmatched` and `_force_ties` call `rng.shuffle`/`rng.choice` on possibly empty `idxs`. The 5 failures are reproducible (reproducible: true) and block instance generation.",
+     "requested_revision": "Guard every rng.choice/rng.sample/rng.shuffle call against empty sequences (e.g. in _seed_boundary_text, _force_ties, _force_nulls, _generate_location's parent_ids branch, and _ensure_groups_different). Ensure the location generator always has a non-empty parent id pool by falling back to a fresh sequential range when generalinfo produced no ids, and never call rng.sample with k=0 on an empty list. Re-run until n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback rows_skipped: geographic 254, generalinfo 1615, location 1172 \u2014 a large fraction of generated rows are silently dropped by the per-row fallback in _write (sqlite3.Error / OverflowError). This means the intended table_sizes_per_instance (geographic 40, generalinfo 200, location 200) are not met and the value variation (boundary literals, ties, NULL shares) is partially lost. The spec requires per-instance sizes and the boundary/tie/NULL rules to hold on the generated rows; skipped rows undermine both.",
+     "requested_revision": "Diagnose why rows are rejected (likely PK collisions from boundary seeding overwriting sequential ids, or FK/NOT NULL violations from _seed_boundary_text overwriting a NOT NULL PK with a duplicate, or type mismatches). Fix the generators so that boundary seeding and dedup preserve uniqueness and FK validity, and so that the per-instance row counts match the specification. Report rows_skipped == 0 (or explain any intentional skips)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specification.py _NULL_SHARE sets ('generalinfo','review'): 0.02, but the semantic rule for generalinfo.review is 'review BETWEEN 1.0 AND 5.0' and the spec's null_targets list includes generalinfo.review. The program's make_sampler forces null_share = 0.0 for NOT NULL columns and otherwise uses spec['null_share']; however _generate_generalinfo calls _force_nulls(cols, 'review', True, rng) which plants NULLs, and then the review-range clamp loop skips None. This is consistent with the NULL rule, but the spec's generic_sampling_rules say real_review has '0% NULL' while null_targets includes review \u2014 an internal inconsistency in the specification that the program resolves by planting NULLs. The execution feedback shows generalinfo.review NULL 62/3032, so the program follows the null_targets interpretation, not the real_review rule.",
+     "requested_revision": "Designer: reconcile the specification \u2014 either remove generalinfo.review from null_targets (and from _NULL_SHARE) or change the real_review rule to allow NULL. Engineer: align _NULL_SHARE and _force_nulls with the resolved specification so the NULL share matches the compact database's share for that column (the interface rule requires the NULL share to follow the compact DB's share, not an arbitrary 0.02)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The interface NULL rule requires the NULL share to follow the compact database's share for each nullable column. specification.py hardcodes _NULL_SHARE (e.g. location.city 0.15, location.street_num 0.048, others 0.02) rather than deriving the share from schema.original_values. Execution feedback shows location.city NULL 214/1398 (~15%) and generalinfo.city NULL 72/3032 (~2.4%), which are fixed constants, not the compact DB's observed shares. This is a specification/program mismatch with the stated NULL rule.",
+     "requested_revision": "Engineer: compute each nullable column's NULL share from the compact database (schema.original_values) and use that as the target share, clamped to [0, 0.30] and with at least one NULL row per nullable column. Designer: if a fixed share is intended, state it explicitly in the specification and remove the 'follow the compact database's share' requirement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's unique_child_pk rule says location.id_restaurant must be a unique subset of parent keys, never dedup after drawing. In _generate_location, after `ids = rng.sample(parent_ids, k)` the code calls `cols = _dedup(cols, ['id_restaurant'])`, which can drop rows if the boundary seeding or extension introduced duplicates. Also the extension branch `extra = [v for v in parent_ids if v not in set(ids)]` can append duplicates if parent_ids itself contains duplicates (it is derived from generalinfo_rows which may include compact + generated ids; compact ids are unique but generated ids may collide with compact ids after boundary seeding). This violates unique_child_pk and contributes to rows_skipped.",
+     "requested_revision": "Engineer: build the location id list as a guaranteed-unique subset of parent ids up front (e.g. rng.sample over a deduplicated parent id set), never call _dedup on it, and ensure boundary PK literals for location.id_restaurant are only seeded when they are already in the parent id set (or seed them into generalinfo first)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence for fk_integrity says the original sample location rows include 'fremont' for a generalinfo id with no matching generalinfo row, 'showing childless parents and dangling-FK tolerance in the source'. But the schema declares FOREIGN KEY (id_restaurant) REFERENCES generalinfo(id_restaurant) and FOREIGN KEY (city) REFERENCES geographic(city), and the program correctly enforces no dangling non-NULL FKs. The spec's unmatched_join_rows target for generalinfo.id_restaurant has child_rows_with_null_fk: false, yet the program's _construct_unmatched only plants NULL FKs for city columns, not for id_restaurant. The spec's unmatched_join rule says 'where child_rows_with_null_fk is true, generate at least 2 child rows with NULL foreign key' \u2014 for id_restaurant it is false, so no NULL FK is required, but the spec also says 'leave at least 2 parent rows without children', which the program satisfies only incidentally.",
+     "requested_revision": "Designer: clarify whether generalinfo.id_restaurant unmatched_join_rows requires parent rows without children (it does, per the target) and whether the 'dangling-FK tolerance' note is meant to permit non-NULL dangling FKs (it should not, given the FK constraint). Engineer: explicitly construct at least 2 generalinfo parent rows whose id_restaurant is not referenced by any location row, and document that non-NULL FKs always reference existing parents."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary for generalinfo.id_restaurant and location.id_restaurant targets [384, 385, 386]. In _generate_generalinfo, boundary PK literals are seeded by overwriting sequential ids, then _dedup is called. If the sequential range already contains 384/385/386 (start = max(compact_ids)+1, which for the compact DB with ids up to ~9590 is > 384), the overwrite creates duplicates that _dedup removes, reducing the row count and potentially dropping the boundary literals. The execution feedback shows generalinfo rows_skipped 1615, consistent with this. The boundary_pk rule requires the literals to be actual key values, which is not guaranteed after dedup.",
+     "requested_revision": "Engineer: seed boundary PK literals by choosing indices whose current value is not already in the literal set, or by reserving the literal values before filling the rest of the sequence, so that 384/385/386 are present exactly once and no dedup loss occurs. Verify in execution feedback that the boundary literals appear in the generated generalinfo rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit for geographic.county has direction 'ASC and DESC and unordered' and tie_at_rank [1]. _force_ties only forces at least min_tie rows to share the maximum COUNT(*) value; it does not ensure a tie at rank 1 for both ASC and DESC orderings (which for COUNT(*) ties is the same set, but the spec's 'unordered' direction and the multiple directions suggest the tie must hold regardless of ordering). The program's _force_ties is direction-agnostic, which is likely fine, but it does not verify the tie survives after _force_nulls (which can turn a tied value into NULL and break the tie).",
+     "requested_revision": "Engineer: apply _force_ties after _force_nulls (or re-check ties after NULL planting) so that NULL planting does not destroy the required tie. Add an assertion in the generator that the tie holds on the final generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's rows_with_different_values for generalinfo.review requires '>= 2 per group with different values'. _ensure_groups_different only fixes groups with len(vs) >= 2 and len(set(vs)) < 2, and it modifies only one index ([1:2]). If a group has exactly 2 rows with the same review, the fix changes one of them, which is correct; but if the group has 1 row, it is skipped (correct, since >= 2 rows are needed). However, _force_nulls(cols, 'review', True, rng) is called after _ensure_groups_different, so a NULL planted in review can reduce a group to 1 non-NULL value, violating the rule. The execution feedback does not report per-group checks, so this is unverified.",
+     "requested_revision": "Engineer: call _ensure_groups_different after _force_nulls, or exclude review from _force_nulls and instead plant NULLs in a way that preserves >= 2 distinct non-NULL review values per food_type group. Add a post-generation check that every food_type group with >= 2 non-NULL reviews has >= 2 distinct values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty section says generalinfo.food_type has 145 distinct values and 'enum rule not feasible; sample from a pool of common food types plus boundary literals'. The program's _spec_pool returns a 28-item FOOD_TYPES list, and make_sampler combines observed values (up to 400 sampled) with literals. This is consistent, but the spec's comparison_boundary for food_type includes 'american food' and 'AMERICAN FOOD', which are not in FOOD_TYPES; the program seeds them via _seed_boundary_text, which is correct. No issue here, but the spec should state the pool size and the near-variant rate explicitly for food_type, since the generic text_short rule (5% near-variant) may not match the observed 145-value distribution.",
+     "requested_revision": "Designer: state the intended food_type pool size and near-variant rate in the specification (or confirm the generic text_short rule applies). Engineer: no change required if the designer confirms."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 5 IndexError failures are all from the same root cause (empty rng.choice/sample) or from multiple sites; the stderr tail does not include tracebacks.",
+    "Whether the boundary PK literals 384/385/386 actually appear in the generated generalinfo rows after dedup (not verified in execution feedback).",
+    "Whether the ties_for_order_limit for geographic.county and generalinfo.food_type survive NULL planting (not verified).",
+    "Whether every food_type group with >= 2 non-NULL reviews has >= 2 distinct review values after NULL planting (not verified).",
+    "Whether the NULL share for each nullable column matches the compact database's share (the program uses hardcoded shares; the compact shares are not reported in the feedback).",
+    "Whether the construction_pairs separated count (62/286) reflects intended value variation or lost variation due to skipped rows; a missing separation alone does not prove an error, but the large rows_skipped suggests variation may be lost."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Multiple columns are declared nullable in the schema (generalinfo.city, generalinfo.review, geographic.county, geographic.region, location.street_num, location.street_name, location.city) with no CHECK/NOT NULL backing for text columns; also generalinfo.food_type / label / region lack explicit nullability semantics but appear in the null_targets list. The specification supplies null_targets plus observed-share clamping, but the '5-30% of generated rows' for location.city aligns with the compact share and is implemented from the compact share (fallback 0.15 in specification._NULL_SHARE).",
+     "requested_revision": "n/a - supported; specification's null model is consistent with schema nullability and the program's compact-share derivation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "geographic.region semantics are uncertain (9 distinct values observed, 'Va', 'NValley', 'Napa Vally' variants, leading-space values). Specification acknowledges this in 'uncertainty' but still seeds the literal list (' Va', ' va', 'NValley', etc.) as boundary literals, which are synthetic near-variants not observed values. The program then stores those literals as actual region values (TextSampler.boundary_lits) and thus plants unobserved strings into the column.",
+     "requested_revision": "Acceptable as an explicit uncertainty marker; no blocking change required because the literals are drawn directly from the specified per_column_exceptions targets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "generalinfo.food_type has 145 observed distinct values; specification restricts the pool to ~28 types, which under-represents the observed domain. This makes some COUNT-based comparisons less discriminating, but is documented and within the specification's stated uncertainty.",
+     "requested_revision": "n/a - accepted trade-off; the execution feedback shows only literal-pool-driven generation, which matches the stated design."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In tscore_gen/instance.py, _generate_geographic seeds boundary literals via _seed_boundary_text (overwriting randomly chosen city values), then dedups with _dedup. Because geographic.city is a PK and pool+observed contain case variants like 'SAN FRANCISCO' vs 'san francisco' that are distinct keys, dedup keeps both. The PK is TEXT; no issue. The single observed-vs-generated deduplication conflict is only a potential risk: if a seeded boundary literal equals a pre-existing sampled or compact value, dedup removes a row and reduces the count. Execution shows rows_added.geographic = 193 over 20 instances \u2248 9.65 per instance, not the target 40 per instance; rows_skipped.geographic = 334, indicating ~20 rows per instance were silently dropped by _dedup. That is a spec/engineer inconsistency (row_count_integrity requires rows_skipped = 0 and per-instance row counts to match table_sizes_per_instance).",
+     "requested_revision": "Fix geographic generation so PK dedup against the compact database's 40 cities is performed before boundary seeding, and/or ensure boundary literal insertion never overwrites an existing key. Do not dedup after boundary seeding. Similarly audit generalinfo (rows_skipped 1960) and location (rows_skipped 1512) for PK collisions against compact rows; ensure the generated-row target is achieved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generalinfo rows: rows_added 2097 over 20 instances = ~104.85/instance but table_sizes_per_instance requires 200 each. rows_skipped 1960 ~98/instance. The _generate_generalinfo computes bound to be list(range(start, start+n)) with n in [160,240], then seeds boundary PKs and dedups \u2014 but the bigger loss is PK collisions with compact ids for location (rows_skipped 1512, ~75/instance) because if start is computed from compact max, generated PKs never collide with compact; the skips must be coming from seeding 384/385/386, which do exist in compact and thus collide. For generalinfo, compact has ~385 ids including 384/385/386; seeding them creates PK duplicates with the compact rows and dedup-in-memory cannot help (dedup runs on generated only), so INSERT fails row-by-row, counted as skipped rather than dropped. That accounts for 3 * 20 = 60 skips, not 1960. Actual cause of large generalinfo skips is not visible in code; the integrity check shows fk_violations 0 and pk_duplicates 0, so it's likely a per-instance violation.",
+     "requested_revision": "Trace _write() insert path: generalinfo row count of ~200 should succeed if PKs are beyond compact max. If rows_skipped is 1960, either start is miscomputed or rows legitimately violate a constraint (e.g., UNIQUE index from a CREATE INDEX not modeled in schema.unique_from_index). Verify with a single-instance build and print failures per row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "_dedup in instance.py is applied to generalinfo after seeding boundary PK literals 384/385/386. Because compact already contains those ids, executemany INSERT will fail on those specific rows; the row-wise fallback drops them. Similarly location.id_restaurant is a unique subset of parent ids including 384/385/386 which may collide with compact location ids. The spec's unique_child_pk says 'seed boundary PK literals only when already in the parent id set', but the code applies _seed_boundary_pk unconditionally for location (no boundary seeding actually\u2014location.id_restaurant has a comparison_boundary_num target of 384/385/386 in _BOUNDARY_NUM, but _generate_location does not call _seed_boundary_pk, so boundary values are NOT guaranteed for location.id_restaurant; the spec requires PRED(location.id_restaurant > 385) to have 384,385,386 in the column).",
+     "requested_revision": "Ensure comparison_boundary targets for location.id_restaurant (384/385/386) are actually present in generated location rows. Filter out ids that collide with compact location ids before drawing the unique subset. For generalinfo, if compact contains 384/385/386, do not attempt to re-insert them; instead ensure a fresh range includes them only where they do not collide."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "location.city null_targets requires 5-30% NULL, and execution feedback shows 'NULL 261 / 1817' = 14.4%, inside the range. generalinfo.review: 79/3997 = 1.98%, similar to compact; but the spec's 'rows_with_different_values' target ('>= 2 per group with different values') is verified by _ensure_groups_different on generated rows only, not on the compact + generated data that an evaluator would execute. If compact review groups already have distinct values, additional generation is fine, but if compact groups are degenerate, the rule could fail. No evidence either way in feedback.",
+     "requested_revision": "Verify _ensure_groups_different across merged (compact + generated) rows for at least one instance; otherwise the rule may not hold on the whole table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "ties_for_order_limit for geographic.county and region: _force_ties ensures min_tie >= 2 for the maximum COUNT(*) value, but the spec's targets for county are 'ASC and DESC and unordered' (min_tie >= 2 at rank 1 in all orderings); for region, direction DESC rank 1. _force_ties only enforces ties on the top-count value in the generated rows; since compact rows may already have a different max, merging can introduce a new maximum. Not visible in feedback; construction disabled due to no execution.",
+     "requested_revision": "Check ties on the merged (compact + generated) distribution: verify that at least two rows share the maximum COUNT(*) of county/region/food_type/street_name after merging, since the evaluator will run on the whole table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generalinfo.food_type comparison_boundary includes 'american food','AMERICAN FOOD','african',...,but the specification's own foods list does not include 'american food'\u2014only 'american'. The boundary literal list is injected via TextSampler.boundary_lits, so 'american food' is planted regardless; that matches the target literals but is not the observed value. This may be intended because the spec explicitly lists boundary literals, so not an error, but it widens the domain beyond the observed and declared type.",
+     "requested_revision": "No change required; note as intentional boundary injection."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback reports 'integers pk_no_duplicates: 0', and 'fk_violations: 0'. That corroborates the two rules. However, construction_pairs shows only 83/286 separated with 0 unknown executions. This is not proof of equivalence failure; many pairs differ only after boundary seeding, and the missing separation means the generator is not reliably inducing the target patterns in the merged DB. The spec's 'boundary_pk' rule requires boundary literals to be reserved in the PK column of generalinfo; but as noted the generalinfo 384/385/386 collide with compact, so they never appear in the output.",
+     "requested_revision": "After fixing the collision issues, re-measure construction_pairs; separation should rise if boundary literals are actually present in the output."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether per-instance row counts (200 generalinfo, 200 location, 40 geographic) are reached without skips; feedback shows large rows_skipped values, and code alone doesn't explain the generalinfo ~98/instance skip.",
+    "Whether boundary literals 384/385/386 for generalinfo.id_restaurant and location.id_restaurant are present in the output given compact collisions.",
+    "Whether ties_for_order_limit and rows_with_different_values hold on the merged (compact + generated) table.",
+    "Whether generalinfo.food_type boundary literal 'american food' and similar manufacturer-specific strings should be retained as domain expansion.",
+    "Whether location.id_restaurant comparison_boundary target 384/385/386 is satisfied; code does not seed boundary for that column."
+   ]
+  }
+ ]
 }

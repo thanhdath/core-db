@@ -1,0 +1,287 @@
+{
+ "generation_specification": {
+  "overview": "Reusable generation spec for the school/school_players database. Four tables: school (parent), school_details (1:1 child of school), school_performance (1:N child of school), player (1:N child of school). Generation order: school -> school_details -> school_performance -> player. Generated rows are appended after the compact (original) rows, which are never deleted or modified; the writer must copy the compact database before appending (schema.source_path must be set by read_schema so write_instance_sqlite copies it). The writer must report per-table rows_ok/rows_failed and compact row counts before/after append; rows_failed > 0 is a hard error, not a silent drop.",
+  "table_sizes_per_instance": {
+   "school": 6,
+   "school_details": 6,
+   "school_performance": 22,
+   "player": 23
+  },
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table, never NULL; never collide with compact primary-key values.",
+   "int_foreign_key": "Copy an existing parent primary-key value; with probability 0.10 emit NULL (only where the column is nullable); with probability 0.05 emit an orphan value (parent_id_max + 1) where the column is nullable and the atomic summary lists child_rows_with_null_fk=true, otherwise never emit an orphan. At least one parent row must be left without children (see per_column_exceptions). NULL and orphan rows must be placed on rows belonging to groups of size >= 3 so that the size-1 and size-2 groups of the FK column survive intact; when a group of size 3 must absorb both a NULL and an orphan, enlarge that group to 4+ first.",
+   "int_numeric": "Uniform integer within the column's range rule; include boundary values (min, min+1, max-1, max) and at least one repeated value to create ties.",
+   "real_numeric": "Uniform real within the column's range rule; include boundary values and at least one repeated value to create ties at ORDER/LIMIT ranks that are reachable at the table size.",
+   "text_short": "Draw from the column's explicit value pool; with probability 0.15 emit a near-variant (case change, trailing space, or one-character substitution) of a pool value. Near-variants are allowed only where the column's semantic rule does not restrict it to an exact enum (see per_column_exceptions).",
+   "text_enum": "Draw uniformly from the enumerated value list; never emit values outside the list.",
+   "text_year_range": "Format 'YYYY-YY' where the second year equals (first year + 1) mod 100 expressed in two digits; years drawn from the column's range rule.",
+   "null_share": "NORMATIVE OVERRIDE: the compact database shows 0% NULL for every column, but instruction 10 requires at least one NULL row per nullable column. Each instance therefore plants NULLs at a 5-10% share (k = max(1, round(n*0.08)) per nullable column), deliberately deviating from the compact share. NULL is a value: a planted NULL is never replaced to satisfy a rule, and rules constrain only non-NULL operands. NULL planting must not destroy the size-1 and size-2 groups required by group_sizes: place NULLs on rows belonging to groups of size >= 3.",
+   "distinct_duplicates": "For columns flagged with duplicates_for_distinct, ensure the distinct-value count is 20-50% below the non-NULL row count (duplicate share 20-50%) counted after NULL planting; protect at least one duplicate row from NULLing so the share stays in range.",
+   "group_sizes": "For columns flagged with group_sizes, ensure the grouped counts of non-NULL values (computed after NULL planting; NULL is its own group where the column is nullable) include groups of size 1, size 2, and size >= 3 whenever the row count permits. At 6 rows with one NULL the target is unsatisfiable (1+2+3=6 > 5 non-NULL); in that case the realizable target is '1, 2 and >= 2' (e.g. 2,2,1) and the reduction is documented in uncertainty. NULL and orphan rows are placed on rows of the >=3 groups so the size-1 and size-2 groups remain.",
+   "aggregate_boundary": "For columns flagged with aggregate_boundary, ensure at least one group has COUNT = 0 (either an orphan/NULL FK child or a parent row with no children), one group has COUNT = 1, and one group has COUNT >= 2. Where no orphan is possible, achieve COUNT=0 via a parent row without children, which requires the parent table to have at least 2 rows. The grouping is the column itself for FK columns (group by child FK value, including NULL and orphan as their own groups) and the parent key for parent-side counts.",
+   "ties_for_order_limit": "For columns flagged with ties_for_order_limit, ensure at least two rows share the value at the listed rank so ORDER BY ... LIMIT returns a tie. A rank that exceeds the table's row count is not realizable at the specified table size; in that case the tie is placed at the highest reachable rank and the reduction is documented in uncertainty. When both ASC and DESC are listed, create a tie at the minimum (rank 1 ASC) and at the maximum (rank 1 DESC) by duplicating both the smallest and largest values.",
+   "comparison_boundary": "For columns flagged with comparison_boundary, include values at each listed literal and one step on each side (numbers by their step; text by a case/whitespace variant). Include only as many boundary literals as fit in the table's row count; a reduction is documented in uncertainty. When the row count is smaller than the literal list, choose a subset that keeps both sides of every boundary pair (e.g. for 1889/1890 and 1900/1901 keep 1889, 1890, 1900, 1901).",
+   "rows_with_different_values": "For columns flagged with rows_with_different_values, the grouping is the table's primary key (each row is its own group), so the target reduces to: the column takes at least 2 distinct non-NULL values across the table. This is satisfied by the boundary/tie rules above."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "school",
+    "column": "School_ID",
+    "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3 (grouped by School_ID itself: 1,1,1,1,1,1)",
+     "aggregate_boundary": "grouped by School_ID: COUNT(school.school_id)=1 per group; COUNT(DISTINCT school.school_id)=1; COUNT(*)=1. COUNT=0 is realized on the child side (a school with zero player rows and zero school_performance rows).",
+     "unmatched_join_rows": "parent_rows_without_children=true (at least one school has zero player rows and zero school_performance rows); child_rows_with_null_fk=true for player.School_ID, false for school_performance.School_Id",
+     "ties_for_order_limit": "tie_at_rank=1, direction=DESC, tie_on=COUNT(player.player_id), COUNT(*); realized by two schools sharing the same player count at the top"
+    }
+   },
+   {
+    "table": "school",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct, aggregate_boundary, group_sizes",
+    "targets": {
+     "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting; at 6 rows with one NULL use 2,2,1 (3 distinct in 5 non-NULL, share 40%)",
+     "aggregate_boundary": "COUNT(*) values 0,1,2 (grouped by Location; COUNT=0 via a school with no players)",
+     "group_sizes": "1, 2 and >= 2 (2,2,1 after NULL planting; >=3 not realizable at 6 rows with one NULL)"
+    }
+   },
+   {
+    "table": "school",
+    "column": "Denomination",
+    "pattern": "duplicates_for_distinct, group_sizes, ties_for_order_limit, aggregate_boundary, comparison_boundary, null_rows",
+    "targets": {
+     "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting (e.g. 2,2,1)",
+     "group_sizes": "after NULL planting, non-NULL grouped counts must include a size-1 group, a size-2 group and a >=2 group (2,2,1); >=3 is not realizable at 6 rows with one NULL and is documented in uncertainty",
+     "ties_for_order_limit": "tie_at_rank=1 (rank 10 not reachable at 6 rows), direction=DESC, tie_on=COUNT(*), COUNT(player.player_id)",
+     "aggregate_boundary": "COUNT(*) values 0,1,2 (COUNT=0 via a school row with no players)",
+     "comparison_boundary": "equal_and_one_step_from=school.Denomination: at least two rows share one exact Denomination value (self-equality group). The near-variant part is DROPPED because the enum rule is authoritative (see semantic_rules_and_formulas); the comparison is realized by the repeated exact value only.",
+     "null_rows": "null_share 5-30% of generated rows; NULL placed on a row of the >=2 group so a size-1 non-NULL group survives"
+    }
+   },
+   {
+    "table": "school",
+    "column": "Enrollment",
+    "pattern": "rows_with_different_values, ties_for_order_limit",
+    "targets": {
+     "rows_with_different_values": ">= 2 distinct non-NULL values across the table (grouped by School_ID)",
+     "ties_for_order_limit": "tie_at_rank=1, direction=ASC and DESC (rank 1000 not reachable at 6 rows); duplicate both the smallest and largest values within 6 rows"
+    }
+   },
+   {
+    "table": "school",
+    "column": "Founded",
+    "pattern": "ties_for_order_limit, comparison_boundary",
+    "targets": {
+     "ties_for_order_limit": "tie_at_rank=1 (ranks 10 and 100 not reachable at 6 rows), direction=DESC; duplicate the maximum value",
+     "comparison_boundary": "include as many of 1888,1889,1890,1891,1899,1900,1901,1902 as fit in 6 rows; must include 1889, 1890, 1900 and 1901 (e.g. [1888,1889,1890,1900,1901,1901]) so both sides of the 1889/1890 and 1900/1901 boundaries are present and the DESC tie exists"
+    }
+   },
+   {
+    "table": "school",
+    "column": "Boys_or_Girls",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "ties_for_order_limit": "tie_at_rank=1, direction=DESC; the lexicographically larger enum value must appear at least twice so it sorts first under DESC (a cross-value tie with the smaller value is acceptable)"
+    }
+   },
+   {
+    "table": "school_details",
+    "column": "Nickname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicates_for_distinct": "duplicate_share 20-50% after NULL planting (e.g. 6 rows, 4 distinct before NULL; protect a duplicate row from NULLing)"
+    }
+   },
+   {
+    "table": "school_performance",
+    "column": "School_Id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "unmatched_join_rows": "parent_rows_without_children=true; child_rows_with_null_fk=false (no NULL, no orphan for this FK). The compact schema declares School_Id NOT NULL (it is part of the composite PK), so NULL is impossible; this is the authoritative resolution of the atomic-summary conflict."
+    }
+   },
+   {
+    "table": "player",
+    "column": "School_ID",
+    "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "after NULL planting, non-NULL grouped counts must include a size-1 group, a size-2 group and a >=3 group; place NULL and orphan rows on DIFFERENT >=3 groups (or enlarge those groups to 4+) so the size-1 and size-2 groups survive and each affected group retains >=3 non-NULL members",
+     "aggregate_boundary": "grouped by School_ID: COUNT(*) and COUNT(player.school_id) values 0,1,2 (COUNT=0 via NULL/orphan group or a childless parent)",
+     "unmatched_join_rows": "parent_rows_without_children=true; child_rows_with_null_fk=true (NULL plus at least one orphan parent_id_max+1). If the compact schema declares player.School_ID NOT NULL, this target is unsatisfiable and must be corrected to child_rows_with_null_fk=false; the writer must report rows_failed so the conflict is visible.",
+     "ties_for_order_limit": "tie_at_rank=1, direction=DESC, tie_on=COUNT(player.player_id), COUNT(*)"
+    }
+   },
+   {
+    "table": "player",
+    "column": "Player_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate_boundary": "grouped by Player_ID: COUNT(player.player_id)=1 per group (unique PK). The 0,1,2 target is realized on the child side via School_ID grouping, not on Player_ID itself; this is the authoritative interpretation."
+    }
+   },
+   {
+    "table": "player",
+    "column": "Age",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "rows_with_different_values": ">= 2 distinct non-NULL values across the table (grouped by Player_ID)"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "school_details",
+    "child_column": "School_ID",
+    "parent_table": "school",
+    "parent_column": "School_ID",
+    "copied_columns": [],
+    "cardinality": "1:1"
+   },
+   {
+    "child_table": "school_performance",
+    "child_column": "School_Id",
+    "parent_table": "school",
+    "parent_column": "School_ID",
+    "copied_columns": [],
+    "cardinality": "1:N"
+   },
+   {
+    "child_table": "player",
+    "child_column": "School_ID",
+    "parent_table": "school",
+    "parent_column": "School_ID",
+    "copied_columns": [],
+    "cardinality": "1:N"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "school",
+    "column": "School_ID",
+    "formula": "School_ID > 0",
+    "evidence": "Primary key; positive integer."
+   },
+   {
+    "table": "school",
+    "column": "Enrollment",
+    "formula": "Enrollment > 0",
+    "evidence": "Enrollment is a positive count of students; observed 1000-2300."
+   },
+   {
+    "table": "school",
+    "column": "Founded",
+    "formula": "Founded BETWEEN 1800 AND 2025",
+    "evidence": "Observed 1879-1924."
+   },
+   {
+    "table": "school",
+    "column": "Denomination",
+    "formula": "Denomination IN ('Catholic','Anglican','Uniting Church')",
+    "evidence": "Observed distinct values; authoritative over the comparison_boundary near-variant."
+   },
+   {
+    "table": "school",
+    "column": "Boys_or_Girls",
+    "formula": "Boys_or_Girls IN ('Boys','Boys only to Yr 9 Co-ed Year 10 to 12')",
+    "evidence": "Observed distinct values."
+   },
+   {
+    "table": "school",
+    "column": "Day_or_Boarding",
+    "formula": "Day_or_Boarding IN ('Day','Day & Boarding')",
+    "evidence": "Observed distinct values."
+   },
+   {
+    "table": "school",
+    "column": "Year_Entered_Competition",
+    "formula": "Year_Entered_Competition BETWEEN 1900 AND 2025",
+    "evidence": "Observed 1929, 1944."
+   },
+   {
+    "table": "school_details",
+    "column": "League",
+    "formula": "League = 'DSHA'",
+    "evidence": "Only observed value is DSHA."
+   },
+   {
+    "table": "school_details",
+    "column": "Class",
+    "formula": "Class IN ('Flight A','Flight B','Fight A')",
+    "evidence": "Observed distinct values (note 'Fight A' typo variant)."
+   },
+   {
+    "table": "school_details",
+    "column": "Division",
+    "formula": "Division IN ('Division 1','Division 2','Division 3')",
+    "evidence": "Observed distinct values."
+   },
+   {
+    "table": "school_performance",
+    "column": "School_Year",
+    "formula": "CAST(substr(School_Year,1,4) AS INTEGER) BETWEEN 1980 AND 2025 AND CAST(substr(School_Year,6,2) AS INTEGER) = (CAST(substr(School_Year,1,4) AS INTEGER) + 1) % 100",
+    "evidence": "Format 'YYYY-YY' with consecutive years; observed 1987-88 through 2006-07."
+   },
+   {
+    "table": "player",
+    "column": "Age",
+    "formula": "Age BETWEEN 14 AND 18",
+    "evidence": "Observed ages 14-18."
+   },
+   {
+    "table": "player",
+    "column": "Position",
+    "formula": "Position IN ('Shortstop','Third baseman','First Baseman','Left-handed pitcher','Catcher','First baseman','Right-handed pitcher','Second baseman')",
+    "evidence": "Observed distinct positions (note case variants 'First Baseman'/'First baseman')."
+   }
+  ],
+  "null_targets": [
+   "school.Denomination",
+   "school.Location",
+   "school.Enrollment",
+   "school.Founded",
+   "school.Boys_or_Girls",
+   "school.Day_or_Boarding",
+   "school.Year_Entered_Competition",
+   "school.School_Colors",
+   "school_details.Nickname",
+   "school_details.Colors",
+   "school_details.League",
+   "school_details.Class",
+   "school_details.Division",
+   "school_performance.Class_A",
+   "school_performance.Class_AA",
+   "player.Player",
+   "player.Team",
+   "player.Age",
+   "player.Position",
+   "player.School_ID"
+  ],
+  "supporting_evidence": {
+   "school.Denomination": "Distinct values Catholic, Anglican, Uniting Church; null_rows pattern requires 5-30% NULL share; group_sizes requires 1, 2 and >=2 after NULL planting (>=3 not realizable at 6 rows with one NULL).",
+   "player.School_ID": "FK to school; unmatched_join_rows requires child_rows_with_null_fk=true and aggregate_boundary requires a COUNT=0 group; group_sizes requires 1, 2 and >=3 after NULL planting. If the compact schema declares the column NOT NULL, the target must be corrected to child_rows_with_null_fk=false.",
+   "school.Enrollment": "Positive real; observed 1000-2300; ties_for_order_limit requires rank-1 ties in both ASC and DESC.",
+   "school.Founded": "Real year; observed 1879-1924; comparison_boundary literals 1888-1902; DESC tie requires a duplicated maximum.",
+   "player.Age": "Integer 14-18; observed distinct 5 values.",
+   "school_performance.School_Year": "Format YYYY-YY with consecutive years; observed 1987-88, 1988-89, 1989-90, 1997-98, 2003-04, 2006-07, 1990-91, 1991-92.",
+   "school.Boys_or_Girls": "Two enum values; ties_for_order_limit direction=DESC requires the lexicographically larger value to appear at least twice.",
+   "school.Location": "6 rows, 4 distinct before NULL; after one NULL the realizable group sizes are 2,2,1 (duplicate share 40%).",
+   "school_details.Nickname": "6 rows, 4 distinct before NULL; protect a duplicate row from NULLing so the share stays 20-50%."
+  },
+  "uncertainty": [
+   "The original data shows 0% NULL rate for all columns, but instruction 10 requires at least one NULL row per nullable column; NULL share is normatively set to 5-10% (deliberate override of the 'follow compact share' rule).",
+   "school_details.Class contains a typo variant 'Fight A' alongside 'Flight A'; both are kept in the enum to preserve observed values.",
+   "player.Position contains case variants 'First Baseman' and 'First baseman'; both are kept in the enum.",
+   "school_performance has 22 rows but only 6 distinct School_Id values; group sizes are not specified in the atomic summary for this table, so uniform distribution across the 5 non-childless schools is used.",
+   "The 'comparison_boundary' for school.Denomination (equal_and_one_step_from) is realized as a repeated exact Denomination value only; the near-variant part is dropped because the enum rule is authoritative.",
+   "Rank-10/100/1000 tie targets for school.Denomination, school.Founded and school.Enrollment are not reachable at a 6-row school table; ties are placed at the highest reachable rank and this reduction is documented here rather than raising the table size.",
+   "The atomic summary for school.School_ID lists child_rows_with_null_fk=true for both player.School_ID and school_performance.School_Id joins, while the school_performance.School_Id entry lists child_rows_with_null_fk=false. This spec resolves the conflict by allowing orphans only for player.School_ID (nullable) and never for school_performance.School_Id; the school_performance entry is treated as authoritative for its own column because School_Id is part of the composite PK and therefore NOT NULL.",
+   "Whether the compact schema declares player.School_ID NOT NULL is unresolved; if it does, the child_rows_with_null_fk=true target is unsatisfiable and must be corrected to false. The writer must report rows_failed per table so silent row loss is visible.",
+   "The group_sizes target '1, 2 and >= 3' is arithmetically unsatisfiable at 6 rows with one NULL (1+2+3=6 > 5 non-NULL); the realizable target is '1, 2 and >= 2' (2,2,1) and this reduction is documented.",
+   "The aggregate_boundary targets for Player_ID and School_ID are interpreted as grouped by the column itself (PK: COUNT=1 per group) with the 0,1,2 variation realized on the child side via School_ID grouping.",
+   "The rows_with_different_values targets for Enrollment and Age are interpreted as '>= 2 distinct non-NULL values across the table' (grouped by the table's PK).",
+   "Compact rows preservation is not verified by execution feedback; the writer must copy the source database when schema.source_path is set and report row counts before/after append and rows_failed per table.",
+   "The reproducible flag was exercised with only one seed base; multi-seed verification is pending.",
+   "Whether the 51 unseparated construction pairs reflect a generation defect or query equivalence is unresolved; per-group construction feedback (realized group sizes, tie ranks, boundary values per instance) is required to verify."
+  ]
+ }
+}

@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + compact-row key bookkeeping."""
 import math
 import sqlite3
 import warnings
@@ -34,6 +34,10 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    compact_keys: dict = field(default_factory=dict)
+    compact_fk: dict = field(default_factory=dict)
+    enums: dict = field(default_factory=dict)
+    null_share: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +62,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +77,11 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _col_index(tm: TableMeta) -> dict:
+    """Name -> position map for a table's columns (case-insensitive)."""
+    return {c.name.lower(): i for i, c in enumerate(tm.columns)}
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -137,6 +146,30 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+        compact_keys: dict = {}
+        compact_fk: dict = {}
+        null_share: dict = {}
+        for t in tnames:
+            tm = tables[t]
+            idx = _col_index(tm)
+            rows = list(zip(*[ov[(t, c.name)] for c in tm.columns])) if tm.columns else []
+            if tm.primary_key:
+                pk_pos = [idx[c.lower()] for c in tm.primary_key]
+                compact_keys[t] = {tuple(r[p] for p in pk_pos) for r in rows}
+            else:
+                compact_keys[t] = set()
+            for (ct, cc), (pt, pc) in fks.items():
+                if ct != t:
+                    continue
+                ci = idx[cc.lower()]
+                compact_fk[(t, cc)] = [r[ci] for r in rows if r[ci] is not None]
+            for c in tm.columns:
+                vals = ov[(t, c.name)]
+                if vals:
+                    null_share[(t, c.name)] = sum(1 for v in vals if v is None) / float(len(vals))
+                else:
+                    null_share[(t, c.name)] = 0.0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index,
+                  compact_keys, compact_fk, {}, null_share)

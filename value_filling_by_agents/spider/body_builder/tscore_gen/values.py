@@ -3,9 +3,17 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+           'October', 'November', 'December']
+_CITIES = ['Port Huron', 'Anchorage', 'Glenview', 'Nashua', 'Farmington Hills', 'Minnetonka', 'Boston',
+           'Denver', 'Austin', 'Seattle', 'Chicago', 'Phoenix']
+_STATES = ['Michigan', 'Alaska', 'Illinois', 'New Hampshire', 'Minnesota', 'Massachusetts', 'Colorado',
+           'Texas', 'Washington', 'Arizona']
 
 
 class ColumnSampler:
@@ -180,6 +188,145 @@ class BoolSampler(ColumnSampler):
         if not self.elements or self.rng.random() < self.p:
             return self.vals[0] if self.rng.random() < 0.5 else self.vals[1]
         return self.rng.choice(self.elements)
+
+
+def _null_mask(n: int, rng, share_lo=spec.NULL_SHARE_LO, share_hi=spec.NULL_SHARE_HI) -> list:
+    """Boolean mask with a NULL share in [lo, hi] and at least one True (if n >= 1)."""
+    if n <= 0:
+        return []
+    share = rng.uniform(share_lo, share_hi)
+    k = max(1, min(n, int(round(share * n))))
+    idx = list(range(n))
+    rng.shuffle(idx)
+    mask = [False] * n
+    for i in idx[:k]:
+        mask[i] = True
+    return mask
+
+
+def _group_sizes(n: int, rng) -> list:
+    """Partition n into group sizes drawn from GROUP_SIZE_MIX (1, 2, >=3)."""
+    sizes, left = [], n
+    while left > 0:
+        g = rng.choice(spec.GROUP_SIZE_MIX)
+        if g >= 3:
+            g = rng.randint(3, max(3, min(left, 5)))
+        g = min(g, left)
+        sizes.append(g)
+        left -= g
+    return sizes
+
+
+def _assign_groups(n: int, rng, make_value) -> list:
+    """Assign n rows to groups of mixed sizes; each group shares one value."""
+    out = []
+    for g in _group_sizes(n, rng):
+        v = make_value()
+        out.extend([v] * g)
+    rng.shuffle(out)
+    return out
+
+
+def _dup_share(n: int, rng) -> int:
+    share = rng.uniform(spec.DUP_SHARE_LO, spec.DUP_SHARE_HI)
+    return max(1, min(n - 1, int(round(share * n)))) if n > 1 else 0
+
+
+def sample_people_height(n: int, rng, pool: list) -> list:
+    """Height: range [120,230], DISTINCT duplicates, group sizes, ASC tie at rank 10."""
+    lo, hi = spec.HEIGHT_RANGE
+    base = [round(rng.uniform(lo, hi), 1) for _ in range(n)]
+    if n >= 3:
+        base = _assign_groups(n, rng, lambda: round(rng.uniform(lo, hi), 1))
+    k = _dup_share(n, rng)
+    for i in range(k):
+        j = rng.randrange(n)
+        base[i] = base[j]
+    if n >= spec.HEIGHT_TIE_RANK:
+        srt = sorted(base)
+        tie = srt[spec.HEIGHT_TIE_RANK - 1]
+        pos = [i for i, v in enumerate(base) if v == tie]
+        if len(pos) < 2:
+            for i in range(n):
+                if base[i] != tie:
+                    base[i] = tie
+                    break
+    return base
+
+
+def sample_people_weight(n: int, rng) -> list:
+    lo, hi = spec.WEIGHT_RANGE
+    return [round(rng.uniform(lo, hi), 1) for _ in range(n)]
+
+
+def sample_people_name(n: int, rng, pool: list) -> list:
+    """Name: DISTINCT duplicates 20-50 %."""
+    first = ['Jack', 'Ty', 'Al', 'Mark', 'Cam', 'Jake', 'Sam', 'Alex', 'Chris', 'Pat']
+    last = ['Campbell', 'Conklin', 'Montoya', 'Fayne', 'Fowler', 'Gardiner', 'Smith', 'Jones', 'Brown']
+    base = ['%s %s' % (rng.choice(first), rng.choice(last)) for _ in range(n)]
+    k = _dup_share(n, rng)
+    for i in range(k):
+        j = rng.randrange(n)
+        base[i] = base[j]
+    return base
+
+
+def sample_people_birth_date(n: int, rng) -> list:
+    """Birth_Date: 'Month D, YYYY', LIKE near-variants, group sizes."""
+    def make():
+        m = rng.choice(_MONTHS)
+        d = rng.randint(1, 28)
+        y = rng.randint(1950, 2000)
+        return '%s %d, %d' % (m, d, y)
+
+    vals = _assign_groups(n, rng, make)
+    k = max(1, int(round(spec.NEAR_VARIANT_SHARE * n)))
+    for i in rng.sample(range(n), min(k, n)):
+        v = rng.choice(spec.LIKE_VARIANTS)
+        if rng.random() < 0.5:
+            vals[i] = v + ', 1990'
+        else:
+            vals[i] = v
+    return vals
+
+
+def sample_people_birth_place(n: int, rng) -> list:
+    """Birth_Place: 'City, State', group sizes."""
+    def make():
+        return '%s, %s' % (rng.choice(_CITIES), rng.choice(_STATES))
+    return _assign_groups(n, rng, make)
+
+
+def sample_lift(n: int, rng, pool: list) -> list:
+    """Snatch / Clean_Jerk: positive real in [0.5, 500], >=2 distinct per group."""
+    lo, hi = spec.LIFT_RANGE
+    vals = [round(rng.uniform(lo, hi), 1) for _ in range(n)]
+    if n >= 2 and len(set(vals)) < 2:
+        vals[1] = round(vals[0] + 0.1, 1)
+    return vals
+
+
+def sample_total(n: int, rng, snatch: list, clean_jerk: list) -> list:
+    """Total = Snatch + Clean_Jerk (conditional), ties at ranks 10 and 50."""
+    vals = []
+    for i in range(n):
+        s, c = snatch[i], clean_jerk[i]
+        if s is not None and c is not None:
+            vals.append(round(s + c, 1))
+        else:
+            vals.append(None)
+    nonnull = [i for i, v in enumerate(vals) if v is not None]
+    for rank in spec.TOTAL_TIE_RANKS:
+        if len(nonnull) >= rank:
+            srt = sorted(nonnull, key=lambda i: vals[i])
+            tie = vals[srt[rank - 1]]
+            pos = [i for i in nonnull if vals[i] == tie]
+            if len(pos) < 2:
+                for i in nonnull:
+                    if vals[i] != tie:
+                        vals[i] = tie
+                        break
+    return vals
 
 
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:

@@ -102,12 +102,12 @@ def _is_ident_operand(v: str) -> bool:
     return bool(re.fullmatch(r'[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*', v))
 
 
-def _clean_qualifier(q: str) -> str:
+def _clean_qualifier(qs: str) -> str:
     """Reduce a regex-captured qualifier to a bare table name (drop keywords, spaces, quotes)."""
-    q = q.strip().replace('"', '').replace('`', '').lower()
-    if not q:
+    qs = qs.strip().replace('"', '').replace('`', '').lower()
+    if not qs:
         return ''
-    tok = q.split()[-1] if q.split() else ''
+    tok = qs.split()[-1] if qs.split() else ''
     if not _QUAL.match(tok):
         return ''
     if tok in ('and', 'or', 'where', 'on', 'not', 'select', 'from', 'join', 'as', 'in', 'between', 'like'):
@@ -117,18 +117,17 @@ def _clean_qualifier(q: str) -> str:
 
 def _add_regex(out: list, qual: str, col: str, v: str) -> None:
     """Add a regex match, normalising the qualifier to a bare table name."""
-    q = _clean_qualifier(qual)
+    qs = _clean_qualifier(qual)
     col = col.strip().replace('"', '').replace('`', '').replace(_PH, '')
     if not col:
         return
-    if q:
-        out.append(((q, col.upper()), _unquote(v)))
+    if qs:
+        out.append(((qs, col.upper()), _unquote(v)))
     out.append(((None, col.upper()), _unquote(v)))
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)

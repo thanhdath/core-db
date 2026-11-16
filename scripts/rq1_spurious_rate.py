@@ -1,15 +1,4 @@
-"""RQ1: spurious-correctness rate measured with CoRE-DB.
-
-A prediction is an *original match* when it returns the gold's result on the official training database
-(comparator positional_bag_v1).  An original match is *spurious* when CoRE-DB refuses it: gold and
-prediction return different results on at least one CoRE-DB member (compact database or selected
-instance).  Spurious rate = spurious matches / original matches, per decoding.
-
-Input: JSON lines with ds, db, gold_sql, pred_sql (e.g. scripts/rq1_decode.py output).
-Usage:
-    python scripts/rq1_spurious_rate.py --predictions outputs/rq1/finer05b.jsonl --coredb data/core-db \
-        --bird-train-root data/bird/train/train_databases --spider-root data/spider
-"""
+"""RQ1: spurious-correctness rate measured with CoRE-DB."""
 import argparse
 import json
 import sys
@@ -40,7 +29,7 @@ def verdicts_for_database(rows, original, members):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--predictions', required=True)
-    parser.add_argument('--coredb', required=True, help='local copy of thanhdath/core-db')
+    parser.add_argument('--coredb', required=True, help='local copy of the CoRE-DB dataset')
     parser.add_argument('--bird-train-root', default='data/bird/train/train_databases')
     parser.add_argument('--spider-root', default='data/spider')
     parser.add_argument('--out', default=None, help='optional JSON summary path')

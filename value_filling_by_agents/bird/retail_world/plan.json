@@ -1,49 +1,465 @@
 {
  "db": "retail_world",
- "operator_io_quirks": [
-  "All table/column names are mixed-case CamelCase (Categories, OrderDetails, CustomerID); generated SQL must double-quote them and column lookup must be case-insensitive.",
-  "No spaces in identifiers here, but BIRD convention still requires quoting; DDL text has tabs before FOREIGN KEY lines (line-based unique/check scan must tolerate tabs).",
-  "All PKs are INTEGER PRIMARY KEY AUTOINCREMENT; sqlite auto-assigns rowid when NULL inserted, so PK sampler values may be overridden silently on insert.",
-  "BirthDate declared DATE and OrderDate declared DATETIME but both stored as TEXT 'YYYY-MM-DD' (no time component); storage class contradicts declared type.",
-  "Date dispatch: first element '1968-12-08' does not parse as int, so Date fuzzer with template %Y-%m-%d; OrderDate same.",
-  "Price REAL DEFAULT 0, storage real, values like 18.0/21.35; Number fuzzer with scale from REAL (no args) -> default scale.",
-  "Quantity INTEGER distinct 43, values 5..40; Number fuzzer will produce negatives/perturbations implausible for quantity.",
-  "PostalCode TEXT with mixed formats ('12209','WA1 1DP','S-958 22','100'); String fuzzer will not preserve format.",
-  "Phone TEXT with formats '(503) 555-9831','(98) 598 76 54'; String fuzzer random charset a-zA-Z 0-9() will produce plausible-looking but wrong phones.",
-  "All FK parents exist and are unique PKs; no dangling FKs, no composite keys, no self-references, no non-unique parents.",
-  "All columns notnull=0 and null_rate=0.0; NOT NULL never enforced, so TS NULLs from empty parents never occur here.",
-  "Small tables (max 518 rows); no huge-table sampling concern, full read fine."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all *_ID columns: uniform in [-10^scale,10^scale] then +-1/+-2 perturbation; produces negative and huge IDs implausible for keys -> likely FN on ID-range predicates.",
-  "FK columns (Products.SupplierID/CategoryID, Orders.CustomerID/EmployeeID/ShipperID, OrderDetails.OrderID/ProductID) drawn from parent's final values with replacement -> duplicates and ties present, good for join/group queries.",
-  "String fuzzer on names/cities/countries: random charset strings plus contamination; destroys 'Germany'/'London' style values -> FN on equality predicates on Country/City.",
-  "Date fuzzer on BirthDate/OrderDate: template %Y-%m-%d, range from min/max of 5 sampled originals; produces dates outside 1996-1998 order window -> FN on date-range predicates.",
-  "Price REAL: Number fuzzer with default scale, list range quirk (upper end overwritten to full range) -> prices can be negative or huge -> FN on price thresholds.",
-  "Quantity INTEGER: Number fuzzer produces negatives and perturbations -> FN on quantity>0 style predicates.",
-  "PostalCode/Phone/Unit: String fuzzer random -> format predicates (LIKE 'WA%', phone patterns) fail -> FN.",
-  "PK uniqueness enforced by sample_fresh_primary_keys; single-column PK gets max_l0=inf so fresh draws always allowed -> many distinct IDs, few ties on PK.",
-  "Small parent tables (Shippers 3, Categories 8, Employees 10) sampled with replacement -> heavy duplication in child FK columns, good for COUNT/GROUP BY ties.",
-  "No NOT NULL/CHECK constraints -> no insert failures expected; rows_ok should equal requested sizes.",
-  "AUTOINCREMENT PK: if TS inserts NULL PK, sqlite assigns sequential rowids, so PK values may not match sampler output but remain unique.",
-  "No composite keys, no unique non-PK columns -> drop_unique_duplicates is a no-op here."
- ],
- "challenger_refs": [
-  "G1",
-  "ge79b45c4",
-  "g087594e1",
-  "ga200458e",
-  "g44b8a879",
-  "G2",
-  "gc261c7d1",
-  "gc261c7d1",
-  "gf1e7b843"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1, never NULL, unique per table; parent tables filled before children.",
+   "integer_fk": "Copy an existing parent key from the parent key set actually present in the written DB; nullable FKs get NULL on 5-30% of rows and a non-NULL parent key otherwise; some parent rows may have no children.",
+   "text_name": "Draw from a pool of realistic names; allow near-duplicate variants (case change, trailing char, truncation) on 5-15% of rows; allow duplicates on DISTINCT-targeted columns per exception.",
+   "text_address": "Street-style strings; near-variants allowed.",
+   "text_city": "City names from a pool; nullable columns get NULL on 5-30% of rows.",
+   "text_postal": "Postal-code-like strings; near-variants allowed.",
+   "text_country": "Country names from a pool of ~20; duplicates allowed (20-50% duplicate share on DISTINCT-targeted columns).",
+   "text_phone": "Phone-like strings '(NNN) NNN-NNNN'.",
+   "text_notes": "Long free text; group sizes 1, 2 and >=3 across rows.",
+   "date": "Dates in %Y-%m-%d; sampled within a plausible range; boundary values at listed literals plus one day on each side.",
+   "datetime": "Datetimes in %Y-%m-%d; boundary values at listed literals plus one day on each side; keep table date-order rules.",
+   "real_price": "Price >= 0, two decimals, sampled in [1, 100].",
+   "integer_quantity": "Quantity > 0, sampled in [1, 100].",
+   "null_rule": "Only columns listed in null_targets (plus columns the compact DB actually contains NULLs in) may receive NULL; every other column, including BirthDate, OrderDate, Price, Quantity, ProductName and all PK columns, is non-NULL. Each nullable column gets at least one NULL row per instance; NULL share follows the compact DB share (5-30% for FK/city columns, 0% where stats show 0). Rules and formulas constrain non-NULL operands only (SQL three-valued logic); a planted NULL is never replaced to satisfy a rule. Apply the NULL rule BEFORE per-column pattern post-processing, and exclude pattern-planted positions from NULL planting."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Products.ProductName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Products.ProductName",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Suppliers.SupplierID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Suppliers.SupplierID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Suppliers.SupplierID",
+      "Products.SupplierID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Employees.FirstName",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Employees.FirstName",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Employees.LastName",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Employees.LastName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Suyama",
+      "suyama",
+      "Peacock",
+      "peacock"
+     ]
+    }
+   },
+   {
+    "column": "Orders.OrderID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Customers.CustomerID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Orders.EmployeeID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "Categories.CategoryID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.CategoryID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Categories.CategoryName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Employees.EmployeeID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Employees.EmployeeID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(orders.orderid)"
+     ]
+    }
+   },
+   {
+    "column": "Products.CategoryID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Categories.CategoryID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Products.ProductID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Products.SupplierID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "Customers.City",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "Suppliers.Country",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.Country",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(customers.customerid)"
+     ]
+    }
+   },
+   {
+    "column": "Employees.BirthDate",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Orders.CustomerID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(orders.orderid)"
+     ]
+    }
+   },
+   {
+    "column": "Orders.ShipperID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Suppliers.ContactName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Orders.OrderDate",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "1996-08%",
+      "1996-08-01"
+     ],
+     "variants": [
+      "1996-07-31",
+      "1996-08-31",
+      "1996-09-01"
+     ]
+    }
+   },
+   {
+    "column": "Shippers.ShipperID",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Categories.Description",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Soft drinks%",
+      "Soft drinks, coffees, teas, beers, and ales"
+     ],
+     "variants": [
+      "Soft drinks",
+      "Soft drinkt",
+      "Soft drinks x",
+      "soft drinks"
+     ]
+    }
+   },
+   {
+    "column": "Employees.Notes",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Products.SupplierID",
+    "parent": "Suppliers.SupplierID",
+    "copied": []
+   },
+   {
+    "child": "Products.CategoryID",
+    "parent": "Categories.CategoryID",
+    "copied": []
+   },
+   {
+    "child": "Orders.CustomerID",
+    "parent": "Customers.CustomerID",
+    "copied": []
+   },
+   {
+    "child": "Orders.EmployeeID",
+    "parent": "Employees.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Orders.ShipperID",
+    "parent": "Shippers.ShipperID",
+    "copied": []
+   },
+   {
+    "child": "OrderDetails.OrderID",
+    "parent": "Orders.OrderID",
+    "copied": []
+   },
+   {
+    "child": "OrderDetails.ProductID",
+    "parent": "Products.ProductID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Products",
+    "column": "Price",
+    "formula": "Price >= 0",
+    "evidence": "Rows 1-8 show Price in [10.0, 40.0], all >= 0."
+   },
+   {
+    "table": "OrderDetails",
+    "column": "Quantity",
+    "formula": "Quantity > 0",
+    "evidence": "Rows 1-8 show Quantity in [5, 40], all > 0."
+   },
+   {
+    "table": "Orders",
+    "column": "OrderDate",
+    "formula": "OrderDate IS NOT NULL",
+    "evidence": "Rows 1-8 show dates 1996-07-04..1996-07-15, all non-NULL."
+   },
+   {
+    "table": "Employees",
+    "column": "BirthDate",
+    "formula": "BirthDate IS NOT NULL",
+    "evidence": "Rows 1-8 show distinct birth dates, all non-NULL."
+   },
+   {
+    "table": "Categories",
+    "column": "CategoryID",
+    "formula": "CategoryID > 0"
+   },
+   {
+    "table": "Shippers",
+    "column": "ShipperID",
+    "formula": "ShipperID > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Categories": 8,
+   "Customers": 20,
+   "Employees": 10,
+   "Shippers": 3,
+   "Suppliers": 12,
+   "Products": 30,
+   "Orders": 40,
+   "OrderDetails": 80
+  },
+  "null_targets": [
+   "Orders.EmployeeID",
+   "Products.SupplierID",
+   "Customers.City",
+   "Products.CategoryID",
+   "Orders.CustomerID",
+   "Orders.ShipperID"
+  ],
+  "supporting_evidence": {
+   "Products.Price": "Rows 1-8 show Price in [10.0, 40.0], all >= 0.",
+   "OrderDetails.Quantity": "Rows 1-8 show Quantity in [5, 40], all > 0.",
+   "Orders.OrderDate": "Rows 1-8 show dates 1996-07-04..1996-07-15, all non-NULL.",
+   "Employees.BirthDate": "Rows 1-8 show distinct birth dates, all non-NULL."
+  },
+  "uncertainty": "No calculated columns exist in the schema; no date-pair order rules apply (only single date columns per table). NULL shares for nullable FKs taken from stats (5-30%). Duplicate and tie targets are sampling-domain hints, not hard constraints. Products.ProductName tie direction set to DESC per atomic operations (overrides prior ASC). Orders.OrderDate literals include the LIKE literal '1996-08%' plus '1996-08-01' and variants 1996-07-31, 1996-08-31, 1996-09-01. The writer must pass orig_path so compact rows are preserved and FK values must reference parent keys present in the written DB (foreign_keys=ON)."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20 with reasons compact_rows_missing (20) and new_integrity_failures (20); integrity.fk_violations = 1619. The writer (tscore_gen/writer.py) is called from cli._one as write_instance_sqlite(_G['schema'], inst, p) with orig_path defaulting to None, so it creates a fresh DB from schema.ddl instead of copying the compact database. The docstring claims 'Copy the compact database' but the call never passes orig_path. This both drops the compact rows (compact_rows_missing) and, because foreign_keys=OFF and the generated FK values are drawn from compact+generated parent keys that may not exist in the freshly-created DB, produces 1619 FK violations.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the worker args and call write_instance_sqlite(schema, inst, p, orig_path=orig)) so the compact rows are preserved, and re-enable foreign_keys=ON (or validate FK targets against the actual parent key set present in the written DB) so generated FK values reference existing parent rows. Re-run and confirm fk_violations = 0 and compact_rows_missing = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback shows NULLs planted on many columns that are NOT NULL or PK in the schema, e.g. 'Employees.BirthDate: NULL 13/91', 'Orders.OrderDate: NULL 19/128', 'Products.Price: NULL 10/91', 'OrderDetails.Quantity: NULL 136/779', 'OrderDetails.OrderID: NULL 105/779', 'OrderDetails.ProductID: NULL 122/779', 'Products.ProductName: NULL 14/91', 'Shippers.ShipperName: NULL 7/23', 'Suppliers.SupplierName: NULL 11/63', 'Categories.CategoryName: NULL 3/26'. In _apply_specification the NULL rule is applied to every column where not cm.notnull and cm.pk_pos == 0; but the schema declares these columns without NOT NULL (e.g. BirthDate DATE, OrderDate DATETIME, Price REAL DEFAULT 0, Quantity INTEGER, ProductName TEXT), so they are treated as nullable and get NULLs. This contradicts the specification's semantic_rules_and_formulas (BirthDate IS NOT NULL, OrderDate IS NOT NULL, Price >= 0, Quantity > 0) and the null_targets list, which restricts NULLs to Orders.EmployeeID, Products.SupplierID, Customers.City, Products.CategoryID, Orders.CustomerID, Orders.ShipperID. It also violates the interface rule that NOT NULL/PK columns never get NULL and that formulas constrain non-NULL operands (a NULL Price/Quantity/BirthDate/OrderDate is not a valid generated value under the stated formulas).",
+     "requested_revision": "Restrict NULL planting to the columns listed in null_targets (and any column the specification explicitly marks nullable), not to every column lacking a NOT NULL constraint. Ensure BirthDate, OrderDate, Price, Quantity, ProductName, and all PK/FK columns not in null_targets never receive NULL. Re-run and confirm the nullable_columns feedback only shows NULLs on the intended nullable columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets includes Products.CategoryID and Orders.CustomerID/ShipperID, and the unmatched_join_rows patterns for Categories.CategoryID and Suppliers.SupplierID require child_rows_with_null_fk. However, the schema declares these FK columns without NOT NULL, so the program's generic 'nullable column' rule (issue above) is what actually drives NULLs; the specification does not clearly state which columns are nullable vs. which are NOT NULL, and it lists BirthDate/OrderDate/Price/Quantity as formula-constrained (non-NULL) while the schema does not enforce NOT NULL. This ambiguity is the root cause of the engineer's over-broad NULL planting.",
+     "requested_revision": "Make the specification explicit about the nullable set: state that only null_targets columns (plus any column the compact DB actually contains NULLs in) may receive NULL, and that BirthDate, OrderDate, Price, Quantity, and all PK columns are non-NULL. Align the semantic_rules_and_formulas with this so the engineer has an unambiguous rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Products.ProductName ties_for_order_limit with direction ASC, but the extracted atomic operations show direction DESC for the same pattern (ties_for_order_limit: tie_at_rank [1], direction DESC). The program's _apply_ties is direction-agnostic and does not implement the ASC tie; more importantly, the specification and the atomic operations disagree on direction, so the intended tie cannot be verified. Similarly, the specification's Orders.OrderDate like_near_variant literals are ['1996-08%', '1996-08-01'] but the program's ORDER_DATE_LITERALS = ['1996-08-01', '1996-08-31'] drops the '1996-08%' LIKE literal and substitutes '1996-08-31', which is not in the specification's literals list.",
+     "requested_revision": "Reconcile the Products.ProductName tie direction between the specification and the atomic operations (pick one and state it), and fix ORDER_DATE_LITERALS to include the specified '1996-08%' literal (and keep the specified variants 1996-07-31, 1996-08-31, 1996-09-01). Re-run and confirm the construction_pairs for these columns separate."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 132, separated 28 (21%). Many specified patterns are not separated by the generated instances. For example, _apply_duplicates and _apply_ties overwrite the first few positions of a column with copies of other values, but the samplers (StringSampler/NumberSampler) already produce many near-duplicates and the post-processing does not guarantee the target duplicate share or tie structure survives the subsequent NULL rule (which can NULL out the planted values). _apply_group_sizes similarly overwrites positions 0-5 and can be undone by the NULL rule applied afterwards in _apply_specification. The order of operations (patterns first, NULL rule last) means planted boundary/tie/group values can be replaced by NULL, defeating the intended variation.",
+     "requested_revision": "Apply the NULL rule before the per-column pattern post-processing (or exclude pattern-planted positions from NULL planting), and make the pattern appliers verify the target (duplicate share, tie at rank 1, group sizes 1/2/>=3, boundary literals present) after NULLs are applied. Re-run and confirm construction_pairs.separated increases substantially for the specified patterns."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database actually contains NULLs in the columns the specification treats as nullable (the feedback shows generated NULLs but not the compact share); the NULL share should follow the compact database's share per the interface rule.",
+    "Whether the 28 separated construction pairs correspond to the intended patterns or are incidental; the by-group breakdown is empty in the feedback.",
+    "Whether the Products.ProductName tie direction should be ASC (specification) or DESC (atomic operations)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules in the specification are backed by explicit row evidence (Price in [10,40] >= 0; Quantity in [5,40] > 0; OrderDate 1996-07-04..1996-07-15 non-NULL; BirthDate distinct non-NULL; CategoryID/ShipperID > 0). These are supported. The 'uncertainty' field correctly flags that duplicate/tie targets are sampling-domain hints, not hard constraints, and that no date-pair order rules apply.",
+     "requested_revision": "None required; the specification already distinguishes supported rules from uncertain patterns. Optionally note that the 'ties_for_order_limit' targets (e.g. Employees.FirstName tie at rank 1 on COUNT(*)) are hints and are not guaranteed by construction, which the spec already states."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL rule is implemented and observed: nullable columns (Customers.City, Orders.CustomerID/EmployeeID/ShipperID, Products.CategoryID/SupplierID) show non-zero NULL counts (12/57, 16/128, 18/128, 14/128, 15/91, 11/91), all within 5-30%. NOT NULL/PK columns show 0 NULLs. NON_NULL_FORCED protects BirthDate, OrderDate, Price, Quantity, ProductName. NULL planting occurs before pattern post-processing and protected positions are excluded (instance.py _apply_specification, _apply_null_rule).",
+     "requested_revision": "None blocking. Note that several nullable-by-schema columns (e.g. Categories.CategoryName, Customers.Address, Employees.Photo, Suppliers.City) show 'NULL 0 / n' because they are not in NULL_TARGETS and the compact DB has no NULLs there; per the interface rule this is a note for the engineer, not a blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "FK dependencies are honored: fill_foreign_keys_consistently draws from parent compact+generated keys; execution feedback reports fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0 across 20 instances. Writer copies orig_path and appends (compact rows preserved), uses foreign_keys=OFF during insert but keys are drawn from present parents so integrity holds.",
+     "requested_revision": "None blocking. Minor: writer sets 'pragma foreign_keys = OFF' during insert; since FK values are drawn from present parents this is safe, but enabling FK enforcement would provide a stronger integrity guarantee. Not required for pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducible=true; run_seconds=2.3; returncode=0; rows_skipped=0. Seeding is deterministic (random.Random(seed_base*100003+i)). Table sizes jittered around spec sizes (choose_table_sizes) \u2014 spec lists fixed sizes but jitter is a reasonable sampling-domain interpretation; observed row counts (e.g. Categories 29 over 20 instances ~1.45/instance) are consistent with jittered small tables.",
+     "requested_revision": "None blocking. If exact table sizes are intended as hard constraints, choose_table_sizes should not jitter; the spec's 'table_sizes_per_instance' reads as target sizes. Recommend clarifying whether jitter is acceptable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Value variation remains possible: construction_pairs eligible=132, separated=30, unknown_executions=0. Separation is partial but the instructions state a missing separation alone does not establish a generation error. Pattern post-processing (_apply_duplicates, _apply_ties, _apply_group_sizes, _apply_comparison_boundary, _apply_like_variants, _apply_rows_with_different_values) is implemented per column.",
+     "requested_revision": "None blocking. Note that _apply_ties and _apply_group_sizes overwrite fixed leading positions (0-5) and may conflict when applied sequentially to the same column (e.g. Employees.FirstName gets group_sizes then ties, the latter overwriting positions 0-3); this can weaken the group-size pattern. Recommend ordering or non-overlapping position selection, but it does not block pass."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether jittered table sizes (choose_table_sizes) are acceptable versus the fixed table_sizes_per_instance in the spec.",
+    "Whether sequential application of _apply_group_sizes then _apply_ties on Employees.FirstName preserves the intended group-size distribution (positions overlap).",
+    "Whether enabling foreign_keys=ON in the writer is desired for stronger integrity assurance."
+   ]
+  }
+ ]
 }

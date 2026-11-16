@@ -1,142 +1,145 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
-import math
+"""Schema introspection of the compact database."""
 import sqlite3
-import warnings
-from dataclasses import dataclass, field
 
 
-@dataclass
 class ColumnMeta:
-    table: str
-    name: str
-    type_str: str
-    notnull: bool
-    default: object
-    pk_pos: int
-    unique: bool
-    checked: bool
+    __slots__ = ('name', 'type_str', 'notnull', 'pk_pos', 'unique', 'checked', 'default')
+
+    def __init__(self, name, type_str='', notnull=False, pk_pos=0, unique=False,
+                 checked=False, default=None):
+        self.name = name
+        self.type_str = type_str or ''
+        self.notnull = bool(notnull)
+        self.pk_pos = int(pk_pos)
+        self.unique = bool(unique)
+        self.checked = bool(checked)
+        self.default = default
+
+    def __repr__(self):
+        return 'ColumnMeta(%r,%r,pk=%d)' % (self.name, self.type_str, self.pk_pos)
 
 
-@dataclass
 class TableMeta:
-    name: str
-    columns: list
-    primary_key: list
+    __slots__ = ('name', 'columns', 'primary_key', 'fks', 'unique_sets')
+
+    def __init__(self, name):
+        self.name = name
+        self.columns = []
+        self.primary_key = []
+        self.fks = {}
+        self.unique_sets = []
+
+    def col(self, name):
+        for c in self.columns:
+            if c.name == name:
+                return c
+        return None
 
 
-@dataclass
 class Schema:
-    tables: dict
-    fks: dict
-    ddl: list
-    table_order: list
-    column_order: list
-    original_values: dict = field(default_factory=dict)
-    original_sizes: dict = field(default_factory=dict)
-    unique_from_index: list = field(default_factory=list)
+    def __init__(self):
+        self.tables = {}
+        self.table_order = []
+        self.fks = {}
+        self.original_values = {}
+        self.unique_indexes = []
 
 
-def q(name: str) -> str:
-    """Double-quote an SQL identifier."""
+def _quote(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def _levels(items: list, deps: dict) -> list:
-    """Topological levels; deterministic cycle breaking by smallest remaining item."""
-    remaining = sorted(set(items))
-    known = set(items)
-    placed: set = set()
-    out = []
-    while remaining:
-        lvl = [x for x in remaining if all(d == x or d in placed or d not in known for d in sorted(deps.get(x, ())))]
-        if not lvl:
-            lvl = [remaining[0]]
-        out.append(sorted(lvl))
-        placed.update(lvl)
-        remaining = [x for x in remaining if x not in placed]
-    return out
+def _parse_fk_list(s):
+    """Parse '("a", "b")' or 'a' from PRAGMA foreign_key_list."""
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s.startswith('(') and s.endswith(')'):
+        s = s[1:-1]
+    parts = [p.strip().strip('"').strip("'") for p in s.split(',')]
+    return parts
 
 
-def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
-    cdeps: dict = {}
-    tdeps: dict = {}
-    for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
-        if (ct, cc) != (pt, pc):
-            cdeps.setdefault((ct, cc), set()).add((pt, pc))
-        if ct != pt:
-            tdeps.setdefault(ct, set()).add(pt)
-    tables = sorted({t for t, _ in all_columns})
-    return _levels(list(all_columns), cdeps), _levels(tables, tdeps)
-
-
-def _first_token(line: str) -> str:
-    toks = line.strip().split()
-    return toks[0].strip('"`[](),') if toks else ''
-
-
-def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
-    con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
+def read_schema(orig: str) -> Schema:
+    """Read the compact database schema and observed values."""
+    sc = Schema()
+    con = sqlite3.connect(orig)
     try:
-        master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
-        ddl = [s for ty, n, s in master if not str(n).startswith('sqlite_')]
-        tnames = [n for ty, n, s in master if ty == 'table' and not str(n).startswith('sqlite_')]
-        create = {n: s for ty, n, s in master if ty == 'table'}
-        tables: dict = {}
-        from_index = []
-        for t in tnames:
-            info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
-            low = {r[1].lower(): r[1] for r in info}
-            uniq, chk = set(), set()
-            for line in create[t].split('\n'):
-                ll = line.lower()
-                tok = _first_token(line).lower()
-                if 'unique' in ll and tok in low:
-                    uniq.add(tok)
-                if ('check (' in ll or 'check(' in ll) and tok in low:
-                    chk.add(tok)
-            for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
-                if idx[2]:
-                    cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
-            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
-                    for r in info]
-            pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
-            tables[t] = TableMeta(t, cols, pk)
-        tlow = {t.lower(): t for t in tables}
-        fks: dict = {}
-        for t in tnames:
-            for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
-                pt = tlow.get(str(r[2]).lower())
-                child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
-                pc = None
-                if pt is not None:
-                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
-                if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        names = [r[0] for r in cur.fetchall()]
+        for t in names:
+            tm = TableMeta(t)
+            cur.execute('PRAGMA table_info(%s)' % _quote(t))
+            info = cur.fetchall()
+            pk_cols = []
+            for cid, cname, ctype, notnull, dflt, pk in info:
+                cm = ColumnMeta(cname, ctype, notnull=bool(notnull) or bool(pk),
+                                pk_pos=int(pk or 0), default=dflt)
+                tm.columns.append(cm)
+                if pk:
+                    pk_cols.append((int(pk), cname))
+            pk_cols.sort()
+            tm.primary_key = [c for _, c in pk_cols]
+            cur.execute('PRAGMA foreign_key_list(%s)' % _quote(t))
+            for row in cur.fetchall():
+                _id, _seq, ptable, frm, to = row[0], row[1], row[2], row[3], row[4]
+                if frm is None:
                     continue
-                fks[(t, child)] = (pt, pc)
-        all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
-        corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
-        for t in tnames:
-            n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
-            sizes[t] = n
-            sel = 'select %s from %s' % (', '.join(q(c.name) for c in tables[t].columns), q(t))
+                if to is None:
+                    to = frm
+                tm.fks[frm] = (ptable, to)
+                sc.fks[(t, frm)] = (ptable, to)
+            cur.execute('PRAGMA index_list(%s)' % _quote(t))
+            for irow in cur.fetchall():
+                iname, uniq = irow[1], irow[2]
+                if not uniq:
+                    continue
+                cur.execute('PRAGMA index_info(%s)' % _quote(iname))
+                cols = [r[2] for r in cur.fetchall()]
+                if not cols:
+                    continue
+                if len(cols) == 1:
+                    cm = tm.col(cols[0])
+                    if cm is not None:
+                        cm.unique = True
+                tm.unique_sets.append(tuple(cols))
+                sc.unique_indexes.append((t, tuple(cols)))
+            sc.tables[t] = tm
+        remaining = set(sc.tables)
+        order = []
+        while remaining:
+            level = []
+            for t in list(remaining):
+                parents = {pt for (pt, _pc) in sc.tables[t].fks.values() if pt in remaining and pt != t}
+                if not parents:
+                    level.append(t)
+            if not level:
+                level = [sorted(remaining)[0]]
+            for t in level:
+                remaining.discard(t)
+            order.append(sorted(level))
+        sc.table_order = order
+        for t, tm in sc.tables.items():
             try:
-                if n > max_rows_per_table:
-                    k = math.ceil(n / max_rows_per_table)
-                    rows = con.execute(sel + ' where rowid %% %d = 0 order by rowid' % k).fetchall()
-                else:
-                    rows = con.execute(sel + ' order by rowid').fetchall()
-            except sqlite3.Error:
-                rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
-            for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                cur.execute('SELECT * FROM %s' % _quote(t))
+                rows = cur.fetchall()
+            except Exception:
+                rows = []
+            colnames = [d[0] for d in cur.description] if cur.description else [c.name for c in tm.columns]
+            for j, cname in enumerate(colnames):
+                vals = []
+                seen = set()
+                for r in rows:
+                    v = r[j]
+                    if v is None:
+                        continue
+                    key = (type(v).__name__, v)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    vals.append(v)
+                sc.original_values[(t, cname)] = vals
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return sc

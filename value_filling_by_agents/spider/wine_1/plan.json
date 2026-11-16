@@ -1,61 +1,528 @@
 {
  "db": "wine_1",
- "operator_io_quirks": [
-  "Table/column names are mixed case ('Grape','Appelation','isAVA','No','ID'); must double-quote and preserve original spelling.",
-  "Note the misspelling 'Appelation' (one 'l') in both appellations and wine \u2014 FK parent_col matches child col exactly, so no dangling FK, but any name-normalisation would break it.",
-  "wine has NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there, and drop_unique_duplicates has no unique columns to act on.",
-  "grapes.Grape and appellations.Appelation are TEXT UNIQUE (line-based 'unique' rule fires); wine.Grape/wine.Appelation are FK children to those unique parents \u2014 parent values are unique so FK draw is 1:1, no fan-out.",
-  "wine.Cases has storage classes ['integer','text'] \u2014 mixed affinity; declared INTEGER but some rows store text. Number fuzzer will emit ints; inserts may coerce or fail.",
-  "wine.Year declared INTEGER but semantically a year (2005-2009); ts dispatches to Number (not Date) because type string is 'INTEGER' \u2014 no date template.",
-  "wine.Drink is TEXT holding mixed 'now' and year strings ('2012','2010') \u2014 String fuzzer, no date semantics.",
-  "appellations.County and Area contain literal 'N/A' strings (not NULL) \u2014 null_rate 0.0 everywhere; no NULLs in original.",
-  "appellations.State and wine.State are constant 'California' (distinct=1) \u2014 String fuzzer will still emit random strings, destroying the constant.",
-  "All tables small (20/57/500 rows) \u2014 no huge-table sampling concern; original_values fully read.",
-  "No composite keys, no self-references, no dangling FKs, no views/triggers/indexes beyond the UNIQUE constraints.",
-  "wine.No is INTEGER distinct=500 but NOT a PK \u2014 looks like a surrogate id; ts treats it as plain Number."
- ],
- "operator_ts_expectations": [
-  "grapes.ID, appellations.No: single-column INTEGER PK -> Number fuzzer, max_l0=inf (unlimited fresh draws), int perturbation +-1/+-2; PK dedup keeps first occurrence.",
-  "grapes.Grape, appellations.Appelation: String fuzzer over charset a-zA-Z 0-9() with 0.5 contaminate; UNIQUE constraint means duplicate rows fail at insert and are dropped \u2014 likely shrinks these tables.",
-  "wine.Grape, wine.Appelation: FK children draw from parent's FINAL filtered values with replacement -> many duplicate wine rows share a grape/appellation; fine (no unique on wine).",
-  "wine.Year/Price/Score/Cases: Number fuzzer, range [-10^scale,10^scale] with scale from type args (none -> default), so values like 2008 become random ints in a wide range \u2014 implausible years/prices/scores drive FN on range predicates (e.g. Year BETWEEN 2005 AND 2010, Score>90).",
-  "wine.Drink: String fuzzer emits random strings, never 'now'/year-like \u2014 queries filtering Drink='now' or Drink LIKE '20%' get empty/random results -> FN.",
-  "appellations.State / wine.State constant 'California' destroyed by String fuzzer -> queries WHERE State='California' return random rows -> FN/FP.",
-  "appellations.isAVA ('Yes'/'No') and grapes.Color ('Red'/'White') are 2-value enums; String fuzzer emits arbitrary strings -> equality predicates on these become near-empty -> FN.",
-  "wine has no PK: no dedup, so 500 rows all survive; joins wine->grapes/appellations are many-to-one, ties present (good for COUNT/GROUP BY).",
-  "appellations.County/Area 'N/A' sentinel: String fuzzer never reproduces 'N/A' -> queries excluding or matching 'N/A' misbehave.",
-  "Number fuzzer's list_max quirk (upper end overwritten to full range) means even with original elements present, fresh draws dominate when p small \u2014 implausible magnitudes.",
-  "No Date/Time/Bool/Bit columns at all \u2014 those fuzzers never fire on wine_1.",
-  "FK consistency holds (parent values reused), so join cardinality is preserved; misses are value-plausibility (FN) and lost constants/enums (FP on negation, FN on equality)."
- ],
- "challenger_refs": [
-  "g7adefea6",
-  "g505d3501",
-  "g505d3501",
-  "g505d3501",
-  "gc56df322",
-  "gc56df322",
-  "gc56df322",
-  "gc56df322",
-  "gc56df322",
-  "gc56df322",
-  "g8d0552bf",
-  "g8d0552bf",
-  "g62544f30",
-  "g0ffda7c0",
-  "g0ffda7c0",
-  "ga797b442",
-  "ga797b442",
-  "g27c9312b",
-  "g27c9312b",
-  "gf33c078c",
-  "g331c48cc"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from (max compact value of that column)+1; never reuse compact or generated keys; never NULL; assign only after all planting passes so no later pass can collide.",
+   "integer_pk_fresh_table": "Start at 1 if the table is empty.",
+   "text_unique": "Fresh distinct value per generated row within the table; first generated rows reuse compact values to keep parent/child overlap; subsequent rows use fresh tokens; UNIQUE columns (grapes.Grape, appellations.Appelation) are never overwritten by any planting pass with a value already present in the table's compact+generated set; run a final de-duplication pass on UNIQUE columns after all planting.",
+   "text_generic": "Fresh plausible wine-related token; 5% near-variants (case/whitespace) of an existing value; no near-variant that violates a declared enum or semantic formula.",
+   "integer_generic": "Uniform integer in [1, 10000] within the column's declared range rule.",
+   "null_share": "Per nullable column, NULL share equals the compact database's share for that column (0.0 per statistics); since the compact share is 0, plant exactly one NULL row per nullable column per generated instance (minimum-one rule). This includes nullable FK child columns (wine.Appelation, wine.Grape) and wine.State; never on NOT NULL/PK columns. NULL_SHARE constant is 0.0 with minimum-one.",
+   "boundary": "For numeric columns with listed literals, include values at literal-1, literal, literal+1. For text literals, include the literal and, only if the semantic formula for that column permits it, one case near-variant.",
+   "tie": "For ORDER columns, plant a group-level tie: at least two distinct values of the ordering column each occur the same maximal count under the stated aggregate. For tie_on COUNT(*) DESC/ASC, at least two values each appear max_count times. For tie_on SUM(col)/COUNT(*) (wine.Price), construct two groups whose average of the ordering column is equal at rank 1.",
+   "duplicate_share": "For DISTINCT columns, 20-50% of generated rows repeat an existing value.",
+   "fk_child": "Child FK values are drawn only from the parent table's generated-or-compact key set or NULL; value-level planting (boundary/duplicate) passes on FK child columns must leave the column within the parent set; after all planting, re-map any non-NULL child FK value not in the parent set to a valid parent value or NULL. Group-size and tie planting is done on the parent table (appellations.Appelation, grapes.Grape) and inherited by the child through the join; it is never attempted directly on the child FK column. The FK child draw is biased so that each boundary literal planted on the parent (St. Helena, st. helena, Zinfandel, zinfandel) is used by at least one child row.",
+   "planting_order": "1) generate full new rows at the specified per-instance sizes with UNIQUE values fresh; 2) plant NULLs (one per nullable column, including nullable FK children and wine.State); 3) plant boundaries, duplicates, ties, group sizes, aggregate boundaries, different-value rows on the designated columns (parent tables for FK joins); 4) re-validate FKs; 5) re-run de-duplication on UNIQUE columns; 6) assign integer PKs above compact max; 7) post-planting validation pass that checks every planted pattern still holds and re-plants if a later pass destroyed an earlier one. Later passes skip None slots and never replace a planted NULL; FK child columns are excluded from boundary/duplicate/tie/group/aggregate/different-value planting.",
+   "row_count_and_failures": "Produce exactly table_sizes_per_instance new rows per table appended to the compact copy. Any nonzero rows_skipped must be treated as n_fail>0 and the instance rejected; the generator must re-sequence PKs and avoid UNIQUE collisions so rows_skipped is 0.",
+   "parent_rows_without_children": "Ensure at least one appellations row and at least one grapes row have zero matching wine rows (by Appelation / Grape) in each instance; likewise plant at least one wine row with NULL Appelation and one with NULL Grape. When creating a parent-without-children row, use a fresh UNIQUE value that does not collide with any existing generated or compact value."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "appellations",
+    "column": "Appelation",
+    "pattern": "unmatched_join_rows, comparison_boundary, duplicates_for_distinct, group_sizes, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "wine.Appelation"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "St. Helena",
+      "st. helena"
+     ],
+     "equal_and_one_step_from": [
+      "wine.Appelation"
+     ],
+     "duplicate_share": "20-50 %",
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "grapes",
+    "column": "Grape",
+    "pattern": "unmatched_join_rows, comparison_boundary, group_sizes, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "wine.Grape"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "Zinfandel",
+      "zinfandel"
+     ],
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Appelation",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "joins_with": [
+      "appellations.Appelation"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "St. Helena",
+      "st. helena"
+     ],
+     "equal_and_one_step_from": [
+      "appellations.Appelation"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Grape",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "joins_with": [
+      "grapes.Grape"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "Zinfandel",
+      "zinfandel"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Year",
+    "pattern": "comparison_boundary, rows_with_different_values, ties_for_order_limit",
+    "targets": {
+     "values": [
+      1999,
+      2000,
+      2001,
+      2007,
+      2008,
+      2009,
+      2010,
+      2011,
+      "2008",
+      "2009"
+     ],
+     "qualifying_rows": ">= 2 per group with different values",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Winery",
+    "pattern": "duplicates_for_distinct, aggregate_boundary",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "aggregate": [
+      "COUNT(*)",
+      "COUNT(wine.winery)"
+     ],
+     "values": [
+      2,
+      3,
+      4,
+      5
+     ]
+    }
+   },
+   {
+    "table": "appellations",
+    "column": "County",
+    "pattern": "ties_for_order_limit, comparison_boundary, null_rows",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Cases",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Score",
+    "pattern": "comparison_boundary, rows_with_different_values",
+    "targets": {
+     "values": [
+      89,
+      90,
+      91
+     ]
+    }
+   },
+   {
+    "table": "appellations",
+    "column": "Area",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Central Coast",
+      "central coast"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct, group_sizes, ties_for_order_limit",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "wine",
+    "column": "Price",
+    "pattern": "ties_for_order_limit, comparison_boundary",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "SUM(wine.price) / COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "appellations",
+    "column": "State",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "California",
+      "california"
+     ]
+    }
+   },
+   {
+    "table": "grapes",
+    "column": "Color",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Red",
+      "red"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "wine",
+    "child_column": "Grape",
+    "parent_table": "grapes",
+    "parent_column": "Grape",
+    "copied_columns": []
+   },
+   {
+    "child_table": "wine",
+    "child_column": "Appelation",
+    "parent_table": "appellations",
+    "parent_column": "Appelation",
+    "copied_columns": []
+   },
+   {
+    "child_table": "wine",
+    "child_column": "State",
+    "parent_table": "appellations",
+    "parent_column": "State",
+    "copied_columns": [
+     "State"
+    ],
+    "via": "wine.Appelation = appellations.Appelation"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "grapes",
+    "column": "Color",
+    "formula": "Color IN ('Red', 'White', 'red')",
+    "evidence": "Sample rows show Red/White; 'red' admitted only as case near-variant used for boundary comparison (uncertain/assumed, not observed)."
+   },
+   {
+    "table": "appellations",
+    "column": "isAVA",
+    "formula": "isAVA IN ('Yes', 'No')"
+   },
+   {
+    "table": "appellations",
+    "column": "State",
+    "formula": "State IN ('California', 'california')",
+    "evidence": "All sample rows California; 'california' admitted only as case near-variant for the comparison boundary (uncertain/assumed, not observed)."
+   },
+   {
+    "table": "wine",
+    "column": "State",
+    "formula": "State IN ('California', 'california')",
+    "evidence": "All sample rows are 'California'; formula widened to match the copied State boundary literal (uncertain/assumed, not observed)."
+   },
+   {
+    "table": "wine",
+    "column": "Year",
+    "formula": "Year BETWEEN 1900 AND 2100",
+    "evidence": "Sample years 2004-2066; range widened to include the observed 2066 outlier and boundary values 1999-2011."
+   },
+   {
+    "table": "wine",
+    "column": "Price",
+    "formula": "Price >= 0"
+   },
+   {
+    "table": "wine",
+    "column": "Score",
+    "formula": "Score BETWEEN 50 AND 100",
+    "evidence": "Sample scores 86-93; bounds 50-100 include boundary values 89-91."
+   },
+   {
+    "table": "wine",
+    "column": "Cases",
+    "formula": "Cases >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "grapes": 20,
+   "appellations": 57,
+   "wine": 500
+  },
+  "null_targets": [
+   "wine.Appelation",
+   "wine.Grape",
+   "wine.Winery",
+   "wine.State",
+   "wine.Name",
+   "wine.Year",
+   "wine.Price",
+   "wine.Score",
+   "wine.Cases",
+   "wine.Drink",
+   "appellations.County",
+   "appellations.Area",
+   "appellations.isAVA",
+   "grapes.Color"
+  ],
+  "supporting_evidence": {
+   "grapes.Color": "Sample rows show only 'Red' and 'White'; 'red' is only a comparison-boundary near-variant (uncertain/assumed).",
+   "appellations.isAVA": "Sample rows show only 'Yes' and 'No'.",
+   "appellations.State": "All sample rows are 'California'; 'california' only as comparison near-variant (uncertain/assumed).",
+   "wine.State": "All sample rows are 'California'; copied from parent, 'california' only as comparison near-variant (uncertain/assumed).",
+   "wine.Year": "Sample years 2004-2066; rule 1900-2100 includes observed 2066 and boundary values 1999-2011.",
+   "wine.Price": "All sample prices positive (15-48).",
+   "wine.Score": "Sample scores 86-93; rule 50-100 includes boundary values 89-91.",
+   "wine.Cases": "All sample cases positive (275-6000).",
+   "row_counts": "Compact sizes grapes=20, appellations=57, wine=500; generated rows appended with PKs above compact max and fresh UNIQUE values."
+  },
+  "uncertainty": "Compact DB reports 0.0 null_rate for all nullable columns; minimum-one NULL row per nullable column is used (NULL_SHARE=0.0 with minimum-one), including nullable FK children (wine.Appelation, wine.Grape) and wine.State. Group-size and tie targets for FK child columns are satisfied via the parent tables (appellations.Appelation, grapes.Grape) and inherited through the join; they are not planted directly on child FK columns. Year upper bound 2100 includes observed 2066 and boundary 2011. Boundary case near-variants ('red', 'california') are admitted in the enum formulas so generated values stay within the declared domain; this widening is a boundary-coverage device, not an observed domain value (uncertain/assumed). The SUM/COUNT average tie for wine.Price is implemented by constructing two groups with equal average price at rank 1. UNIQUE columns (grapes.Grape, appellations.Appelation) are never overwritten with an existing value; a final de-duplication pass runs after all planting. Any rows_skipped > 0 must be treated as a hard failure."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances is invalid with new_integrity_failures; 5939 FK violations total (wine.Appelation -> appellations.Appelation: 4151 rows across 20 instances; wine.Grape -> grapes.Grape: 1788 rows). The program reports n_ok=20, n_fail=0, errors={} and rows_added={} \u2014 it never surfaces the skipped rows.",
+     "requested_revision": "Fix FK generation so generated wine.Appelation and wine.Grape values always exist in the parent tables (or are NULL). The current flow in instance.py builds child FK values from parent_vals, but then _plant_boundary/_plant_duplicates/_plant_ties/_plant_group_sizes/_plant_aggregate/_plant_different_values overwrite child FK columns with values (e.g. 'St. Helena', 'st. helena', 'Zinfandel', 'zinfandel', random pool picks) that are not guaranteed to be present in the parent table. Either (a) exclude FK child columns from the planting passes, or (b) after planting, re-map any child FK value not in the parent set to a valid parent value (or NULL). Also make writer.write_instance_sqlite return rows_ok/rows_failed into the CLI summary so skipped rows are visible instead of silently dropped."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets 'pragma foreign_keys = OFF' and inserts with executemany; on failure it falls back to row-by-row and counts bad rows but the CLI ignores the returned dict (rows_added/rows_skipped are hard-coded to {}). The construction feedback shows 523 rows added for a 500-row wine table plus 20+57 parent rows, i.e. the generated rows are being written but many violate FKs and are not reported.",
+     "requested_revision": "Propagate the writer's {'rows_ok','rows_failed'} into the CLI JSON summary (rows_added/rows_skipped) and, more importantly, prevent FK-violating rows from being generated at all (see previous issue). A run that silently drops or writes FK-violating rows must not report n_fail=0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'uncertainty' states: 'NULL shares assumed ~5% since statistics report 0.0 null_rate but nullable columns exist' and 'Year upper bound 2030 chosen to include boundary 2011 and plausible future vintages; original data has 2066 outlier.' The Year range (1900,2030) excludes the observed 2066 value, and the NULL share is not derived from the compact database as the interface rule requires ('NULL share following the compact database's share for that column').",
+     "requested_revision": "Derive the NULL share per column from the compact database (or explicitly document that the compact share is 0 and a minimum of one NULL row is used), and widen/justify the wine.Year range so it does not contradict observed compact values (e.g. include 2066 or state the range is a deliberate domain restriction). These are specification-level clarifications, not per-query exceptions."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY_TEXT includes ('appellations','State'): ['California','california'] and ('grapes','Color'): ['Red','red'], but ENUMS for those columns are ['California'] and ['Red','White']. In values.py StringSampler.sample, when self.enum is set the boundary list is ignored (the enum branch returns only enum values plus a 5% case flip), so the 'california'/'red' near-variants are not guaranteed. Conversely, for non-enum columns the boundary injection in _plant_boundary can overwrite values that were already made consistent.",
+     "requested_revision": "Make the enum and boundary handling consistent: either include the near-variants in the enum pool, or have the enum branch also draw from the boundary list. Ensure _plant_boundary does not run on FK child columns (see first issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_ties uses 'top = max(pool) if all numeric else pool[0]' and _plant_group_sizes/_plant_aggregate/_plant_duplicates overwrite arbitrary positions, including positions that were set to NULL by _plant_null (which runs first). This can replace planted NULLs, contradicting the interface rule 'a planted NULL is never replaced to satisfy a rule', and can also break the FK consistency established earlier.",
+     "requested_revision": "Run planting passes in an order that preserves NULLs (skip None slots in _plant_ties/_plant_group_sizes/_plant_aggregate/_plant_duplicates/_plant_different_values), and exclude FK child columns from all planting passes or re-validate FKs after planting."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 30/85 separated construction pairs are sufficient for the intended value variation cannot be fully assessed without the per-pair execution details; the reported 0 unknown executions is good, but the FK failures mean many instances are not usable for query evaluation.",
+    "The compact-database NULL share per column was not provided in the feedback; the designer's ~5% assumption could not be verified against the compact data."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution summary: rows_added {grapes: 76, appellations: 245, wine: 5251} but rows_skipped {grapes: 149, appellations: 303, wine: 4749}. The specification's table_sizes_per_instance requires grapes=20, appellations=57, wine=500 per instance. The writer appends generated rows to a copy of the compact DB, so the intended per-instance generated counts are 20/57/500; instead the program attempted ~225/548/10000 rows and dropped the majority (5201 skipped). The CLI even surfaces this as errors {\"rows_skipped\": 5201} yet reports n_fail=0 and the run is marked valid. This means the generated instances do not match the specified table sizes and the majority of generated rows are silently discarded (only counted, not prevented).",
+     "requested_revision": "Make the generator produce exactly the specified per-instance row counts (grapes 20, appellations 57, wine 500) of *new* rows appended to the compact copy, and ensure those rows satisfy all constraints so that rows_skipped is 0. Investigate why ~95% of wine rows and ~70% of grapes/appellations rows fail insertion (likely PK collisions on integer PKs that are not re-sequenced past the compact max, and UNIQUE collisions on grapes.Grape / appellations.Appelation). The integer_pk rule says 'Sequential from 1, unique' \u2014 for appended rows the sequence must start above the compact max, not at 1. Also treat any nonzero rows_skipped as a hard failure (n_fail>0) rather than a passing run."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_TARGETS includes ('wine','Appelation') and ('wine','Grape'), which are FK child columns. instance.py _plant_null runs before FK revalidation and sets ~5% of these to NULL; _revalidate_fks then re-maps non-NULL values not in the parent set but leaves NULLs. The generic_sampling_rules say 'planting passes never overwrite FK child columns' and 'FK child columns are excluded from boundary/duplicate/tie/group/aggregate/different-value planting' \u2014 NULL planting is not explicitly excluded, and the interface NULL rule does allow nullable FK NULLs. However the execution feedback shows wine.Appelation NULL 464/5280 and wine.Grape NULL 300/5280, i.e. ~8.8% and ~5.7%, exceeding the 5% NULL_SHARE and inconsistent with the 'minimum-one NULL row' intent (the compact share is 0.0). More importantly, the spec's per_column_exceptions for wine.Appelation and wine.Grape list 'unmatched_join_rows' with 'child_rows_with_null_fk: true', which is satisfied, but the large NULL share on FK children combined with revalidation means many generated FK values are replaced, reducing the intended value variation.",
+     "requested_revision": "Clarify in the specification whether FK child columns are NULL targets (the interface rule permits it) and, if so, cap the NULL share at the minimum-one rule (one NULL row per instance) rather than 5% of rows, since the compact share is 0.0. Ensure _plant_null does not run on FK child columns unless explicitly listed, and that the NULL share matches the compact share (0.0 \u2192 minimum one)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for wine.Appelation include pattern 'group_sizes' with target 'group_sizes: 1, 2 and >= 3' and 'ties_for_order_limit' with tie_on COUNT(*), direction DESC. But wine.Appelation is an FK child column, and the generic_sampling_rules explicitly exclude FK child columns from group/aggregate/tie planting. The spec is internally contradictory: it lists group_sizes and ties_for_order_limit for an FK child column while the generic rules forbid planting on FK children. Similarly wine.Grape (FK child) lists group_sizes and ties_for_order_limit. The program resolves this by excluding FK children from _plant_group_sizes and _plant_ties, so these targets are never planted.",
+     "requested_revision": "Either (a) remove group_sizes/ties_for_order_limit from the FK-child columns wine.Appelation and wine.Grape in the specification, or (b) explicitly state that these patterns are satisfied indirectly via the parent table (appellations.Appelation, grapes.Grape) and that the FK child inherits them through the join. Do not leave contradictory instructions that the program must silently resolve."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY_TEXT includes ('appellations','State'): ['California','california'] and ('grapes','Color'): ['Red','red'], and ENUMS includes the near-variants. But the semantic_rules_and_formulas state 'State = California' and 'Color IN (Red, White)'. The program's StringSampler enum branch returns the near-variants ('california', 'red') as valid enum values, so generated rows can violate the stated semantic formula (State must be 'California', Color must be in {Red, White}). The specification's own semantic_rules_and_formulas and the boundary literal pools are inconsistent: the boundary near-variants are not in the declared domain.",
+     "requested_revision": "Reconcile the semantic formulas with the boundary literal pools. Either widen the formulas to include the case variants (e.g. State IN ('California','california'), Color IN ('Red','White','red')) or drop the near-variants from BOUNDARY_TEXT/ENUMS for these columns. The program must not generate values outside the declared domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_ties for non-numeric columns sets 'top = pool[0]' and assigns it to two random free slots, which does not guarantee the rank-1 value under any ORDER BY (e.g. ORDER BY COUNT(*) DESC for wine.Appelation). For numeric columns it uses max(pool), which is also not the rank-1 value for a DESC order on COUNT(*). The tie target 'tie_at_rank: [1], direction: DESC, tie_on: COUNT(*)' requires two groups sharing the highest COUNT(*), which is a group-level property, not a per-row value property. The planting as implemented cannot guarantee this.",
+     "requested_revision": "Implement tie planting at the group level: for the tie column, ensure at least two distinct values each occur the same maximal number of times (for DESC on COUNT(*)), or document that the tie is only approximate. The current per-row assignment does not satisfy the stated target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes picks three random pool values a,b,c and assigns counts 1,2,3, but the assignments use rng.sample(free, cnt) independently for each, so the same slot can be overwritten and the final group sizes are not guaranteed to be 1, 2, and >=3. Also for wine.Appelation and wine.Grape (FK children) this pass is skipped entirely, so the group_sizes target is never met for those columns.",
+     "requested_revision": "Assign disjoint slot sets for the three group sizes so the final counts are exactly 1, 2, and >=3, and resolve the FK-child contradiction noted above."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows construction_pairs separated 34 of 85 eligible, with construction_pairs_by_group empty. While a missing separation alone does not prove a generation error, the very low separation rate combined with the massive rows_skipped (5201) and the fact that only ~377 rows per instance were actually added (vs. the specified 577 = 20+57+500) suggests the intended value variation is largely not realized. The nullable_columns feedback shows wine.Appelation NULL 464/5280 and wine.Grape NULL 300/5280, and many columns have NULL counts far above the minimum-one rule (e.g. wine.Winery 292/5280 \u2248 5.5%, wine.Year 255/5280 \u2248 4.8%), consistent with the 5% NULL_SHARE rather than the compact share of 0.0.",
+     "requested_revision": "After fixing the row-count and PK/UNIQUE collision issues, re-run and verify that construction_pairs separated increases substantially and that NULL shares match the compact share (0.0 \u2192 minimum one NULL row per nullable column per instance)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's integer PKs (grapes.ID, appellations.No) and wine.No are the cause of the massive rows_skipped; the program does not re-sequence PKs above the compact max, and the integer_pk rule 'Sequential from 1' conflicts with appending to a non-empty table.",
+    "Whether wine.No (declared INTEGER, not PK in the schema but appears to be a row identifier) is intended to be unique; the schema does not declare it UNIQUE, but the writer's PK/UNIQUE handling may still collide.",
+    "The exact intended NULL share for FK child columns (wine.Appelation, wine.Grape) given the interface rule and the compact share of 0.0.",
+    "Whether the 'unmatched_join_rows' target 'parent_rows_without_children: true' is satisfied: the program draws FK children only from parent values, so every parent row may have children, contradicting the target. This needs verification against the generated instances."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, errors {\"rows_skipped\": 421}, rows_skipped {grapes: 180, appellations: 241, wine: 0}. The CLI (cli.py) explicitly treats any nonzero rows_skipped as a hard failure: `if n_skipped: ... n_fail += n_ok; n_ok = 0`. The specification's row_count_and_failures rule states: 'Any nonzero rows_skipped must be treated as n_fail>0 and the instance rejected; the generator must re-sequence PKs and avoid UNIQUE collisions so rows_skipped is 0.' The run therefore reports every instance as failed.",
+     "requested_revision": "Fix the generator so rows_skipped is 0 for every table. The skipped rows are in grapes (180/164 added) and appellations (241/693 added), i.e. the parent tables with UNIQUE text columns (Grape, Appelation) and integer PKs. Likely causes: (a) _resequence_integer_pks assigns PKs above compact max but sample_fresh_primary_keys/drop_unique_duplicates run after planting, and _plant_boundary/_plant_duplicates/_plant_ties/_plant_group_sizes/_plant_aggregate/_plant_different_values can overwrite UNIQUE text columns (Grape, Appelation) with duplicate values, violating the UNIQUE constraint; (b) _ensure_parent_without_children can write a fresh value into a UNIQUE column that collides with an existing generated value. Ensure UNIQUE columns (grapes.Grape, appellations.Appelation) are never overwritten with a value already present in the same table's generated+compact set, and re-run drop_unique_duplicates after all planting passes. Re-run until rows_skipped is 0 and n_ok equals the instance count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_TARGETS omits ('wine','State') and ('appellations','State') is present but ('wine','State') is missing; also ('appellations','Appelation') and ('grapes','Grape') are not NULL targets (correct, they are UNIQUE/PK-adjacent). More importantly, the specification's null_targets list includes 'wine.State' and 'appellations.State' is not listed but the spec's null_targets does list 'appellations.County','appellations.Area','appellations.isAVA','grapes.Color' and all wine nullable columns. The execution feedback shows 'wine.State: generated rows: NULL 0 / 10000' and 'appellations.Appelation: NULL 0 / 842' and 'grapes.Grape: NULL 0 / 294'. wine.State is a nullable column (no NOT NULL in schema) and is in the spec's null_targets, but spec.py NULL_TARGETS does not include ('wine','State'), so no NULL is planted. This violates the interface NULL rule ('for every nullable column ... each instance contains generated rows with NULL').",
+     "requested_revision": "Add ('wine','State') to spec.NULL_TARGETS (and confirm appellations.State handling). The interface rule requires at least one NULL per nullable column; wine.State is nullable and currently gets 0 NULLs. Note: the feedback line 'NULL 0 / n' is explicitly allowed to be noted without blocking, but here the omission is a spec/program mismatch (spec lists wine.State in null_targets, spec.py does not), which should be reconciled."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions and the atomic-operation targets require group_sizes '1, 2 and >= 3' for appellations.Appelation and grapes.Grape (parent tables), and ties_for_order_limit with tie_on COUNT(*) DESC for those columns. spec.py GROUP_SIZE_COLUMNS only lists ('wine','Name') and TIE_COLUMNS lists ('wine','Year'),('appellations','County'),('wine','Price'),('wine','Name') \u2014 it does NOT include ('appellations','Appelation') or ('grapes','Grape'). The spec text says group-size and tie planting is done on the parent tables and inherited by the child, but the program never plants group sizes or ties on appellations.Appelation or grapes.Grape. The atomic operations explicitly list group_sizes for grapes.Grape and appellations.Appelation (via the join) and ties_for_order_limit for appellations.Appelation (ORDER(COUNT(*), DESC)).",
+     "requested_revision": "Either (a) add ('appellations','Appelation') and ('grapes','Grape') to spec.GROUP_SIZE_COLUMNS and spec.TIE_COLUMNS so the parent-table planting actually occurs, or (b) if the designer intends these to be satisfied only through the child join, document that explicitly and confirm the child-side group sizes (wine.Grape, wine.Appelation) are planted \u2014 but the spec currently excludes FK child columns from group/tie planting, so neither side is planted. The specification and program must agree on where these targets are realized."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas widen enums to include case near-variants ('california', 'red') and the spec.py ENUMS include them. However, the specification's boundary rule says 'For text literals, include the literal and, only if the semantic formula for that column permits it, one case near-variant.' The formulas were widened to admit the near-variants, which is internally consistent, but the supporting_evidence states 'red' and 'california' are 'only a comparison-boundary near-variant' \u2014 i.e., they are not attested in the compact data. This is a design choice that should be flagged as uncertain rather than fully supported: the compact database shows only 'Red'/'White' and 'California'. The widening is defensible for boundary coverage but is not evidence-backed as a domain value.",
+     "requested_revision": "Mark the enum widening ('red', 'california') as an uncertain/assumed rule in the specification (it is a boundary-coverage device, not an observed domain value). No program change required if the designer accepts the widening; otherwise restrict boundary near-variants to columns without UNIQUE/enum constraints."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_boundary writes boundary literals into FK child columns? No \u2014 it skips fk_children. But _plant_boundary for ('wine','Appelation') and ('wine','Grape') is in BOUNDARY_TEXT yet those are FK children and are skipped, so the boundary literals 'St. Helena'/'st. helena' and 'Zinfandel'/'zinfandel' are never planted on wine.Appelation/wine.Grape. The atomic operations list comparison_boundary for wine.Appelation and wine.Grape with values ['St. Helena','st. helena'] and ['Zinfandel','zinfandel']. The spec's per_column_exceptions for wine.Appelation/wine.Grape list these values. Since FK child columns are excluded from boundary planting and the parent tables (appellations.Appelation, grapes.Grape) do get BOUNDARY_TEXT planting, the values may appear in the parent and be inherited via FK draw \u2014 but only if the FK sampler happens to draw them. There is no guarantee the child rows contain these boundary values.",
+     "requested_revision": "Ensure the boundary literals for wine.Appelation and wine.Grape are reachable: either plant them on the parent tables (already done via BOUNDARY_TEXT for appellations.Appelation and grapes.Grape) and bias the FK child draw to include them, or explicitly document that child-side boundary coverage is inherited from the parent and verify at least one child row uses each boundary value. The current FK draw is uniform random over parent values, so coverage is probabilistic, not guaranteed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_ties for ('wine','Price') uses tie_on 'SUM(wine.price)/COUNT(*)' per the spec, but the implementation simply assigns two distinct values to equal counts \u2014 it does not construct a tie on the aggregate SUM/COUNT. Similarly _plant_ties for ('wine','Year') with direction ASC and tie_on COUNT(*) is approximated by equal counts of two values, which is a reasonable proxy for COUNT(*) ties but not for the SUM/COUNT average tie. The spec's ties_for_order_limit for wine.Price targets tie_on ['SUM(wine.price) / COUNT(*)'], which the program does not implement.",
+     "requested_revision": "Either implement the SUM/COUNT average tie for wine.Price (construct groups whose average price ties at rank 1) or narrow the spec's tie_on for wine.Price to COUNT(*) if the average-tie is not intended. The program and specification must agree on the tie semantics."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes for ('wine','Name') creates groups of size 1, 2, and 3 by assigning values to disjoint slots, but wine.Name is also a DUPLICATE_COLUMNS and TIE_COLUMNS target. The planting order runs _plant_duplicates then _plant_ties then _plant_group_sizes, so group-size planting can overwrite the duplicate/tie structure. There is no re-validation that all three patterns (duplicate share 20-50%, tie at rank 1, group sizes 1/2/>=3) hold simultaneously after all passes. The execution feedback does not report per-pattern satisfaction, so this is an unresolved check.",
+     "requested_revision": "Add a post-planting validation pass (in Python, no SQL) that checks each planted pattern still holds after all passes, and re-plant or adjust if a later pass destroyed an earlier one. Report per-pattern satisfaction in the execution feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_share rule says 'Per nullable column, NULL share equals the compact database's share for that column (0.0 per statistics); since the compact share is 0, plant exactly one NULL row per nullable column per generated instance (minimum-one rule).' But spec.py sets NULL_SHARE = 0.05 and _plant_null uses `k = max(1, int(round(n * spec.NULL_SHARE)))` for non-FK columns, producing ~5% NULLs (e.g., wine.Cases 500/10000, wine.Winery 500/10000). This contradicts the specification's 'exactly one NULL row per nullable column' (compact share 0.0). The execution feedback confirms 500 NULLs per wine column, not 1.",
+     "requested_revision": "Reconcile the NULL share: the specification says compact share is 0.0 so exactly one NULL per nullable column; the program uses 5%. Either change spec.NULL_SHARE to 0.0 (with minimum-one) to match the specification, or update the specification to state a 5% share. The interface rule says 'NULL share following the compact database's share for that column and at least one NULL row per nullable column' \u2014 with compact share 0.0, the program's 5% share does not follow the compact share."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the boundary literals 'St. Helena'/'st. helena' and 'Zinfandel'/'zinfandel' actually appear in generated wine.Appelation/wine.Grape rows (probabilistic FK draw; not verified in feedback).",
+    "Whether all three patterns on wine.Name (duplicate share, tie, group sizes) hold simultaneously after all planting passes.",
+    "Whether the SUM/COUNT average tie for wine.Price is realized (program does not implement it).",
+    "Whether group sizes 1/2/>=3 and COUNT(*) ties are realized on appellations.Appelation and grapes.Grape (not planted by program).",
+    "Whether the 5% NULL share vs. specification's 'exactly one NULL' is the intended design."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, errors {\"rows_skipped\": 298}, rows_skipped {grapes: 64, appellations: 234, wine: 0}. The CLI (cli.py) treats any nonzero rows_skipped as a hard failure: `if n_skipped: errs['rows_skipped']=...; n_fail += n_ok; n_ok = 0`. The specification's row_count_and_failures rule states: 'Any nonzero rows_skipped must be treated as n_fail>0 and the instance rejected; the generator must re-sequence PKs and avoid UNIQUE collisions so rows_skipped is 0.' The writer (writer.py) reports rows_failed for grapes and appellations, meaning generated rows violate a constraint (almost certainly UNIQUE on grapes.Grape / appellations.Appelation, or PK collisions) and are dropped.",
+     "requested_revision": "Fix the generation so rows_skipped is 0 for every table. The UNIQUE text de-duplication and PK re-sequencing must guarantee no generated row collides with compact or generated values. Note that _dedup_unique_text only replaces duplicates within the generated batch, but the writer inserts into a copy of the compact DB where the compact UNIQUE values already exist; the fresh-value generator must also avoid compact values (it does via _unique_text_set, but the planting passes _plant_boundary/_plant_group_sizes/_plant_ties/_validate_and_replant write raw boundary literals like 'St. Helena'/'Zinfandel' into UNIQUE columns without checking against compact values, and _validate_and_replant runs after the final dedup, so a re-planted duplicate survives). Re-run and confirm rows_skipped is 0 and n_ok=20."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _validate_and_replant writes boundary literals into UNIQUE columns (appellations.Appelation, grapes.Grape) via `cols[cm][rng.choice(free)] = v` for v in BOUNDARY_TEXT, and then _dedup_unique_text is called again, but _dedup_unique_text only checks duplicates within the generated batch (`seen` starts empty), not against compact values. So a boundary literal equal to a compact value (e.g. 'St. Helena' if present in compact appellations) is inserted and then the writer rejects it as a UNIQUE violation. This is consistent with the observed rows_skipped on grapes/appellations.",
+     "requested_revision": "Make _dedup_unique_text (and the boundary/group/tie planting on UNIQUE columns) check against the compact+generated set via _unique_text_set, and ensure the post-validation dedup runs against compact values too. Alternatively, exclude UNIQUE columns from boundary/group/tie planting and satisfy those patterns only on non-UNIQUE columns or via the parent-inheritance mechanism."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification admits case near-variants 'red' (grapes.Color), 'california' (appellations.State, wine.State) into the enum formulas, explicitly flagged as 'uncertain/assumed, not observed'. The database statistics show only 'Red'/'White' and 'California'. This widening is a boundary-coverage device; it is defensible but should be recorded as an uncertain rule rather than a supported one.",
+     "requested_revision": "No blocking change required, but mark these enum widenings explicitly as uncertain in the specification (they already are in the uncertainty field). Confirm the boundary comparison literals ('red', 'california') are only used to exercise comparison boundaries and do not claim observed domain membership."
+    },
+    {
+     "agent": "designer",
+     "evidence": "wine.Year range widened to (1900, 2100) to include observed 2066 and boundary 1999-2011. This is supported by the observed outlier and is reasonable. wine.Score range 50-100 includes observed 86-93 and boundaries 89-91; supported. wine.Price >= 0 and wine.Cases >= 0 are supported by observed positive values. These are adequately evidenced.",
+     "requested_revision": "None; these rules are supported."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule: execution feedback shows NULL 0 / n for appellations.Appelation, appellations.State, grapes.Grape, wine.No. appellations.Appelation and grapes.Grape are UNIQUE columns and are not in NULL_TARGETS, so NULL 0 is expected and acceptable per the interface note. appellations.State is not in NULL_TARGETS either (only wine.State is), and the compact share is 0.0; the interface says a 'NULL 0 / n' line may be noted but does not block. wine.No is the PK and correctly never NULL.",
+     "requested_revision": "Note for the engineer: appellations.State is nullable in the schema but not a NULL target; if the compact share is 0.0 this is acceptable, but confirm the minimum-one rule is intentionally not applied to appellations.State (it is not in NULL_TARGETS). No blocking change."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction pairs: eligible 85, separated 32, unknown_executions 0. The construction_pairs_by_group is empty, so per-group separation cannot be inspected. The overall separation of 32/85 is low but the instructions state a missing separation alone does not establish a generation error. However, combined with the rows_skipped failure, the generated instances are not yet trustworthy for separation analysis.",
+     "requested_revision": "After fixing rows_skipped, re-run and report construction_pairs_by_group so per-pattern separation can be verified. This is a follow-up check, not a separate blocking issue."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-group construction separation (construction_pairs_by_group is empty) could not be inspected.",
+    "Whether the 298 skipped rows are all UNIQUE violations vs PK collisions was not directly confirmed; the writer only reports counts.",
+    "appellations.State NULL 0 / n: whether the minimum-one NULL rule should apply to this nullable column (it is not in NULL_TARGETS) is a design decision to confirm."
+   ]
+  }
+ ]
 }

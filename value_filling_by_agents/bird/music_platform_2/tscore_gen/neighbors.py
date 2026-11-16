@@ -62,9 +62,8 @@ def _norm(s: str) -> str:
     return re.sub(r'count\s*\([^)]*\)', 'count()', s, flags=re.I).strip().rstrip(';').strip()
 
 
-def neighbor_queries(sql: str, schema, rng, max_neighbors: int = 5000) -> list:
-    """Span drops + token replacements kept if executable on an empty schema clone (neighbor.py:1-177).
-    Neighbours that lose the FROM clause of a query that has one are excluded (new, recorded)."""
+def neighbor_queries(sql: str, schema, rng, max_neighbors: int = 50000) -> list:
+    """Span drops + token replacements kept if executable on an empty schema clone (neighbor.py:1-177)."""
     try:
         toks = [t for st in sqlparse.parse(sql) for t in st.flatten()]
     except Exception:

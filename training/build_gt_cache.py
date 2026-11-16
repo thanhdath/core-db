@@ -1,13 +1,4 @@
-"""Cache the gold execution results of every training prompt on the CoRE-DB environment.
-
-The trainer reads this pickle instead of executing the gold SQL at every step.  Golds are executed
-through the CoRE-DB bundle proxy (``db_execution/bundle_proxy.py``), so each cached value is the
-member-tagged row list ``[{"__member__": i, **row}, ...]`` over the compact database and every selected
-instance.  Failures are stored as ``{"timeout": True, ...}`` or ``{"gold_error": True, ...}``.
-
-Usage:
-    python training/build_gt_cache.py --data DATA_DIR --api http://127.0.0.1:8021/execute --out gt_cache.pkl
-"""
+"""Cache the gold execution results of every training prompt on the CoRE-DB environment."""
 import argparse
 import collections
 import hashlib

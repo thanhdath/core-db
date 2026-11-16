@@ -39,11 +39,16 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_lim = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_lim, hi_lim)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -214,17 +219,27 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     return StringSampler(els, p, max_l0, rng)
 
 
-def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+def _init_sampler(column, literal_pool, original_values, p: float, rng, n_pk: int,
+                  max_l0: float = float('inf'), spec_pool=None, spec_range=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
-    ov = list(original_values)
-    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    ov = [v for v in (original_values or []) if v is not None]
+    els = [str(v) for v in (rng.choices(ov, k=min(5, len(ov))) if ov else [])]
+    els += sorted({str(v) for v in (literal_pool or []) if v is not None})
+    if spec_pool:
+        els = sorted(set(els) | {str(v) for v in spec_pool if v is not None})
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
+    t = (column.type_str or '').lower()
+    if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
+        is_int = 'int' in t
+        lo = hi = None
+        if spec_range is not None:
+            lo, hi = spec_range
+        return NumberSampler(els, p, max_l0, rng, is_int=is_int, lo=lo, hi=hi)
     return make_column_sampler(column, els, p, max_l0, rng)
 
 

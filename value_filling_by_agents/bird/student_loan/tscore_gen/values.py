@@ -182,6 +182,35 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform sampler over an explicit enum pool (spec: text_enum)."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class MonthSampler(ColumnSampler):
+    """Integer month sampler 0..12 with boundary values (spec: integer_month)."""
+
+    def __init__(self, elements, p, max_l0, rng, lo=0, hi=12):
+        super().__init__(elements, p, max_l0, rng)
+        self.lo, self.hi = lo, hi
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        u = r.random()
+        if u < 0.15:
+            return self.lo
+        if u < 0.30:
+            return self.hi
+        return r.randint(self.lo, self.hi)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]

@@ -3,9 +3,14 @@ import datetime as dt
 import re
 import string
 
+from . import specification as spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+_NUMERIC_TYPES = ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')
+_NUMERIC_RE = re.compile(r'-?\d+(?:\.\d+)?')
 
 
 class ColumnSampler:
@@ -30,6 +35,8 @@ class ColumnSampler:
 
 
 def _num(x):
+    if isinstance(x, bool):
+        return None
     try:
         return float(x)
     except (TypeError, ValueError):
@@ -39,25 +46,39 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 domain=None, secondary=None, secondary_share=0.0):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
+        self.domain = list(domain) if domain else None
+        self.secondary = list(secondary) if secondary else None
+        self.secondary_share = secondary_share
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
+    def _draw(self):
+        r = self.rng
+        if self.domain:
+            if self.secondary and r.random() < self.secondary_share:
+                return r.choice(self.secondary)
+            return r.choice(self.domain)
+        full = r.random() < self.p or len(self.elements) <= 1
+        lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
+        return r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi)
+
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
-            full = r.random() < self.p or len(self.elements) <= 1
-            lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
+            v = self._fresh_or_reuse(self._draw)
         else:
             v = r.choice(self.elements)
+        if self.domain:
+            return self._cast(v)
         d = 1 if self.is_int else 0.01
         if r.random() < 1 / 6:
             v += d
@@ -104,6 +125,24 @@ class StringSampler(ColumnSampler):
                 v = v[:-1]
             else:
                 v = v[1:]
+        return v
+
+
+class EnumSampler(ColumnSampler):
+    """Short enum text: pick from the column exception enum, with a 10 % near-variant share."""
+
+    def __init__(self, elements, p, max_l0, rng, enum):
+        super().__init__(elements, p, max_l0, rng)
+        self.enum = list(enum)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+        else:
+            v = r.choice(self.enum)
+        if r.random() < 0.10:
+            v = v + r.choice(string.ascii_lowercase)
         return v
 
 
@@ -182,15 +221,42 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+def _domain_for(column):
+    """Specification domain for a column: enum, comparison boundary or semantic range."""
+    key = (column.table, column.name)
+    if key in spec.ENUMS:
+        return ('enum', spec.ENUMS[key])
+    if key in spec.BOUNDARIES:
+        return ('boundary', spec.BOUNDARIES[key])
+    f = spec.FORMULAS.get(key)
+    if f and f[0] == 'in':
+        return ('enum', list(f[1]))
+    return None
+
+
+def _is_numeric_column(column, elements) -> bool:
+    """True for declared numeric types or when every observed element is numeric."""
+    t = (column.type_str or '').lower()
+    if any(k in t for k in _NUMERIC_TYPES):
+        return True
+    if t in ('', 'blob'):
+        els = [e for e in elements if e is not None]
+        return bool(els) and all(isinstance(e, (int, float)) and not isinstance(e, bool)
+                                 or (isinstance(e, str) and _NUMERIC_RE.fullmatch(e)) for e in els)
+    return False
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
-    args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    m = re.search(r'\(([^)]*)\)', t)
+    args = [int(a) for a in re.findall(r'\d+', m.group(1))][:2] if m else []
+    dom = _domain_for(column)
+    if dom and dom[0] == 'enum' and not any(k in t for k in _NUMERIC_TYPES):
+        return EnumSampler(els, p, max_l0, rng, dom[1])
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
-    if t == '' or t == 'blob':
-        return StringSampler(els, p, max_l0, rng)
     if 'date' in t or 'timestamp' in t:
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
@@ -202,16 +268,28 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
         return NumberSampler(els, p, max_l0, rng, scale=4)
-    if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
-        is_int = 'int' in t
+    if _is_numeric_column(column, els) or t == '' or t == 'blob':
+        if not _is_numeric_column(column, els) and t not in ('', 'blob'):
+            return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
+        is_int = 'int' in t or (t in ('', 'blob') and _all_int(els))
         scale, prec = 10, (0 if is_int else 4)
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        domain = list(dom[1]) if dom else None
+        secondary = spec.MEMORY_SECONDARY.get((column.table, column.name)) if dom else None
+        sec_share = spec.MEMORY_SECONDARY_SHARE if secondary else 0.0
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, domain=domain, secondary=secondary,
+                             secondary_share=sec_share)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)
+
+
+def _all_int(els) -> bool:
+    vals = [e for e in els if e is not None]
+    return bool(vals) and all(re.fullmatch(r'-?\d+', str(e)) for e in vals)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,

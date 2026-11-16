@@ -1,4 +1,4 @@
-"""Literal extraction and typing (sql_util/parse.py:146-253, sql_util/value_typing.py:1-75)."""
+"""Literal extraction and typing (sql_util/parse.py, value_typing.py) plus spec pool merge."""
 import re
 
 import sqlparse
@@ -12,12 +12,10 @@ _COL = r'((?:[`"]?[\w -]+?[`"]?\.)*[`"]?[\w-]+[`"]?)'
 _IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
 _BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
 _CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
-# a bare qualifier token: identifier possibly quoted, no spaces
 _QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
 
 
 def _unquote(v: str) -> str:
-    """Strip surrounding quotes, collapse doubled quotes (parse.py:246-253)."""
     v = v.strip().rstrip(';')
     if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
         v = v[1:-1].replace(v[0] * 2, v[0])
@@ -25,7 +23,6 @@ def _unquote(v: str) -> str:
 
 
 def _split_cols(name: str) -> list:
-    """Column key plus tolerant table variants: (table, COL), (raw qualifier, COL), (None, COL)."""
     raw = name.strip().split('.')
     parts = [p.replace('"', '').replace('`', '').strip() for p in raw]
     col = parts[-1].upper().replace(_PH.upper(), '')
@@ -43,7 +40,6 @@ def _split_cols(name: str) -> list:
 
 
 def _left_name(tok):
-    """Identifier, or the identifier inside a Function/Parenthesis wrapper (e.g. LOWER(x))."""
     if isinstance(tok, Identifier) and re.fullmatch(r'[\w."` -]+', tok.value):
         return tok.value
     if isinstance(tok, (Function, Parenthesis, Identifier)):
@@ -54,7 +50,6 @@ def _left_name(tok):
 
 
 def _is_literal(tok) -> bool:
-    """True only for a constant right operand: string/number literal, not a column reference."""
     if tok is None:
         return False
     if tok.ttype is not None and tok.ttype in T.Literal:
@@ -93,7 +88,6 @@ def _walk(tok, out: list) -> None:
 
 
 def _is_ident_operand(v: str) -> bool:
-    """True if v looks like a bare (possibly qualified) column reference, not a constant."""
     if not v or v[0] in '\'"':
         return False
     if re.fullmatch(r'-?\d+(?:\.\d+)?', v):
@@ -104,11 +98,9 @@ def _is_ident_operand(v: str) -> bool:
 
 
 def _clean_qualifier(q: str) -> str:
-    """Reduce a regex-captured qualifier to a bare table name (drop keywords, spaces, quotes)."""
     q = q.strip().replace('"', '').replace('`', '').lower()
     if not q:
         return ''
-    # take the last whitespace-separated token (drops 'and', 'where', 'on', ...)
     tok = q.split()[-1] if q.split() else ''
     if not _QUAL.match(tok):
         return ''
@@ -118,19 +110,16 @@ def _clean_qualifier(q: str) -> str:
 
 
 def _add_regex(out: list, qual: str, col: str, v: str) -> None:
-    """Add a regex match, normalising the qualifier to a bare table name."""
-    q = _clean_qualifier(qual)
+    qq = _clean_qualifier(qual)
     col = col.strip().replace('"', '').replace('`', '').replace(_PH, '')
     if not col:
         return
-    if q:
-        out.append(((q, col.upper()), _unquote(v)))
+    if qq:
+        out.append(((qq, col.upper()), _unquote(v)))
     out.append(((None, col.upper()), _unquote(v)))
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -186,7 +175,6 @@ def _root(schema, key: tuple) -> tuple:
 
 
 def _routing_items(tv: list) -> list:
-    """One routing key per literal: the first tabled variant, or (None, COL) if none exists."""
     best: dict = {}
     order = []
     for (t, c), v in tv:
@@ -199,8 +187,8 @@ def _routing_items(tv: list) -> list:
     return [((best[k], k[0]), k[1]) for k in order]
 
 
-def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> dict:
-    """Route literals to FK-root columns = type_values_w_db(loose=True) (value_typing.py:31-75)."""
+def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True, spec_pool: dict = None) -> dict:
+    """Route literals to FK-root columns plus spec pool seeds; skip internal uid-like ids."""
     pool: dict = {}
     cache: dict = {}
 
@@ -208,6 +196,14 @@ def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> di
         if k not in cache:
             cache[k] = {str(x) for x in schema.original_values.get(k, []) if x is not None}
         return cache[k]
+
+    internal = set()
+    for (ct, cc), (pt, pc) in schema.fks.items():
+        internal.add(cc.lower())
+        internal.add(pc.lower())
+
+    def add(key, v):
+        pool.setdefault(key, []).append(str(v))
 
     for sql in sqls:
         for (t, c), v in _routing_items(extract_typed_values(sql)):
@@ -230,5 +226,18 @@ def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> di
                                 keep.add(a)
                     anc = sorted(keep)
             for a in anc:
-                pool.setdefault(a, []).append(str(v))
+                add(a, v)
+    if spec_pool:
+        for (t, c), vs in spec_pool.items():
+            tt = t.lower()
+            match = None
+            for tn, tm in schema.tables.items():
+                if tn.lower() != tt:
+                    continue
+                for cm in tm.columns:
+                    if cm.name.lower() == c.lower():
+                        match = (tn, cm.name)
+            if match is not None:
+                for v in vs:
+                    add(match, v)
     return pool

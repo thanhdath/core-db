@@ -1,51 +1,723 @@
 {
  "db": "cre_Theme_park",
- "operator_io_quirks": [
-  "Mixed-case table/column names (Ref_Hotel_Star_Ratings, star_rating_code, hotel_id vs Location_ID) \u2014 must quote and compare case-insensitively.",
-  "Six subtype tables (Street_Markets, Shops, Museums, Royal_Family, Theme_Parks) have PK column that is ALSO an FK to Tourist_Attractions.Tourist_Attraction_ID \u2014 PK is a subset of parent keys, so child rows must be drawn from parent values, not fresh.",
-  "Tourist_Attraction_Features has composite PK (Tourist_Attraction_ID, Feature_ID) and both columns are FKs \u2014 composite-PK member max_l0=30 path applies.",
-  "Ref_Hotel_Star_Ratings.star_rating_code and Ref_Attraction_Types.Attraction_Type_Code are CHAR(15) but store digit strings '1'..'5'/'2','3','5','6','9' \u2014 String fuzzer, not Number.",
-  "Hotels.pets_allowed_yn CHAR(1) stores '1' and '' (empty string, not NULL) \u2014 String fuzzer with empty-string element.",
-  "Hotels.price_range REAL has mixed storage classes: real AND text ('' empty string present) \u2014 Number fuzzer will drop non-parsable, but original_values include ''.",
-  "Visits.Visit_Date DATETIME stores text 'YYYY-MM-DD HH:MM:SS' \u2014 dispatches to Date fuzzer (first element not int), template likely '%Y-%m-%d %H:%M:%S'.",
-  "Visits.Visit_Details VARCHAR(40) NOT NULL with distinct=1 and sample '' \u2014 single empty-string value, NOT NULL so empty string is legal.",
-  "Many VARCHAR(255) columns are 100% NULL (Other_Details, Description, Opening_Hours, other_hotel_details, Royal_Family_Details) \u2014 original_values all NULL, sampler drops None -> p:=1 fresh.",
-  "Small tables (2-20 rows) \u2014 original_values lists are tiny; rng.choices(k=min(5,len)) will repeat heavily.",
-  "Locations.Location_ID values are large (333..868) not 1..N \u2014 Number fuzzer range [-10^0,10^0] for INTEGER (scale 0) will produce tiny ints, far from originals.",
-  "All FKs have parent_exists=true; no dangling FKs, no self-references, no non-unique parents."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on INTEGER PKs: scale=0 -> range [-1,1] plus +-1/+-2 perturbation -> tiny ints (0,1,2,-1) vs originals 100-9000; implausible values drive FN on range/join predicates.",
-  "String fuzzer on CHAR(15) codes: fresh random strings over a-zA-Z0-9() length 0-15, plus contaminate \u2014 will not match '1'..'5' digit codes; joins to Ref_* still work via FK fill but WHERE star_rating_code='5' misses.",
-  "Date fuzzer on Visit_Date: template from first parsable element '%Y-%m-%d %H:%M:%S', range 1980..2013 from originals; fresh dates uniform in that range \u2014 plausible, but p=0.2 element reuse means many fresh.",
-  "String fuzzer on names (Location_Name, Tourist_Details, Staff.Name): random charset strings, not realistic names \u2014 WHERE Name='Whitney' misses (FN).",
-  "Empty-string columns (pets_allowed_yn, Visit_Details): String sampler with element '' plus int-like +1/-1 additions; fresh draws rarely '' -> WHERE pets_allowed_yn='' may miss.",
-  "NULL-heavy columns (Other_Details etc.): original_values all None -> dropped -> p=1 -> always fresh random strings, never NULL; queries testing IS NULL will FP (TS never produces NULL there).",
-  "FK fill: child draws from parent's FINAL filtered values with replacement -> duplicates in child FK columns; joins produce many-to-many fan-out, plausible for TS.",
-  "Subtype tables (Shops etc.): PK=FK drawn from Tourist_Attractions values -> PK uniqueness filter drops duplicates, so Shops rows are a random subset of attraction ids; queries joining Shops to Museums on id will find overlaps TS may or may not create.",
-  "Composite PK Tourist_Attraction_Features: max_l0=30 caps fresh draws, so (attraction,feature) pairs repeat -> PK dedup keeps first; coverage of pairs sparse.",
-  "price_range REAL: Number scale=4 -> range [-10^4,10^4] plus +-0.01/0.02; originals up to 7.6e8 \u2014 TS values far smaller; range predicates on price miss (FN).",
-  "Small tables (2-5 rows): choose_table_sizes gives 30-230 rows, far more than original 2-5; COUNT(*) queries will differ wildly (FP on count predicates).",
-  "checked/unique line-scan: UNIQUE (star_rating_code) line marks star_rating_code unique; drop_unique_duplicates will collapse Hotels.star_rating_code to 5 distinct values \u2014 matches original cardinality by luck."
- ],
- "challenger_refs": [
-  "g7d8f8002",
-  "gcb01c6b0",
-  "gcb01c6b0",
-  "gf03063ab",
-  "ga271661e",
-  "G2",
-  "G4",
-  "G6",
-  "G9",
-  "G12",
-  "G11"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers from a per-table start (1-based); NEVER sample or rewrite a PK that is also an FK (PK-is-FK child tables: Museums.Museum_ID, Shops.Shop_ID, Street_Markets.Market_ID, Royal_Family.Royal_Family_ID, Theme_Parks.Theme_Park_ID); such PKs are filled only by copying a finalized parent PK value in fill_foreign_keys_consistently, choosing parent values not already present in the compact child table so no PK collision occurs. Parent tables fully finalized before any child FK is drawn.",
+   "integer_fk": "Copy an existing value from the FINAL surviving parent PK set; draw after the parent is finalized; reserve at least one parent PK value and exclude it from the child draw on columns listed with unmatched_join_rows so a parent-without-child is guaranteed by construction (never post-hoc redirection). NULL only if the column is nullable.",
+   "char_code": "Short code strings (length 1-3) drawn from the column's enum pool; upper/lower variants only where the enum formula allows them.",
+   "varchar_text": "Random short human-readable strings 3-40 chars; column listed with duplicates_for_distinct gets a 20-50% duplicate share; otherwise distinct values are fresh.",
+   "varchar_nullable": "Same as varchar_text; NULL share 5-30% per instance on nullable columns with at least one NULL row; never replace a planted NULL to satisfy a rule.",
+   "real_amount": "Positive real numbers in [1, 1e9] with 2-6 decimals; NULL share 5-30% on nullable columns with at least one NULL row.",
+   "char1_flag": "Values from {'0','1'} (or '' where observed); NULL only if the column is nullable.",
+   "datetime": "Random timestamps between 1980-01-01 and 2020-12-31 formatted '%Y-%m-%d %H:%M:%S'; 20-50% duplicate share on DISTINCT-sensitive columns.",
+   "boundary_numeric": "For each listed literal L include L, L-step, L+step, only where the value stays inside the column's declared enum/formula domain.",
+   "boundary_text": "For each listed literal L include L, lower(L), upper(L) and one typo variant, only where the variant stays inside the column's declared formula domain.",
+   "tie_order": "Include at least two rows sharing the value at the listed LIMIT rank; a sampling-stage tie must survive _finalize (do not drop both tied rows).",
+   "null_count_column": "Include at least one NULL row in nullable columns used by COUNT(col).",
+   "group_sizes": "For a NON-key, NON-FK grouping column realize group sizes 1, 2 and >= 3 (requires >= 6 rows and >= 3 distinct values). NEVER apply by value rewriting to a PK or FK column; realize group_sizes on key/FK columns only through child FK distribution (FK_GROUP_SIZES).",
+   "aggregate_boundary": "For a non-key column realize COUNT(col) values in {0,1,2} where reachable (0 only if nullable). For PK/FK columns realize via child FK distribution (FK_AGG_BOUNDARY); never by value rewriting. Where a column carries both group_sizes and aggregate_boundary, apply a single combined pass that keeps at least one >=3 group AND caps every group at 2 for the COUNT(col)<=1/2 targets only on distinct-value-sensitive checks; document that the two are reconciled per column in per_column_exceptions.",
+   "fk_group_sizes": "For a parent-key column listed with group_sizes, realize child-count group sizes 1, 2 and >= 3 by how many child FK rows point at each parent value, shaping EACH specific (child_table, child_column) pair named in the spec, not only the first child of a parent (reserve parents that get no child for unmatched_join_rows).",
+   "fk_aggregate_boundary": "For a parent-key column listed with aggregate_boundary, realize child COUNT(col) in {0,1,2} where 0 only via an unmatched parent row, applied per specific (child_table, child_column) pair from the spec."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Ref_Hotel_Star_Ratings",
+    "column": "star_rating_code",
+    "pattern": "enum",
+    "targets": [
+     "1",
+     "2",
+     "3",
+     "4",
+     "5"
+    ]
+   },
+   {
+    "table": "Ref_Hotel_Star_Ratings",
+    "column": "star_rating_code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "reserve >=1 parent value excluded from Hotels draw"
+    ]
+   },
+   {
+    "table": "Ref_Attraction_Types",
+    "column": "Attraction_Type_Code",
+    "pattern": "enum",
+    "targets": [
+     "2",
+     "3",
+     "5",
+     "6",
+     "9"
+    ]
+   },
+   {
+    "table": "Ref_Attraction_Types",
+    "column": "Attraction_Type_Code",
+    "pattern": "fk_group_sizes",
+    "targets": [
+     "1, 2 and >= 3 via Tourist_Attractions.Attraction_Type_Code distribution; not by value rewrite"
+    ]
+   },
+   {
+    "table": "Hotels",
+    "column": "star_rating_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "5",
+     "4",
+     "3",
+     "6 (only if inside the enum; else excluded)"
+    ]
+   },
+   {
+    "table": "Hotels",
+    "column": "price_range",
+    "pattern": "null_rows",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "table": "Locations",
+    "column": "Address",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "254 Ottilie Junction",
+     "254 ottilie junction",
+     "660 Shea Crescent",
+     "660 shea crescent",
+     "254 Ottile Junction",
+     "254 ottile junction"
+    ]
+   },
+   {
+    "table": "Locations",
+    "column": "Location_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Locations",
+    "column": "Location_Name",
+    "pattern": "tie_order",
+    "targets": [
+     ">=2 rows tied at LIMIT rank (ties survive finalize)"
+    ]
+   },
+   {
+    "table": "Locations",
+    "column": "Location_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "reserve >=1 value excluded from Tourist_Attractions.Location_ID draw"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "How_to_Get_There",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "walk",
+     "bus",
+     "shuttle (upper-case WALK/BUS excluded: violate formula)"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "Name",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}; 0 unreachable at fixed size; combined with group_sizes in one pass so the >=3 group survives"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "Attraction_Type_Code",
+    "pattern": "fk_group_sizes",
+    "targets": [
+     "1, 2 and >= 3 via child distribution only; never value rewrite"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "Tourist_Attraction_ID",
+    "pattern": "fk_group_sizes",
+    "targets": [
+     "1, 2 and >= 3 via child distribution across child tables"
+    ]
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "Tourist_Attraction_ID",
+    "pattern": "fk_aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2} via child distribution; 0 via parents excluded from all child draws"
+    ]
+   },
+   {
+    "table": "Visits",
+    "column": "Tourist_Attraction_ID",
+    "pattern": "fk_group_sizes",
+    "targets": [
+     "1, 2 and >= 3 via child distribution"
+    ]
+   },
+   {
+    "table": "Visits",
+    "column": "Tourist_Attraction_ID",
+    "pattern": "fk_aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2} via child distribution"
+    ]
+   },
+   {
+    "table": "Visits",
+    "column": "Visit_ID",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(DISTINCT visit_id) in {1,2}; 0 unreachable (PK NOT NULL)"
+    ]
+   },
+   {
+    "table": "Visits",
+    "column": "Visit_Date",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Visits",
+    "column": "Visit_Details",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(visit_details) in {1,2}; 0 unreachable (NOT NULL)"
+    ]
+   },
+   {
+    "table": "Visitors",
+    "column": "Tourist_Details",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Rosalind",
+     "rosalind",
+     "Alison",
+     "alison"
+    ]
+   },
+   {
+    "table": "Visitors",
+    "column": "Tourist_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "reserve >=1 value excluded from Visits.Tourist_ID draw"
+    ]
+   },
+   {
+    "table": "Features",
+    "column": "Feature_Details",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "park",
+     "PARK",
+     "shopping",
+     "SHOPPING"
+    ]
+   },
+   {
+    "table": "Staff",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Staff",
+    "column": "Name",
+    "pattern": "tie_order",
+    "targets": [
+     "ties survive finalize"
+    ]
+   },
+   {
+    "table": "Museums",
+    "column": "Museum_Details",
+    "pattern": "tie_order",
+    "targets": [
+     "ties at rank, ASC"
+    ]
+   },
+   {
+    "table": "Photos",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Photos",
+    "column": "Description",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Hotels.star_rating_code",
+    "parent": "Ref_Hotel_Star_Ratings",
+    "parent_column": "star_rating_code",
+    "copied": []
+   },
+   {
+    "child": "Tourist_Attractions.Location_ID",
+    "parent": "Locations",
+    "parent_column": "Location_ID",
+    "copied": []
+   },
+   {
+    "child": "Tourist_Attractions.Attraction_Type_Code",
+    "parent": "Ref_Attraction_Types",
+    "parent_column": "Attraction_Type_Code",
+    "copied": []
+   },
+   {
+    "child": "Street_Markets.Market_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": [],
+    "note": "PK-is-FK: skip _next_pk_start; filled only by parent copy; use parent PK values not already in the compact Street_Markets table"
+   },
+   {
+    "child": "Shops.Shop_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": [],
+    "note": "PK-is-FK: skip _next_pk_start; exclude parent PKs already in compact Shops table"
+   },
+   {
+    "child": "Museums.Museum_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": [],
+    "note": "PK-is-FK: skip _next_pk_start; exclude parent PKs already in compact Museums table"
+   },
+   {
+    "child": "Royal_Family.Royal_Family_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": [],
+    "note": "PK-is-FK: skip _next_pk_start; exclude parent PKs already in compact Royal_Family table"
+   },
+   {
+    "child": "Theme_Parks.Theme_Park_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": [],
+    "note": "PK-is-FK: skip _next_pk_start; exclude parent PKs already in compact Theme_Parks table"
+   },
+   {
+    "child": "Visits.Tourist_Attraction_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": []
+   },
+   {
+    "child": "Visits.Tourist_ID",
+    "parent": "Visitors",
+    "parent_column": "Tourist_ID",
+    "copied": []
+   },
+   {
+    "child": "Photos.Tourist_Attraction_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": []
+   },
+   {
+    "child": "Staff.Tourist_Attraction_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": []
+   },
+   {
+    "child": "Tourist_Attraction_Features.Tourist_Attraction_ID",
+    "parent": "Tourist_Attractions",
+    "parent_column": "Tourist_Attraction_ID",
+    "copied": []
+   },
+   {
+    "child": "Tourist_Attraction_Features.Feature_ID",
+    "parent": "Features",
+    "parent_column": "Feature_ID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Hotels",
+    "column": "star_rating_code",
+    "formula": "star_rating_code IN ('1','2','3','4','5')"
+   },
+   {
+    "table": "Hotels",
+    "column": "pets_allowed_yn",
+    "formula": "pets_allowed_yn IS NULL OR pets_allowed_yn IN ('0','1','')"
+   },
+   {
+    "table": "Hotels",
+    "column": "price_range",
+    "formula": "price_range IS NULL OR price_range >= 0"
+   },
+   {
+    "table": "Ref_Hotel_Star_Ratings",
+    "column": "star_rating_code",
+    "formula": "star_rating_code IN ('1','2','3','4','5')"
+   },
+   {
+    "table": "Ref_Attraction_Types",
+    "column": "Attraction_Type_Code",
+    "formula": "Attraction_Type_Code IN ('2','3','5','6','9')"
+   },
+   {
+    "table": "Tourist_Attractions",
+    "column": "How_to_Get_There",
+    "formula": "How_to_Get_There IS NULL OR How_to_Get_There IN ('bus','walk','shuttle')"
+   },
+   {
+    "table": "Visits",
+    "column": "Visit_Date",
+    "formula": "Visit_Date IS NOT NULL"
+   },
+   {
+    "table": "Visits",
+    "column": "Visit_Details",
+    "formula": "Visit_Details IS NOT NULL"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Ref_Hotel_Star_Ratings": 5,
+   "Ref_Attraction_Types": 5,
+   "Features": 5,
+   "Locations": 15,
+   "Visitors": 20,
+   "Hotels": 20,
+   "Tourist_Attractions": 15,
+   "Street_Markets": 2,
+   "Shops": 4,
+   "Museums": 3,
+   "Royal_Family": 2,
+   "Theme_Parks": 3,
+   "Visits": 20,
+   "Photos": 15,
+   "Staff": 20,
+   "Tourist_Attraction_Features": 18
+  },
+  "null_targets": [
+   "Hotels.price_range",
+   "Hotels.pets_allowed_yn",
+   "Hotels.other_hotel_details",
+   "Locations.Other_Details",
+   "Locations.Location_Name",
+   "Locations.Address",
+   "Tourist_Attractions.Description",
+   "Tourist_Attractions.Opening_Hours",
+   "Tourist_Attractions.Other_Details",
+   "Tourist_Attractions.How_to_Get_There",
+   "Tourist_Attractions.Name",
+   "Photos.Description",
+   "Photos.Other_Details",
+   "Photos.Name",
+   "Staff.Other_Details",
+   "Staff.Name",
+   "Royal_Family.Royal_Family_Details",
+   "Museums.Museum_Details",
+   "Shops.Shop_Details",
+   "Street_Markets.Market_Details",
+   "Theme_Parks.Theme_Park_Details",
+   "Visitors.Tourist_Details",
+   "Features.Feature_Details",
+   "Ref_Attraction_Types.Attraction_Type_Description",
+   "Ref_Hotel_Star_Ratings.star_rating_description"
+  ],
+  "supporting_evidence": {
+   "Hotels.star_rating_code": "Observed 1-5; comparison boundary targets 3,4,5; '6' excluded by formula.",
+   "Hotels.price_range": "Observed positive reals; null_rows requires 5-30% NULL.",
+   "Locations.Address": "Observed '254 Ottilie Junction', '660 Shea Crescent'; boundary variants listed.",
+   "Tourist_Attractions.How_to_Get_There": "Observed 'bus','walk','shuttle'; boundary WALK/BUS excluded because formula restricts to lower-case set.",
+   "Visitors.Tourist_Details": "Observed names; boundary targets Rosalind/rosalind/Alison/alison.",
+   "Features.Feature_Details": "Observed 'park','shopping'; boundary targets park/PARK/shopping/SHOPPING.",
+   "Visits.Visit_Date": "Observed distinct datetimes; duplicates_for_distinct 20-50%.",
+   "Visits.Visit_Details": "Observed single value; aggregate boundary COUNT in {1,2} (NOT NULL).",
+   "Ref_Attraction_Types": "Table size reduced to 5 to match the 5-value enum pool; fk_group_sizes 1/2/>=3 is realized via Tourist_Attractions.Attraction_Type_Code child distribution, which has 15 children across 5 parent values.",
+   "Ref_Hotel_Star_Ratings": "Enum pool {1,2,3,4,5}; 5 rows fill every PK exactly once; >=1 value reserved out of the Hotels draw for unmatched_join_rows.",
+   "Photos.Tourist_Attraction_ID": "The unmatched-parent guarantee is provided by the single reservation on ('Tourist_Attractions','Tourist_Attraction_ID') which excludes the reserved value from all children including Photos."
+  },
+  "uncertainty": "No calculated columns or date-pair order rules exist in the schema; no formulas were derived beyond range/enum rows. Enum pools for Ref tables are from observed distinct values. NULL shares approximate from statistics. Unmatched-parent rows are guaranteed by reserving parent PK values during the child FK draw, not by post-hoc redirection; a single parent-side reservation excludes the value from every child of that parent (stronger than only Photos, but consistent). PK-is-FK child tables must skip _next_pk_start and PK rewriting and must draw parent PK values not already present in the compact child table. _apply_group_sizes must never touch a PK/FK column (move such columns to fk_group_sizes); _shape_fk_distribution must shape each (child_table, child_column) pair from the spec, not just the first child of a parent. For Tourist_Attractions.Name (both group_sizes and aggregate_boundary), one combined pass is needed so the >=3 group survives while COUNT targets hold. Nullable columns are all planted with at least one NULL per instance via null_targets; NOT NULL columns never get NULL. Upper-case boundary variants of How_to_Get_There and non-enum star ratings ('6') are excluded to respect declared formulas. TieSampler first-two-equal values must survive _finalize for Locations.Location_Name, Staff.Name and Museums.Museum_Details. The dead `n = ...` line and the SyntaxError in instance.py must be removed before generation runs; writer must use PRAGMA foreign_keys=ON and confirm counts match table_sizes_per_instance."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations = 903 across 20 instances (all 20 invalid with reason 'new_integrity_failures'). The writer disables FK enforcement (`pragma foreign_keys = OFF` in writer.py) and the generator's `fill_foreign_keys_consistently` draws child FK values from `_parent_values`, which combines compact parent values with *generated* parent values. But `sample_fresh_primary_keys` and `drop_unique_duplicates` run *after* FK filling and can drop generated parent rows, and the later 'unmatched-parent' pass rewrites child FKs to `rng.choice(others)` where `others` are generated parent values that may themselves have been dropped. Also `_apply_group_sizes`/`_apply_aggregate_boundary` overwrite values in grouping columns (e.g. `Tourist_Attractions.Tourist_Attraction_ID`, `Visits.Tourist_Attraction_ID`) *after* PK/FK consistency was established, so child FKs no longer match surviving parent PKs. Net effect: generated child rows reference parent keys that do not exist.",
+     "requested_revision": "Re-establish FK consistency after all value-rewriting passes: (a) run group-size/aggregate-boundary/unmatched-parent transformations before final PK assignment, or re-derive child FK columns from the final surviving parent PK set; (b) ensure the 'unmatched-parent' pass only redirects to parent values that survive in the final parent table; (c) verify with `pragma foreign_key_check` that generated rows introduce zero FK violations (compact rows already satisfy FKs). Do not rely on `foreign_keys = OFF` to mask violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_group_sizes` and `_apply_aggregate_boundary` are applied to `Tourist_Attractions.Tourist_Attraction_ID` and `Visits.Tourist_Attraction_ID` (spec.GROUP_SIZES / AGG_BOUNDARY). These are primary-key / foreign-key columns. Overwriting PK values after `sample_fresh_primary_keys` and after FK filling breaks both PK uniqueness guarantees and FK references. The spec lists these columns under group_sizes/aggregate_boundary, but the program applies the transformation to the raw column values rather than to a derived grouping, corrupting key semantics.",
+     "requested_revision": "Do not apply group-size/aggregate-boundary rewrites to primary-key or foreign-key columns. Either (i) restrict these patterns to non-key grouping columns, or (ii) if the pattern is genuinely required on a key column, implement it by controlling how many child rows reference each parent key (i.e. via the child FK distribution) rather than by overwriting the key value. Update spec.py accordingly so GROUP_SIZES/AGG_BOUNDARY do not list PK/FK columns for direct value rewriting."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `table_sizes_per_instance` fixes e.g. `Tourist_Attractions: 15`, `Visits: 20`, `Locations: 15`, but execution feedback shows rows_added far exceeding these (Locations 233, Visitors 306, Hotels 290, Tourist_Attractions 232, Visits 303, etc.). The program's `choose_table_sizes` returns `spec.TABLE_SIZES`, yet the writer appends to the compact DB and `_sum_rows` subtracts `original_sizes`; the large deltas indicate the per-instance generated counts do not match the declared sizes. This is a specification/program mismatch: either the spec intends these as *total* table sizes (compact + generated) or as *generated* sizes, and the program does not honor either consistently.",
+     "requested_revision": "Clarify in the specification whether `table_sizes_per_instance` denotes total rows or appended rows, and make the program honor it exactly (e.g. generate `max(0, target - compact_size)` rows, or target total). Add an assertion in the writer/CLI that per-table generated counts equal the specified sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_unmatched_parent` is a no-op (returns values unchanged) and the actual unmatched-parent logic in `build_random_instance` picks `spare = pvals[-1]` from *generated* parent values and redirects child FKs away from it. But because generated parent rows may be dropped by `sample_fresh_primary_keys`/`drop_unique_duplicates`, and because the pass runs after FK filling, the 'spare' parent may not exist, and the redirection may point to non-existent parents (contributing to the 903 FK violations). The spec's `UNMATCHED_PARENT` includes `Tourist_Attractions.Tourist_Attraction_ID`, whose children include `Visits`, `Photos`, `Staff`, `Street_Markets`, etc.; the pass only iterates `schema.tables` children but does not guarantee the spare parent survives.",
+     "requested_revision": "Compute the spare parent value from the *final* surviving parent PK set, and redirect child FKs only to surviving parent values. Ensure at least one parent row has no children in the final instance (verify with a post-generation check)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.NULL_TARGETS` includes `('Hotels','pets_allowed_yn')` and `('Hotels','price_range')`, and the program plants exactly one NULL per listed column (`col[rng.randrange(len(col))] = None`). Execution feedback shows NULL 20/290 for these columns (one per instance), which satisfies 'at least one NULL row' but the spec's `null_rows` pattern for `Hotels.price_range` targets '5-30% NULL' and the generic `varchar_nullable`/`real_amount` rules say 'NULL share 5-30%'. One NULL per instance is far below 5%. The program does not implement the 5-30% share for nullable columns; it only guarantees a single NULL.",
+     "requested_revision": "Implement the 5-30% NULL share for nullable columns (per the generic sampling rules and the `null_rows` pattern for `Hotels.price_range`), while still guaranteeing at least one NULL row. Update `_init_sampler`/`build_random_instance` to plant NULLs at the specified rate rather than a single row."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `per_column_exceptions` lists `('Ref_Attraction_Types','Attraction_Type_Code')` with `group_sizes` target '1, 2 and >= 3', but the table has only 5 rows and the enum pool is `['2','3','5','6','9']`. With 5 rows and 5 distinct enum values, group sizes of 1, 2, and >=3 cannot all be realized simultaneously (5 rows cannot form groups of 1+2+3=6). The program's `_apply_group_sizes` returns unchanged when `n < 6`, so this pattern is silently unenforced. Similarly `Ref_Attraction_Types.Attraction_Type_Description` is listed under GROUP_SIZES but the table has 5 rows.",
+     "requested_revision": "Either increase `Ref_Attraction_Types` table size to at least 6 (and ensure the enum pool has at least 3 distinct values that can form groups 1/2/3), or remove the group_sizes pattern for this table from the specification. Document the minimum row count required for each group_sizes target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.BOUNDARY_NUM` includes `('Ref_Hotel_Star_Ratings','star_rating_code'): (['5','6','4'], 1)`, and `_init_sampler` adds `str(n-step)` and `str(n+step)` to the enum pool, producing values like '6' and '4'. But the semantic formula for `Ref_Hotel_Star_Ratings.star_rating_code` is `IN ('1','2','3','4','5')`, and the PK is `star_rating_code`. Adding '6' violates the formula and, since it is a PK, may also create a value outside the declared domain. The `Hotels.star_rating_code` FK references this table; a '6' in the parent with no matching child is fine, but '6' violates the stated formula.",
+     "requested_revision": "Do not add boundary values outside the declared enum/formula domain to primary-key or reference-code columns. For `Ref_Hotel_Star_Ratings.star_rating_code`, restrict to `['1','2','3','4','5']`; if a comparison-boundary pattern is needed, apply it to a non-key column or to the child `Hotels.star_rating_code` only where the formula permits. Reconcile `BOUNDARY_NUM` with `FORMULAS`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.BOUNDARY_TEXT` for `('Tourist_Attractions','How_to_Get_There')` includes 'WALK' and 'BUS', and `BoundaryStringSampler` cycles through them. But the semantic formula is `How_to_Get_There IS NULL OR How_to_Get_There IN ('bus','walk','shuttle')`. 'WALK' and 'BUS' (uppercase) violate the formula. Similarly `('Visitors','Tourist_Details')` boundary includes 'Rosalind'/'rosalind'/'Alison'/'alison' \u2014 these are fine as free text, but `('Features','Feature_Details')` includes 'PARK'/'SHOPPING' which may violate any case-sensitive formula (none declared, so acceptable). The `How_to_Get_There` case is a clear formula violation.",
+     "requested_revision": "For columns with a declared case-sensitive formula (e.g. `How_to_Get_There IN ('bus','walk','shuttle')`), do not generate case variants that violate the formula. Either relax the formula to be case-insensitive, or restrict boundary variants to the allowed set. Reconcile `BOUNDARY_TEXT` with `FORMULAS`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.DUP_SHARE` includes `('Visits','Visit_Date')` with 20-50% duplicate share, but `Visits.Visit_Date` is `DATETIME NOT NULL` and the semantic formula is `Visit_Date IS NOT NULL`. The `DuplicateShareSampler` wraps the base `DateSampler` and repeats values, which is fine for the formula, but the spec's `duplicates_for_distinct` target for `Visit_Date` is '20-50% duplicate share' \u2014 the program uses `rng.uniform(0.2, 0.5)` per instance, which is correct in expectation but not guaranteed per instance. More importantly, `Visits.Visit_ID` is a PK and `Visits.Visit_Details` is `NOT NULL`; the `AGG_BOUNDARY` for `Visit_Details` requires `COUNT(visit_details) in {0,1,2}`, but `Visit_Details` is NOT NULL so COUNT cannot be 0. The spec's `aggregate_boundary` target for `Visit_Details` is unreachable.",
+     "requested_revision": "Remove `('Visits','Visit_Details')` from `AGG_BOUNDARY` (COUNT cannot be 0 on a NOT NULL column) or change the target to `{1,2}`. Similarly review `('Visits','Visit_ID')` (PK, NOT NULL) \u2014 COUNT(DISTINCT visit_id) in {0,1,2} is reachable only if the table has 0,1,2 rows, which conflicts with the fixed size 20. Clarify the intended semantics."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_group_sizes` and `_apply_aggregate_boundary` overwrite values in `Tourist_Attractions.Name` and `Tourist_Attractions.Tourist_Attraction_ID` after `drop_unique_duplicates` has run. `Tourist_Attractions.Name` is not unique, so overwriting is safe for uniqueness, but `Tourist_Attraction_ID` is the PK; overwriting it after `sample_fresh_primary_keys` can reintroduce duplicate PKs or break FK references. The execution feedback shows `pk_duplicates: 0`, but this is because the writer's `executemany` would fail on duplicate PKs and fall back to row-by-row, silently skipping rows (counted in `rows_failed`, which is empty here \u2014 suggesting the overwrite happened to not collide, but this is not guaranteed).",
+     "requested_revision": "Apply group-size/aggregate-boundary transformations only to non-PK columns, or re-run `sample_fresh_primary_keys` after all transformations. Add a post-generation assertion that PK uniqueness holds and that no rows were silently skipped."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` claims 'Observed values 1-5; comparison boundary targets 4,5,6' for `Hotels.star_rating_code`, but the semantic formula is `star_rating_code IN ('1','2','3','4','5')`. The boundary target '6' is inconsistent with the formula. Similarly `Ref_Hotel_Star_Ratings.star_rating_code` formula is `IN ('1','2','3','4','5')` but `BOUNDARY_NUM` adds '6'. The specification contains an internal contradiction between the formula and the boundary target.",
+     "requested_revision": "Reconcile the formula and boundary targets: either extend the formula to include '6' (if the domain truly allows it) or remove '6' from the boundary targets. Document which is authoritative."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`fill_foreign_keys_consistently` draws child FK values from `_parent_values`, which includes compact parent values and generated parent values. But `_parent_values` is called *before* the parent table's `sample_fresh_primary_keys` and `drop_unique_duplicates` have run for the current table (the loop processes tables in topological order, but `inst[t]` for the parent is set before FK filling for the child, and the parent's PKs are only finalized in the later 'Fresh integer primary keys' pass). So child FKs may reference parent PK values that are later overwritten by the fresh-PK pass. This is a root cause of the 903 FK violations.",
+     "requested_revision": "Finalize parent PKs (including the fresh-integer-PK pass) before filling child FKs. Restructure `build_random_instance` so that all parent tables are fully finalized (PKs assigned, duplicates dropped, transformations applied) before any child FK is drawn. Then re-verify with `pragma foreign_key_check`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `construction_pairs` feedback shows `eligible: 91, separated: 20, unknown_executions: 0`. Only 20 of 91 eligible pairs were separated, and `construction_pairs_by_group` is empty. This suggests the construction patterns are not effectively separating query pairs \u2014 possibly because the transformations are applied to the wrong columns (PK/FK) or because the fixed table sizes are too small to realize the patterns. While a missing separation alone does not prove a generation error, combined with the FK violations and the unreachable patterns noted above, it indicates the construction is not achieving its intended effect.",
+     "requested_revision": "After fixing the FK/PK issues, re-run and verify that construction pairs are separated at a higher rate. Investigate why `construction_pairs_by_group` is empty (the grouping metadata may not be populated). Ensure the transformations target the columns actually used in the query pairs."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's original rows are preserved: the writer copies the compact DB and appends, so compact rows should be preserved, but the FK violations suggest generated rows may reference non-existent parents; this does not affect compact-row preservation but affects overall integrity.",
+    "Whether the NULL share for nullable columns matches the compact database's share: the program plants exactly one NULL per listed column, which is below the 5-30% target; the compact share was not measured.",
+    "Whether `construction_pairs_by_group` being empty indicates a metadata bug or simply no grouped pairs; needs investigation.",
+    "Whether the `Ref_Attraction_Types` group_sizes pattern is reachable with 5 rows; appears unreachable.",
+    "Whether `Visits.Visit_Details` aggregate_boundary target `{0,1,2}` is reachable given NOT NULL; appears unreachable for 0."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with KeyError('Museum_ID') (n_ok=0, n_fail=20, rows_added={}). In tscore_gen/instance.py, _finalize() calls sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols}) and then _next_pk_start(schema, t, pk) / cols[pk] = ...; for child tables whose PK is also an FK (Museums.Museum_ID, Shops.Shop_ID, Street_Markets.Market_ID, Royal_Family.Royal_Family_ID, Theme_Parks.Theme_Park_ID), the PK column is excluded from the non-FK samplers (build_random_instance only initializes samplers for columns not in schema.fks), so cols[pk] does not exist when _finalize runs. The KeyError aborts every unit.",
+     "requested_revision": "Handle PK-is-FK tables in _finalize/build_random_instance: skip _next_pk_start and PK rewriting when the PK column is also an FK (it is filled by fill_foreign_keys_consistently), or guard with 'if pk in cols'. Re-run generation and confirm n_ok>0 and rows_added non-empty for all tables."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZES includes ('Ref_Attraction_Types','Attraction_Type_Code') and ('Tourist_Attractions','Attraction_Type_Code'), but _apply_group_sizes in instance.py rewrites values in place. For Ref_Attraction_Types.Attraction_Type_Code this is a PK/unique column; rewriting it after _finalize (and after child FKs were already drawn from the finalized parent set) breaks FK integrity and the UNIQUE/PK constraint. The spec's own generic_sampling_rules state group_sizes must 'Never apply to PK/FK columns by value rewriting'.",
+     "requested_revision": "Remove PK/FK columns from GROUP_SIZES (Ref_Attraction_Types.Attraction_Type_Code, Tourist_Attractions.Attraction_Type_Code) or realize them via child FK distribution only. Ensure _apply_group_sizes is never called on a column that is a PK or FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py UNMATCHED_PARENT includes ('Tourist_Attractions','Tourist_Attraction_ID') and ('Visitors','Tourist_ID'), and the redirection loop in instance.py runs AFTER child FKs were drawn. For Tourist_Attractions the child tables (Street_Markets, Shops, Museums, Royal_Family, Theme_Parks, Visits, Photos, Staff, Tourist_Attraction_Features) have PK-is-FK columns; redirecting their FK values to 'others' still leaves parent rows without children only if some parent value is never chosen \u2014 but the redirection replaces 'spare' with 'others', which does not guarantee an unmatched parent row and may also violate the PK-is-FK uniqueness when the same child PK value is redirected. More importantly, for Visitors.Tourist_ID the redirection only affects Visits.Tourist_ID, which is fine, but the spec's intent (parent rows without children) is not guaranteed by construction.",
+     "requested_revision": "Realize unmatched-parent by explicitly leaving at least one finalized parent PK value unselected when drawing child FKs (e.g., reserve one parent value and exclude it from the child draw), rather than post-hoc redirection. Document this in the spec's uncertainty section."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py BOUNDARY_TEXT for ('Tourist_Attractions','How_to_Get_There') lists ['walk','bus','shuttle'] and the spec's supporting_evidence says 'boundary targets restricted to formula domain (no WALK/BUS)'. However the atomic summary's comparison_boundary targets for this column are ['walk','WALK','bus','BUS'], and the generic boundary_text rule says to include L, lower(L), upper(L), and one typo variant. The spec deliberately drops upper-case variants, which is a deviation from the generic rule; this is defensible given the formula IN ('bus','walk','shuttle'), but the spec should state explicitly that upper-case variants are excluded because they violate the formula.",
+     "requested_revision": "Add an explicit note in the spec's uncertainty/supporting_evidence that upper-case variants of How_to_Get_There are excluded to respect the declared formula, and confirm the same for Hotels.star_rating_code (no '6')."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py GROUP_SIZES lists ('Ref_Attraction_Types','Attraction_Type_Code') and ('Tourist_Attractions','Attraction_Type_Code') as non-key grouping columns, but both are PK/FK columns. The spec's own generic_sampling_rules forbid applying group_sizes to PK/FK columns by value rewriting. The atomic summary lists group_sizes for these columns, but the spec should route them to FK_GROUP_SIZES (child distribution) instead.",
+     "requested_revision": "Move these two columns from GROUP_SIZES to FK_GROUP_SIZES (or remove them), and document that their group-size pattern is realized via child FK distribution."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py AGG_BOUNDARY only lists ('Tourist_Attractions','Name'), but the atomic summary lists aggregate_boundary for Tourist_Attractions.Tourist_Attraction_ID, Visits.Tourist_Attraction_ID, Visits.Visit_ID and Visits.Visit_Details. The spec's per_column_exceptions include these; the program's AGG_BOUNDARY does not. The spec's uncertainty says these are realized via child FK distribution, but the program does not implement that for Visit_ID/Visit_Details.",
+     "requested_revision": "Either add these columns to AGG_BOUNDARY (for non-key columns Visit_Details) or document in spec.py that Visit_ID/Visit_Details aggregate boundaries are realized by the PK/fixed-size construction. For FK columns, add explicit child-distribution logic in instance.py."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py TIE_ORDER includes ('Museums','Museum_Details'), ('Locations','Location_Name'), ('Staff','Name'), and _init_sampler wraps these with TieSampler. However, _finalize runs sample_fresh_primary_keys and drop_unique_duplicates AFTER sampling; for Museums.Museum_Details (non-key) this is fine, but for Locations.Location_Name and Staff.Name the TieSampler's first-two-equal guarantee may be broken if drop_unique_duplicates removes one of the tied rows (Location_Name is not unique, so OK; Staff.Name is not unique, so OK). No blocking issue here, but the tie guarantee is not verified in execution feedback.",
+     "requested_revision": "Add a construction check (or note in spec) that TieSampler's first-two-equal values survive _finalize for the listed columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py NULL_TARGETS and NULL_SHARE include ('Hotels','pets_allowed_yn') and ('Hotels','other_hotel_details'), but the atomic summary's null_rows pattern only lists Hotels.price_range. The spec's null_targets list includes these columns, which is consistent with the program interface's NULL rule (every nullable column gets NULLs). This is supported, not an issue.",
+     "requested_revision": "No change; noted as supported."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _plant_nulls uses rng.sample(range(n), min(k, n)) and sets col[i]=None; for columns in NULL_SHARE it plants a 5-30% share, and for other nullable columns it plants exactly one NULL. This matches the program interface's NULL rule. However, _plant_nulls is called AFTER _apply_group_sizes and _apply_aggregate_boundary, so a NULL planted in a grouping column could change group sizes; the spec's GROUP_SIZES columns (Name, Attraction_Type_Code) are not in NULL_TARGETS, so this is not triggered. No blocking issue.",
+     "requested_revision": "No change; noted as consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_group_sizes and _apply_aggregate_boundary are applied to inst[t][c] AFTER _finalize and AFTER FK drawing. For non-key columns this is fine, but for Tourist_Attractions.Name (non-key) the aggregate_boundary _apply_aggregate_boundary may overwrite values that were already used as FK targets? No \u2014 Name is not an FK. For Visits.Visit_Details (NOT NULL) the spec's AGG_BOUNDARY does not include it, so COUNT(visit_details) in {1,2} is not realized. The atomic summary lists aggregate_boundary for Visits.Visit_Details.",
+     "requested_revision": "Add ('Visits','Visit_Details') to AGG_BOUNDARY (it is NOT NULL, so 0 is unreachable; realize 1 and 2) or document why it is omitted."
+    }
+   ],
+   "unresolved_checks": [
+    "Execution feedback shows 0 successful instances; integrity constraints (FK enforcement, PK uniqueness) could not be verified because generation aborted with KeyError('Museum_ID').",
+    "Preservation of compact rows: writer.py copies the compact database and appends rows; not verified in execution because no instances were written.",
+    "Reproducibility: seed_base*100003+i is deterministic; not verified in execution.",
+    "Value variation: boundary variants, duplicate shares, tie values and NULL shares are implemented in values.py/spec.py; not verified in execution.",
+    "The spec's GROUP_SIZES for Ref_Attraction_Types.Attraction_Type_Code and Tourist_Attractions.Attraction_Type_Code conflicts with the generic rule against rewriting PK/FK columns; needs designer clarification.",
+    "The spec's AGG_BOUNDARY omits Visits.Visit_Details and the FK aggregate boundaries listed in the atomic summary; needs designer/engineer alignment."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py line 203 contains `n = len(co ls[pk]) if False else len(cols[pk])  # placeholder removed below` \u2014 a syntax error (`co ls`). Execution feedback: `SyntaxError: invalid syntax. Perhaps you forgot a comma?` at instance.py:203, returncode 1, n_instances 0.",
+     "requested_revision": "Remove the placeholder line entirely (it is dead code: `if False`). The following line already assigns `cols[pk] = [start + i for i in range(len(cols[pk]))]`, so the `n = ...` line is unnecessary. Fix the syntax error so the module imports and generation runs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because of the SyntaxError, no instances were produced (n_instances 0, construction_pairs_by_group empty). Integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified by execution.",
+     "requested_revision": "After fixing the syntax error, re-run generation and confirm: (a) all instances written without errors, (b) FK integrity holds (PRAGMA foreign_keys=ON in writer.py), (c) compact rows preserved (writer copies orig then appends), (d) deterministic output for a fixed seed (rng seeded per unit in cli.py)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py UNMATCHED_PARENT includes ('Photos', 'Tourist_Attraction_ID') with comment 'reserve from Tourist_Attractions side', but Photos.Tourist_Attraction_ID is a child FK, not a parent key. In instance.py `_reserved_parent_values` is only invoked for `(pt, pc)` where `pt == t` and `pc in inst[t]`; for ('Photos','Tourist_Attraction_ID') this reserves a value in the Photos table itself, which is meaningless (Photos has no children). The intended reservation should be on ('Tourist_Attractions','Tourist_Attraction_ID'), which is already listed. This entry is redundant/incorrect and does not guarantee a Photos-less attraction.",
+     "requested_revision": "Remove ('Photos','Tourist_Attraction_ID') from UNMATCHED_PARENT, or change the reservation logic so that reserving a Tourist_Attractions.Tourist_Attraction_ID value excludes it from the Photos FK draw specifically (per-child reservation). The current single global `reserved[(pt,pc)]` set excludes the value from ALL children of that parent, which is stronger than needed but at least consistent; the Photos entry as written is a no-op for its stated purpose."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_shape_fk_distribution` ends with `break  # shape only the first child table`. For parent Tourist_Attractions.Tourist_Attraction_ID, the first child encountered (by schema.tables iteration order) is shaped, but Visits.Tourist_Attraction_ID and Photos/Staff/Tourist_Attraction_Features are not. The spec lists both ('Tourist_Attractions','Tourist_Attraction_ID') and ('Visits','Tourist_Attraction_ID') under FK_GROUP_SIZES/FK_AGG_BOUNDARY; the Visits child distribution is never shaped because the loop breaks on the first child of the Tourist_Attractions parent. Also, `_shape_fk_distribution` is called once per (pt,pc) pair, but the `break` means only one child per parent is ever shaped.",
+     "requested_revision": "Shape each child FK column listed in FK_GROUP_SIZES/FK_AGG_BOUNDARY, not just the first child of a parent. Either iterate over the specific (child_table, child_col) pairs from the spec, or remove the `break` and shape all children (accepting that later children overwrite earlier shaping for the same parent \u2014 better to shape per-child explicitly)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_group_sizes` and `_apply_aggregate_boundary` are applied to spec.GROUP_SIZES / spec.AGG_BOUNDARY which include ('Tourist_Attractions','Name') and ('Visits','Visit_Details'). These are non-key columns, so the rule is respected. However, `_apply_group_sizes` requires `len(pool) >= 3`; for Visits.Visit_Details the spec says COUNT in {1,2} (NOT NULL, 0 unreachable) \u2014 `_apply_aggregate_boundary` requires `len(pool) >= 2`, which is satisfiable. This is consistent. No issue here beyond noting the group_sizes on Name may be overwritten by later aggregate_boundary on the same column (Name appears in both GROUP_SIZES and AGG_BOUNDARY); the aggregate pass runs after and may destroy the 1/2/>=3 group sizes.",
+     "requested_revision": "For columns listed in both GROUP_SIZES and AGG_BOUNDARY (Tourist_Attractions.Name), ensure the two transformations are compatible or apply them in a combined pass so group sizes 1,2,>=3 and COUNT in {0,1,2} both hold. Currently `_apply_aggregate_boundary` runs after `_apply_group_sizes` and can collapse the >=3 group."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `boundary_text` generic rule says 'include L, lower(L), upper(L) and one typo variant', but per_column_exceptions for How_to_Get_There explicitly exclude upper-case WALK/BUS ('violate formula'), and for Hotels.star_rating_code exclude '6'. This is a deliberate, documented reconciliation with the declared formulas and is consistent with the schema (How_to_Get_There formula restricts to lower-case; star_rating_code enum is '1'..'5'). Supported.",
+     "requested_revision": "No change required; this is a supported rule with clear evidence."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `Ref_Attraction_Types` table size raised to 6 rows 'so fk_group_sizes 1/2/>=3 is reachable with enum pool of 5 values'. The enum pool has 5 values ('2','3','5','6','9') and 6 rows, so at least one value repeats \u2014 group sizes 1,2,>=3 are reachable. Supported. However, the spec's `table_sizes_per_instance` sets Ref_Attraction_Types to 6 while the enum has 5 values; the 6th row must duplicate a code, which is fine for a non-PK grouping column but the PK is Attraction_Type_Code (UNIQUE). Since the table is a reference table with PK=code, 6 rows with 5 distinct codes would violate the PK/UNIQUE constraint. This is a real conflict.",
+     "requested_revision": "Either reduce Ref_Attraction_Types to 5 rows (matching the enum pool) and realize fk_group_sizes via child distribution only (which the spec already says: 'via Tourist_Attractions.Attraction_Type_Code distribution; not by value rewrite'), or expand the enum pool to 6 distinct values. As written, 6 rows with a 5-value enum pool cannot satisfy the PK/UNIQUE constraint on Attraction_Type_Code."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `_init_sampler` for ENUMS returns an `EnumSampler` that draws uniformly from the pool. For Ref_Attraction_Types with 6 rows and 5 pool values, the PK dedupe in `_finalize` (`sample_fresh_primary_keys`) will drop duplicate PK rows, reducing the table below 6 rows. This compounds the designer issue above. Also, `_finalize` for Ref_Attraction_Types will drop rows to 5, so the generated table size will not match TABLE_SIZES.",
+     "requested_revision": "Coordinate with the designer fix: either the enum pool must have >= table size distinct values, or the table size must be <= enum pool size. Ensure `_finalize` does not silently shrink reference tables below their specified size."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the compact database and appends generated rows. For PK-is-FK child tables (Museums, Shops, Street_Markets, Royal_Family, Theme_Parks), the generated PK values are copied from Tourist_Attractions.Tourist_Attraction_ID. If a generated PK collides with a compact PK already in the copied database, the INSERT will fail (PK violation) and the row is skipped/counted. The spec says 'must be distinct child PK values' but the program does not check against compact PKs. This may silently drop rows.",
+     "requested_revision": "When filling PK-is-FK child tables, exclude parent PK values that already exist in the compact child table (or use INSERT OR IGNORE and verify counts). Ensure generated PK-is-FK values are distinct from compact ones so the specified table sizes are met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` plants NULLs on spec.NULL_TARGETS including ('Tourist_Attractions','How_to_Get_There'). The formula for How_to_Get_There is 'IS NULL OR IN (bus,walk,shuttle)', so NULL is allowed. However, `_plant_nulls` is called after `_apply_group_sizes`/`_apply_aggregate_boundary`; if How_to_Get_There were a grouping column this could interfere, but it is not. No issue. Separately, `_plant_nulls` uses `rng.uniform(0.05,0.30)` share, matching the 5-30% rule. Supported.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL interface rule requires 'for every nullable column ... each instance contains generated rows with NULL and rows with non-NULL values'. `_plant_nulls` only plants NULLs for columns in spec.NULL_TARGETS. Nullable columns not in NULL_TARGETS (e.g., Hotels.other_hotel_details is listed, but Locations.Address, Tourist_Attractions.Name, etc. are nullable in schema but not in NULL_TARGETS) will never receive NULLs. The interface rule says every nullable column should have at least one NULL row per instance.",
+     "requested_revision": "Extend NULL planting to all nullable columns (per schema `notnull` flag), not just spec.NULL_TARGETS, to satisfy the interface NULL rule. At minimum, document why non-listed nullable columns are exempt, or add them to NULL_TARGETS."
+    }
+   ],
+   "unresolved_checks": [
+    "Execution could not verify FK integrity, compact-row preservation, or reproducibility because the program failed to import (SyntaxError).",
+    "Whether Ref_Attraction_Types can reach 6 rows with a 5-value enum pool under PK/UNIQUE constraints is unresolved pending the designer/engineer fix.",
+    "Whether PK-is-FK child tables meet specified sizes without colliding with compact PKs is unresolved pending execution.",
+    "Whether Tourist_Attractions.Name simultaneously satisfies group_sizes (1,2,>=3) and aggregate_boundary (COUNT in {0,1,2}) after both transformations is unresolved."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py TABLE_SIZES sets Ref_Hotel_Star_Ratings=5 and Ref_Attraction_Types=5, and instance.py appends these as *generated* rows on top of the compact database (writer.py copies orig then inserts). Execution feedback shows rows_added Ref_Hotel_Star_Ratings=0 and Ref_Attraction_Types=0, i.e. every generated row was rejected (PK/UNIQUE collision with compact rows) and silently counted as 'bad' in writer.write_instance_sqlite. The spec's own supporting_evidence claims '5 rows fill every PK exactly once' and 'Table size reduced to 5 to match the 5-value enum pool', which is only true if the compact table is empty; the compact DB evidently already contains these reference rows.",
+     "requested_revision": "Reconcile reference-table sizing with the compact database: either (a) do not append generated rows to Ref_Hotel_Star_Ratings / Ref_Attraction_Types (set their generated size to 0 and rely on compact rows, adjusting the unmatched_join_rows reservation to reserve a *compact* parent value excluded from the Hotels/Attractions draw), or (b) generate fresh enum values that do not collide with compact PKs. Also make writer.py surface per-table rows_failed in the CLI summary so silent drops are visible, and assert rows_added matches TABLE_SIZES for every table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _reserved_parent_values only reserves *generated* parent values (gen_vals from inst[pt][pc]). For Ref_Hotel_Star_Ratings and Ref_Attraction_Types the generated rows are all rejected (see above), so the reservation is empty and the unmatched_join_rows guarantee for Ref_Hotel_Star_Ratings.star_rating_code is not realized by construction. Similarly, Locations.Location_ID and Visitors.Tourist_ID reservations depend on generated PKs surviving _finalize; the code reserves the first two generated values but does not verify they are actually excluded from every child draw after _shape_fk_distribution runs (which re-samples child FK values from the full parent list, ignoring `reserved`).",
+     "requested_revision": "_shape_fk_distribution must exclude reserved unmatched-parent values when choosing g1/g2/g3, and _reserved_parent_values must fall back to compact parent values when no generated parent value exists. Add a post-build assertion that for each (pt,pc) in UNMATCHED_PARENT at least one final parent value has zero children across all child tables."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _shape_fk_distribution is called for ('Tourist_Attractions','Tourist_Attraction_ID') and ('Visits','Tourist_Attraction_ID') but the parent of Visits.Tourist_Attraction_ID is Tourist_Attractions, while the parent of Tourist_Attractions.Tourist_Attraction_ID is itself (PK). The function looks up schema.fks[(ct,cc)]; for ('Tourist_Attractions','Tourist_Attraction_ID') there is no FK entry (it is a PK), so the call is a no-op and the fk_group_sizes/fk_aggregate_boundary targets for Tourist_Attraction_ID are never realized. The spec lists Tourist_Attractions.Tourist_Attraction_ID under fk_group_sizes/fk_aggregate_boundary meaning 'child distribution across child tables' (Street_Markets, Shops, Museums, Royal_Family, Theme_Parks, Visits, Photos, Staff, Tourist_Attraction_Features), which the code does not implement.",
+     "requested_revision": "Implement parent-side child-count shaping for Tourist_Attractions.Tourist_Attraction_ID across all its child tables (reserve parents with 0 children, ensure some parents have 1, 2, >=3 children), or remove that entry from FK_GROUP_SIZES/FK_AGG_BOUNDARY and document that it is realized only via the individual child columns. Do not silently no-op."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZES includes ('Ref_Attraction_Types','Attraction_Type_Description') and ('Tourist_Attractions','Name'); instance.py applies _apply_group_sizes to these, but _apply_group_sizes only rewrites 6 slots and leaves the rest of the column unchanged, so the resulting group sizes are not guaranteed to be exactly {1,2,>=3} \u2014 other values may also appear with arbitrary counts. More importantly, for Tourist_Attractions.Name the combined _apply_group_and_agg is applied, but the column is also in NULL_TARGETS and _plant_nulls runs afterwards, which can turn the single-count value into NULL and destroy the COUNT=1 boundary. The spec's uncertainty note explicitly requires the >=3 group to survive _finalize and NULL planting.",
+     "requested_revision": "Apply NULL planting before group/aggregate shaping, or make _plant_nulls skip slots that carry the boundary counts. Add a post-build check that for each GROUP_SIZES/AGG_BOUNDARY column the realized counts include 1, 2 and >=3 (or 1 and 2 for AGG_BOUNDARY) on non-NULL values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The extracted atomic operations list comparison_boundary targets for Tourist_Attractions.How_to_Get_There including 'WALK' and 'BUS' (targets values ['walk','WALK','bus','BUS']), and for Hotels.star_rating_code including '6'. The specification excludes these as violating the declared formulas (How_to_Get_There IN ('bus','walk','shuttle'); star_rating_code IN ('1'..'5')). This is a defensible reconciliation, but the spec should state explicitly that the boundary targets are filtered by the formula and that the filtered variants are intentionally not generated, so the reviewer/engineer does not treat the missing WALK/BUS/'6' as a defect.",
+     "requested_revision": "Add an explicit note in per_column_exceptions for How_to_Get_There and Hotels.star_rating_code that upper-case variants and '6' are excluded by the declared formula, and that the boundary rule is applied to the formula-legal subset only. (No program change required; documentation only.)"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py catches sqlite3.Error per row and increments bad[t], but the CLI _sum_rows recomputes added rows from file counts and never reports bad rows; the execution summary shows rows_skipped={} even though Ref_Hotel_Star_Ratings and Ref_Attraction_Types added 0 rows against a TABLE_SIZES of 5. This hides the silent rejection described above.",
+     "requested_revision": "Propagate write_instance_sqlite's rows_failed into the CLI summary (rows_skipped) and fail the run (or emit a warning) when any table's rows_added is below its TABLE_SIZES target."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database already contains rows in Ref_Hotel_Star_Ratings and Ref_Attraction_Types (inferred from rows_added=0 with TABLE_SIZES=5); the reviewer did not inspect the compact DB directly.",
+    "Whether the reserved unmatched-parent values for Locations.Location_ID and Visitors.Tourist_ID actually survive _shape_fk_distribution (the code re-samples child FKs from the full parent list, ignoring `reserved`).",
+    "Whether the combined group/aggregate pass on Tourist_Attractions.Name survives NULL planting (order of operations suggests it may not).",
+    "Whether the fk_group_sizes/fk_aggregate_boundary targets for Tourist_Attractions.Tourist_Attraction_ID are realized at all (the code path is a no-op for a PK column)."
+   ]
+  }
+ ]
 }

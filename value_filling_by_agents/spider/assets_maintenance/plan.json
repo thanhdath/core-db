@@ -1,52 +1,654 @@
 {
  "db": "assets_maintenance",
- "operator_io_quirks": [
-  "All table/column names are backtick-quoted in DDL; identifiers are mixed-case (Third_Party_Companies, Maintenance_Contracts, Engineer_Visits) \u2014 must preserve original case and double-quote in generated SQL.",
-  "All tables are tiny (3-20 rows); no huge-table sampling concern, but read_schema must still handle the 300k cap path.",
-  "DATETIME columns store TEXT like '2017-09-13 11:51:29' (space-separated, no T, no timezone); ts_fuzzer dispatch is 'Date|Number(int elements)' \u2014 first element parses as int? No, so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "VARCHAR(1) columns (chargeable_yn, gender) store '0'/'1' text \u2014 String fuzzer, not Bool/Bit.",
-  "VARCHAR(20) chargeable_amount stores '4','9' \u2014 String fuzzer, int-like strings get +1/-1 neighbors.",
-  "Several columns are 100% NULL (other_contract_details, other_part_details, other_fault_details, other_visit_details) \u2014 original_values all NULL, sampler drops None -> p:=1, always fresh.",
-  "High-null columns (other_staff_details 0.733, other_asset_details 0.733, other_details 0.867) have 1-2 distinct non-null values.",
-  "Junction tables Asset_Parts, Engineer_Skills, Fault_Log_Parts, Skills_Required_To_Fix have NO primary key (pk=[]) \u2014 sample_fresh_primary_keys is a no-op; drop_unique_duplicates also no-op (no unique cols).",
-  "All FKs point to existing parents with INTEGER PKs; no dangling FKs, no self-references, no composite PKs.",
-  "FK columns are NOT NULL (maintenance_contract_company_id, supplier_company_id, asset_id, part_id, engineer_id, skill_id, fault_log_entry_id, part_fault_id, recorded_by_staff_id) \u2014 TS may still emit NULLs from empty parents, causing insert failures.",
-  "contact_staff_id in Engineer_Visits is nullable FK (notnull=0) \u2014 TS may emit NULL, which is valid.",
-  "No CHECK constraints, no UNIQUE constraints beyond PKs; 'unique'/'checked' line-scan will find nothing."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on all DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max of 5 sampled originals; contract dates cluster 2017-2018, visit dates span 1973-2010 \u2014 wide range per column.",
-  "Number fuzzer on all INTEGER PKs and FK columns: scale=4, range [-10^4,10^4], int perturbation +-1/+-2; PKs will be large random ints, not 1..N.",
-  "String fuzzer on VARCHAR columns: charset a-zA-Z 0-9(), length 0..20 (or args[0]); company_type VARCHAR(5) gets 0-5 char strings, not 'Supplier'/'Maintenance Contractor'.",
-  "String fuzzer on VARCHAR(1) gender/chargeable_yn: 0-1 char random strings, mostly not '0'/'1' \u2014 breaks equality predicates on these.",
-  "String fuzzer on fault_status VARCHAR(10): random strings, not 'Waiting'/'Fixed'/'Reported'/'Return' \u2014 breaks status filters.",
-  "Literal pool from train SQL will seed some real values (e.g. 'Fixed', 'Waiting', 'Supplier') but p=0.2 fresh-draw probability means most values are random.",
-  "FK consistency: child FK columns draw from parent's FINAL filtered PK values with replacement \u2014 junction tables get many duplicate (asset_id,part_id) pairs, which is fine (no PK).",
-  "Empty-parent case: if a parent table's PK filtering leaves 0 rows (unlikely here, sizes >=30), child FK gets NULLs -> NOT NULL insert failures -> rows skipped.",
-  "Known FN driver: random strings for company_type/gender/fault_status make WHERE col='Supplier' etc. return 0 rows, so gold and mutant both empty -> missed kill.",
-  "Known FP driver: junction tables with no PK get duplicate rows from FK sampling with replacement; COUNT(*) queries may differ spuriously between gold and neighbor.",
-  "Known FP driver: Date fuzzer range from 5 sampled originals can be narrow (e.g. contract dates all 2017-2018) \u2014 date-range predicates may behave differently than on full original.",
-  "Number fuzzer on PKs produces huge ints; joins still work but ORDER BY / LIMIT queries may pick different rows than original distribution."
- ],
- "challenger_refs": [
-  "G3",
-  "g0d777eff",
-  "g0d777eff",
-  "g0d777eff",
-  "g0d777eff",
-  "g0d777eff",
-  "g0d777eff",
-  "G4",
-  "gb071fbdf",
-  "G5",
-  "G2",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table; no NULL; never reused; PK columns are never mutated by boundary/duplicate/group-size patterns.",
+   "integer_fk": "Drawn only from parent keys that survive insertion (re-derived after PK dedup and row skipping); NULL only for nullable FK columns; never NULL for NOT NULL FK columns.",
+   "varchar_short": "Random short token from a small vocabulary; near-duplicates allowed for text columns.",
+   "varchar_enum": "Random pick from the listed enum; no NULL unless the column is nullable.",
+   "datetime": "Uniform random timestamp within [2017-01-01, 2018-12-31]; format %Y-%m-%d %H:%M:%S; order rules applied after sampling.",
+   "varchar_free": "Random short phrase from a pool; NULL allowed when nullable.",
+   "null_share": "Nullable columns get a NULL share matching the compact database's share for that column; at least one NULL row per nullable column per instance; NOT NULL and PK columns never get NULL.",
+   "boundary": "For numeric columns, one boundary value at each listed literal and one step on each side; for dates, one day on each side of the literal while keeping the table's date-order rules.",
+   "tie_and_duplicate": "For DISTINCT/ORDER columns, ensure duplicates at 20-50% share and ties at the listed rank; ties are computed over the joined/derived relation, not the raw PK.",
+   "unmatched": "For join columns, achieve 'parent rows without children' by omitting some parent keys from the child draw; plant NULL only on nullable FK columns; never write NULL to a NOT NULL FK column."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Third_Party_Companies",
+    "column": "company_type",
+    "pattern": "enum",
+    "targets": [
+     "Maintenance Contractor",
+     "Supplier"
+    ]
+   },
+   {
+    "table": "Parts",
+    "column": "chargeable_yn",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Parts",
+    "column": "chargeable_amount",
+    "pattern": "null_range",
+    "targets": {
+     "null_share": "5-30%",
+     "min": 0,
+     "max": 100
+    }
+   },
+   {
+    "table": "Skills",
+    "column": "skill_code",
+    "pattern": "enum",
+    "targets": [
+     "ELEC",
+     "MECH",
+     "TV"
+    ]
+   },
+   {
+    "table": "Skills",
+    "column": "skill_description",
+    "pattern": "enum",
+    "targets": [
+     "Electrical",
+     "Mechanical",
+     "TV, Video"
+    ]
+   },
+   {
+    "table": "Staff",
+    "column": "gender",
+    "pattern": "enum",
+    "targets": [
+     "0",
+     "1"
+    ]
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "fault_status",
+    "pattern": "enum",
+    "targets": [
+     "Waiting",
+     "Return",
+     "Fixed",
+     "Reported"
+    ]
+   },
+   {
+    "table": "Fault_Log_Parts",
+    "column": "fault_status",
+    "pattern": "enum",
+    "targets": [
+     "Waiting",
+     "Return",
+     "Fixed",
+     "Reported"
+    ]
+   },
+   {
+    "table": "Assets",
+    "column": "asset_model",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Assets",
+    "column": "asset_make",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Maintenance_Engineers",
+    "column": "last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Skills",
+    "column": "skill_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Parts",
+    "column": "part_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Maintenance_Engineers",
+    "column": "company_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Staff",
+    "column": "staff_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Staff",
+    "column": "other_staff_details",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Maintenance_Contracts",
+    "column": "contract_end_date",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Fault_Log",
+    "column": "fault_description",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Fault_Log",
+    "column": "fault_log_entry_datetime",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "contact_staff_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Assets",
+    "column": "supplier_company_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "table": "Assets",
+    "column": "asset_details",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "ops": [
+      "HAVING(COUNT(*) < 2)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "Parts",
+    "column": "part_name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "ops": [
+      "HAVING(COUNT(*) > 2)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "Fault_Log",
+    "column": "fault_log_entry_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(fault_log_parts.part_fault_id)"
+     ]
+    }
+   },
+   {
+    "table": "Assets",
+    "column": "asset_acquired_date",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "engineer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Maintenance_Engineers.engineer_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Part_Faults",
+    "column": "part_fault_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Skills_Required_To_Fix.part_fault_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Part_Faults",
+    "column": "part_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Parts.part_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Asset_Parts",
+    "column": "part_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Parts.part_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Fault_Log_Parts",
+    "column": "fault_log_entry_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Fault_Log.fault_log_entry_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Maintenance_Contracts.maintenance_contract_company_id",
+    "parent": "Third_Party_Companies.company_id",
+    "copied": []
+   },
+   {
+    "child": "Assets.maintenance_contract_id",
+    "parent": "Maintenance_Contracts.maintenance_contract_id",
+    "copied": []
+   },
+   {
+    "child": "Assets.supplier_company_id",
+    "parent": "Third_Party_Companies.company_id",
+    "copied": []
+   },
+   {
+    "child": "Asset_Parts.asset_id",
+    "parent": "Assets.asset_id",
+    "copied": []
+   },
+   {
+    "child": "Asset_Parts.part_id",
+    "parent": "Parts.part_id",
+    "copied": []
+   },
+   {
+    "child": "Maintenance_Engineers.company_id",
+    "parent": "Third_Party_Companies.company_id",
+    "copied": []
+   },
+   {
+    "child": "Engineer_Skills.engineer_id",
+    "parent": "Maintenance_Engineers.engineer_id",
+    "copied": []
+   },
+   {
+    "child": "Engineer_Skills.skill_id",
+    "parent": "Skills.skill_id",
+    "copied": []
+   },
+   {
+    "child": "Fault_Log.asset_id",
+    "parent": "Assets.asset_id",
+    "copied": []
+   },
+   {
+    "child": "Fault_Log.recorded_by_staff_id",
+    "parent": "Staff.staff_id",
+    "copied": []
+   },
+   {
+    "child": "Engineer_Visits.contact_staff_id",
+    "parent": "Staff.staff_id",
+    "copied": []
+   },
+   {
+    "child": "Engineer_Visits.engineer_id",
+    "parent": "Maintenance_Engineers.engineer_id",
+    "copied": []
+   },
+   {
+    "child": "Engineer_Visits.fault_log_entry_id",
+    "parent": "Fault_Log.fault_log_entry_id",
+    "copied": []
+   },
+   {
+    "child": "Part_Faults.part_id",
+    "parent": "Parts.part_id",
+    "copied": []
+   },
+   {
+    "child": "Fault_Log_Parts.fault_log_entry_id",
+    "parent": "Fault_Log.fault_log_entry_id",
+    "copied": []
+   },
+   {
+    "child": "Fault_Log_Parts.part_fault_id",
+    "parent": "Part_Faults.part_fault_id",
+    "copied": []
+   },
+   {
+    "child": "Skills_Required_To_Fix.part_fault_id",
+    "parent": "Part_Faults.part_fault_id",
+    "copied": []
+   },
+   {
+    "child": "Skills_Required_To_Fix.skill_id",
+    "parent": "Skills.skill_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Maintenance_Contracts",
+    "column": "contract_end_date",
+    "formula": "contract_end_date >= contract_start_date",
+    "evidence": "Maintenance_Contracts rows 1-8"
+   },
+   {
+    "table": "Assets",
+    "column": "asset_disposed_date",
+    "formula": "asset_disposed_date >= asset_acquired_date",
+    "evidence": "Assets rows 1-8"
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "visit_end_datetime",
+    "formula": "visit_end_datetime >= visit_start_datetime",
+    "evidence": "Engineer_Visits rows 1-8"
+   },
+   {
+    "table": "Parts",
+    "column": "chargeable_amount",
+    "formula": "CAST(chargeable_amount AS INTEGER) >= 0",
+    "evidence": "Parts rows 1-3"
+   },
+   {
+    "table": "Parts",
+    "column": "chargeable_yn",
+    "formula": "chargeable_yn IN ('0','1')",
+    "evidence": "Parts rows 1-3"
+   },
+   {
+    "table": "Third_Party_Companies",
+    "column": "company_type",
+    "formula": "company_type IN ('Maintenance Contractor','Supplier')",
+    "evidence": "Third_Party_Companies rows 1-8"
+   },
+   {
+    "table": "Skills",
+    "column": "skill_code",
+    "formula": "skill_code IN ('ELEC','MECH','TV')",
+    "evidence": "Skills rows 1-3"
+   },
+   {
+    "table": "Skills",
+    "column": "skill_description",
+    "formula": "skill_description IN ('Electrical','Mechanical','TV, Video')",
+    "evidence": "Skills rows 1-3"
+   },
+   {
+    "table": "Staff",
+    "column": "gender",
+    "formula": "gender IN ('0','1')",
+    "evidence": "Staff rows 1-8"
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "fault_status",
+    "formula": "fault_status IN ('Waiting','Return','Fixed','Reported')",
+    "evidence": "Engineer_Visits rows 1-8"
+   },
+   {
+    "table": "Fault_Log_Parts",
+    "column": "fault_status",
+    "formula": "fault_status IN ('Waiting','Return','Fixed','Reported')",
+    "evidence": "Fault_Log_Parts rows 1-8"
+   },
+   {
+    "table": "Assets",
+    "column": "asset_id",
+    "formula": "asset_id > 0"
+   },
+   {
+    "table": "Maintenance_Contracts",
+    "column": "maintenance_contract_id",
+    "formula": "maintenance_contract_id > 0"
+   },
+   {
+    "table": "Fault_Log",
+    "column": "fault_log_entry_id",
+    "formula": "fault_log_entry_id > 0"
+   },
+   {
+    "table": "Engineer_Visits",
+    "column": "engineer_visit_id",
+    "formula": "engineer_visit_id > 0"
+   },
+   {
+    "table": "Part_Faults",
+    "column": "part_fault_id",
+    "formula": "part_fault_id > 0"
+   },
+   {
+    "table": "Maintenance_Engineers",
+    "column": "engineer_id",
+    "formula": "engineer_id > 0"
+   },
+   {
+    "table": "Staff",
+    "column": "staff_id",
+    "formula": "staff_id > 0"
+   },
+   {
+    "table": "Third_Party_Companies",
+    "column": "company_id",
+    "formula": "company_id > 0"
+   },
+   {
+    "table": "Skills",
+    "column": "skill_id",
+    "formula": "skill_id > 0"
+   },
+   {
+    "table": "Parts",
+    "column": "part_id",
+    "formula": "part_id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Third_Party_Companies": 15,
+   "Maintenance_Contracts": 15,
+   "Parts": 3,
+   "Skills": 3,
+   "Staff": 15,
+   "Assets": 15,
+   "Asset_Parts": 15,
+   "Maintenance_Engineers": 15,
+   "Engineer_Skills": 20,
+   "Fault_Log": 15,
+   "Engineer_Visits": 15,
+   "Part_Faults": 15,
+   "Fault_Log_Parts": 15,
+   "Skills_Required_To_Fix": 15
+  },
+  "null_targets": [
+   "Engineer_Visits.contact_staff_id",
+   "Assets.other_asset_details",
+   "Maintenance_Engineers.other_details",
+   "Staff.other_staff_details",
+   "Parts.chargeable_amount",
+   "Parts.other_part_details",
+   "Fault_Log.other_fault_details",
+   "Maintenance_Contracts.other_contract_details",
+   "Part_Faults.other_fault_details",
+   "Engineer_Visits.other_visit_details"
+  ],
+  "supporting_evidence": [
+   "Ordering rules verified by Maintenance_Contracts rows 1-8 (contract_start_date <= contract_end_date).",
+   "Assets rows 1-8 (asset_acquired_date <= asset_disposed_date).",
+   "Engineer_Visits rows 1-8 (visit_start_datetime <= visit_end_datetime).",
+   "Parts rows 1-3 (chargeable_amount non-negative).",
+   "Enum values verified from Parts 1-3, Skills 1-3, Staff 1-8, Third_Party_Companies 1-8, Engineer_Visits 1-8, Fault_Log_Parts 1-8."
+  ],
+  "uncertainty": "No formula beyond the three date-order rules and the non-negative chargeable_amount was found; no other calculated columns were identified. The observed null distributions are sparse and the null shares are approximate. The 'HAVING(COUNT(*) > 2)' pattern for Parts is interpreted as a grouping over the joined relation (Parts joined to Part_Faults/Asset_Parts), not over the raw PK, since PK uniqueness forbids value-groups of size >=3. Duplicate/group-size patterns are kept on non-key columns only; PK columns are excluded from duplicates_for_distinct and group_sizes. The compact database's NULL shares for nullable columns beyond null_targets could not be confirmed from the provided evidence; null_targets lists only the columns appearing in COUNT/IS NULL/LEFT JOIN/COALESCE atomic operations."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 2744 across 20 instances, and validity.reasons.new_integrity_failures = 20 (every instance). The writer (writer.py) sets `pragma foreign_keys = OFF` and inserts generated rows whose FKs are drawn from `_parent_values`, which includes compact parent rows AND generated parent rows. But `_apply_unmatched` (instance.py) then sets child FK values to NULL for columns that are NOT NULL in the schema (e.g. Engineer_Visits.engineer_id, Part_Faults.part_id, Asset_Parts.part_id, Fault_Log_Parts.fault_log_entry_id, Skills_Required_To_Fix.part_fault_id). Those NULLs are rejected by NOT NULL and the row is skipped (rows_skipped: Asset_Parts 14, Part_Faults 17, Parts 60), but the surviving rows still reference parent keys that were themselves dropped/skipped, producing dangling FKs. The spec's `unmatched` rule says 'child rows with NULL FK where nullable' \u2014 the program applies NULL to non-nullable FK columns, which is both a spec violation and the source of the FK violations.",
+     "requested_revision": "In `_apply_unmatched`, only plant NULLs on nullable FK columns; for NOT NULL FK columns, achieve 'parent rows without children' by omitting some parent keys from the child draw (or by ensuring at least one parent value is never chosen) rather than by writing NULL. Also ensure generated child FKs only reference parent keys that actually survive insertion (i.e. re-derive FK draws after PK/UNIQUE dedup and after any row skipping), so no dangling references remain. Re-run and confirm fault_log/part/visit FKs resolve and integrity.fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.compact_rows_missing = 20 (all instances). The writer is supposed to copy the compact DB and append rows (`_copy_compact`), but `write_instance_sqlite` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` with `orig_path=None`, so it replays DDL into an empty file instead of copying the compact rows. The docstring even says 'if None, the DDL is replayed into an empty file (fallback)'. This contradicts the stated Round-1 design ('instances are copies of the compact database plus appended generated rows') and the spec's supporting evidence, which relies on compact rows (e.g. 'verified by Maintenance_Contracts rows 1-8').",
+     "requested_revision": "Pass the compact database path (`a['orig']`) through to `write_instance_sqlite` (e.g. store it in `_G['args']` and call `write_instance_sqlite(schema, inst, p, orig_path=...)`), so each instance is a true copy of the compact DB plus appended rows. Verify compact_rows_missing = 0 afterwards."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: Parts generated rows = 0 (rows_added Parts: 0, rows_skipped Parts: 60) while spec.TABLE_SIZES['Parts'] = 3. All 3 Parts rows per instance are rejected. Root cause: `_build_table` assigns `cols['part_id'] = _fresh_int_keys(...)` (sequential fresh PKs), then `_apply_aggregate_boundary` for ('Parts','part_id') with op 'gt' overwrites `vals[1] = vals[0]; vals[2] = vals[0]`, creating duplicate PKs; `sample_fresh_primary_keys` then drops the duplicates, and the remaining single row still collides with the compact PK range or is otherwise rejected. The aggregate-boundary rule for Parts.part_id (HAVING COUNT(*) > 2) is being applied to the PK column itself, which is impossible to satisfy while keeping PK uniqueness \u2014 the rule must be about a grouping over a non-PK column or over the join, not the PK.",
+     "requested_revision": "Do not apply the 'gt 2' aggregate-boundary mutation to a primary-key column. Either drop ('Parts','part_id') from AGGREGATE_BOUNDARY (the HAVING(COUNT(*) > 2) pattern in the extracted ops is over a join/group, not the PK) or implement it on a non-unique column. Confirm Parts rows_added = 3 per instance and rows_skipped Parts = 0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` lists `Skills.skill_id` with pattern `duplicates_for_distinct` (duplicate_share 20-50%), but `skill_id` is the INTEGER PRIMARY KEY of Skills. Duplicates are impossible under the PK constraint, and the program's `drop_unique_duplicates`/`sample_fresh_primary_keys` will strip them anyway. The extracted atomic ops also show `Skills.skill_id` with `duplicates_for_distinct` \u2014 this is a mis-attribution (the duplicate pattern belongs to a non-key column such as skill_code/description). Similarly `Parts.part_id`, `Maintenance_Engineers.engineer_id`, `Staff.staff_id`, `Third_Party_Companies.company_id`, `Maintenance_Contracts.maintenance_contract_id` are listed under `group_sizes` '1,2,>=3' but are PKs, so value-groups of size >=3 cannot exist.",
+     "requested_revision": "Remove PK columns from `duplicates_for_distinct` and `group_sizes` exceptions (or reinterpret them as grouping over the joined/derived relation, not the raw PK). Keep duplicate/group-size patterns on non-key columns only. This also removes the conflict that caused the Parts PK collision above."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `construction_pairs.separated = 24` of 65 eligible, with `construction_pairs_by_group` empty. Several specified patterns are not actually realized: (a) `_apply_tie_fault_log_parts` only moves Fault_Log_Parts rows onto fl[0]/fl[1] but does not guarantee the two entries share the *maximal* count (other entries may have more), so the rank-1 DESC tie is not established; (b) `_apply_acquired_date_distinct` only fixes vals[0]==vals[1] for the first two rows, not '>= 2 per group with different values' for every group; (c) `_apply_aggregate_boundary` for Assets.asset_id/asset_details sets a value to '__uniq_%d' on an INTEGER PK column (asset_id), which will fail type/constraint checks or be coerced, and does not create a genuine size-1 group in the intended sense. These are construction gaps, not just missing separations.",
+     "requested_revision": "Make the tie rule explicit: compute counts over Fault_Log_Parts, pick the two entries with the highest counts and force them equal to the global maximum. For acquired-date distinctness, ensure every group (by the relevant grouping key) has at least two distinct non-NULL dates. For the Assets aggregate boundary, do not mutate the integer PK with a string sentinel; instead ensure a genuine singleton group on a non-key grouping column. Re-run and report construction_pairs.separated closer to eligible."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows many nullable columns with 'NULL 0 / n' (e.g. Assets.asset_acquired_date, Assets.asset_details, Assets.asset_make, Assets.asset_model, Engineer_Visits.visit_start_datetime, Fault_Log.fault_description, Maintenance_Contracts.contract_start_date, Maintenance_Engineers.first_name/last_name, Part_Faults.fault_short_name, Parts.part_name, Skills.skill_code, Staff.gender, Third_Party_Companies.company_name/address). Per the interface NULL rule these are noted, not blocking; however the spec's `null_targets` only lists 10 columns, so the program deliberately plants NULLs only there. The compact DB evidently has NULLs in additional nullable columns (the feedback lists them as nullable), so the 'NULL share following the compact database's share' is not honored for those columns.",
+     "requested_revision": "Extend `NULL_TARGETS` (or the null-planting loop) to cover every nullable column that has a non-zero NULL share in the compact DB, so the generated NULL share tracks the compact share. This is a note-level improvement; it does not by itself block a pass, but combined with the blocking issues above it should be fixed in the same revision."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB actually contains NULLs in the extra nullable columns listed in feedback (needed to justify extending NULL_TARGETS) could not be confirmed from the provided evidence alone.",
+    "The exact intended grouping for the 'HAVING(COUNT(*) > 2)' Parts.part_id pattern (join vs. raw column) is ambiguous in the extracted ops; the designer should clarify before the engineer re-implements it.",
+    "Reproducibility was reported true, but with compact rows missing the instances are not the intended 'copy + append' units, so reproducibility of the intended design is unverified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 9 of 20 units failed with IndexError('list index out of range') (units 2,3,6,8,12,13,14,15,16). The failure is in the cross-table post-processing, most plausibly in instance._apply_tie_fault_log_parts / _apply_aggregate_boundary / _apply_unmatched, which index into inst[table][col] lists that may have been shortened by sample_fresh_primary_keys / drop_unique_duplicates (e.g. `vals[-1] = ...` in _apply_aggregate_boundary when vals is empty, or `parts[0]`/`parent_vals[0]` when the list is empty after dedup). The writer then never runs for those units, so ~45% of instances are missing.",
+     "requested_revision": "Guard every cross-table post-processing routine against empty/short lists (check `if not vals: continue`, `if not parts: continue`, `if not parent_vals: continue` before indexing), and re-run the generator so that n_fail == 0. The IndexError must not occur for any seed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.NULL_TARGETS lists every nullable column (e.g. Assets.asset_make, Assets.asset_model, Staff.gender, Parts.chargeable_yn, Skills.skill_code, Skills.skill_description, Maintenance_Contracts.contract_start_date/end_date, Fault_Log.fault_log_entry_datetime, Part_Faults.fault_short_name, Engineer_Visits.visit_start_datetime/end_datetime, Maintenance_Engineers.first_name/last_name, Third_Party_Companies.company_name/address). The generation specification's null_targets list is much shorter (only 10 columns: Engineer_Visits.contact_staff_id, Assets.other_asset_details, Maintenance_Engineers.other_details, Staff.other_staff_details, Parts.chargeable_amount, Parts.other_part_details, Fault_Log.other_fault_details, Maintenance_Contracts.other_contract_details, Part_Faults.other_fault_details, Engineer_Visits.other_visit_details). The program therefore plants NULLs in columns the spec did not designate, and the execution feedback confirms this (e.g. 'Assets.asset_make: NULL 11/165', 'Staff.gender: NULL 11/165', 'Parts.chargeable_yn: NULL 11/165', 'Skills.skill_code: NULL 11/33').",
+     "requested_revision": "Either (a) restrict spec.NULL_TARGETS to the specification's null_targets list, or (b) update the generation specification to include the additional nullable columns. The two must agree. Note that planting NULL in enum columns such as Parts.chargeable_yn and Staff.gender also breaks the enum domain (see next issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.ENUMS declares Parts.chargeable_yn \u2208 {'0','1'}, Staff.gender \u2208 {'0','1'}, Skills.skill_code \u2208 {'ELEC','MECH','TV'}, Skills.skill_description \u2208 {'Electrical','Mechanical','TV, Video'}, Engineer_Visits.fault_status and Fault_Log_Parts.fault_status \u2208 {'Waiting','Return','Fixed','Reported'}. But because these columns are also in NULL_TARGETS, _build_table step 5 overwrites some values with NULL. Execution feedback shows 'Parts.chargeable_yn: NULL 11/33', 'Staff.gender: NULL 11/165', 'Skills.skill_code: NULL 11/33', 'Skills.skill_description: NULL 11/33'. The semantic rule 'chargeable_yn IN (0,1)' / 'gender IN (0,1)' / 'skill_code IN (...)' is then violated for those rows (NULL is not in the enum).",
+     "requested_revision": "Do not apply the NULL rule to enum-constrained columns (or, if the spec intends NULLs there, remove the enum constraint from the semantic rules). The enum domain and the NULL rule must be reconciled in spec.py."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.GROUP_SIZE_COLUMNS includes ('Staff','gender') and ('Skills','skill_description'), and spec.DUPLICATE_COLUMNS includes ('Skills','skill_description'). These columns are also in NULL_TARGETS, so the group-size / duplicate-share structure is destroyed by the NULL overwrite (NULLs form their own group). Additionally, GroupSizeSampler.draw() calls plan_groups(n) which builds a plan of size >= 6 (1+2+3) and then trims; for n=3 (Parts, Skills) the plan is trimmed to [1,2] or similar, so the '>=3' group cannot exist for Parts.part_name / Skills.skill_description when n=3. The spec's group_sizes target '1, 2 and >= 3' is therefore not achievable for the 3-row tables.",
+     "requested_revision": "Either increase the table size for Parts/Skills (or the relevant columns) so that a group of size >= 3 is possible, or drop the '>=3' requirement for those columns in the spec. Also ensure group-size columns are not simultaneously NULL targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._apply_aggregate_boundary for ('Parts','part_name') with op 'gt' val 2 does `vals[1] = v; vals[2] = v` when len(vals) >= 3, but Parts has TABLE_SIZES['Parts'] = 3 and after NULL overwrite / dedup the list may be shorter; also the 'lt' branch does `vals[-1] = '__uniq_%d'` which can IndexError on empty list. Similarly _apply_tie_fault_log_parts appends to flp but does not re-check that Fault_Log_Parts.fault_log_entry_id values still reference existing Fault_Log entries after dedup, potentially creating dangling references (though FK is off during insert, the resulting DB would violate the FK).",
+     "requested_revision": "Make the aggregate-boundary and tie routines robust to short lists and re-validate FK references after mutation (re-draw or drop appended values that do not reference surviving parent keys)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification's null_targets list (10 columns) is inconsistent with the program's spec.NULL_TARGETS (34 columns). The specification also does not state that enum columns may receive NULLs, yet the program does so. The specification's group_sizes targets for Parts.part_name and Skills.skill_description ('1, 2 and >= 3') are not achievable with the specified table sizes (Parts=3, Skills=3).",
+     "requested_revision": "Update the generation specification to (a) list the full set of nullable columns that should receive NULLs, (b) state explicitly whether enum-constrained columns may be NULL, and (c) either raise the table sizes for Parts/Skills or relax the group-size target for those columns. The specification and spec.py must be consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._apply_unmatched for NOT NULL FK columns re-draws the child column with `_fk_values(..., omit=omit)`, but `_fk_values` draws from `_parent_values` which includes compact + generated parent values. If the omitted parent value is the only one available (e.g. Parts has only 3 rows and all are referenced), the re-draw may still produce a value in `omit` (the `keep` fallback only sets new_vals[0]). The unmatched property is then not guaranteed. Also, for ('Part_Faults','part_fault_id','Skills_Required_To_Fix','part_fault_id') the child is Skills_Required_To_Fix, but the code checks `if ct not in inst or pt not in inst` \u2014 Part_Faults is the parent here, so the check is inverted relative to the tuple order (ct=Part_Faults, pt=Skills_Required_To_Fix).",
+     "requested_revision": "Fix the tuple semantics in _apply_unmatched: the tuple is (child_table, child_col, parent_table, parent_col), so the guard should check the child table and the parent table correctly, and the omit logic should guarantee at least one parent value is not referenced. Add a post-check that verifies the unmatched property for every listed pair."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction feedback: construction_pairs eligible=65, separated=29. 36 of 65 atomic-operation pairs are not separated by the generated instances. While a missing separation alone does not prove a generation error, the combination with the 9 IndexError failures and the NULL/enum/group-size inconsistencies means the intended value variation is not reliably produced. In particular, the aggregate-boundary and tie patterns are applied only in post-processing that can fail or be overwritten.",
+     "requested_revision": "After fixing the IndexError and the NULL/enum/group-size conflicts, re-run and confirm that the construction pairs that are achievable under the spec (e.g. group_sizes, duplicates_for_distinct, unmatched_join_rows) are separated. Report which pairs remain unseparated and why (e.g. table too small)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL shares for the 10 spec null_targets match the program's clamped [0.05, 0.30] share (the execution feedback shows 11/165 \u2248 6.7% and 44/165 \u2248 26.7%, consistent with the clamp, but the compact shares were not provided).",
+    "Whether the 'rows_with_different_values' pattern for Assets.asset_acquired_date is satisfied per maintenance_contract_id group (the program groups by maintenance_contract_id, but the spec does not name the grouping key).",
+    "Whether the tie_for_order_limit pattern on Fault_Log.fault_log_entry_id is actually achieved after the Fault_Log_Parts list is mutated (the program appends/removes entries but does not re-verify the rank-1 tie).",
+    "Whether the compact rows are preserved exactly (the writer copies the file and appends, which should preserve them, but the execution feedback does not explicitly confirm row-by-row equality)."
+   ]
+  }
+ ]
 }

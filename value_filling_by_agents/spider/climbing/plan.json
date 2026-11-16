@@ -1,61 +1,468 @@
 {
  "db": "climbing",
- "operator_io_quirks": [
-  "Tiny DB: mountain=7 rows, climber=10 rows; no sampling cap needed, full read is trivial.",
-  "All columns notnull=0 and null_rate=0.0: no NULLs in original, but schema permits them; TS may emit NULLs only via empty-parent FK path.",
-  "climber.Mountain_ID FK -> mountain.Mountain_ID, parent exists, parent PK unique; 5 distinct child values over 7 parents (some parents unreferenced).",
-  "climber.Time is TEXT storing race times like '1:13.05.6' (colon+dot, not HH:MM:SS); declared TEXT so TS dispatches String, not Time fuzzer.",
-  "climber.Country has 3 distinct over 10 rows (heavy duplication); mountain.Country 4 distinct incl. 'DR Congo Uganda' (space-joined multi-country).",
-  "mountain.Range only 3 distinct (Kilimanjaro/Mount Kenya/Rwenzori) over 7 rows; low-cardinality text.",
-  "mountain.Name contains parentheses, slashes, spaces ('Ngaliema / Mt Stanley (Margherita Pk)'); String fuzzer charset a-zA-Z 0-9() will not reproduce '/'.",
-  "Height/Prominence REAL with plausible 100-5900 range; Number fuzzer full range for REAL (scale from type args, none given) is far wider.",
-  "Points REAL small (6-15); Number fuzzer will draw from full [-10^scale,10^scale].",
-  "Mountain_ID/Climber_ID INT PKs, distinct==rows, no gaps in climber (1..10) but mountain has 7; TS fresh PKs are random ints, not sequential.",
-  "No composite keys, no self-FK, no dangling FK, no unique/check constraints, no views/triggers/indexes in DDL.",
-  "Mixed-case identifiers ('Mountain_ID','Name') require double-quoting; column lookup case-insensitive."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on Mountain_ID/Climber_ID/Height/Prominence/Points: uniform over full type range then +-1/+-2 (int) or +-0.01/+-0.02 (float) perturbation; values implausible vs original (heights ~5000, points ~10).",
-  "String fuzzer on Name/Country/Range/Time: random a-zA-Z 0-9() strings length 0-20 with 0.5 contaminate; will not match real names, 'DR Congo Uganda', or '1:13.05.6' format.",
-  "climber.Time declared TEXT -> String fuzzer, so no time-format preservation; queries filtering Time patterns will see garbage.",
-  "FK fill: climber.Mountain_ID drawn with replacement from mountain's FINAL Mountain_ID values; with small mountain size, ties/duplicates in child FK are likely (original has 5 distinct over 10).",
-  "PK dedup drops duplicate Mountain_ID/Climber_ID rows; with random ints over huge range collisions rare, so sizes stay near chosen n.",
-  "choose_table_sizes: 50% flat ~30-230 rows per table, else level-based (mountain level 0, climber level 1 x4); both far exceed 7/10 originals -> many more rows than original.",
-  "No NOT NULL/CHECK enforcement: NULLs possible only if parent empty; otherwise all columns filled.",
-  "Likely FN driver: implausible numeric magnitudes (heights/points) make range predicates (Height>5000, Points>10) return wrong cardinality vs gold.",
-  "Likely FP driver: String fuzzer produces no ties/duplicates matching original low-cardinality Country/Range groupings, so GROUP BY / DISTINCT counts differ from gold.",
-  "FK ties: original climber.Mountain_ID has duplicates (5 distinct/10 rows); TS with replacement may or may not reproduce join multiplicities, affecting COUNT joins.",
-  "No Date/Time/Bool fuzzers exercised here (no such declared types); crash fallback not triggered (all types map to Number/String)."
- ],
- "challenger_refs": [
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g82d5fbeb",
-  "g03fb08af",
-  "g6b09b53b",
-  "g67318355",
-  "g9485a775",
-  "g39a31acd",
-  "g63c1aaa9",
-  "g259bac51",
-  "g1a2a9fde",
-  "g1a2a9fde",
-  "g1a2a9fde",
-  "g1a2a9fde",
-  "g1a2a9fde",
-  "g1a2a9fde",
-  "gf80a86ec"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generation_specification": {
+   "overview": "Reusable generation recipe for the mountain/climber schema. Two tables: mountain (parent) and climber (child, FK Mountain_ID -> mountain.Mountain_ID). Generation order: mountain first, then climber. Each instance starts as a copy of the compact database (7 mountain rows, 8 climber rows) and appends generated rows; compact rows are never deleted or changed. table_sizes_per_instance counts GENERATED rows only (compact rows are additional). All rules describe non-NULL values only; NULLs are planted per null_targets and never replaced.",
+   "table_sizes_per_instance": {
+    "mountain": 12,
+    "climber": 14
+   },
+   "generic_sampling_rules": {
+    "int_primary_key": "Sequential integers starting at max(compact PK)+1, unique per table, never NULL; never collide with compact rows.",
+    "int_foreign_key": "Sample from the FINAL parent table's primary-key values (compact + generated, after dedupe/truncation); with probability 0.20 emit NULL (only where the column is nullable).",
+    "text_short": "Sample from a small pool of realistic short strings; allow near-duplicate variants (case, spacing, punctuation) with probability 0.2; NULL with probability equal to the compact share for that column (at least one NULL row per nullable column).",
+    "text_name": "Sample from a pool of realistic proper names; allow near-duplicate variants with probability 0.2; NULL with probability equal to the compact share for that column.",
+    "text_country": "Sample from a fixed country pool; allow duplicates across rows (20-50% duplicate share); NULL with probability equal to the compact share for that column.",
+    "real_positive": "Sample a positive real number within the column's range rule; include boundary values at each listed literal and one step on each side; clamp to satisfy the semantic range rule; NULL with probability equal to the compact share for that column.",
+    "real_ranked": "Sample a positive real number; force ties at the listed LIMIT ranks by repeating the value at each forced rank; NULL with probability equal to the compact share for that column.",
+    "text_time": "Sample a race-time string of the form H:MM.SS.S; allow duplicates (20-50% duplicate share); NULL with probability equal to the compact share for that column.",
+    "fresh_value_share": "0.8 of values are fresh samples; 0.2 are near-variants or duplicates of existing values. The reuse share is applied deterministically per column (not via a per-instance coin flip); no column-type override may set the reuse share to 0.",
+    "null_share_default": "Per (table, column) NULL share = count(NULLs)/count(rows) in the compact database; spec NULL_SHARE overrides only where stated (climber.Mountain_ID = 0.20). At least one NULL row per nullable column per instance, even when the compact share is 0."
+   },
+   "per_column_exceptions": [
+    {
+     "table": "mountain",
+     "column": "Mountain_ID",
+     "pattern": "unmatched_join_rows",
+     "targets": {
+      "joins_with": [
+       "climber.Mountain_ID",
+       "climber.Climber_ID"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Mountain_ID",
+     "pattern": "aggregate_boundary",
+     "targets": {
+      "aggregate": [
+       "COUNT(mountain.Mountain_ID)"
+      ],
+      "values": [
+       0,
+       1,
+       2
+      ]
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Height",
+     "pattern": "comparison_boundary",
+     "targets": {
+      "values": [
+       4999,
+       5000,
+       5001,
+       5002,
+       5199,
+       5200,
+       5201,
+       5599,
+       5600,
+       5601
+      ]
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Height",
+     "pattern": "ties_for_order_limit",
+     "targets": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Height",
+     "pattern": "rows_with_different_values",
+     "targets": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Prominence",
+     "pattern": "ties_for_order_limit",
+     "targets": {
+      "tie_at_rank": [
+       1,
+       3
+      ],
+      "direction": "DESC"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Prominence",
+     "pattern": "comparison_boundary",
+     "targets": {
+      "values": [
+       999,
+       1000,
+       1001
+      ]
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Prominence",
+     "pattern": "rows_with_different_values",
+     "targets": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Country",
+     "pattern": "duplicates_for_distinct",
+     "targets": {
+      "duplicate_share": "20-50 %"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Country",
+     "pattern": "aggregate_boundary",
+     "targets": {
+      "aggregate": [
+       "COUNT(*)"
+      ],
+      "values": [
+       0,
+       1,
+       2
+      ]
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Country",
+     "pattern": "group_sizes",
+     "targets": {
+      "group_sizes": "1, 2 and >= 3"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Name",
+     "pattern": "duplicates_for_distinct",
+     "targets": {
+      "duplicate_share": "20-50 %"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Range",
+     "pattern": "duplicates_for_distinct",
+     "targets": {
+      "duplicate_share": "20-50 %"
+     }
+    },
+    {
+     "table": "mountain",
+     "column": "Range",
+     "pattern": "ties_for_order_limit",
+     "targets": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC",
+      "tie_on": [
+       "COUNT(mountain.Mountain_ID)",
+       "COUNT(*)"
+      ]
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Mountain_ID",
+     "pattern": "unmatched_join_rows",
+     "targets": {
+      "joins_with": [
+       "mountain.Mountain_ID"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Mountain_ID",
+     "pattern": "aggregate_boundary",
+     "targets": {
+      "aggregate": [
+       "COUNT(*)"
+      ],
+      "values": [
+       0,
+       1,
+       2
+      ]
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Mountain_ID",
+     "pattern": "group_sizes",
+     "targets": {
+      "group_sizes": "1, 2 and >= 3"
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Mountain_ID",
+     "pattern": "null_rows",
+     "targets": {
+      "null_share": "5-30 % of generated rows"
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Points",
+     "pattern": "ties_for_order_limit",
+     "targets": {
+      "tie_at_rank": [
+       1,
+       10
+      ],
+      "direction": "DESC"
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Points",
+     "pattern": "rows_with_different_values",
+     "targets": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Time",
+     "pattern": "duplicates_for_distinct",
+     "targets": {
+      "duplicate_share": "20-50 %"
+     }
+    },
+    {
+     "table": "climber",
+     "column": "Climber_ID",
+     "pattern": "unmatched_join_rows",
+     "targets": {
+      "joins_with": [
+       "mountain.Mountain_ID"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": false
+     }
+    }
+   ],
+   "dependencies": [
+    {
+     "child_table": "climber",
+     "child_column": "Mountain_ID",
+     "parent_table": "mountain",
+     "parent_column": "Mountain_ID",
+     "copied_columns": []
+    }
+   ],
+   "semantic_rules_and_formulas": [
+    {
+     "table": "mountain",
+     "column": "Height",
+     "formula": "Height > 0",
+     "evidence": "All 7 original rows have positive Height (4890-5895)."
+    },
+    {
+     "table": "mountain",
+     "column": "Prominence",
+     "formula": "Prominence > 0",
+     "evidence": "All 7 original rows have positive Prominence (110-5885)."
+    },
+    {
+     "table": "mountain",
+     "column": "Prominence",
+     "formula": "Prominence <= Height",
+     "evidence": "Rows 1-7: 5885<=5895, 3825<=5199, 850<=5148, 3951<=5109, 130<=4985, 110<=4977, 720<=4890. Physical plausibility hint, not a declared constraint."
+    },
+    {
+     "table": "mountain",
+     "column": "Country",
+     "formula": "Country IN ('Tanzania','Kenya','DR Congo Uganda','Uganda')",
+     "evidence": "Original rows use these four country values. Soft hint only; no CHECK constraint confirms the enum, and 'DR Congo Uganda' may be a data-entry artifact."
+    },
+    {
+     "table": "mountain",
+     "column": "Range",
+     "formula": "Range IN ('Kilimanjaro','Mount Kenya','Rwenzori')",
+     "evidence": "Original rows use these three range values. Soft hint only; no CHECK constraint confirms the enum."
+    },
+    {
+     "table": "climber",
+     "column": "Points",
+     "formula": "Points >= 0",
+     "evidence": "All 8 original rows have non-negative Points (3.0-15.0)."
+    },
+    {
+     "table": "climber",
+     "column": "Country",
+     "formula": "Country IN ('West Germany','Switzerland','United Kingdom')",
+     "evidence": "Original rows use these three country values."
+    }
+   ],
+   "null_targets": [
+    "climber.Mountain_ID"
+   ],
+   "supporting_evidence": {
+    "mountain.Height": "Rows 1-7: 5895, 5199, 5148, 5109, 4985, 4977, 4890 (all > 0).",
+    "mountain.Prominence": "Rows 1-7: 5885, 3825, 850, 3951, 130, 110, 720 (all > 0 and <= Height).",
+    "mountain.Country": "Rows: Tanzania, Kenya, DR Congo Uganda, Uganda.",
+    "mountain.Range": "Rows: Kilimanjaro, Mount Kenya, Rwenzori.",
+    "climber.Points": "Rows 1-8: 15.0, 12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0 (all >= 0).",
+    "climber.Country": "Rows: West Germany, Switzerland, United Kingdom."
+   },
+   "uncertainty": [
+    "No formula links climber.Points to climber.Time or to mountain.Height; Points appears to be a rank-based score, not a computed column.",
+    "climber.Mountain_ID is nullable in the schema; the original sample has no NULLs but the atomic summary requires a 5-30% NULL share (spec uses 0.20).",
+    "mountain.Country and mountain.Range enum values are taken from the original sample; no CHECK constraint confirms them. They are kept as soft generation hints, not asserted invariants.",
+    "The 'Prominence <= Height' rule holds on all shown rows but is a physical plausibility rule, not a declared constraint; kept as a soft hint.",
+    "climber.Points tie_at_rank [10,1000] from the atomic summary: rank 1000 is not representable at the declared generated size (climber=14); the spec keeps rank 1 and rank 10 (the largest representable rank) and drops rank 1000. This is consistent with table_sizes_per_instance.climber = 14.",
+    "climber.Climber_ID unmatched_join_rows target (joins_with mountain.Mountain_ID, child_rows_with_null_fk false) is not representable: Climber_ID is a primary key and cannot be NULL, and it is not a foreign key to mountain. The target is documented here as not implemented.",
+    "table_sizes_per_instance counts generated rows only; compact rows (7 mountain, 8 climber) are copied in addition and never modified.",
+    "Unmatched-parent planting must respect the climber.Mountain_ID NULL share budget (0.20); it is applied within the null-share step, not as an extra post-hoc NULL."
+   ]
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "cb176a32bef2af2c"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "topic": "Compact rows not preserved; database copy never used",
+     "evidence": "writer.write_instance_sqlite(schema, instance, path, orig_path=None) is called from cli._one as write_instance_sqlite(_G['schema'], inst, p) \u2014 orig_path is not passed. The writer therefore enters the `if not orig_path:` branch, executes schema.ddl to build a fresh empty database, and appends only generated rows. Execution feedback confirms this: validity.reasons.compact_rows_missing = 20 (all 20 units), and the review input states mountain has 7 original rows / climber has 8, but rows_added per unit are ~182 and ~248 (over 20 units \u2248 9 and 12 per unit) with no compact rows present. instance.py's docstring and the module docstring ('instances start as a copy of the compact database and append generated rows') are contradicted by the CLI/writer wiring.",
+     "request": "Pass orig_path into write_instance_sqlite from cli._one (write_instance_sqlite(_G['schema'], inst, p, a['orig'])) so the compact database is copied and generated rows are appended to it. Then re-run and verify compact rows (7 mountain, 8 climber) are preserved in every unit and no PK collisions occur (the writer's per-row fallback already counts skipped rows)."
+    },
+    {
+     "agent": "designer",
+     "topic": "Table sizes in the specification are inconsistent with the program and with what is needed",
+     "evidence": "specification.overview and table_sizes_per_instance say {mountain: 7, climber: 10}. In instance.build_random_instance, choose_table_sizes returns large upstream-style sizes (30-2500), then `n = max(spec_sizes.get(t, n), min(n, spec_sizes.get(t, n) + 3))` = max(7, min(n, 10)) and similarly max(10, min(n,13)). So the spec-declared sizes are only used as a lower bound and generated rows are empirically 9-13 per unit \u2014 the '7/10' definition is not what is produced. Meanwhile, spec-level patterns (ties at ranks 1/3, group shapes 1/2/3, boundary list of 10 Height values, duplicate share 20-50% plus NULL share) cannot all be satisfied within ~10 generated rows per table, and validity.reasons.no_rows_added=2 on 2 units shows those sizes sometimes collapse. The sizes and the per-column constraints are mutually incompatible as stated.",
+     "request": "Reconcile the specification: either raise the declared per-instance generated-row sizes (e.g. to a range compatible with all boundary/tie/group/duplicate targets) and make the program use them as the target rather than a lower bound, or relax the pattern targets accordingly. State explicitly whether table_sizes_per_instance refers to generated + compact rows or generated rows only, and make the program follow that definition."
+    },
+    {
+     "agent": "engineer",
+     "topic": "Spec NULL share not applied to climber.Mountain_ID; nullable columns get an ad-hoc 5% NULL",
+     "evidence": "specification.null_share(('climber','Mountain_ID')) = 0.20, but instance.build_random_instance passes `ns = spec.null_share(t, cm.name, 0.0)` with fallback 0.0 for FKs. Additionally, for every FK it always plants NULLs: `k = max(1, int(round(ns * n)))` at ns=0.0 still yields k=1 NULL per unit. For non-FK columns, values._init_sampler passes ns = spec.null_share(..., 0.05) for every nullable column, so every nullable column gets ~5% rows NULL. The interface rule (NULL 7) requires the NULL share to follow the compact database's share per column and at least one NULL row per nullable column. Feedback nullable_columns shows climber.Mountain_ID NULL 15/55 (~27% of generated climber rows across units), while e.g. mountain.Range NULL 1/54, mountain.Height NULL 2/54 - none of these are the compact share, and the spec-required 20% is not actually used for the FK (fallback 0.0).",
+     "request": "Derive NULL shares from schema.original_values per (table, column) (count NULLs / count rows) as the default per the interface rule, with spec.NULL_SHARE only overriding where stated; do not force a hard-coded 0.05 fallback. For climber.Mountain_ID, use the spec's 0.20 (or the compact share, and record which), and verify the share lands in the requested 5-30% range."
+    },
+    {
+     "agent": "engineer",
+     "topic": "Unmatched-join / group-size targets not demonstrable at current sizes; ties_for_limit for rank 10/1000 unsatisfiable",
+     "evidence": "specper_column_exceptions request parent_rows_without_children=true for both joiner columns of mountain.Mountain_ID/climber.Mountain_ID and both directions climber.Climber_ID=mountain.Mountain_ID and climber.Mountain_ID=mountain.Mountain_ID; but generation produces ~10-13 rows per table, so 'parent_rows_without_children' and 'child_rows_with_null_fk' are left to chance. climer.Points ties at rank [10,1000] cannot be represented with <=13 generated climber rows. The execution feedback has construction_pairs separated=24/66 and 42 pairs with no separation, and the review input already recalls that a missing separation alone does not prove an error - but the program has no explicit code paths planting these specific rank ties (TIE_TOP only has ('mountain','Height'), ('mountain','Prominence'), ('climber','Points') with tie_top=2 for Points, which creates a tie at rank 1, not at ranks 10 and 1000).",
+     "request": "Either (a) reduce the target ranks in the spec (e.g. drop rank 1000 or make sizes support it), or (b) implement explicit per-column rank-tie forcing in values.ColumnSampler._forced (a list of ranks with a distinct value per forced rank and equal values for the tie group). Also add explicit construction for parent_rows_without_children (leave at least one parent with no child) as a named post-step rather than relying on sampling."
+    },
+    {
+     "agent": "engineer",
+     "topic": "FK candidates include generated parent rows that may not exist in the final parent table",
+     "evidence": "instance.build_random_instance builds parent rows first (order is topological, mountain then climber), uses inst.get(pt, {}).get(pc) as parent_vals after mountain is built, then truncates the parent with `cols = {c: v[:n] ...}` and applies sample_fresh_primary_keys/drop_unique_duplicates AFTER the FK for the child is fixed in fill_foreign_keys_consistently (which reads inst). Truncation and dedupe can remove parent rows from the final instance, while the child's FK values were drawn before dedupe, leaving references to parent keys that no longer exist. This does not surface in the current run because compact parent rows exist and writer uses foreign_keys=OFF, but once compact rows are restored and foreign_keys=ON, this is a latent integrity bug. Feedback integrity.fk_violations=0 is not conclusive because foreign_keys is OFF and orig_path is None.",
+     "request": "Build the final parent row set first (including dedupe and truncation), then sample child FKs from the final parent key list. Add a post-insert explicit FK consistency check in the writer (after commit, with foreign_keys=ON, run PRAGMA foreign_key_check) so integrity evidence is meaningful."
+    },
+    {
+     "agent": "engineer",
+     "topic": "Compact share of NULLs and compact value sets are read but not preserved as targets",
+     "evidence": "read_schema reads original_values read-only (correct), but values._init_sampler mixes original values, literal pool and boundaries without honoring the semantic_formulas for Height>0 / Prominence>0 / Points>=0 in sampling. NumberSampler.sample can subtract (@v -= 2*d) and the unsigned flag is 'unsigned' in the declared type (real has no UN); so mountain.Height/Prominence can go negative check: instance._apply_relations repairs Prominence<=Height but not Prominence>0/Height>0, and climber.Points can go negative since it is REAL unsigned-spec-first-value and p can be 0.0 only when checked. Feedback shows all rows valid and no integrity failures on current runs, but the semantic rules are not enforced by construction, they are only 'repaired' partially (Prominence random <= Height, still can be <0).",
+     "request": "Enforce the semantic_formulas Height>0, Prominence>0, Prominence<=Height, Points>=0 in values (clamp in sample_many or repair in _apply_relations with a documented non-negative clamp and a Prominence in (0, Height] draw), and add a runtime assertion per generated instance that all non-NULL rows of those columns satisfy the formulas, reported in the writer stats."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether any query intends NULL-safe comparison semantics (IS NULL / IS NOT NULL) that would be affected by the chosen NULL share - the program only checks IS NULL in the atomic summary for climber.Mountain_ID; other nullable columns have no NULL-row rules listed in the spec but are still planted with ~5% NULL.",
+    "Whether the tie_at_rank for climber.Points [10,1000] is intended literally given the tiny climber table (10 rows) - it is not representable without increasing size, so either the spec is wrong or the generation should raise size.",
+    "Whether preserving compact rows before appending generated rows could cause a PK collision because instance.fresh_pk_sequence starts from max(original)+1 - this depends on compact values in the actual orig DB, which were not shown here.",
+    "Full execution-level verification (query denotation on restored compact+generated instances) was not run by the automated feedback, and construction_pairs separated=24/66 leaves the majority of the specified patterns unverified at the execution level."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "specification.py TABLE_SIZES = {'mountain': 24, 'climber': 30}, but the generation specification states table_sizes_per_instance = {mountain: 12, climber: 14}. The module docstring even says 'mountain 24, climber 30' while the spec says 12/14. Execution feedback shows rows_added mountain 468/20 = 23.4 and climber 590/20 = 29.5, confirming the program generates ~24/~30, not 12/14.",
+     "requested_revision": "Set TABLE_SIZES to match the specification (mountain 12, climber 14), or update the specification to 24/30 and justify that the larger size is required to satisfy all boundary/tie/group targets. The two must agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: `p = 0.0 if rng.random() < 0.3 else 0.2`. This is a per-instance coin flip that sets the reuse probability p to 0 for 30% of instances. The spec's generic_sampling_rules.fresh_value_share says 0.8 fresh / 0.2 near-variants or duplicates; a per-instance p=0.0 disables reuse entirely for those instances, contradicting the 0.2 reuse share. Also `_init_sampler` overrides p to 0.0 when column.checked, and the max_l0 randomization (`rng.random() < 0.5`) is not in the spec.",
+     "requested_revision": "Make the fresh/reuse share follow the spec (0.2 reuse) deterministically per column rather than a per-instance coin flip, and document or remove the checked/max_l0 overrides so the sampling rules match the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py ColumnSampler._forced: the duplicate-share forcing picks donors from `free[:max(1, k // 2)]` and then assigns `vals[i % len(vals)]` to `free[:k]`. Because donors are the first free positions and the assignment also starts at free[0], the 'duplicate' values are written into the same positions that were used as donors, so the intended 20-50% duplicate share is not reliably produced (the donor values are themselves overwritten). Additionally the group-shape forcing uses `pool[i % len(pool)]` for a,b,c which can yield a==b or b==c when the enum pool has <3 distinct values, breaking the '1,2,>=3' shape.",
+     "requested_revision": "Rework _forced so duplicate values are copied from a disjoint donor set into distinct target positions, and ensure the three group representatives are distinct enum values (or fall back to fresh values) so the 1/2/>=3 group shape is actually realized."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_unmatched_parents: when every parent key is referenced, it sets one child FK to None to create an unmatched parent. But this runs AFTER _plant_null_fk and after the null-share planting in sample_many, and it can push the climber.Mountain_ID NULL share above the 0.20 target (execution shows 118/590 = 20.0%, which happens to be fine, but the mechanism is not share-controlled and can over-plant). More importantly, for the climber.Climber_ID 'unmatched_join_rows' target (joins_with mountain.Mountain_ID, child_rows_with_null_fk false), the code treats Climber_ID as a PK and never plants anything, so that target is not addressed at all.",
+     "requested_revision": "Make unmatched-parent planting respect the NULL share budget (plant before/within the null-share step, or re-balance), and either implement the climber.Climber_ID unmatched-join target or document in the spec that it is not representable (Climber_ID is a PK and cannot be NULL)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include Country IN ('Tanzania','Kenya','DR Congo Uganda','Uganda') and Range IN ('Kilimanjaro','Mount Kenya','Rwenzori'), but the uncertainty list itself notes these are 'taken from the original sample; no CHECK constraint confirms them.' The 'DR Congo Uganda' value looks like a data-entry artifact (two countries concatenated), so treating it as an enum member is weakly supported. Similarly Prominence <= Height is flagged as physical plausibility, not a declared constraint.",
+     "requested_revision": "Mark the Country/Range enum rules and Prominence<=Height as uncertain (soft) rather than hard formulas, or provide evidence (CHECK constraint / larger sample) that they are true domain rules. Keep them as generation hints, not asserted invariants, unless confirmed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The atomic summary requires climber.Points tie_at_rank [10,1000]; the spec drops rank 1000 and keeps rank 10, and TIE_RANKS for climber.Points is {1:2, 10:2}. With TABLE_SIZES climber=30 (or spec 14) rank 10 is representable, but the spec's own uncertainty says rank 1000 is 'not representable at the declared generated size'. The declared size in the spec (14) is smaller than the program's (30), so the representability argument is inconsistent between spec and program.",
+     "requested_revision": "Reconcile the declared generated size with the tie-rank requirements and state explicitly which ranks are dropped and why, consistently in both the specification and specification.py."
+    }
+   ],
+   "unresolved_checks": [
+    "Execution feedback shows NULL 0/n for all nullable columns except climber.Mountain_ID. Per the interface rule this is noted but not blocking; however it indicates the compact-share NULL planting is not firing for columns whose compact share is 0 (e.g. mountain.Height, climber.Points). The spec says 'at least one NULL row per nullable column per instance' \u2014 this is not satisfied for those columns. Engineer should confirm whether compact share 0 should still force >=1 NULL.",
+    "construction_pairs separated 26/66 with no per-group breakdown; cannot confirm which boundary/tie/group targets are actually separated without held-out queries. Not blocking on its own.",
+    "Reproducibility confirmed (reproducible: true) and integrity clean (fk_violations 0, pk_duplicates 0, not_null_violations 0), so those checks pass."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's semantic_rules_and_formulas lists 'Prominence <= Height' and the Country/Range enum values as soft hints, and the uncertainty section explicitly says they are not declared constraints. The program (specification.py) keeps them in SOFT_FORMULAS/ENUMS and only asserts positivity/non-negativity as HARD. This is consistent with the evidence (7/7 rows satisfy them, but no CHECK constraint confirms).",
+     "requested_revision": "None required; the distinction between supported (positivity) and uncertain (Prominence<=Height, enums) rules is correctly documented and implemented."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic summary requests climber.Points tie_at_rank [10,1000] and climber.Climber_ID unmatched_join_rows with joins_with mountain.Mountain_ID. The spec documents rank 1000 as not representable at climber size 14 (DROPPED_TIE_RANKS) and the Climber_ID join target as not representable (PK, not an FK). Both are explicitly recorded in the uncertainty section.",
+     "requested_revision": "None required; the unrepresentable targets are documented rather than silently dropped."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 20/20 instances valid, 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, 0 rows skipped, reproducible=true. climber.Mountain_ID NULL 55/267 (~20.6%) matches the spec's 0.20 override; every other nullable column has NULL 20/n (>=1 per instance).",
+     "requested_revision": "None required; integrity, NULL-share, and reproducibility evidence are consistent with the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py: table sizes come from spec.TABLE_SIZES (mountain 12, climber 14); fresh PKs start at max(compact)+1; FKs sample from the FINAL parent key set (compact+generated); _plant_unmatched_parents respects the NULL budget; _plant_null_fk plants the spec share; _apply_relations repairs HARD formulas and soft Prominence<=Height; formula_ok asserts HARD formulas. values.py: _forced plants boundaries, rank ties, top ties, duplicate share (disjoint donor set), and group shapes; sample_many plants NULLs last so they are never replaced.",
+     "requested_revision": "None required; the program implements the specified domains, sampling rules, and dependencies."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 66, separated 26, unknown_executions 0. The 40 unseparated pairs are not evidence of a generation error; the spec's forced values (boundaries, ties, duplicate shares) intentionally create overlapping denotations for some pairs, and the review instructions state a missing separation alone does not establish a generation error.",
+     "requested_revision": "None required; value variation remains possible (fresh share 0.8, boundaries/ties/duplicates forced per spec)."
+    }
+   ],
+   "unresolved_checks": [
+    "climber.Climber_ID unmatched_join_rows target (joins_with mountain.Mountain_ID) is not implemented; documented as not representable (PK, not an FK).",
+    "climber.Points tie_at_rank 1000 is not implemented; documented as not representable at climber size 14.",
+    "mountain.Range ties_for_order_limit (tie_at_rank 1 on COUNT) is not explicitly forced in code; the duplicate-share forcing on Range (0.30) makes a top-count tie likely but not guaranteed. Not blocking: the spec lists it as a target, and the execution feedback shows no integrity/validity failure."
+   ]
+  }
+ ]
 }

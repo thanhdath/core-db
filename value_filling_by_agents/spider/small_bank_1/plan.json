@@ -1,48 +1,311 @@
 {
  "db": "small_bank_1",
- "operator_io_quirks": [
-  "All identifiers are plain upper-case ASCII, no spaces/mixed case; quoting still required by spec.",
-  "Tiny DB (7/6/7 rows); read_schema sampling is a no-op, original_values are complete.",
-  "BIGINT declared type: not in the number-family list literally? 'int' substring matches -> Number fuzzer, is_int=True, scale=0, precision=0 (no args).",
-  "FLOAT -> Number fuzzer, is_int=False, scale=0, precision=0 (no args); range [-1,1] then perturbed by +-0.01/0.02.",
-  "VARCHAR(64) -> String fuzzer with length=64 (args[0]); CHARSET a-zA-Z 0-9() only.",
-  "custid storage integer, balance storage real: consistent with declared types, no contradiction.",
-  "FKs SAVINGS.custid->ACCOUNTS.custid and CHECKING.custid->ACCOUNTS.custid both exist and parent is unique PK; no dangling FKs.",
-  "All three tables have single-column PK custid; SAVINGS/CHECKING PK is also the FK column (child PK = FK).",
-  "No composite keys, no self-references, no views/triggers/indexes beyond PKs.",
-  "NOT NULL on every column; no CHECK constraints, no UNIQUE beyond PK.",
-  "name samples include apostrophe (O'mahony) and mixed case; String fuzzer will not reproduce apostrophes (CHARSET lacks ').",
-  "balance samples include 999999999.0 (near 1e9) far outside Number's [-1,1] range; original values only enter via 5 rng.choices elements."
- ],
- "operator_ts_expectations": [
-  "custid (BIGINT, PK, Number is_int): fresh draws uniform in [-1,1] then int-perturbed (+-1/+-2) -> mostly small ints like -3..3; PK dedup keeps first occurrence, so ACCOUNTS gets ~7 distinct small ints.",
-  "SAVINGS/CHECKING custid: FK fill draws from ACCOUNTS.custid final values with replacement -> subset of ACCOUNTS keys, PK dedup on child reduces to distinct subset; child row count <= parent distinct count.",
-  "balance (FLOAT, Number): fresh draws in [-1,1] perturbed by +-0.01/0.02 -> values like -1.02..1.02; original 200000/999999999 never sampled unless rng<p picks an element (p=0.2).",
-  "name (VARCHAR(64), String): fresh random strings over a-zA-Z 0-9() length 0..64, plus 50% contaminate (suffix/prefix/drop char); original names Brown/Wang/O'mahony only via element path.",
-  "p=0.2 default, whole-instance p=0 w.p. 0.3 -> in ~30% of instances every column always returns an element (original or pool value), so balance/name become near-original.",
-  "max_l0 cap: single-column PK -> inf (custid always fresh); non-PK columns get max_l0 = rng.random()*30, so after ~0-30 fresh draws they reuse a previous fresh value -> low distinct counts on balance/name.",
-  "Table sizes: rand_lin path gives int(30*u + u2*200) ~ 30..230 rows per table; level path gives level0=1+30u, next x4 capped 2500 -> SAVINGS/CHECKING can be 4x ACCOUNTS, but FK+PK dedup caps them at ACCOUNTS distinct count.",
-  "Likely FN driver: balance values clustered in [-1,1] make SUM/AVG/MAX comparisons on balance implausible vs gold (gold uses 200000/999999999); queries filtering balance>1000 return empty.",
-  "Likely FP driver: custid small ints (-3..3) collide with literal pool ints from train SQL (e.g. custid=1,2,3) so equality/join predicates match spuriously; also name random strings rarely equal gold names -> name predicates mostly empty (FN).",
-  "FK consistency holds (child custid subset of parent), so join queries ACCOUNTS-join-SAVINGS return rows; but child PK=FK means at most one row per custid, matching original cardinality.",
-  "No NOT NULL/CHECK violations expected: all columns NOT NULL but Number/String fuzzers never emit None (Base drops None, p=1 if empty), so inserts succeed; rows_failed ~0."
- ],
- "challenger_refs": [
-  "G3",
-  "G1",
-  "G4",
-  "G7",
-  "G2",
-  "G5",
-  "G6",
-  "g1fca421e",
-  "g1fca421e"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "BIGINT_pk": "Sequential integers starting at 1; unique per table; never NULL. Fresh rows appended after compact max use compact_max+1, compact_max+2, ...",
+   "BIGINT_fk": "Copy from parent primary key pool; allow parent rows without children; never NULL unless column is nullable.",
+   "VARCHAR_name": "Draw from a pool of realistic surnames; allow near-duplicate variants (case changes, extra characters) and duplicate values on DISTINCT columns; keep exact-duplicate share of the whole column in [0.20, 0.50].",
+   "FLOAT_balance": "Non-negative decimal amounts; mix of small values (0-1000), medium (1000-100000), and large (100000-1e9); allow ties at MIN and at SUM(checking.balance+savings.balance) rank 1.",
+   "NULL_share": "For nullable columns, at least one NULL row per instance; share follows compact database (0% here since all columns NOT NULL).",
+   "fresh_value_share": "Generated rows are appended after compact rows; compact rows are never deleted or changed; fresh PKs continue after compact max.",
+   "forced_value_application": "Planted values (boundary pairs, ties, duplicate shares, LIKE variants) are written deterministically into the first generated slots of each column before any random sampling; forced slots are never perturbed or overwritten; every planted pattern is verified present in the generated instance."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "columns": [
+      "SAVINGS.custid",
+      "CHECKING.custid",
+      "ACCOUNTS.custid"
+     ],
+     "rule": "Ensure some ACCOUNTS rows have no SAVINGS and/or no CHECKING child; child rows with custid not in ACCOUNTS are forbidden by FK, so only parent-without-child direction."
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "columns": [
+      "ACCOUNTS.custid",
+      "CHECKING.custid"
+     ],
+     "rule": "In generated rows (not relying on compact rows), deterministically insert an ACCOUNTS row with custid = k and a CHECKING row with custid = k+1 for a fresh k = compact_max+1, plus an equality pair accounts.custid = checking.custid = k+2; verify the one-step pair exists in generated rows."
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "columns": [
+      "ACCOUNTS.name"
+     ],
+     "rule": "Include values 'Brown' and 'brown' (case variant) and values on each side of equality to 'Brown'."
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "columns": [
+      "ACCOUNTS.name"
+     ],
+     "literals": [
+      "%ee%"
+     ],
+     "rule": "Include names containing 'ee', 'ef', 'ee x', 'EE' to exercise LIKE '%ee%' and near variants."
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "columns": [
+      "ACCOUNTS.name"
+     ],
+     "rule": "Exact-duplicate share of the whole ACCOUNTS.name column in [0.20, 0.50]; near-variant mutations count as distinct values, not exact duplicates; ACCOUNTS.custid is PK so no duplicates."
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "columns": [
+      "CHECKING.balance",
+      "SAVINGS.balance"
+     ],
+     "rule": "After FK assignment, force at least two shared custids to carry planted tie_check/tie_save values so that checking.balance + savings.balance ties at rank 1 for ORDER BY ... ASC on at least two joined rows; also plant at least two rows tying at MIN(checking.balance) and at MIN(savings.balance), with the planted tie value being the column minimum (clamp other draws above it)."
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "columns": [
+      "SAVINGS.balance",
+      "CHECKING.balance"
+     ],
+     "rule": "At least two distinct balance values across the table (variation across custids, not within a group) so MIN/AVG are non-degenerate."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "SAVINGS",
+    "child_column": "custid",
+    "parent_table": "ACCOUNTS",
+    "parent_column": "custid",
+    "copied_columns": []
+   },
+   {
+    "child_table": "CHECKING",
+    "child_column": "custid",
+    "parent_table": "ACCOUNTS",
+    "parent_column": "custid",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "SAVINGS",
+    "column": "balance",
+    "formula": "balance >= 0"
+   },
+   {
+    "table": "CHECKING",
+    "column": "balance",
+    "formula": "balance >= 0"
+   },
+   {
+    "table": "ACCOUNTS",
+    "column": "custid",
+    "formula": "custid > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "ACCOUNTS": 7,
+   "SAVINGS": 6,
+   "CHECKING": 7
+  },
+  "null_targets": [],
+  "supporting_evidence": {
+   "SAVINGS.balance >= 0": "All shown SAVINGS.balance values (200000.0, 999999999.0, 230000.0, 60.0, 80000.0, 240.0) are non-negative.",
+   "CHECKING.balance >= 0": "All shown CHECKING.balance values (10000.0, 2000.0, 3000.0, 7000.0, 77.0, 7.0) are non-negative.",
+   "ACCOUNTS.custid > 0": "All shown ACCOUNTS.custid values (1-7) are positive."
+  },
+  "uncertainty": "No nullable columns exist, so NULL rules are vacuous. No calculated columns or date pairs exist. Formula for balance is only a non-negativity range; no offset/rate formula is supported by the sample. Duplicate share on ACCOUNTS.name is inferred from DISTINCT pattern; exact share is uncertain and near-variants are counted as distinct. The joined-sum tie, the MIN ties, the one-step custid boundary, and the duplicate share must be constructed explicitly in generated rows (forced-value application), not inherited from compact rows; compact rows may also satisfy them but do not count as the planted guarantee."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite is called in cli._one as write_instance_sqlite(_G['schema'], inst, p) with no orig_path. With orig_path=None the function takes the 'fallback' branch and reconstructs the database from schema.ddl only, so the compact (original) rows are never copied. Execution feedback confirms this: 20/20 instances report 'compact_rows_missing', and 18/20 report 'no_rows_added' (the generated rows are mostly identical duplicates of existing PK values that get dropped, or are themselves not persisted correctly), yielding validity.valid = 0 / invalid = 20. cli also reads rows_added solely from _G.get('stats', {}) which is never populated by _one/_init, so rows_added/rows_skipped are always empty in the summary.",
+     "requested_revision": "Make cli._one pass the original database path through to writer.write_instance_sqlite (e.g. build, then call write_instance_sqlite(_G['schema'], inst, p, orig_path=_G['args']['orig'])), so the compact rows are preserved and generated rows are appended. Additionally, have _one return the writer's {'rows_ok','rows_failed'} dict (or store it in _G['stats']) so the CLI reports rows_added/rows_skipped truthfully. Rerun and confirm validity.valid>0, compact_rows_missing=0, and rows_added nonzero."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec requires 'Ensure at least two rows tie at rank 1 for ORDER BY checking.balance + savings.balance ASC'. But instance._plant_balance_values plants two copies of tie_check into CHECKING.balance and two copies of tie_save into SAVINGS.balance independently; CHECKING and SAVINGS are joined on custid, so the planted check-tie rows and savings-tie rows only produce a shared SUM if the same custid is a parent of both \u2014 the tie on the joined sum is not guaranteed. Similarly, the spec plants ties at MIN(checking.balance) and MIN(savings.balance) via two copies of tie value each, which does hold per column, but the joined-sum tie is not constructed. The comparison_boundary helper _plant_custid_boundary is a no-op, relying on compact rows 1..7; with generation that appends rows this boundary can be diluted and the spec does not enforce the pair in generated rows. Also table_sizes_per_instance = {ACCOUNTS: 7, SAVINGS: 6, CHECKING: 7} is small enough that after adding a 'fresh sequential PK after compact max' policy, appended rows cannot form the (a, a+1) FK pair that the spec requires for accounts.custid < checking.custid unless the compact pair (1,2) survives; execution shows separated=18 of 71 pairs, with 20/20 invalid instances, so the specification's construction targets are not effectively realized.",
+     "requested_revision": "Revise the specification (and corresponding instance.py construction) so that: (i) planted tie values are tied on the joined sum (e.g. tie_check + tie_save is enforced on at least two shared custid parents), and (ii) the one-step comparison boundary pair (accounts.custid, checking.custid) is guaranteed to exist in each generated instance by explicitly inserting an ACCOUNTS row with custid = k and a CHECKING row with custid = k+1 for some k (and equality pairs likewise), rather than relying on the compact rows. Specify how _plant_custid_boundary is to be implemented instead of leaving it as a no-op."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._plant_balance_values always returns exactly two copies of the tie value; instance._plant_name_values returns forced lists with fewer entries than n (n_accounts=7). In BalanceSampler/NameSampler forced values are popped only while r.random()<0.5 or <0.6, so the two tie values may not both be consumed in a single draw of size 7 (probability of consuming both is ~(0.5)^2 or (0.6)^2 and, importantly, depends on order because forced entries are only consumed probabilistically). Therefore the 'at least two rows tie at MIN/rank 1' guarantee is not actually guaranteed by construction. Additionally, _fresh_pk_values assigns sequential PKs starting at compact_max+1 for every table; with CHECKING.custid as FK to ACCOUNTS.custid, fill_foreign_keys_consistently draws check custid from accounts pks so this is fine, but the fresh-PK policy combined with appending rows means the constructed 'accounts.custid = checking.custid - 1' one-step relation in the spec is not maintained for appended rows.",
+     "requested_revision": "Make the planters deterministic: insert forced values by index (e.g. cols[c][0]=cols[c][1]=tie_value for CHECKING and SAVINGS of joined custids; cols[name][0..1] = 'Brown','brown'; etc.), guaranteeing the exact counts the specification requires, regardless of the sampler's random consumption. Replace the no-op custid boundary planter with an explicit construction of the required pairs in ACCOUNTS/CHECKING."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec requires 'Allow 20-50% duplicate share on DISTINCT queries; for ACCOUNTS.name include repeated surnames'. instance._plant_name_values computes n_dup = round(share * n) and appends n_dup surnames from a shuffled pool; share is uniform(0.20,0.50). This is consistent with the spec, but the program also has NameSampler applying case/prefix/suffix variants with p=0.5 on every non-forced draw, which can push duplicate share well above 50 % for the surname column (variants collapse surnames into near-duplicates). The spec's DUP_SHARE is not enforced on the resulting distinct query share because samplers add extra duplicates. Not a blocking bug on its own, but the designer should clarify whether 'duplicate share' is measured on the whole column values or only on exact duplicates.",
+     "requested_revision": "Either (a) restrict NameSampler mutation with low probability so total duplicate share stays in [0.20, 0.50], or (b) update the spec to note that variant generation is allowed and duplicate-share refers to exact duplicates; state which interpretation is intended so engineer and designer agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Extracted atomic operation 'rows_with_different_values' for SAVINGS.balance (pairs: 3) and CHECKING.balance (pairs: 1) requires '>= 2 per group with different values' \u2014 but there is no group key in the spec (tables are keyed by custid). Since each table has one balance per custid, the 'group' is implicitly the joined (custid) row from checking+savings; a given custid has only one savings.balance and one checking.balance, so 'at least 2 rows per group with different values' cannot be satisfied by a single balance column per custid. The spec should acknowledge that the relevant quantity for MIN/AVG is variation across custids, not within a group.",
+     "requested_revision": "Clarify in semantic_rules_and_formulas that '>= 2 per group with different values' for SAVINGS.balance/CHECKING.balance is realized as at least two distinct balance values across the table for any MIN/AVG to be non-degenerate, and drop the per-group wording for single-valued-per-key columns."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify program output first-hand because the writer path was invoked without orig_path \u2014 rerun after engineering fix is required to confirm compact rows preserved and rows_added > 0.",
+    "The exact duplicate share observed in ACCOUNTS.name under the current samplers (NameSampler adding variants) was not measured; requires a rerun to verify it stays in [0.20,0.50] per the spec.",
+    "The one-step comparison-boundary pair (accounts.custid, checking.custid) was not proven to be present per instance; construction_pairs shows separated=18/71, so further change orders may be needed after engine fix.",
+    "Reproducibility was reported as true (returncode 0, reproducible=true); not independently re-run here."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_custid_boundary` is a no-op (`return None`) and is never called. The spec's comparison_boundary rule for ACCOUNTS.custid/CHECKING.custid requires an explicit one-step pair (accounts.custid = k, checking.custid = k+1) plus an equality pair 'in generated rows, not relying on the compact rows'. The docstring even admits it relies on compact rows 1..7. Meanwhile `_fresh_pk_values` starts fresh PKs at compact_max+1, and `fill_foreign_keys_consistently` draws CHECKING.custid from ACCOUNTS PKs, so a generated (k, k+1) pair is not guaranteed. The construction_pairs feedback shows only 20/71 pairs separated, consistent with the boundary being inherited from compact data rather than planted.",
+     "requested_revision": "Implement `_plant_custid_boundary` (or equivalent) so that generated rows deterministically contain an ACCOUNTS row with custid = k and a CHECKING row with custid = k+1 for a fresh k, plus an equality pair, without depending on compact rows. Wire it into `build_random_instance` and verify with a targeted check that the one-step pair exists in generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit rule requires ties at rank 1 of ORDER BY checking.balance + savings.balance on at least two shared custid parents. instance.py plants `tie_check` in CHECKING.balance and `tie_save` in SAVINGS.balance by index, but CHECKING.custid and SAVINGS.custid are filled independently by `fill_foreign_keys_consistently` (random choice from parent PKs). There is no guarantee the two planted rows share the same custid, so the joined sum tie is not constructed. The spec explicitly says 'Plant tie values deterministically by index on at least two shared custid parents'.",
+     "requested_revision": "After FK assignment, force at least two shared custids to carry the planted tie_check/tie_save values (or assign the planted balance rows to matching custids), so that checking.balance + savings.balance ties at rank 1 for at least two joined rows. Add a verification step."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires ties at MIN(checking.balance) and MIN(savings.balance) ('also plant at least two rows tying at MIN(checking.balance) and at MIN(savings.balance)'). `_plant_balance_values` plants two copies of `tie_value`, but the BalanceSampler then perturbs values (`v += 1.0`, `v -= 1.0`, `v += 2.0`) and draws from bands that can produce values below `tie_value` (e.g. small band 0-1000 vs a medium tie). The planted value is not guaranteed to be the MIN, and the two planted rows may not remain equal after perturbation. The forced list is also never actually consumed: `_apply_forced_by_index` is defined but not called, and `BalanceSampler.sample` ignores `self.forced`.",
+     "requested_revision": "Actually write forced values into the first slots (call `_apply_forced_by_index` or equivalent) and ensure the planted tie value is the minimum of the column (e.g. plant 0.0 or clamp other draws above it), with at least two equal rows at MIN for both SAVINGS.balance and CHECKING.balance. Remove or fix the dead `_apply_forced_by_index`/`forced` plumbing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's duplicates_for_distinct rule requires exact-duplicate share of ACCOUNTS.name in [0.20, 0.50]. `_plant_name_values` computes `n_dup` from the share but the result is never applied: `_apply_forced_by_index` is not called, and `NameSampler.sample` ignores `self.forced`, drawing from `spec.SURNAMES` (a large pool) with 15% mutation. With table size 7, the actual exact-duplicate share is essentially uncontrolled and unlikely to land in [0.20, 0.50]. The spec's own note ('the sampler mutates with low probability so the exact-duplicate share stays in that band') is not enforced.",
+     "requested_revision": "Apply the forced name values (including the computed duplicate share) to the generated ACCOUNTS.name column, and verify the exact-duplicate share of the whole column falls in [0.20, 0.50] per instance. Also ensure 'Brown'/'brown' and the LIKE variants ('ee','ef','ee x','EE') are actually present in generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_name_values` and `_plant_balance_values` build forced lists, but `build_random_instance` passes them to `_init_sampler(..., forced=...)`; the samplers store `self.forced` but never use it, and `_apply_forced_by_index` is never invoked. Consequently none of the 'planted by index' guarantees described in the module docstring ('All planted values are written by index (deterministic), so the exact counts the specification requires are guaranteed') hold. This is the root cause of the boundary/tie/duplicate issues above.",
+     "requested_revision": "Either implement forced-value application (write forced values into the first slots of each column before/after sampling, and skip perturbation for forced slots) or remove the misleading forced plumbing and implement the guarantees directly. Add assertions/checks that each planted pattern is present in the generated instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's rows_with_different_values rule for SAVINGS.balance/CHECKING.balance is worded as '>= 2 per group with different values', but each custid has a single balance per table (PK on custid), so per-group variation is impossible. spec.py acknowledges this reinterpretation ('variation across custids, not within a group'). The rule as written is not satisfiable as stated.",
+     "requested_revision": "Reword the rule to 'at least two distinct balance values across the table' to match the schema, so the engineer's implementation target is unambiguous."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's comparison_boundary rule for ACCOUNTS.custid/CHECKING.custid says 'do not rely on compact rows', but the compact data already contains custid 1..7 in both tables, so the one-step pair (1,2) and equality pairs exist in compact rows. The construction_pairs feedback (20/71 separated) cannot distinguish planted from inherited boundaries. The spec should state whether compact-row satisfaction counts.",
+     "requested_revision": "Clarify whether the boundary must be present in generated rows specifically, or whether compact rows suffice. If generated rows are required, keep the current wording and the engineer must implement it; if not, relax the wording to avoid an unsatisfiable-by-construction requirement."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the exact-duplicate share of ACCOUNTS.name in generated instances actually falls in [0.20, 0.50] (not measured in feedback; code suggests it does not).",
+    "Whether the joined-sum tie at rank 1 and the MIN ties are actually present in generated instances (not measured; code suggests they are not guaranteed).",
+    "Whether the one-step custid boundary exists in generated rows (not measured; code suggests it is inherited from compact rows).",
+    "The construction_pairs_by_group list is empty, so per-pattern separation could not be inspected."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added CHECKING=41, rows_skipped CHECKING=55 across 20 instances (\u22482.75 skipped per instance out of ~7). The spec requires CHECKING size 7 per instance and the one-step boundary pair (accounts.custid=k, checking.custid=k+1) plus equality pair (k+2) to be present in generated rows. _plant_custid_boundary rewrites the first CHECKING custids to k+1, k+2, but these are FK values that must exist in ACCOUNTS. The ACCOUNTS table only has 7 rows (compact 7 + jitter), and _fresh_pk_values starts at compact_max+1; the planted k, k+1, k+2 are written into ACCOUNTS slots 0..2, but the CHECKING rows are then subject to sample_fresh_primary_keys/drop_unique_duplicates and, more importantly, the writer inserts CHECKING rows whose custid may not exist in ACCOUNTS (FK is OFF during insert, but the integrity check reports 0 FK violations only because the planted values happen to align). The 55 skipped CHECKING rows indicate PK/unique collisions on custid (CHECKING.custid is PK) \u2014 the FK fill draws with replacement from a 7-value parent pool, so many duplicates are dropped. This means the planted boundary pair and the joined-sum tie (which needs \u22652 shared custids) are not reliably present in the surviving rows.",
+     "requested_revision": "Make CHECKING/Savings FK assignment produce distinct custids (sample without replacement from the parent pool, or dedupe before planting), and apply _plant_custid_boundary / _plant_joined_sum_tie AFTER deduplication so the planted boundary pair and tie rows are guaranteed to survive. Verify per-instance that checking.custid=k+1 and accounts.custid=k both exist and that \u22652 shared custids carry the tie values; report a per-instance assertion failure instead of silently skipping rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_name_values` builds `forced` = NAME_BOUNDARY (2) + LIKE_VARIANTS (4) + n_dup duplicates, where n_dup = round(share*n) with share\u2208[0.20,0.50]. For n=7 (ACCOUNTS size), n_dup \u2208 {1,2,3}. The forced list length is 6+n_dup \u2265 7, so `_apply_forced_by_index` overwrites the first 7 slots entirely with forced values \u2014 the surname pool duplicates are appended after the boundary/LIKE values, but since forced length \u2265 n, the LIKE variants and boundary occupy slots 0-5 and only slot 6 gets a duplicate. The exact-duplicate share of the whole column is then at most 1/7 \u2248 0.14, below the required [0.20, 0.50]. Additionally, 'Brown' and 'brown' are near-variants (distinct), and 'ee'/'ef'/'ee x'/'EE' are all distinct, so the only exact duplicates come from the surname pool, which is truncated.",
+     "requested_revision": "Compute the duplicate count against the full column size n (not against the forced prefix), and ensure the number of exact-duplicate values in the final ACCOUNTS.name column is in [0.20, 0.50] of n. For n=7 this means 2-3 exact duplicates; reserve slots for boundary/LIKE variants and fill the remainder with repeated surnames so the exact-duplicate share is verified post-application."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `TABLE_SIZES = {'ACCOUNTS': 7, 'SAVINGS': 6, 'CHECKING': 7}` but `choose_table_sizes` applies `jitter = rng.randrange(-2, 3)` giving sizes in [5,9] for ACCOUNTS/CHECKING and [4,8] for SAVINGS. The specification's `table_sizes_per_instance` is a fixed target; the jitter is not authorized by the spec. With ACCOUNTS as small as 5, the forced name list (6+ values) exceeds the column length, and the boundary/tie planting (which needs \u22653 ACCOUNTS rows and \u22652 shared custids) may not fit.",
+     "requested_revision": "Remove the jitter or document it as an explicit spec deviation; if jitter is kept, guarantee the minimum sizes needed for the planted patterns (\u22653 ACCOUNTS rows for k,k+1,k+2; \u22652 shared custids for the tie; enough name slots for boundary+LIKE+duplicates)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `ties_for_order_limit` rule requires ties at rank 1 of `checking.balance + savings.balance` AND at MIN(checking.balance) and MIN(savings.balance). The program plants tie_check=tie_save=0.0 on shared custids, but `_plant_balance_values` writes 0.0 into the first two balance slots of each table independently, and `_plant_joined_sum_tie` then overwrites balances for the first two shared custids. If the first two shared custids are not the same rows that received the 0.0 forced values, the MIN tie and the joined-sum tie may be on different rows. The spec does not state whether the MIN tie and the joined-sum tie must coincide; the program assumes they do.",
+     "requested_revision": "Clarify in the spec whether the MIN ties and the joined-sum rank-1 tie must be on the same rows, and whether the tie value must be the column minimum. If so, the program must plant the tie value on the shared custids that also carry the MIN, and verify both conditions per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_custid_boundary` sets `k = acc[0]` (the first generated ACCOUNTS custid) and writes k, k+1, k+2 into ACCOUNTS slots 0-2 and k+1, k+2 into CHECKING slots 0-1. But `_fresh_pk_values` already assigned sequential PKs starting at compact_max+1, so acc[0] is already compact_max+1; the rewrite is redundant for ACCOUNTS but the CHECKING rewrite may collide with existing CHECKING PKs (since CHECKING.custid is PK and FK fill drew with replacement). The 55 skipped CHECKING rows confirm collisions. The spec requires the one-step pair to be verified present in generated rows; the program does not verify it.",
+     "requested_revision": "After all planting and deduplication, assert per instance that there exists an ACCOUNTS row with custid=k and a CHECKING row with custid=k+1 (one-step) and an equality pair; if the assertion fails, raise rather than silently producing an instance that violates the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `unmatched_join_rows` rule requires parent rows without children (ACCOUNTS rows with no SAVINGS and/or no CHECKING child). The program's `fill_foreign_keys_consistently` draws FK values with replacement from the parent pool, which tends to cover most parents; with ACCOUNTS=7 and SAVINGS=6/CHECKING=7, it is not guaranteed that some ACCOUNTS rows have no child. The spec does not quantify how many unmatched parents are required, and the program does not verify the pattern.",
+     "requested_revision": "Specify a minimum number of ACCOUNTS rows without SAVINGS children and without CHECKING children (e.g., at least one each), and have the program plant and verify these unmatched parents explicitly."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance verification that the one-step custid boundary pair and equality pair survive deduplication was not performed; the 55 skipped CHECKING rows suggest they may not.",
+    "Exact-duplicate share of ACCOUNTS.name in [0.20, 0.50] was not verified post-application; the forced-prefix logic likely yields <0.20 for n=7.",
+    "Whether the MIN ties and the joined-sum rank-1 tie are required to coincide is ambiguous in the spec.",
+    "The number of unmatched parent rows (ACCOUNTS without SAVINGS/CHECKING children) is not quantified or verified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with AssertionError('name exact-duplicate share 0.000 outside [0.20, 0.50]'); n_ok=0, n_fail=20, rows_added={}. The failure originates in _verify() in instance.py, which computes the exact-duplicate share over the full ACCOUNTS.name column and requires it in [0.20,0.50]. The forced name values are applied by _apply_forced_by_index() into the first slots of the generated column, but the generated ACCOUNTS table has only 7 rows and the forced prefix from _plant_name_values() is 'Brown','brown','ee','ef','ee x','EE' plus n_dup repeats. With n=7, lo=ceil(0.20*7)=2, hi=floor(0.50*7)=3, n_reserved=min(6,7)=6, so n_dup=min(n_dup, max(0, 7-6))=min(2..3,1)=1. Only one duplicate is planted, giving n_dup=1 and share=1/7\u22480.143, below 0.20. The verification therefore always fails. The spec's own note ('for n=7 this means 2-3 exact duplicates') is inconsistent with reserving 6 slots for boundary/LIKE variants in a 7-row column: 6 distinct forced values + 2-3 duplicates cannot fit in 7 rows. The program cannot satisfy both the boundary/LIKE reservation and the duplicate share at n=7.",
+     "requested_revision": "Reconcile the duplicate-share rule with the boundary/LIKE reservation for n=7. Either (a) reduce the reserved distinct forced values (e.g. drop some LIKE variants or boundary values from the forced prefix and rely on the sampler to produce them, or allow the boundary/LIKE values to also serve as duplicate bases), or (b) increase ACCOUNTS size so that 6 distinct forced values plus 2-3 duplicates fit (n>=9), or (c) change the duplicate-share computation to count duplicates among the non-reserved slots. The chosen fix must make _verify() pass for every instance and must keep the boundary ('Brown'/'brown'), LIKE variants ('ee','ef','ee x','EE'), and exact-duplicate share in [0.20,0.50] simultaneously. Update spec.py and instance.py consistently."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_custid_boundary() rewrites the first generated ACCOUNTS custids to k, k+1, k+2 and the first CHECKING custids to k+1, k+2. But _plant_unmatched_parents() then reserves acc_ids[-1] as a SAVINGS-orphan and acc_ids[-2] as a CHECKING-orphan and removes those custids from the child tables. With ACCOUNTS size 7 and CHECKING size 7, the CHECKING table has 7 rows; after _plant_custid_boundary the first two CHECKING custids are k+1 and k+2, and the remaining 5 are drawn from the parent pool. _plant_unmatched_parents removes the CHECKING row with custid = acc_ids[-2] = k+1 (the second-to-last ACCOUNTS custid is k+1 since acc_ids = [k,k+1,k+2,...]). This deletes the planted one-step boundary pair (accounts.custid=k, checking.custid=k+1) that _verify() requires. The verification 'one-step boundary pair missing' would then fire. The execution feedback shows the name-share assertion fires first, masking this, but the ordering of _plant_custid_boundary, _plant_joined_sum_tie, and _plant_unmatched_parents is fragile: _plant_unmatched_parents can delete rows that _plant_custid_boundary and _plant_joined_sum_tie planted.",
+     "requested_revision": "Make the planting order and orphan selection mutually consistent. Either plant unmatched parents before the custid boundary and joined-sum tie (and choose orphan custids that are not used by the boundary/tie planting), or have _plant_unmatched_parents skip custids that are part of the planted boundary/tie patterns. Add a verification that the boundary pair and the joined-sum tie survive after _plant_unmatched_parents. Also verify that the CHECKING orphan removal does not remove the equality pair (k+2) or the one-step pair (k+1)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_joined_sum_tie() picks the first two shared custids and sets their CHECKING and SAVINGS balances to spec.TIE_VALUE=0.0. But _plant_unmatched_parents() removes the SAVINGS row with custid = acc_ids[-1] and the CHECKING row with custid = acc_ids[-2]. If either of the first two shared custids equals acc_ids[-1] or acc_ids[-2], the tie row is deleted. With ACCOUNTS size 7 and SAVINGS size 6, the shared custids are the intersection of CHECKING and SAVINGS custids; the first two shared custids are likely k+1 and k+2 (the planted boundary values), and acc_ids[-2]=k+1 is removed from CHECKING, so the joined-sum tie on k+1 is destroyed. _verify() would then raise 'joined-sum rank-1 tie missing' or 'MIN tie and joined-sum tie do not coincide'. The execution feedback does not reach this assertion because the name-share assertion fires first, but the ordering is still incorrect.",
+     "requested_revision": "Apply _plant_unmatched_parents before _plant_joined_sum_tie, or choose the tie custids from the shared custids that survive the orphan removal. Verify that at least two shared custids with the planted tie values remain after all planting steps. Update the verification to check the tie after orphan removal."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for duplicates_for_distinct says 'for n=7 this means 2-3 exact duplicates; reserve slots for boundary/LIKE variants and fill the remainder with repeated surnames'. But the boundary/LIKE variants are 6 distinct values ('Brown','brown','ee','ef','ee x','EE'), leaving only 1 slot for duplicates in a 7-row column. The specification is internally inconsistent: it cannot simultaneously reserve 6 distinct slots and plant 2-3 exact duplicates in 7 rows. The program's _plant_name_values() resolves this by clamping n_dup to 1, which then fails the [0.20,0.50] share check. The specification also says 'near-variant mutations count as distinct values, not exact duplicates', which is consistent with the program, but the arithmetic does not work at n=7.",
+     "requested_revision": "Revise the specification to make the duplicate-share rule feasible at the chosen table size. Options: (a) increase ACCOUNTS size to at least 9 so 6 distinct forced values plus 2-3 duplicates fit; (b) reduce the number of distinct forced name values (e.g. use only 'Brown','brown','ee','EE' and let the sampler produce 'ef','ee x'); (c) allow some boundary/LIKE values to be duplicated (e.g. 'Brown' appears twice) so the duplicate share is met while the boundary/LIKE values are still present. The revised specification must state the exact forced prefix and the exact duplicate count for the chosen n, and the program must implement it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows n_ok=0, n_fail=20, rows_added={}, rows_skipped={}. No instance was written, so the integrity constraints (FK, NOT NULL, PK), preservation of compact rows, and dependent-value consistency were never exercised. The writer's fallback (row-by-row insert on batch failure) and the FK-off pragma mean that FK violations would be silently skipped and counted in rows_failed, but no such counts appear because no instance was built. The program's _verify() raises before writing, so the writer's integrity behavior is untested.",
+     "requested_revision": "After fixing the name-share and planting-order issues, re-run the construction and confirm that n_ok>0, rows_added matches the expected table sizes (ACCOUNTS 7, SAVINGS 6, CHECKING 7), rows_skipped is empty, and the written instances preserve the compact rows (the writer copies orig_path and appends). Also confirm that the FK constraints hold in the written instances (foreign_keys=OFF during insert means the program must rely on _verify() and the FK-consistent fill; add a post-write check that every child custid exists in ACCOUNTS)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py fill_foreign_keys_consistently() samples FK values from the parent pool without replacement, but if the parent pool is smaller than n it cycles the pool, producing duplicate FK values. The child PK is the same column (custid is both PK and FK in SAVINGS and CHECKING), so duplicate FK values would violate the child PK. sample_fresh_primary_keys() then drops rows with repeated PK tuples, reducing the child table size below the specified size. With ACCOUNTS size 7 and SAVINGS size 6, the parent pool has 7 values, so no cycling occurs for SAVINGS (6<=7) or CHECKING (7<=7). However, after _plant_custid_boundary() rewrites the first ACCOUNTS custids to k,k+1,k+2 and the first CHECKING custids to k+1,k+2, the CHECKING table may have duplicate custids if the remaining sampled values include k+1 or k+2. sample_fresh_primary_keys() is called before _plant_custid_boundary(), so the boundary planting can introduce duplicates that are not deduplicated. This would violate the CHECKING PK and cause the writer to skip rows (rows_failed>0) or the FK to fail.",
+     "requested_revision": "Apply _plant_custid_boundary() before sample_fresh_primary_keys() and drop_unique_duplicates(), or re-run deduplication after the boundary planting. Ensure that the planted boundary values (k, k+1, k+2) do not collide with the remaining sampled custids. Add a verification that CHECKING.custid and SAVINGS.custid are unique after all planting steps, and that every child custid exists in ACCOUNTS."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's comparison_boundary rule for ACCOUNTS.custid/CHECKING.custid says 'deterministically insert an ACCOUNTS row with custid = k and a CHECKING row with custid = k+1 for a fresh k = compact_max+1, plus an equality pair accounts.custid = checking.custid = k+2'. But CHECKING.custid is an FK to ACCOUNTS, so the CHECKING row with custid=k+1 requires an ACCOUNTS row with custid=k+1. The specification does not explicitly state that the ACCOUNTS table must also contain k+1 and k+2, though the program's _plant_custid_boundary() does add them. The specification should state this dependency explicitly to avoid ambiguity.",
+     "requested_revision": "Clarify in the specification that the ACCOUNTS table must contain custid values k, k+1, and k+2 (not just k), so that the CHECKING FK rows with custid=k+1 and k+2 are valid. Also state that the equality pair requires both ACCOUNTS and CHECKING to contain k+2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows pool_values=33 and pool_sqls=268, but the literal pool is not used to seed the name or balance samplers in a way that guarantees the boundary/LIKE values. The forced values are applied by index, which is correct, but the sampler's NameSampler draws from spec.SURNAMES and applies mutations with probability 0.15, which can produce exact duplicates that are not controlled. The _verify() duplicate-share check is the only guard, and it fails. The program does not verify that the forced name values are actually present after _apply_forced_by_index() if the column length is shorter than the forced list (the function silently skips indices beyond len(cols)). With n=7 and forced list length 7 (6 distinct + 1 duplicate), all forced values fit, but if the duplicate count were 2 or 3, the forced list would be longer than 7 and the extra duplicates would be dropped, further reducing the share.",
+     "requested_revision": "Make _apply_forced_by_index() raise an error if the forced list is longer than the column, rather than silently truncating. Ensure that the forced list length is exactly n (or that the duplicate count is chosen so that the forced list fits). Add a verification that the forced values are present in the final column."
+    }
+   ],
+   "unresolved_checks": [
+    "The execution feedback does not show whether the writer's FK-off insert and row-by-row fallback preserve compact rows and enforce FK consistency, because no instance was written (n_ok=0).",
+    "The execution feedback does not show whether the joined-sum tie and MIN tie survive after _plant_unmatched_parents(), because the name-share assertion fires first.",
+    "The execution feedback does not show whether the CHECKING PK remains unique after _plant_custid_boundary(), because no instance was written.",
+    "The specification's NULL rule is vacuous (all columns NOT NULL), so no NULL checks are needed; this is consistent with the program.",
+    "The semantic rules (balance >= 0, custid > 0) are supported by the compact values and implemented by BalanceSampler (max(0.0, v)) and _fresh_pk_values (start >= 1); no issue found.",
+    "The table sizes (ACCOUNTS 7, SAVINGS 6, CHECKING 7) are fixed and consistent with the specification; no jitter is applied."
+   ]
+  }
+ ]
 }

@@ -1,49 +1,526 @@
 {
  "db": "insurance_fnol",
- "operator_io_quirks": [
-  "Mixed-case table/column names (Customers, Customer_ID, First_Notification_of_Loss, Available_Policies) \u2014 must double-quote and preserve original spelling; case-insensitive lookup.",
-  "Composite PK on Customers_Policies (Customer_ID, Policy_ID) \u2014 sample_fresh_primary_keys must dedupe on the tuple, not single column.",
-  "Composite FK: First_Notification_of_Loss (Customer_ID, Policy_ID) -> Customers_Policies (Customer_ID, Policy_ID); pragma foreign_key_list reports two rows (id shared) \u2014 must be treated as one composite edge for consistency, not two independent draws.",
-  "Self-consistent FK chain: FNOL.Customer_ID/Policy_ID must come from the SAME Customers_Policies row; upstream draws each column independently from the parent column, so it will produce pairs that don't exist in the parent \u2014 insert succeeds (FKs off) but joins yield 0 rows.",
-  "DATE columns stored as TEXT 'YYYY-MM-DD' (Date_Opened, Date_Closed, Effective_Date) \u2014 declared DATE dispatches to Date fuzzer; first element parses as int? no, so Date (not Number).",
-  "Effective_Date in Claims has values 1973-1992 while Settlements.Effective_Date is 1971-2009 and Customers_Policies dates are 2016-2018 \u2014 no cross-column date ordering constraint, but business ordering (opened<closed, claim<settlement) is violated by TS.",
-  "Settlements.Claim_ID is nullable (notnull=0) but FK to Claims; TS may emit NULLs there \u2014 fine for insert, breaks joins.",
-  "REAL Settlement_Amount: Number fuzzer with scale from 'real' (no args) -> scale 0, so ints in [-1,1] perturbed by \u00b11/\u00b12 \u2014 implausible amounts (0,1,2,-1) vs original 1500-9800.",
-  "CHAR(15) policy_type_code: String fuzzer length=15, but original values are 17-19 chars ('Life Insurance') \u2014 length range from elements [min,max+1] will be ~17-20, ok, but fresh strings capped at 15.",
-  "VARCHAR(255) Customer_Phone: String fuzzer length=255 -> fresh strings up to 255 chars, wildly unlike phone formats; contamination adds random chars.",
-  "Tiny tables (4-15 rows): choose_table_sizes level-0 = 1+30*u gives 1-31 rows; Services (4 rows) may get 1 row, making Service_ID FK draws degenerate.",
-  "UNIQUE (Policy_ID) etc. declared inline on single-column PKs \u2014 redundant; drop_unique_duplicates will re-dedupe PK columns harmlessly."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on Date_Opened/Date_Closed/Effective_Date: template inferred from first parsable element = '%Y-%m-%d'; range = [min,max] of 5 sampled originals (e.g. 2016-2018 for Customers_Policies, 1971-2009 for Settlements) \u2014 fresh dates stay in that narrow window, so cross-table date comparisons (claim date vs settlement date) rarely match.",
-  "Number fuzzer on all *_ID columns: scale 0, range [-1,1] for fresh draws, but list range [min(el), 1] (upstream quirk: list_max overwritten to full max) \u2014 so fresh IDs cluster near 0/\u00b11, not near original 100-4000 values; joins on IDs still work because FK columns copy parent values.",
-  "String fuzzer on Customer_name: fresh strings from charset a-zA-Z 0-9() length 0-40, contaminated 50% \u2014 names like 'aB3(x' vs 'America Jaskolski'; LIKE '%Jaskolski%' queries get 0 rows.",
-  "String fuzzer on Customer_Phone: fresh strings up to 255 chars, no phone structure \u2014 LIKE '%-%' or regex-ish patterns miss.",
-  "String fuzzer on policy_type_code: elements are 4 distinct values, p=0.2 fresh -> mostly reuses 'Life Insurance' etc.; ENUM-like queries (WHERE policy_type_code='Life Insurance') still hit, but COUNT DISTINCT may be 4-5.",
-  "Composite FK FNOL(Customer_ID,Policy_ID): upstream fills each column independently from Customers_Policies.Customer_ID and .Policy_ID \u2014 pairs (214,257) may not exist as a row; join FNOL-Customers_Policies returns fewer rows than FNOL count.",
-  "Settlements.Claim_ID nullable: Number sampler may emit NULL only if elements include None (they don't, null_rate 0) \u2014 so no NULLs; but fresh draws near 0 won't match Claims.Claim_ID (100-4000) -> join yields 0 rows often.",
-  "Settlement_Amount: Number scale 0 -> values in {-2,-1,0,1,2} mostly; SUM/AVG queries return tiny numbers vs original thousands \u2014 plausible-value FNs.",
-  "Tiny Services table (4 rows) with level-0 size 1-31: if size=1, Service_ID FK draws all the same value; DISTINCT Service_ID queries return 1.",
-  "PK dedup: sample_fresh_primary_keys drops duplicate PK tuples \u2014 with Number fresh draws clustered near 0, many collisions -> tables shrink below requested size, sometimes to 1-2 rows.",
-  "No NOT NULL enforcement in Python: Customer_ID NOT NULL but Number sampler never emits None (no None elements), so ok; but if a parent is empty, FK fill gives NULLs -> insert fails on NOT NULL, rows skipped."
- ],
- "challenger_refs": [
-  "G1",
-  "g5d647823",
-  "G3",
-  "gc4d042c5",
-  "G5",
-  "G6",
-  "G7",
-  "G8",
-  "G4",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table, never NULL; PK values stay unique across compact and generated rows.",
+   "integer_fk": "Sample from the parent PK pool; for composite FKs sample the whole tuple from the parent's existing key tuples; leave at least one parent row with no children; only nullable FKs receive NULLs; NOT NULL FKs never get NULL.",
+   "varchar_name": "Random first+last name from a fixed name pool; include near-duplicate variants (case change, appended suffix, one-character substitution) and duplicates on DISTINCT columns.",
+   "varchar_phone": "Random phone format from a fixed pool of formats; allow duplicates; plant NULLs only in columns declared nullable.",
+   "char_code": "Sample from the table's enum pool; include case variants for equality literals.",
+   "date": "Random date in 2015-01-01..2019-12-31 formatted %Y-%m-%d; allow duplicates on DISTINCT date columns; when a row-level start/end pair exists, the end date is later than the start.",
+   "real_amount": "Uniform random in [0.01, 10000.0], two decimals.",
+   "boundary": "For each listed literal, include the literal and one step on each side (numbers by step 1, dates by 1 day, strings by case/suffix change).",
+   "near_variant": "For each listed LIKE/equality literal, deterministically plant the literal plus every listed case, suffix and one-character variant (at least one row each) before random filling.",
+   "tie": "Ensure at least two groups share the top value of the ORDER aggregate (COUNT(*) or COUNT(DISTINCT child.col)) at the listed rank.",
+   "group_sizes": "Distribute child rows so that some parents have 1 child, some 2, and some >= 3 children.",
+   "aggregate_boundary": "Plant groups whose COUNT crosses each listed boundary value (e.g. 3, 4, 5) so HAVING COUNT > k is true for some groups and false for others.",
+   "null_share": "For nullable columns, replace 5-30% of sampled values with NULL (at least one per column); never replace a NULL to satisfy a rule.",
+   "fresh_share": "Use at least 20% fresh values not drawn from the compact sample for free-sampled columns.",
+   "fk_validation": "Re-enable FK enforcement in the writer (or run an explicit post-generation FK check) and fail loudly on any violation; never silently commit FK violations."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Customers.Customer_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.Customer_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.Customer_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT customers_policies.policy_id)"
+     ]
+    }
+   },
+   {
+    "column": "Customers.Customer_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Diana%",
+      "%sian%"
+     ],
+     "variants": [
+      "Diana",
+      "Dianb",
+      "Diana x",
+      "diana",
+      "sian",
+      "siao",
+      "sian x",
+      "SIAN"
+     ]
+    }
+   },
+   {
+    "column": "Customers.Customer_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    },
+    "note": "group sizes refer to join counts with Customers_Policies, not to duplicate Customer_ID values"
+   },
+   {
+    "column": "Customers.Customer_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT customers_policies.policy_id)"
+     ]
+    }
+   },
+   {
+    "column": "Customers_Policies.Customer_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    },
+    "note": "Customers.Customer_ID is a PK and cannot duplicate; the DISTINCT target applies to the child FK column"
+   },
+   {
+    "column": "First_Notification_of_Loss.Service_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "First_Notification_of_Loss.Service_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(first_notification_of_loss.service_id)",
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "First_Notification_of_Loss.Service_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Services.Service_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Services.Service_name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Services.Service_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Available_Policies.Customer_Phone",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Available_Policies.Customer_Phone",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "Available_Policies.policy_type_code",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      3,
+      4,
+      5
+     ]
+    }
+   },
+   {
+    "column": "Available_Policies.policy_type_code",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Life Insurance",
+      "life insurance"
+     ]
+    }
+   },
+   {
+    "column": "Customers_Policies.Policy_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Available_Policies.Policy_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT available_policies.policy_id)"
+     ],
+     "values": [
+      3,
+      4,
+      5
+     ]
+    }
+   },
+   {
+    "column": "Customers_Policies.Date_Closed",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers_Policies.Date_Opened",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customers_Policies.Customer_ID",
+    "parent_table": "Customers",
+    "parent_column": "Customer_ID",
+    "copied": []
+   },
+   {
+    "child": "Customers_Policies.Policy_ID",
+    "parent_table": "Available_Policies",
+    "parent_column": "Policy_ID",
+    "copied": []
+   },
+   {
+    "child": "First_Notification_of_Loss.Customer_ID",
+    "parent_table": "Customers",
+    "parent_column": "Customer_ID",
+    "copied": [],
+    "note": "composite FK (Customer_ID, Policy_ID) must be sampled as a pair from existing Customers_Policies tuples"
+   },
+   {
+    "child": "First_Notification_of_Loss.Policy_ID",
+    "parent_table": "Available_Policies",
+    "parent_column": "Policy_ID",
+    "copied": [],
+    "note": "composite FK (Customer_ID, Policy_ID) must be sampled as a pair from existing Customers_Policies tuples"
+   },
+   {
+    "child": "First_Notification_of_Loss.Service_ID",
+    "parent_table": "Services",
+    "parent_column": "Service_ID",
+    "copied": []
+   },
+   {
+    "child": "Claims.FNOL_ID",
+    "parent_table": "First_Notification_of_Loss",
+    "parent_column": "FNOL_ID",
+    "copied": []
+   },
+   {
+    "child": "Settlements.Claim_ID",
+    "parent_table": "Claims",
+    "parent_column": "Claim_ID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Available_Policies",
+    "column": "policy_type_code",
+    "formula": "policy_type_code IN ('Life Insurance','Property Insurance','Mortgage Insurance','Travel Insurance')"
+   },
+   {
+    "table": "Customers_Policies",
+    "column": "Date_Closed",
+    "formula": "Date_Closed >= Date_Opened",
+    "evidence": "All sample rows have Date_Closed > Date_Opened (e.g. 2016-11-19 -> 2018-03-04)."
+   },
+   {
+    "table": "Settlements",
+    "column": "Settlement_Amount",
+    "formula": "Settlement_Amount >= 0",
+    "evidence": "All shown amounts positive (6451.65, 1588.45, ...)."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 15,
+   "Services": 4,
+   "Available_Policies": 15,
+   "Customers_Policies": 14,
+   "First_Notification_of_Loss": 7,
+   "Claims": 10,
+   "Settlements": 10
+  },
+  "null_targets": [
+   "Available_Policies.Customer_Phone",
+   "Settlements.Claim_ID"
+  ],
+  "supporting_evidence": {
+   "Available_Policies.policy_type_code": "Rows 246,257,300,301 show the four enum values.",
+   "Customers_Policies.Date_Closed": "All shown rows have Date_Closed > Date_Opened (e.g. 2016-11-19 -> 2018-03-04).",
+   "Settlements.Settlement_Amount": "All shown amounts positive (6451.65, 1588.45, ...)."
+  },
+  "uncertainty": "Claims.Effective_Date and Settlements.Effective_Date are nullable DATE columns; the IS NOT NULL rules from the previous spec were removed so the interface NULL rule applies. No formula links Settlement_Amount to other columns, so no such formula is stated. Group-size, tie, aggregate-boundary and LIKE targets are joint-satisfiable only if the generation order plants them before dedup; the program must verify after sampling. Settlement_Amount >= 0 is stated as >= 0 (a price-like amount) even though the sample happens to be positive. Composite FK (First_Notification_of_Loss.Customer_ID, Policy_ID) must be sampled as a pair from existing Customers_Policies tuples; Customers_Policies composite PK must be generated from unused parent cross-product pairs to achieve the requested row count."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'int' object is not iterable\") (n_ok=0, n_fail=20, n_instances=0). In tscore_gen/instance.py, build_spec_instance does `for t, tm in schema.tables.items():` and later `for t in order: tm = schema.tables[t]`, but schema.tables is a dict keyed by table name, so `tm` is a TableMeta (fine) \u2014 however the FK branch does `parent_pool = [v for v in all_pk_values.get((pt, pc), []) ...]` and `all_pk_values[(t, pk)] = list(vals)` where `vals` comes from `schema.original_values.get((t, pk), [])`; more directly, `generated_ids[key] = vals` then `start = max([max_existing] + (max_gen or [0])) + 1` \u2014 when `max_gen` is a list of ints this is fine, but the crash is a TypeError on an int being iterated. The most likely culprit is `_distinct_pool` being called with `base_pool` that is an int (e.g. `ncols['Customer_name']` after the phone/name branch) or `_group_targets`/`_tie_extend` returning ints where a list is expected. Regardless of the exact line, the program does not run: zero instances were produced.",
+     "requested_revision": "Fix the TypeError so that build_spec_instance completes for every unit. Add a unit test that runs build_spec_instance on the compact schema and asserts non-empty rows for every table with a declared size. Re-run generation and confirm n_ok == n_instances and n_fail == 0 before resubmitting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py: `write_spec_instance(schema, rows, path, orig_path=None)` copies the compact DB only `if orig_path and os.path.exists(orig_path)`. But tscore_gen/cli.py calls `write_spec_instance(_G['schema'], rows, p)` without passing orig_path, so the compact rows are never copied \u2014 the generated unit would contain only the appended rows, violating 'preservation of compact rows'. Also `_one` never passes `a['orig']`.",
+     "requested_revision": "Pass the original DB path through to write_spec_instance (e.g. store it in args and call write_spec_instance(schema, rows, p, orig_path=a['orig'])), and assert after writing that every compact table's row count is >= the original count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the FK branch sets `has_null = None in observed or True` (always True) and unconditionally plants NULLs in every FK column, including non-nullable FKs such as Customers_Policies.Customer_ID/Policy_ID, First_Notification_of_Loss.Customer_ID/Policy_ID/Service_ID, Claims.FNOL_ID. The spec's null_targets are only Available_Policies.Customer_Phone and Settlements.Claim_ID; the interface rule says NOT NULL / PK columns never get NULL. Planting NULL in a NOT NULL FK will either be rejected by the writer (row skipped) or corrupt referential integrity.",
+     "requested_revision": "Only plant NULLs in columns that are actually nullable (cm.notnull == False) and in the spec's null_targets. For NOT NULL FK columns, sample only from the parent PK pool. Also ensure at least one parent row with no children is achievable (the spec's integer_fk rule) \u2014 currently the FK sampler picks from the full parent pool with no guarantee of an unused parent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the group_sizes, ties_for_order_limit, aggregate_boundary and comparison_boundary patterns are essentially not implemented. The Customers.Customer_name block contains `if any(...group_sizes...): pass` (a no-op). `_group_targets` and `_tie_extend` are defined but never called. `agg_values` from build_plan is never read. `cmp_values` is only applied to real columns (`if col_plan.get('cmp_values'): vals[0] = ...`), so Available_Policies.policy_type_code comparison_boundary ('Life Insurance'/'life insurance') is not honoured \u2014 the enum branch overrides it. The spec requires group sizes 1, 2 and >=3 for Customers.Customer_name, Customers.Customer_ID, FNOL.Service_ID, Services.Service_name; ties at rank 1 for the listed ORDER columns; and aggregate boundary values 1/2/3 and 3/4/5.",
+     "requested_revision": "Implement the group_sizes, ties_for_order_limit, aggregate_boundary and comparison_boundary patterns in build_spec_instance (or a dedicated post-processing step) so that each instance actually contains the required group-size mix, tie at rank 1, and boundary aggregate counts. Wire `agg_values` and `cmp_values` into the relevant columns (including char_code columns)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the semantic rule for Customers_Policies.Date_Closed >= Date_Opened is applied via `_ge_rules`, but the code path only runs `if col not in ncols: continue` and then `if r['kind'] == 'ge_cols' and r.get('ref') in ncols`. Date_Closed is generated in the `typ == 'date'` branch, which is fine, but the rule is applied before dedup and the dedup step can drop rows; more importantly, the `_ge_rules` loop is inside the per-table loop but `rules_by_table` is rebuilt inside the loop from `plan.get('rules', [])` \u2014 that is fine \u2014 yet the `ge_lit` branch does `max(v if v is not None else r['min'], r['min'])` which will raise TypeError if v is a string (Settlement_Amount is REAL so ok, but the pattern is fragile). Also the `not_null` set is computed as `_not_null_cols(...) | {c.name for c in tm.columns if not c.notnull}` \u2014 this is inverted: `not c.notnull` means nullable, so nullable columns are added to `not_null`, and the subsequent loop `if cm.name in not_null: continue` skips NULL enforcement for exactly the columns that should get NULLs.",
+     "requested_revision": "Fix the inverted nullability test (`c.notnull` should be the NOT NULL set). Apply the Date_Closed >= Date_Opened rule after all values are sampled and before dedup, and re-apply it after any row filtering. Ensure Settlement_Amount >= 0 and Effective_Date IS NOT NULL rules are enforced on the final rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas include 'Claims.Effective_Date IS NOT NULL' and 'Settlements.Effective_Date IS NOT NULL', but the schema declares both as nullable DATE columns and the spec's own null_targets do not list them. The interface rule says every nullable column should contain generated NULLs and non-NULLs. The spec is internally inconsistent: it forbids NULL on columns the interface says must sometimes be NULL. Also 'Settlements.Settlement_Amount >= 0' is supported by the sample (all positive), but 'Date_Closed >= Date_Opened' is only weakly supported ('All shown rows have Date_Closed > Date_Opened') and the spec's own uncertainty note says no order rule between Claims.Effective_Date and Settlements.Effective_Date is enforced.",
+     "requested_revision": "Either drop the IS NOT NULL rules for Claims.Effective_Date and Settlements.Effective_Date (and let the interface NULL rule apply), or add them to null_targets with an explicit justification. Clarify whether Date_Closed >= Date_Opened is a hard rule or a soft pattern; if hard, state it as a constraint the generator must satisfy for every row."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification table_sizes_per_instance sets Customers=15, Available_Policies=15, Customers_Policies=14, FNOL=7, Claims=10, Settlements=10, Services=4. But the spec also requires group_sizes '1, 2 and >= 3' for Customers.Customer_ID and Customers.Customer_name, and ties at rank 1 for ORDER(COUNT(*)) and ORDER(COUNT(DISTINCT customers_policies.policy_id)). With only 15 customers and 14 policies, a group of size >=3 plus a size-1 and size-2 group is feasible, but the tie at rank 1 for COUNT(DISTINCT policy_id) requires at least two customers with the same top distinct-policy count \u2014 this is not obviously achievable with 14 policies across 15 customers. The spec does not state how these targets interact with the fixed sizes.",
+     "requested_revision": "Either increase table sizes so the group-size and tie targets are jointly satisfiable, or relax the tie target (e.g. tie at rank 1 only for COUNT(*)). Document the intended interaction between table_sizes_per_instance and the per-column group/ties targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: `_distinct_pool` is called with `base_pool` that may be a list of ints (for integer columns) but the function does `uniq = list(dict.fromkeys(base_pool))` and then `v = key + ' ' + _rand_str(rng, 6)` for fresh values \u2014 this produces strings for integer columns, which will fail type checks or produce wrong types. Also for Customers.Customer_ID the PK branch is taken (sequential ints), so the duplicates_for_distinct target on Customer_ID is not honoured (PKs are unique by construction). The spec lists duplicates_for_distinct on Customers.Customer_ID, which is impossible for a PK \u2014 this is a spec/program mismatch.",
+     "requested_revision": "For integer columns, generate integer fresh values (e.g. random ints in a range) rather than string concatenation. For Customers.Customer_ID, either remove the duplicates_for_distinct target (PKs cannot duplicate) or clarify that the target applies to the join with Customers_Policies (i.e. duplicate Customer_ID values in the child table), and implement it there."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the `like_near_variant` branch uses `col_plan.get('like_variants')` and `col_plan.get('like_literals')`, but build_plan stores these under `d['like_variants']` and `d['like_literals']` only when the pattern is 'like_near_variant'. The spec's variants list includes 'Diana', 'Dianb', 'Diana x', 'diana', 'sian', 'siao', 'sian x', 'SIAN' \u2014 these are stored, but `_near_variants` is also applied to the literals '%Diana%' and '%sian%', producing variants like 'Diana', 'DIANA', 'Dianax', etc. The resulting pool may not contain the exact required variants (e.g. 'Dianb', 'siao', 'sian x') unless they are in the spec's variants list, which they are \u2014 but the code does `lv = list(col_plan['like_variants'])` then extends with `_near_variants(lit)`, so the spec variants are included. However, the branch is only reached if `col_plan.get('like_variants')` is truthy, and the earlier `if col_plan.get('dup_share') or col_plan.get('distinct')` branch may shadow it for Customers.Customer_name (which has both duplicates_for_distinct and like_near_variant). The order of branches means the dup_share branch wins, so the LIKE variants are never generated.",
+     "requested_revision": "Reorder the branches so that like_near_variant is applied (or merge the two: generate the duplicate-share pool and then inject the required LIKE variants). Verify that each instance contains at least one row matching '%Diana%' and one matching '%sian%' (and the listed variants)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the `Available_Policies.Customer_Phone` null_rows target is stored as `d['null_share']` in build_plan, but the instance builder never reads `col_plan.get('null_share')` for non-FK columns \u2014 the phone branch generates only non-NULL phones. The spec requires 5-30% NULLs on Customer_Phone. Similarly, Settlements.Claim_ID is a null_target but the FK branch plants NULLs in all FK columns (see issue 3), so it may get NULLs, but the share is not controlled.",
+     "requested_revision": "Implement null_share for non-FK nullable columns: after sampling, replace a random 5-30% of values with NULL (at least one). For FK null_targets, control the NULL share explicitly rather than the current uniform 5-30% applied to all FKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: the `_distinct_pool` function's `dup_share` semantics are inverted relative to the spec. The spec says duplicate_share is the fraction of rows that are duplicates (20-50%). The code computes `n_dup = int(round(share * n_values))` and `n_fresh = n_values - n_dup`, then appends `n_dup` repeats \u2014 this is correct in direction, but `n_dup = max(0, min(n_dup, n_values - 1))` caps duplicates at n-1, which for n=15 and share=0.5 gives n_dup=7, n_fresh=8 \u2014 the duplicate share is 7/15 \u2248 47%, within range. However, the function is also used for Customers.Customer_name with `(0.2, 0.45)` hardcoded, overriding the spec's 20-50% \u2014 minor. More importantly, the function is called for Customers_Policies.Date_Opened/Date_Closed only via the generic date branch, which uses a different share computation and may not hit 20-50%.",
+     "requested_revision": "Use the spec's dup_share for all columns that declare duplicates_for_distinct, including Date_Opened and Date_Closed. Remove the hardcoded (0.2, 0.45) override for Customer_name. Add a post-generation check that the duplicate share on each such column is within the declared range."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact line raising TypeError('int' object is not iterable) was not isolated; the program must be fixed and re-run to confirm.",
+    "Whether the compact DB is actually copied into each unit could not be verified because no unit was written (n_instances=0).",
+    "Whether the group-size, tie, aggregate-boundary and comparison-boundary targets are jointly satisfiable with the declared table sizes was not verified.",
+    "The spec's IS NOT NULL rules on Claims.Effective_Date and Settlements.Effective_Date conflict with the interface NULL rule; the designer must resolve this before the program can be considered correct."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=140 and validity.invalid=20 with reason 'new_integrity_failures' for every instance. The generator disables FK enforcement in writer.py ('pragma foreign_keys = OFF') and never verifies FK consistency. In instance.py, First_Notification_of_Loss.Customer_ID and Policy_ID are sampled independently from the parent PK pools, but the schema requires the composite FK (Customer_ID, Policy_ID) to reference an existing Customers_Policies row. Independent sampling produces pairs that do not exist in Customers_Policies, yielding 140 FK violations (7 FNOL rows x 20 instances).",
+     "requested_revision": "Sample First_Notification_of_Loss.(Customer_ID, Policy_ID) as a pair drawn from the actual Customers_Policies (Customer_ID, Policy_ID) tuples (compact + generated), not independently. More generally, for composite FKs, sample the whole tuple from the parent's existing key tuples. Re-enable FK checking (or add an explicit post-generation FK validation) so the writer fails loudly on violations instead of silently committing them."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped shows Customers_Policies: 260 skipped out of 280 attempted (only 20 added), and Customers: 60 skipped. The dedup step in instance.py drops rows whose PK/UNIQUE tuple collides with existing rows, but the FK columns of Customers_Policies are sampled from small parent pools (15 Customers, 15 Available_Policies), so most (Customer_ID, Policy_ID) pairs collide with the compact rows' composite PK. The spec's table_sizes_per_instance asks for 14 Customers_Policies rows per instance; the program cannot reliably produce them.",
+     "requested_revision": "For composite-PK child tables, generate fresh (Customer_ID, Policy_ID) combinations that do not already exist (e.g. enumerate unused pairs from the parent cross-product) rather than sampling independently and discarding collisions. Ensure the requested per-instance row counts are actually achieved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions include group_sizes and ties_for_order_limit for Customers.Customer_name and Customers.Customer_ID, and aggregate_boundary for First_Notification_of_Loss.Service_ID, Services.Service_name, Available_Policies.Policy_ID, and policy_type_code. In instance.py the group_sizes branch computes `labels = _group_sizes(...)` but then discards it (`ncols[cm.name] = [ncols[cm.name][i] for i in range(n)]`), and the tie branch only forces vals[0]=vals[1] on the column itself, not on the join-count aggregate the target refers to (COUNT(*) / COUNT(DISTINCT customers_policies.policy_id) grouped by the column). The aggregate_boundary targets (COUNT(*) > 2, COUNT(DISTINCT policy_id) > 4, etc.) are stored in plan['cols'] as 'agg_values' but never used by the builder. So the specified group-size, tie and aggregate-boundary patterns are not actually implemented.",
+     "requested_revision": "Implement group_sizes by controlling the number of child rows per parent (e.g. distribute Customers_Policies / FNOL rows so some parents have 1, some 2, some >=3 children). Implement ties_for_order_limit by ensuring at least two groups share the top COUNT(*) / COUNT(DISTINCT ...) value. Implement aggregate_boundary by planting groups whose COUNT crosses the listed boundary values (3/4/5). Verify these post-generation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's like_near_variant target for Customers.Customer_name lists literals ['%Diana%','%sian%'] and variants ['Diana','Dianb','Diana x','diana','sian','siao','sian x','SIAN']. In instance.py the like branch does `vals[i] = lit.strip('%')` for the literals, planting 'Diana' and 'sian' but not guaranteeing the listed variants (Dianb, Diana x, diana, siao, sian x, SIAN) appear; it only samples randomly from the variant list, so with n=15 rows the required variants are not guaranteed present. Also the comparison_boundary for policy_type_code plants 'Life Insurance' and 'life insurance' but the enum branch first fills with random variants and only overwrites the first len(cv) positions, which is acceptable, but the LIKE variants are not guaranteed.",
+     "requested_revision": "Deterministically plant every listed LIKE literal and every listed near-variant (at least one row each) before random filling, and verify presence after generation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include 'Settlement_Amount >= 0' with evidence 'All shown amounts positive'. The generic_sampling_rules say real_amount is 'Uniform random in [0.01, 10000.0]', which already satisfies >= 0; the >= 0 rule is redundant but harmless. More importantly, the spec's uncertainty note says Claims.Effective_Date and Settlements.Effective_Date are nullable DATE columns and the IS NOT NULL rules were removed. The execution feedback shows Claims.Effective_Date and Settlements.Effective_Date generated with NULL 0 / n, i.e. no NULLs planted, which is allowed by the interface NULL rule (noted, not blocking). However the spec does not state a Date_Closed >= Date_Opened rule for Customers_Policies in a way the program enforces correctly when Date_Closed is NULL \u2014 the program's _apply_ge_rules skips NULL operands, which is consistent with three-valued logic, so this is fine.",
+     "requested_revision": "No change strictly required, but the designer should confirm whether Claims.Effective_Date / Settlements.Effective_Date are intended to be nullable (the interface NULL rule would then require at least one NULL per instance). If they are meant to be non-null, add an IS NOT NULL rule; if nullable, the engineer should plant NULLs per the interface rule."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the composite-FK pair sampling fix also restores the requested Customers_Policies row count (14/instance) needs re-running the construction feedback.",
+    "Whether group-size / tie / aggregate-boundary targets become satisfiable after the FK fix (they depend on child-row distribution) needs verification.",
+    "The interface NULL rule for Claims.Effective_Date and Settlements.Effective_Date (NULL 0 / n) is noted but not blocking per instructions."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 5 of 20 units failed with RuntimeError('FK violation Claims.FNOL_ID -> First_Notification_of_Loss.FNOL_ID: ...'). Root cause in instance.py: Claims.FNOL_ID is sampled from all_pk_values[(First_Notification_of_Loss, FNOL_ID)], which is populated from schema.original_values (compact rows) plus generated_ids. But generated_ids for FNOL_ID is only recorded in the 'is_pk and len(tm.primary_key)==1 and typ=='int'' branch, and the final loop 'for c in list(generated_ids): if c[0]==t and c[1] in ncols: generated_ids[c] = [ncols[c[1]][i] for i in keep]' overwrites it with the kept values \u2014 however, the dedup step (step 5) can drop rows (stats show Customers skipped 45, Customers_Policies skipped 195), and the FK pool for Claims is built from all_pk_values which was extended with generated_ids BEFORE dedup filtering in some paths, or the FNOL rows kept are fewer than the pool claims. Concretely: First_Notification_of_Loss generated 105 rows but Claims samples FNOL_ID from a pool that includes values whose FNOL rows were later dropped by dedup, producing dangling FKs. The writer's _check_fks correctly raises, so the failure is loud, but 25% of units fail.",
+     "requested_revision": "Build the FK parent pool for each child table from the *final kept* parent rows only (after dedup), not from pre-dedup generated_ids. In instance.py, after out_rows[t] is finalized for a parent table, set all_pk_values[(t, pk)] = compact values + [out_rows[t][pk][i] for i in range(len(out_rows[t][pk]))]. Ensure Claims.FNOL_ID and Settlements.Claim_ID sample only from these finalized pools. Re-run and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py step 2 'Group-size / tie targets' is a no-op stub: it sets vals[0]=vals[1]=vals[2]=vals[0] and vals[3]=vals[4] on the *parent* column (e.g. Customers.Customer_name), which does not create 1/2/>=3 child counts in Customers_Policies, nor ties at rank 1 of COUNT(*) / COUNT(DISTINCT policy_id). The comment admits 'the join counts are checked indirectly through the child FK sampling below', but the child FK sampling (rng.choice(parent_pool)) is uniform random and does not plant group sizes. Similarly, aggregate_boundary (agg_values) is parsed into the plan but never consumed anywhere in instance.py \u2014 no group is planted to cross COUNT > k boundaries for Services.Service_name, First_Notification_of_Loss.Service_ID, Available_Policies.policy_type_code, or Available_Policies.Policy_ID. The construction_pairs feedback shows only 12 of 51 eligible pairs separated, consistent with these targets not being planted.",
+     "requested_revision": "Implement group_sizes by distributing child rows across parents with explicit counts of 1, 2, and >=3 (use _distribute_children, which exists but is never called). Implement ties_for_order_limit by ensuring at least two parents share the top COUNT(*) and top COUNT(DISTINCT child.col). Implement aggregate_boundary by planting groups whose COUNT crosses each listed value (3,4,5) so HAVING COUNT > k is true for some and false for others. Verify after sampling in Python (not SQL) that the targets hold, and fail loudly if not."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py 'like_near_variant' branch plants only the stripped literals ('Diana','sian') and the listed variants, but the spec requires the LIKE patterns '%Diana%' and '%sian%' to match. The planted values 'Diana','Dianb','Diana x','diana' do match '%Diana%' (case-insensitive in SQLite LIKE), and 'sian','siao','sian x','SIAN' match '%sian%', so this is mostly OK \u2014 but the branch also strips '%' from literals and never guarantees the literal-with-percent form is present as a distinct value, and it does not guarantee the near-variant set is disjoint from the random fill. More importantly, the branch is only reached when col_plan has like_variants/like_literals, which is correct for Customers.Customer_name, but the planted list is truncated to n and shuffled, so with n=15 and 10 planted values it is fine; however the 'duplicates_for_distinct' target (20-50% duplicate share) for the same column is bypassed because the like branch returns before the dup_share branch. The spec lists both patterns for Customers.Customer_name; the program implements only one.",
+     "requested_revision": "Combine the like_near_variant planting with the duplicates_for_distinct target for Customers.Customer_name: plant the variants, then fill the remainder with duplicates drawn from the planted set so the duplicate share is 20-50%. Do not let one pattern branch short-circuit another for the same column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py 'is_fk and not is_pk' branch: for nullable FKs it plants NULLs with rate 5-30%, but for Settlements.Claim_ID the spec null_targets includes it and the feedback shows NULL 43/150 (28.7%), which is within range. However, the same branch is used for Claims.FNOL_ID (NOT NULL FK) with want_null = (not cm.notnull) or col_plan.get('null_target') \u2014 Claims.FNOL_ID is NOT NULL so want_null is False, correct. But the branch samples from parent_pool which, as noted in issue 1, includes stale values. Also, the branch does not guarantee 'at least one parent row with no children' (generic_sampling_rules.integer_fk) \u2014 uniform rng.choice over the pool will almost surely give every parent a child when n_children >> n_parents, violating the stated rule.",
+     "requested_revision": "After sampling child FKs, verify at least one parent has zero children; if not, reassign one child to a different parent or reserve one parent as childless before sampling. Combine with the finalized-pool fix from issue 1."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas includes 'Settlement_Amount >= 0' with evidence 'All shown amounts positive'. The program's _rand_real generates [0.01, 10000.0], so >= 0 holds trivially. But the spec's uncertainty note says 'Settlement_Amount >= 0 is stated as >= 0 (a price-like amount) even though the sample happens to be positive' \u2014 this is a weak rule (any non-negative real satisfies it) and does not constrain the data meaningfully. Similarly, 'Date_Closed >= Date_Opened' is supported by sample evidence and is a reasonable rule. The enum rule for policy_type_code is well-supported (four values shown). The 'Settlement_Amount >= 0' rule is supported but trivial; it is not an error, just low-value.",
+     "requested_revision": "No change required for correctness; optionally strengthen or drop the trivial Settlement_Amount >= 0 rule, or add a more informative bound if evidence supports one. This is a note, not a blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Feedback nullable_columns shows 'Available_Policies.policy_type_code: generated rows: NULL 0 / 225', 'Claims.Effective_Date: NULL 0 / 150', 'Customers.Customer_name: NULL 0 / 180', 'Services.Service_name: NULL 0 / 60', 'Settlements.Effective_Date: NULL 0 / 150', 'Settlements.Settlement_Amount: NULL 0 / 150'. Per the interface NULL rule, every nullable column should have at least one NULL row per instance. The program only plants NULLs when col_plan has null_share or null_target (step 3), so nullable columns without an explicit null target (policy_type_code, Claims.Effective_Date, Customer_name, Service_name, Settlements.Effective_Date, Settlement_Amount) get zero NULLs. The interface rule says this 'may be noted for the engineer; it does not block a pass', so this is a note.",
+     "requested_revision": "Note only: extend step 3 to plant at least one NULL in every nullable column (not just those with explicit null_share/null_target), following the compact database's NULL share. Not a blocker per the interface rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py composite-FK handling: for First_Notification_of_Loss, composite_cols = {Customer_ID, Policy_ID} are filled as a group from _parent_tuples(schema, 'Customers_Policies', ['Customer_ID','Policy_ID'], out_rows). But _parent_tuples reads schema.original_values for the parent columns and generated_rows.get(parent_table, {}).get(c, []) \u2014 for Customers_Policies, out_rows['Customers_Policies'] is populated only after the Customers_Policies table is processed, which happens before First_Notification_of_Loss in FK order, so this is OK. However, the composite FK columns are set to [None]*n first and then overwritten; if _parent_tuples returns empty (no compact Customers_Policies rows and no generated ones), it falls back to [(None,)*len(pcols)], which would insert NULLs into NOT NULL composite FK columns \u2014 a NOT NULL violation. The feedback shows 0 not_null_violations, so this path was not hit, but it is a latent bug.",
+     "requested_revision": "If _parent_tuples returns empty for a NOT NULL composite FK, raise a clear error instead of falling back to NULL tuples. Also ensure the composite FK tuple pool is built from finalized (post-dedup) Customers_Policies rows."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 5 failing units (RuntimeError FK violation) are the only failures or whether more would fail with different seeds \u2014 the fix in issue 1 should be verified across the full 0..800 range.",
+    "Whether group_sizes, ties_for_order_limit, and aggregate_boundary targets are actually satisfiable given the table sizes (Customers=15, Customers_Policies=14, Services=4, FNOL=7) \u2014 the spec's uncertainty note flags this; the program must verify after sampling.",
+    "Whether the like_near_variant + duplicates_for_distinct combination for Customers.Customer_name can simultaneously satisfy both targets with n=15 \u2014 needs verification after the fix in issue 3."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, all RuntimeError('aggregate_boundary not satisfied for First_Notification_of_Loss.Service_ID'). The program produced zero instances.",
+     "requested_revision": "Fix the aggregate-boundary planting/verification so instances are produced. The spec requires First_Notification_of_Loss.Service_ID to have groups with COUNT crossing 1, 2, 3 (HAVING COUNT > k true for some, false for others). With only 7 FNOL rows and 4 Services, the current _plant_aggregate_boundary cannot simultaneously satisfy 'some group > k' and 'some group <= k' for k=1,2,3 (needs at least 1+2+3+... rows and enough parents). Either the designer must relax the target (e.g. only k=1,2 feasible with 7 rows / 4 services) or the engineer must implement a feasible planting that is verified against the actual row count, and the spec's table_sizes_per_instance must be consistent with the boundary values. The program must not fail every unit."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec table_sizes_per_instance: First_Notification_of_Loss=7, Services=4. aggregate_boundary targets values [1,2,3] for First_Notification_of_Loss.Service_ID. To have a group with COUNT>3 and a group with COUNT<=1 simultaneously requires at least 4+1=5 rows on two distinct services, plus groups for k=1 and k=2 boundaries \u2014 feasible only with careful allocation, but the current spec does not state how many rows per service are needed, and the engineer's verifier demands both 'some > k' and 'some <= k' for every k in {1,2,3}, which with 7 rows and 4 services is tight but possible (e.g. counts 4,1,1,1 gives >3, <=3, >1, <=1, >2, <=2). The spec should state the required per-group counts explicitly or reduce the boundary set.",
+     "requested_revision": "Either (a) reduce aggregate_boundary values to a feasible set given the table size, or (b) specify explicit per-service child counts (e.g. 4,1,1,1) that satisfy all boundaries, and require the engineer to plant exactly those counts. Also reconcile the group_sizes target (1,2,>=3) on the same column with the aggregate_boundary target \u2014 both must hold on the same 7 rows across 4 services, which requires counts like 1,2,4 (sums to 7) \u2014 the spec should state this joint constraint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_aggregate_boundary and _distribute_children are applied to the same FK column (First_Notification_of_Loss.Service_ID has both group_sizes and aggregate_boundary in the plan). In build_spec_instance, the code uses `if cp.get('group_sizes') ... elif cp.get('tie_at_rank') ... elif cp.get('agg_values')` \u2014 only ONE planting runs. So group_sizes and aggregate_boundary cannot both be satisfied; the verifier then fails on whichever is not planted. This is a logic bug: the elif chain short-circuits joint targets.",
+     "requested_revision": "Combine the plantings: when a column has both group_sizes and agg_values, plant a single distribution that satisfies both (e.g. counts 1,2,4 across 4 services for 7 rows), and verify both. Do not use mutually exclusive elif branches for targets that the spec lists jointly on the same column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py _EMBEDDED differs from the supplied specification: it omits the 'Customers_Policies.Customer_ID duplicates_for_distinct' exception, omits the note on Customers.Customer_ID group_sizes, and its generic_sampling_rules text is shortened. If specification.json is absent, the embedded fallback is used and silently diverges from the reviewed spec.",
+     "requested_revision": "Make the embedded fallback identical to the supplied specification, or remove the fallback and fail loudly if specification.json is missing. Silent divergence between spec and program is not acceptable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _fill_column for Customers.Customer_name with like_variants: it plants variants and fills the rest by choosing from `planted` only, so the duplicate share is computed over the planted set, but the DISTINCT duplicate_share target (20-50%) is not verified after dedup. Also _dedup_rows dedups on PK/UNIQUE only; Customer_name is not unique, so duplicates survive \u2014 but the 20-50% share is never checked. Similarly for other duplicates_for_distinct columns (Customer_Phone, Date_Opened, Date_Closed, Customers_Policies.Policy_ID) no post-generation verification exists.",
+     "requested_revision": "Add post-generation verification (fail loudly) for every duplicates_for_distinct target: compute the duplicate share on the final kept column values and assert it lies in the target range. The spec's generic rule says 'verify after sampling in Python and fail loudly if not satisfied' \u2014 this is not implemented for duplicate shares."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls is applied to every nullable column including Settlements.Claim_ID (a nullable FK). But Settlements.Claim_ID is also a single-column FK filled from the Claims PK pool; _plant_nulls replaces values with None, which is allowed. However, the spec's null_targets lists Settlements.Claim_ID, and the interface NULL rule requires at least one NULL and at least one non-NULL per nullable column. _plant_nulls uses max(1, round(share*n)) which can equal n when n is small (e.g. n=10, share up to 0.30 -> 3, fine; but if n=1, n_null=1 -> all NULL). With table size 10 this is fine, but the code does not guarantee at least one non-NULL remains.",
+     "requested_revision": "Ensure _plant_nulls leaves at least one non-NULL value when n>=2 (cap n_null at n-1). Also verify per nullable column that both NULL and non-NULL appear in the final kept rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py inserts rows in `schema.tables.items()` order, not `schema.table_order` (FK order). The comment says 'rows are inserted in FK order' but the loop iterates dict order. FK enforcement is OFF during insert and _check_fks runs after, so violations raise \u2014 but the claim of FK-order insertion is false. More importantly, _check_fks only checks single-column FKs from schema.fks; composite FK (First_Notification_of_Loss.Customer_ID, Policy_ID) -> Customers_Policies is registered as two single-column entries in schema.fks (from _parse_create), so the composite check is effectively two independent single-column checks, which is weaker than the composite FK constraint.",
+     "requested_revision": "Insert in schema.table_order (parents first) and add an explicit composite-FK check for (Customer_ID, Policy_ID) against Customers_Policies tuples. The current check would accept a (Customer_ID, Policy_ID) pair that exists separately but not as a tuple."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _parent_tuples for composite FK uses schema.original_values and out_rows, but for First_Notification_of_Loss the composite FK is (Customer_ID, Policy_ID) -> Customers_Policies. The code fills composite FK columns by sampling from _parent_tuples, but Customers_Policies is itself generated in the same run and its kept rows are in out_rows \u2014 however, the composite FK columns Customer_ID and Policy_ID are also listed as single FKs in schema.fks (from the composite declaration), so they are in comp_cols and skipped in the single-FK loop. This is correct, but the spec's dependencies list First_Notification_of_Loss.Customer_ID -> Customers and .Policy_ID -> Available_Policies as separate dependencies, which is misleading: the actual constraint is the composite FK to Customers_Policies. The spec should state the composite dependency explicitly (it does in a note, but the dependencies list is inconsistent).",
+     "requested_revision": "Designer: make the dependencies list reflect the composite FK (one entry for the pair) rather than two single-column entries. Engineer: ensure the composite FK is sampled as a pair (it is) and that the single-column entries do not cause double-filling (they don't, due to comp_cols, but this is fragile)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules: 'Settlement_Amount >= 0' is trivially satisfied by the real_amount domain [0.01, 10000.0] and is acknowledged as weak. 'Date_Closed >= Date_Opened' is supported by sample rows. 'policy_type_code IN (...)' is supported by rows 246,257,300,301. These are adequately evidenced. However, the spec's uncertainty note says Claims.Effective_Date and Settlements.Effective_Date are nullable DATE columns with no IS NOT NULL rule \u2014 consistent with the interface NULL rule. No unsupported rule is asserted. This is acceptable.",
+     "requested_revision": "No change required; noted as supported."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli.py in multiprocess mode does not aggregate rows_added/rows_skipped (comment admits it), so the JSON reports empty rows_added even on success. This is a reporting gap, not a generation error, but it prevents verifying that rows were actually added.",
+     "requested_revision": "Return per-unit stats from _one and aggregate them in the parent process so rows_added/rows_skipped are accurate."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the joint group_sizes + aggregate_boundary targets on First_Notification_of_Loss.Service_ID are satisfiable with 7 rows and 4 services under the spec's exact wording (counts 1,2,4 would satisfy both, but the spec does not state this).",
+    "Whether duplicate_share targets (20-50%) are actually met after dedup for all listed columns \u2014 no verification exists.",
+    "Whether the composite FK (Customer_ID, Policy_ID) is validated as a tuple in _check_fks \u2014 currently only single-column checks are performed.",
+    "Whether the embedded fallback spec in spec.py matches the supplied specification \u2014 it does not, and this could silently change behavior if specification.json is missing."
+   ]
+  }
+ ]
 }

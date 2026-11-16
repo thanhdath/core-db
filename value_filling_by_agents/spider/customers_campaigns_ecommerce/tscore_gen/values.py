@@ -71,7 +71,7 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped); perturbed with prefix/suffix/dropped char and LIKE patterns."""
 
     def __init__(self, elements, p, max_l0, rng, length=20):
         els = [str(e) for e in elements if e is not None]

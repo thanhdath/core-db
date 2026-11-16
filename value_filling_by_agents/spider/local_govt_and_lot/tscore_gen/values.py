@@ -3,9 +3,56 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def parse_dt(s):
+    """Parse a datetime string in any of the known templates; None on failure."""
+    if isinstance(s, dt.datetime):
+        return s
+    s = str(s).strip()
+    for t in _TEMPLATES:
+        try:
+            return dt.datetime.strptime(s, t)
+        except ValueError:
+            pass
+    return None
+
+
+def fmt_dt(d):
+    """Format a datetime with the canonical spec format."""
+    return d.strftime(spec.DATE_FMT)
+
+
+def rand_dt(rng, lo=spec.DATE_LO, hi=spec.DATE_HI):
+    """Uniform datetime in [lo, hi]."""
+    span = int((hi - lo).total_seconds())
+    return lo + dt.timedelta(seconds=rng.randint(0, max(0, span)))
+
+
+def perturb_text(rng, v):
+    """Prefix / suffix / dropped-character variants (generic_sampling_rules.varchar_text)."""
+    if not v:
+        return v
+    u = rng.random()
+    if u < 0.2:
+        return v + ''.join(rng.choice(CHARSET) for _ in range(3))
+    if u < 0.4:
+        return ''.join(rng.choice(CHARSET) for _ in range(3)) + v
+    if u < 0.6:
+        return v[:-1] if len(v) > 1 else v
+    if u < 0.8:
+        return v[1:] if len(v) > 1 else v
+    return v
+
+
+def perturb_int(rng, v):
+    """+-1 / +-2 integer perturbation."""
+    return int(v) + rng.choice([-2, -1, 0, 1, 2])
 
 
 class ColumnSampler:
@@ -93,28 +140,8 @@ class StringSampler(ColumnSampler):
         else:
             v = r.choice(self.elements)
         if r.random() < 0.5:
-            u = r.random()
-            if u < 0.2:
-                v = v + self._rand(5)
-            elif u < 0.4:
-                v = self._rand(5) + v
-            elif u < 0.6:
-                v = self._rand(3) + v + self._rand(3)
-            elif u < 0.8:
-                v = v[:-1]
-            else:
-                v = v[1:]
+            v = perturb_text(r, v)
         return v
-
-
-def _parse_date(s: str):
-    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
-    for t in _TEMPLATES:
-        try:
-            return t, dt.datetime.strptime(s, t)
-        except ValueError:
-            pass
-    return None, None
 
 
 class DateSampler(ColumnSampler):
@@ -127,12 +154,12 @@ class DateSampler(ColumnSampler):
         strs = [str(e) for e in self.elements]
         self.template, parsed = None, []
         for s in strs:
-            t, d = _parse_date(s)
+            d = parse_dt(s)
             if d is not None:
-                self.template = self.template or t
+                self.template = self.template or spec.DATE_FMT
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.template = self.template or spec.DATE_FMT
+        self.full = (spec.DATE_LO, spec.DATE_HI)
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -140,7 +167,7 @@ class DateSampler(ColumnSampler):
     def _draw(self):
         r = self.rng
         lo, hi = self.full if (r.random() < self.p or self.n_parsed <= 1) else self.rng_dates
-        d = lo + dt.timedelta(seconds=r.randint(0, int((hi - lo).total_seconds())))
+        d = rand_dt(r, lo, hi)
         s = d.strftime(self.template)
         if self.strip0:
             s = re.sub(r'(^|[-/ :])0(\d)', r'\1\2', s)
@@ -182,6 +209,21 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Pick from a fixed enum pool; near-variant (case change) of a pool value."""
+
+    def __init__(self, pool, rng, near_variants=()):
+        super().__init__(list(pool) + list(near_variants), 0.0, float('inf'), rng)
+        self.pool = list(pool)
+        self.near = list(near_variants)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.05:
+            return r.choice(self.pool).lower()
+        return r.choice(self.pool)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -216,9 +258,18 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224, with spec overrides."""
+    key = (column.table, column.name)
+    if key in spec.ENUM_POOLS:
+        return EnumSampler(spec.ENUM_POOLS[key], rng, spec.NEAR_VARIANTS.get(key, ()))
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    for nv in spec.NEAR_VARIANTS.get(key, ()):
+        if nv not in els:
+            els.append(nv)
+    for bd in spec.BOUNDARY_DATES.get(key, ()):
+        if bd not in els:
+            els.append(bd)
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:

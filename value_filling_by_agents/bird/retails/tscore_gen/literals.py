@@ -23,14 +23,6 @@ def _unquote(v: str) -> str:
     return v.replace(_PH, '')
 
 
-def _raw_unquote(v: str) -> str:
-    """Strip surrounding quotes but KEEP doubled quotes (upstream parse.py:246-253 keeps them)."""
-    v = v.strip().rstrip(';')
-    if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
-        v = v[1:-1]
-    return v.replace(_PH, '')
-
-
 def _split_cols(name: str) -> list:
     """Column key plus tolerant table variants: (table, COL), (raw qualifier, COL), (None, COL)."""
     raw = name.strip().split('.')
@@ -84,7 +76,7 @@ def _is_literal(tok) -> bool:
 
 def _add(out: list, name: str, v: str) -> None:
     for k in _split_cols(name):
-        out.append((k, _raw_unquote(v)))
+        out.append((k, _unquote(v)))
 
 
 def _walk(tok, out: list) -> None:
@@ -130,13 +122,12 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
     if not col:
         return
     if q:
-        out.append(((q, col.upper()), _raw_unquote(v)))
-    out.append(((None, col.upper()), _raw_unquote(v)))
+        out.append(((q, col.upper()), _unquote(v)))
+    out.append(((None, col.upper()), _unquote(v)))
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)

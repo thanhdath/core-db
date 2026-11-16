@@ -1,15 +1,4 @@
-"""CoRE-DB proxy: executes a query on every member (compact database + selected instances) of a database.
-
-For a db_id listed in $COREDB_TREE/members.json ({db_id: [db_id, instance, ...]}) the request is sent to the
-execution API ($COREDB_UPSTREAM) once per member. The reply carries the first member's ok/error/timed_out and
-    rows   = [{"__member__": i, **row}, ...] for every member i, or {"__member__": i, "__error__": message}
-             for a member i > 0 whose execution failed,
-    bundle = {"members": [...], "member_truncated": [...]}.
-Comparing row sets of these tagged rows therefore compares gold and prediction on every member at once.
-Other databases are passed through unchanged.
-
-Run: COREDB_TREE=coredb_tree uvicorn bundle_proxy:app --app-dir db_execution --host 127.0.0.1 --port 8021
-"""
+"""CoRE-DB proxy: executes a query on every member (compact database + selected instances) of a database."""
 import json
 import os
 import threading

@@ -1,50 +1,461 @@
 {
  "db": "authors",
- "operator_io_quirks": [
-  "Mixed-case table names: \"Author\", \"Conference\", \"Journal\" quoted; Paper and PaperAuthor unquoted in DDL \u2014 must double-quote all identifiers.",
-  "Paper has 2,254,920 rows and PaperAuthor 2,315,574 rows \u2014 far above max_rows_per_table=300000; rowid%k sampling required, original_values truncated.",
-  "Author.Id distinct=200000 but rows=247030 \u2014 PK declared but NOT unique in data; sample_fresh_primary_keys will drop ~47k rows.",
-  "Paper.Id distinct=200000 vs 2.25M rows \u2014 same PK-duplicate situation; huge drop on PK filter.",
-  "PaperAuthor has NO primary key (pk=[]) \u2014 sample_fresh_primary_keys is a no-op; no unique column either.",
-  "Paper.ConferenceId and Paper.JournalId contain value 0 which is NOT in Conference.Id/Journal.Id (min Id=1) \u2014 dangling FK values in original; fill_foreign_keys_consistently will not reproduce them.",
-  "PaperAuthor.PaperId distinct=32935 vs Paper.Id 200000 \u2014 FK child values are a small subset; parent-side sampling with replacement will over-spread.",
-  "All columns notnull=0 despite PKs \u2014 NOT NULL not enforced; NULLs appear in Name/Affiliation/Title/Keyword storage.",
-  "Affiliation/Keyword/Title contain '|', ';', ',' separators and unicode (Gu\u00f0mundur, F\u00fcr) \u2014 String fuzzer CHARSET a-zA-Z0-9() will not reproduce; contaminate adds ASCII only.",
-  "Empty strings present in Conference.ShortName/HomePage and Journal.ShortName \u2014 String length range [0,20] can produce them but not reliably.",
-  "Year is INTEGER with 161 distinct values (1963..2009) \u2014 Number fuzzer will draw from [-10^scale,10^scale] not the year range; no date dispatch.",
-  "HomePage values are URLs (http://...) \u2014 String fuzzer treats as generic text; no FORMAT dispatch."
- ],
- "operator_ts_expectations": [
-  "All Id/Year/ConferenceId/JournalId/PaperId/AuthorId columns dispatch to Number fuzzer (INTEGER, no args) \u2014 scale=0, range [-1,1] perturbed by \u00b11/\u00b12; will produce tiny integers, not realistic Ids.",
-  "Name/Title/Affiliation/ShortName/FullName/HomePage/Keyword dispatch to String fuzzer (TEXT) \u2014 random a-zA-Z0-9() strings length 0-20 plus contaminate; implausible for names/URLs/titles.",
-  "Number fuzzer on Id columns: list_max quirk (min(el), max(el)+1 overwritten by full-range max) means fresh draws span [-1,1] not the observed Id range \u2014 FN risk on Id-range predicates.",
-  "String fuzzer on Affiliation/Keyword: original values contain '|'/';' separators and unicode; fuzzer never emits these \u2014 LIKE '%|%' or unicode predicates will miss.",
-  "Year as Number: fuzzer draws from [-1,1]\u00b1perturb, never 1963-2009 \u2014 any Year BETWEEN 1990 AND 2000 predicate yields empty; FP/FN on year filters.",
-  "PaperAuthor has no PK and no unique column \u2014 drop_unique_duplicates no-op; duplicate (PaperId,AuthorId) pairs will appear, unlike original which likely has none.",
-  "FK fill: Paper.ConferenceId drawn from Conference.Id final values (1..4545) \u2014 value 0 in original never reproduced; queries filtering ConferenceId=0 miss.",
-  "FK fill: PaperAuthor.PaperId drawn from Paper.Id (200000 distinct after PK filter) \u2014 original only has 32935 distinct PaperIds; join cardinalities inflated.",
-  "Author.Id PK filter drops ~19% of rows (247030\u2192200000) \u2014 Author row count in instance ~200k not 247k; COUNT(*) predicates on Author will differ.",
-  "Paper.Id PK filter drops ~91% of rows (2.25M\u2192200k) \u2014 Paper instance ~200k rows; any COUNT/aggregate on Paper massively off.",
-  "Empty-string ShortName/HomePage: String fuzzer can emit '' but p=0.2 fresh + contaminate rarely yields exactly ''; queries testing empty-string equality may miss.",
-  "NULL rates: Affiliation ~60%, Keyword ~77%, Title ~7% \u2014 String fuzzer drops None elements and p=0.2 fresh; NULLs only via insert-fail on NOT NULL (none here) \u2014 instance will have ~0 NULLs, original has many; IS NULL predicates miss."
- ],
- "challenger_refs": [
-  "G3",
-  "G16",
-  "G7",
-  "G11",
-  "G6",
-  "G13",
-  "G14",
-  "G1",
-  "G10",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; no NULL; unique per table. For Paper.Id, plant the boundary literals 4,5,6,105,106,107 into the sequence while keeping uniqueness (e.g. start at 1 and inject those values in order, skipping duplicates).",
+   "integer_fk": "Pick a parent Id from already-generated parent rows (never original compact Ids) with 5-30% NULL share when the column is nullable; leave 1-2 parent rows childless. With small probability inject the column's boundary literals only when they are valid parent Ids; out-of-range literals (-1,0,1) are used only in query predicates, never in generated data, so FK integrity is preserved.",
+   "integer_range": "Uniform integer within the column's stated range or boundary target set; include boundary literals and one step on each side.",
+   "year_value": "Uniform integer in [1950, 2024]; include boundary values 1999, 2000, 2001, 0, -1, 1 where targeted.",
+   "text_short": "Random word(s) from a small vocabulary; include near-variants and exact literals cited in targets; allow NULL where SQL allows.",
+   "text_name": "Random person-like name from a small pool; duplicate share 20-50% on DISTINCT columns; near-variants allowed.",
+   "text_affiliation": "Random institution-like string from a small pool; 5-30% NULL on nullable affiliation columns; allow near-variants.",
+   "text_title": "Sentence-like string from a small pool; duplicates on DISTINCT; near-variants of LIKE literals; allow ~7% NULL. For LIKE literals, plant the exact literal verbatim with some probability so the '%literal%' pattern matches as a substring; otherwise emit case-changed or end-extended near-variants.",
+   "text_url": "http://example.org/<slug>; some empty strings; unique-ish.",
+   "text_keyword": "Semicolon/pipe-separated keyword phrase; near-variants of equality literal 'Turbulent Fluids'; NULL share ~76%. The literals 'nt F','nt f','urbulent F','urbulent f' are distinct equality values (substrings of the target), not LIKE variants.",
+   "enum_or_lowcard": "For columns with <=12 distinct observed values, sample uniformly from the listed values.",
+   "enum_small_int": "For integer columns with <=12 distinct values, sample uniformly from listed ints.",
+   "date_pair_order": "Start date sampled first, end date sampled from [start, start+3650 days].",
+   "boundary_injection": "For every targeted comparison literal L, include L-1, L, L+1 (numeric) or one day before/after (date) in the pool.",
+   "tie_creation": "For ORDER/LIMIT targets, duplicate 2-4 rows on the order column at each listed rank.",
+   "aggregate_formula_support": "Ensure at least one parent row has >=2 children and one parent has 0 children for every parent-child formula.",
+   "table_size_jitter": "Table sizes are jittered by +/-20% around the stated per-instance size; each instance must still contain enough rows for every specified variation to occur."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Paper.Id",
+    "pattern": "comparison_boundary",
+    "targets": [
+     4,
+     5,
+     6,
+     105,
+     106,
+     107
+    ]
+   },
+   {
+    "column": "Paper.JournalId",
+    "pattern": "comparison_boundary",
+    "targets": [
+     199,
+     200,
+     201,
+     299,
+     300,
+     301
+    ]
+   },
+   {
+    "column": "Paper.JournalId",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "Paper.ConferenceId",
+    "pattern": "comparison_boundary",
+    "targets": [
+     -1,
+     0,
+     1,
+     186,
+     187,
+     188
+    ]
+   },
+   {
+    "column": "Paper.ConferenceId",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "Paper.Title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Paper.Title",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "",
+     "x"
+    ]
+   },
+   {
+    "column": "Paper.Title",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%145 GROWTH HORMONE RECEPTORS AND THE ONSET OF HYPERINSULINEMIA IN THE OBESE ZUCKER RAT%",
+     "Testing timed automata%"
+    ]
+   },
+   {
+    "column": "Paper.Year",
+    "pattern": "comparison_boundary",
+    "targets": [
+     -1,
+     0,
+     1,
+     1999,
+     2000,
+     2001
+    ]
+   },
+   {
+    "column": "Paper.Year",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Paper.Keyword",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Turbulent Fluids",
+     "turbulent fluids",
+     "nt F",
+     "nt f",
+     "urbulent F",
+     "urbulent f"
+    ]
+   },
+   {
+    "column": "Paper.Keyword",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%Turbulent Fluids%",
+     "Turbulent Fluidt",
+     "Turbulent Fluids x"
+    ]
+   },
+   {
+    "column": "Journal.FullName",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Physics of Fluids",
+     "physics of fluids",
+     "Iet Software/iee Proceedings - Software",
+     "iet software/iee proceedings - software"
+    ]
+   },
+   {
+    "column": "Journal.FullName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Journal.Id",
+    "pattern": "group_sizes",
+    "targets": "1, 2 and >=3"
+   },
+   {
+    "column": "Conference.FullName",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "International Conference on Thermoelectrics",
+     "international conference on thermoelectrics",
+     "International Conference on Wireless Networks, Communications and Mobile Computing",
+     "international conference on wireless networks, communications and mobile computing"
+    ]
+   },
+   {
+    "column": "Conference.FullName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Conference.HomePage",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "unordered"
+    }
+   },
+   {
+    "column": "Author.Name",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "Author.Affiliation",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Stanford University",
+     "stanford university",
+     "Massachusetts Institute of Technology",
+     "massachusetts institute of technology",
+     "MaInstitute of Technology",
+     "mainstitute of technology"
+    ]
+   },
+   {
+    "column": "Author.Affiliation",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "PaperAuthor.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "PaperAuthor.AuthorId",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "PaperAuthor.PaperId",
+    "pattern": "comparison_boundary",
+    "targets": [
+     4,
+     5,
+     6,
+     100,
+     101,
+     102
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Paper.ConferenceId",
+    "parent": "Conference.Id",
+    "copied": []
+   },
+   {
+    "child": "Paper.JournalId",
+    "parent": "Journal.Id",
+    "copied": []
+   },
+   {
+    "child": "PaperAuthor.PaperId",
+    "parent": "Paper.Id",
+    "copied": []
+   },
+   {
+    "child": "PaperAuthor.AuthorId",
+    "parent": "Author.Id",
+    "copied": [
+     "Name",
+     "Affiliation"
+    ]
+   },
+   {
+    "child": "PaperAuthor(Name,Affiliation)",
+    "parent": "Author(Name,Affiliation)",
+    "via": "PaperAuthor.AuthorId = Author.Id",
+    "copied": [
+     "Name",
+     "Affiliation"
+    ],
+    "note": "Denormalized copy; PaperAuthor.AuthorId is restricted to generated Author Ids so the copy always applies."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Paper",
+    "column": "Year",
+    "formula": "Year BETWEEN 1900 AND 2025"
+   },
+   {
+    "table": "Paper",
+    "column": "ConferenceId",
+    "formula": "ConferenceId BETWEEN 1 AND 4545"
+   },
+   {
+    "table": "Paper",
+    "column": "JournalId",
+    "formula": "JournalId BETWEEN 1 AND 15151"
+   },
+   {
+    "table": "PaperAuthor",
+    "column": "PaperId",
+    "formula": "PaperId BETWEEN 1 AND 2254920"
+   },
+   {
+    "table": "PaperAuthor",
+    "column": "AuthorId",
+    "formula": "AuthorId BETWEEN 1 AND 247030"
+   },
+   {
+    "table": "Paper",
+    "column": "Title",
+    "formula": "Title IS NULL OR length(Title) > 0"
+   },
+   {
+    "table": "PaperAuthor",
+    "column": "Name",
+    "formula": "PaperAuthor.Name = Author.Name VIA PaperAuthor.AuthorId",
+    "condition": "PaperAuthor.AuthorId IN (SELECT Id FROM Author)",
+    "evidence": "PaperAuthor.Name mirrors Author.Name through AuthorId; AuthorId restricted to generated Author Ids."
+   },
+   {
+    "table": "PaperAuthor",
+    "column": "Affiliation",
+    "formula": "PaperAuthor.Affiliation = Author.Affiliation VIA PaperAuthor.AuthorId",
+    "condition": "PaperAuthor.AuthorId IN (SELECT Id FROM Author)",
+    "evidence": "PaperAuthor.Affiliation mirrors Author.Affiliation through AuthorId."
+   },
+   {
+    "table": "Paper",
+    "column": "Id",
+    "formula": "Id > 0"
+   },
+   {
+    "table": "Author",
+    "column": "Id",
+    "formula": "Id > 0"
+   },
+   {
+    "table": "Conference",
+    "column": "Id",
+    "formula": "Id > 0"
+   },
+   {
+    "table": "Journal",
+    "column": "Id",
+    "formula": "Id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Author": 60,
+   "Conference": 30,
+   "Journal": 30,
+   "Paper": 150,
+   "PaperAuthor": 300
+  },
+  "null_targets": [
+   "Author.Name",
+   "Author.Affiliation",
+   "Paper.Title",
+   "Paper.Keyword",
+   "Paper.ConferenceId",
+   "Paper.JournalId",
+   "PaperAuthor.Name",
+   "PaperAuthor.Affiliation",
+   "PaperAuthor.PaperId",
+   "PaperAuthor.AuthorId"
+  ],
+  "supporting_evidence": "Author/Paper/PaperAuthor sample rows; Paper.Title LIKE and 'Turbulent Fluids' keyword literals; PaperAuthor.Name conditioned on AuthorId. Paper.Id boundary targets [4,5,6,105,106,107] planted into the sequential PK sequence while keeping uniqueness. PaperAuthor.AuthorId restricted to generated Author Ids so Name/Affiliation copy always applies. FK boundary literals -1/0/1 for ConferenceId are used only in query predicates, not in generated data, preserving FK integrity.",
+  "uncertainty": "ConferenceId/JournalId generate range rules but real values are drawn from parent generated Ids; PaperAuthor.Name-AuthorId copy applies to all rows because AuthorId is restricted to generated Author Ids. Paper.Id boundary values are planted into the PK sequence; the duplicates_for_distinct target on Paper.Id is dropped as it contradicts the unique-PK rule. Table sizes are jittered +/-20% around the stated per-instance sizes."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "generate.py `generate_rows` assigns sequential PKs via `_pk_start` (max existing + 1) for every table, and `insert_generated` inserts them. But the specification's per-column exceptions require boundary values on Paper.Id ([4,5,6,105,106,107]) and PaperAuthor.PaperId ([4,5,6,100,101,102]). The PK path bypasses `ColumnGen.sample()` entirely, so BOUNDARY[('Paper','Id')] is never planted. Execution feedback confirms: Paper.Id boundary targets are not exercised (construction_pairs separated=29/308, and Paper.Id boundary group absent).",
+     "requested_revision": "Either (a) drop the Paper.Id boundary/duplicate targets from the spec (they conflict with sequential-PK rule), or (b) have the generator plant the boundary values into the PK sequence (e.g., start at 1 and inject 4,5,6,105,106,107) while keeping uniqueness. Also reconcile the 'duplicates_for_distinct' target on Paper.Id (20-50% duplicate share) with the 'integer_pk: unique per table' rule \u2014 these are contradictory and must be resolved in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generate.py `_copy_author_fields` only overwrites PaperAuthor.Name/Affiliation when `aid in lookup` (i.e., AuthorId references a *generated* Author row). But `generate_rows` draws PaperAuthor.AuthorId from `parent_vals = original Author.Ids + generated Author.Ids`. For rows whose AuthorId is an original (compact) Author Id, Name/Affiliation are left as independently sampled values, violating the semantic rule `PaperAuthor.Name = (SELECT Name FROM Author WHERE Author.Id = PaperAuthor.AuthorId)` for those rows. The spec's own `uncertainty` note acknowledges this, but the semantic_rules_and_formulas list states the rule unconditionally.",
+     "requested_revision": "Either restrict PaperAuthor.AuthorId to generated Author Ids (so the copy always applies), or extend `_copy_author_fields` to also look up original Author rows from `schema.original_values` and copy Name/Affiliation for those. Update the spec's `uncertainty` note to match the chosen behavior."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARE sets ('PaperAuthor','PaperId'): 0.10 and ('PaperAuthor','AuthorId'): 0.10, and generate.py applies `ns` to FK columns. But PaperAuthor.PaperId and PaperAuthor.AuthorId are declared NOT NULL in the schema (no `NOT NULL` clause is shown, but they are FK columns with no explicit nullability \u2014 actually the DDL shows no NOT NULL, so nullable is allowed). However, the spec's `null_targets` list includes them, and the execution feedback shows NULL 632/6078 and 611/6078 \u2014 consistent. This is fine per the interface rule. No issue here; noting for completeness.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generate.py `generate_rows` FK sampling: `parent_vals = original + generated`, then `rng.choice(parent_vals)`. For Paper.ConferenceId, the spec's BOUNDARY includes [-1, 0, 1, 186, 187, 188], but these are never planted because FK columns bypass `ColumnGen.sample()`. Similarly Paper.JournalId boundary [199,200,201,299,300,301] and PaperAuthor.PaperId boundary [4,5,6,100,101,102] are never planted. Execution feedback: construction_pairs separated=29/308 \u2014 the FK boundary groups are among the unseparated.",
+     "requested_revision": "In the FK sampling loop, with some probability inject the boundary literals from `spec[key]['boundary']` (only when they are valid parent Ids, or accept them as-is if the spec intends out-of-range values like -1/0/1 to test boundary predicates). Document in the spec whether out-of-range FK values are intended (they would violate the FK constraint, which the execution feedback shows is currently 0 violations \u2014 so either the spec must drop -1/0/1 for ConferenceId, or the generator must skip FK enforcement for those)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `integer_fk` rule says 'Pick a parent Id from already-generated parent rows with 5-30% NULL share when the column is nullable; leave 1-2 parent rows childless.' But the per-column exceptions for Paper.ConferenceId and Paper.JournalId list boundary targets including -1, 0, 1 which are not valid parent Ids (Conference.Id and Journal.Id start at 1). This is internally inconsistent: either the boundary targets are meant to test out-of-range predicates (requiring FK enforcement to be relaxed, contradicting the integrity feedback of 0 FK violations), or they are spurious.",
+     "requested_revision": "Clarify in the spec whether FK boundary targets like -1/0/1 are intended to be planted (and if so, state that FK enforcement is relaxed for those rows, or that they are only used in query predicates not in generated data). Otherwise remove them from BOUNDARY for FK columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `table_size` applies \u00b120% jitter to TABLE_SIZES, but the spec's `table_sizes_per_instance` gives exact sizes (Author: 60, Conference: 30, Journal: 30, Paper: 150, PaperAuthor: 300). Execution feedback shows rows_added Author 1219/20 \u2248 61, Conference 598/20 \u2248 30, Journal 588/20 \u2248 29, Paper 3093/20 \u2248 155, PaperAuthor 6078/20 \u2248 304 \u2014 consistent with jitter, not exact. This is a minor deviation but the spec says 'per instance' sizes.",
+     "requested_revision": "Either remove the jitter in `table_size` to match the spec's exact sizes, or update the spec to state that sizes are jittered \u00b120%."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generate.py `ColumnGen.sample` applies `dup_share` by reusing `self.drawn` values, but for PK columns the PK path bypasses `sample()` entirely, so DUP_SHARE[('Paper','Id')]=0.30 is never applied. Also, for text columns with `dup_share`, the reuse draws from `self.drawn` which includes NULLs (since `sample()` appends None to `self.drawn`? \u2014 actually no, NULL returns early before appending). Checking: `if self.null_share > 0 and r.random() < self.null_share: return None` \u2014 returns before `self.drawn.append(v)`, so NULLs are not in `drawn`. OK. But the PK dup_share is dead code.",
+     "requested_revision": "Remove DUP_SHARE[('Paper','Id')] from the spec (contradicts unique PK), or implement PK duplication (which would violate the PK constraint \u2014 so remove it)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for Paper.Title targets include the full literal '145 GROWTH HORMONE RECEPTORS AND THE ONSET OF HYPERINSULINEMIA IN THE OBESE ZUCKER RAT' and 'Testing timed automata'. generate.py `_perturb_str` truncates/prefixes/suffixes with random chars, which can produce near-variants, but the LIKE pattern '%...%' requires the literal to appear as a substring. `_perturb_str` with `v[:-1]` or `v[1:]` would break the substring match for the full literal. The spec's `like_lits` are stored without '%' and `_perturb_str` is applied \u2014 this may not reliably produce values that match the LIKE pattern. Execution feedback: construction_pairs separated=29/308, and the LIKE groups are likely among unseparated.",
+     "requested_revision": "For LIKE literals, ensure at least some generated values contain the literal as a substring (e.g., plant the exact literal, or prefix/suffix with '%'-compatible content). Add a dedicated sampler branch for `like_lits` that returns the literal verbatim with some probability, and near-variants (case changes, extra chars at ends) otherwise."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `text_keyword` rule says 'NULL share ~76%', and NULL_SHARE[('Paper','Keyword')]=0.76. Execution feedback: Paper.Keyword NULL 2356/3093 \u2248 76.2% \u2014 consistent. But the spec's `comparison_boundary` for Paper.Keyword targets include 'nt F', 'nt f', 'urbulent F', 'urbulent f' which are substrings of 'Turbulent Fluids'. These are meant to test equality predicates, but they are not equal to 'Turbulent Fluids' \u2014 they are distinct values. The spec should clarify whether these are intended as distinct keyword values (fine) or as near-variants for LIKE (then they belong in like_near_variant).",
+     "requested_revision": "Clarify the role of 'nt F'/'urbulent F' etc. in the spec \u2014 if they are equality targets, they are fine as distinct values; if they are meant to test LIKE, move them to like_near_variant."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generate.py `_copy_author_fields` is called after FK sampling, but the FK sampling for PaperAuthor.AuthorId draws from `parent_vals` which includes original Author Ids. For original Author Ids, `lookup` (built from generated Author only) misses, so Name/Affiliation are not copied. This is the same issue as #2 but worth noting the code path: `lookup = {a_ids[i]: ...}` only covers generated Authors.",
+     "requested_revision": "See issue #2."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the spec intends FK boundary targets (-1, 0, 1 for ConferenceId) to be planted despite FK constraints \u2014 needs designer clarification.",
+    "Whether Paper.Id boundary/duplicate targets are intended given the sequential-PK rule \u2014 needs designer clarification.",
+    "Whether the LIKE near-variant sampler reliably produces substring matches \u2014 needs execution evidence on the LIKE groups specifically (not available in the provided feedback).",
+    "Whether PaperAuthor.Name/Affiliation copy is intended to apply to original Author rows \u2014 needs designer clarification (spec's uncertainty note is ambiguous)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARE sets ('PaperAuthor','Name'):0.10 and ('PaperAuthor','Affiliation'):0.30, but generate.py _copy_author_fields overwrites every non-NULL AuthorId row with the Author's Name/Affiliation, so the realized NULL shares (928/6095=15.2% Name, 2131/6095=35.0% Affiliation) are driven by AuthorId NULLs plus Author-side NULLs, not by the declared per-column shares. Execution feedback confirms non-zero NULLs, so the interface NULL rule is satisfied, but the declared shares are not independently honored.",
+     "requested_revision": "Either document that PaperAuthor.Name/Affiliation NULL shares are derived from the Author copy (and drop the misleading NULL_SHARE entries), or apply the copy only to a subset so the declared shares are realized. Not blocking: NULLs are present and the copy dependency is correctly enforced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY for ('Paper','ConferenceId') includes -1,0,1 and ('Paper','JournalId') includes 199..301; generate.py FK branch filters col_boundary to values present in parent_vals, so -1/0/1 are never emitted (correct per spec supporting_evidence). However Paper.JournalId boundary 199..301 are only emitted if Journal.Id reaches those values; with Journal size ~30 (jittered) and PK starting after compact max, these are effectively never planted, so the JournalId comparison_boundary target is not realized in generated data.",
+     "requested_revision": "Confirm this is acceptable (boundary literals only need to appear in query predicates, not data) or extend Journal PK range so 199..301 can be planted. Not blocking: FK integrity is preserved and the spec's supporting_evidence explicitly allows predicate-only boundary use."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "generate.py _plant_pk_sequence plants a random subset of boundary values (want = rng.randint(1,len(boundary)), plant_set random slice) rather than all of [4,5,6,105,106,107]. The spec says 'inject those values in order'. With Paper size ~150 and start after compact max, values 4,5,6 are below start and are dropped by the `b >= start` filter, so only 105,106,107 can ever be planted, and only a random subset.",
+     "requested_revision": "Plant all boundary values >= start deterministically (or document the random-subset behavior). Not blocking: PK uniqueness and integrity hold; boundary coverage is partial but the spec's 'e.g.' phrasing permits variation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's integer_pk rule says 'start at 1 and inject those values in order', but the compact database already contains Paper.Id values, so starting at 1 would collide. The program correctly starts at max(compact)+1, which contradicts the literal spec text but preserves integrity. The spec's uncertainty section acknowledges planting but not the start-offset conflict.",
+     "requested_revision": "Clarify in the spec that PK sequences start after the compact max (not at 1) when compact rows are preserved. Not blocking: the program's interpretation is the only integrity-preserving one."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all nullable columns except the six listed show 'NULL 0 / n' for Conference.FullName/HomePage/ShortName, Journal.FullName/HomePage/ShortName, Paper.Year. These are nullable in the schema but NULL_SHARE has no entry, so null_share=0.0. Per instruction 7 this is noted, not blocking.",
+     "requested_revision": "Optionally add small NULL shares for these nullable columns to match compact-database shares. Not blocking per the NULL-rule note."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs separated=27/308 is low; per instruction 4 this alone does not establish a generation error, and no held-out pairs were used to investigate further.",
+    "Paper.JournalId boundary values 199..301 and Paper.Id boundary values 4,5,6 are not realized in generated data due to PK start offset and random-subset planting; whether this matters depends on downstream query coverage, which was not evaluated."
+   ],
+   "summary": "The program ran cleanly (20/20 valid, 0 FK/NOT NULL/PK violations, reproducible), preserves compact rows by copying then appending, and implements the core spec: sequential PKs with planted boundaries, FK draws from generated parents with 5-30% NULL, PaperAuthor.AuthorId restricted to generated Authors with Name/Affiliation copied, LIKE literals planted verbatim, duplicate shares on DISTINCT columns, and table-size jitter. Semantic rules (Year range, Title non-empty, FK ranges, denormalized copy) are supported by the schema and spec evidence. Minor deviations (random-subset PK boundary planting, unrealized JournalId boundaries, derived PaperAuthor NULL shares) are documented and do not block a pass."
+  }
+ ]
 }

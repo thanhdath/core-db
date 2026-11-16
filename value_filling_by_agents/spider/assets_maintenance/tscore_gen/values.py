@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -180,6 +182,84 @@ class BoolSampler(ColumnSampler):
         if not self.elements or self.rng.random() < self.p:
             return self.vals[0] if self.rng.random() < 0.5 else self.vals[1]
         return self.rng.choice(self.elements)
+
+
+class EnumSampler(ColumnSampler):
+    """Random pick from the listed enum; no NULL."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class DuplicateShareSampler(ColumnSampler):
+    """Draws from a small pool so that 20-50 % of values repeat an earlier value."""
+
+    def __init__(self, pool, share, rng):
+        super().__init__(list(pool), 0.0, float('inf'), rng)
+        self.share = share
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < self.share:
+            return r.choice(self.seen)
+        v = r.choice(self.elements)
+        self.seen.append(v)
+        return v
+
+
+class GroupSizeSampler(ColumnSampler):
+    """Partitions n draws into groups of size 1, 2 and >= 3 (spec group_sizes)."""
+
+    def __init__(self, pool, rng):
+        super().__init__(list(pool), 0.0, float('inf'), rng)
+        self.plan: list = []
+
+    def plan_groups(self, n: int) -> None:
+        """Build a group-size plan covering n rows: at least one 1, one 2, one >=3."""
+        r = self.rng
+        plan = [1, 2, 3]
+        while sum(plan) < n:
+            plan.append(r.choice([1, 1, 2, 3, 4]))
+        while sum(plan) > n:
+            for i in range(len(plan) - 1, -1, -1):
+                if plan[i] > 1 and sum(plan) - 1 >= n:
+                    plan[i] -= 1
+                    break
+            else:
+                plan.pop()
+        r.shuffle(plan)
+        self.plan = plan
+
+    def sample(self):
+        raise NotImplementedError
+
+    def draw(self, n: int) -> list:
+        """Return n values whose value-groups follow the plan."""
+        self.plan_groups(n)
+        out: list = []
+        for g in self.plan:
+            v = self.rng.choice(self.elements)
+            out.extend([v] * g)
+        return out[:n]
+
+
+class DateWindowSampler(ColumnSampler):
+    """Uniform random timestamp within [2017-01-01, 2018-12-31]."""
+
+    def __init__(self, rng, lo=spec.DATE_LO, hi=spec.DATE_HI):
+        super().__init__([], 1.0, float('inf'), rng)
+        self.lo, self.hi = lo, hi
+
+    def draw_dt(self) -> dt.datetime:
+        span = int((self.hi - self.lo).total_seconds())
+        return self.lo + dt.timedelta(seconds=self.rng.randint(0, span))
+
+    def sample(self):
+        return self.draw_dt().strftime(spec.DATE_FMT)
 
 
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:

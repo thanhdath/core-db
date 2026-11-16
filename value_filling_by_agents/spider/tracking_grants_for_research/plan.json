@@ -1,50 +1,477 @@
 {
  "db": "tracking_grants_for_research",
- "operator_io_quirks": [
-  "Column name with spaces and mixed case: Tasks.\"eg Agree Objectives\" (VARCHAR(1), all NULL) \u2014 must be double-quoted in generated SQL; case-insensitive lookup must still find it.",
-  "All identifiers are backtick-quoted in DDL; generated SQL must use double quotes, so read_schema must strip backticks and keep original spelling.",
-  "Project_Staff.staff_id is declared DOUBLE but is the PRIMARY KEY and stores integral reals (0.0, 3.0, 29.0) \u2014 Number fuzzer with float perturbation will produce non-integer PKs; sqlite accepts them.",
-  "Project_Outcomes has NO primary key (pk=[]) \u2014 sample_fresh_primary_keys must be a no-op there; drop_unique_duplicates also no-op (no unique cols).",
-  "Project_Outcomes.outcome_details, Project_Staff.other_details, Tasks.\"eg Agree Objectives\" are 100% NULL (distinct=0, storage=['null']) \u2014 original_values lists are all None; Base sampler drops None -> empty elements -> p:=1 (always fresh).",
-  "Documents.other_details has distinct=1 with sample '' (empty string) \u2014 String sampler with one element and length range [0,1].",
-  "DATETIME columns store text 'YYYY-MM-DD HH:MM:SS' (with time component); ts_fuzzer dispatch is 'Date|Number(int elements)' \u2014 first element parses as int? No (has '-'), so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "Grants.grant_amount DECIMAL(19,4) has mixed storage ['real','integer'] \u2014 Number fuzzer scale=19, precision=4, is_int=False; range [-1e19,1e19] huge.",
-  "FK Documents.grant_id -> Grants.grant_id: parent has 15 rows, child 15 rows, child distinct=8 (many-to-one) \u2014 FK fill draws with replacement from parent's final values, so duplicates expected.",
-  "FK Project_Outcomes.project_id -> Projects.project_id: parent 15 rows, child distinct=10; Project_Outcomes has no PK so no dedup.",
-  "All FK parents exist (parent_exists=true everywhere); no dangling FKs, no self-references, no composite keys in this DB.",
-  "Small DB (all tables <=15 rows, 2-row lookup tables) \u2014 choose_table_sizes will produce sizes 1..~2500, far larger than original; original_sizes tiny."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on all DATETIME columns: template '%Y-%m-%d %H:%M:%S' from first parsable element; range = [min,max] of parsed elements (e.g. 1970..2016) \u2014 fresh dates stay in that narrow window, so queries filtering outside it (e.g. year>2020) get 0 rows -> FN.",
-  "String fuzzer on VARCHAR(10) code columns (document_type_code, organisation_type, role_code, outcome_code): fresh random strings over a-zA-Z0-9() of length 0..10, plus contaminate \u2014 values like 'APP','REG','RES','SPON','Paper','Patent','leader','researcher' will be diluted; equality joins on these codes still work via FK fill but WHERE code='APP' may miss.",
-  "String fuzzer on VARCHAR(255) description/details columns: random strings, not the original English words \u2014 queries matching text patterns (LIKE '%research%') get FN.",
-  "Number fuzzer on INTEGER PKs: fresh uniform in [-1e4,1e4] (scale=4) with +-1/+-2 perturbation \u2014 PKs become large/negative, so queries with id<10 or BETWEEN small ranges get FN; joins still consistent via FK fill.",
-  "Number fuzzer on grant_amount DECIMAL(19,4): range [-1e19,1e19] \u2014 SUM/AVG/MAX comparisons against plausible amounts (e.g. >1000) become trivially true or false -> FP/FN.",
-  "Number fuzzer on Project_Staff.staff_id DOUBLE PK: float perturbation +-0.01/+-0.02 \u2014 non-integer PKs; queries staff_id=3 (int) may miss due to 3.0 vs 3.01.",
-  "FK fill draws with replacement from parent's FINAL filtered values \u2014 Documents.grant_id gets duplicates (many-to-one), matching original distinct=8<15; but if parent PK dedup drops rows, child may get NULLs (empty parent) -> NOT NULL insert failures skipped -> fewer rows.",
-  "NOT NULL not enforced in Python: rows violating NOT NULL (e.g. Documents.sent_date NULL from empty Date elements) fail at insert and are silently skipped \u2014 table sizes shrink, causing FN on COUNT(*) queries.",
-  "Empty-string element in Documents.other_details (distinct=1, '') \u2014 String sampler returns '' often; queries other_details='' match, others miss.",
-  "All-NULL columns (Project_Outcomes.outcome_details etc.): Base drops None -> p=1 -> always fresh random strings, never NULL \u2014 queries IS NULL get FN, IS NOT NULL get FP.",
-  "Small lookup tables (2 rows) with FK children: FK fill from 2 parent values gives only 2 distinct child codes \u2014 good for join coverage, but WHERE code IN (list) may miss if list has other values.",
-  "No composite PKs, no self-FK, no dangling FK \u2014 process_order is a simple 4-level DAG (Organisation_Types/Staff_Roles/Research_Outcomes/Document_Types -> Organisations -> Grants/Projects/Research_Staff -> Documents/Tasks/Project_Outcomes/Project_Staff)."
- ],
- "challenger_refs": [
-  "G6",
-  "G3",
-  "G4",
-  "G11",
-  "G1",
-  "G2",
-  "G7",
-  "G5",
-  "G9",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; unique; never NULL.",
+   "integer_fk": "Uniformly pick an existing parent key; 5% of rows get NULL only if the column is nullable.",
+   "varchar_code": "Pick from the enum pool for the column; 10% near-variants (case flip, one-char edit) when no FK.",
+   "varchar_text": "Random lowercase word 3-12 chars; 5% near-duplicate of an existing value.",
+   "datetime": "Random timestamp between 1970-01-01 and 2016-12-31 23:59:59, format %Y-%m-%d %H:%M:%S.",
+   "decimal_amount": "Uniform in [0, 100000000] with 4 decimals; 5% boundary values near 6000.",
+   "double_pk": "Sequential doubles starting at 0.0; unique; never NULL.",
+   "nullable_any": "5% NULL share; at least one NULL row per nullable column per instance."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Document_Types",
+    "column": "document_type_code",
+    "pattern": "enum",
+    "targets": [
+     "APP",
+     "REG"
+    ]
+   },
+   {
+    "table": "Document_Types",
+    "column": "document_description",
+    "pattern": "enum",
+    "targets": [
+     "Initial Application",
+     "Regular"
+    ]
+   },
+   {
+    "table": "Organisation_Types",
+    "column": "organisation_type",
+    "pattern": "enum",
+    "targets": [
+     "RES",
+     "SPON"
+    ]
+   },
+   {
+    "table": "Organisation_Types",
+    "column": "organisation_type_description",
+    "pattern": "enum",
+    "targets": [
+     "Research",
+     "Sponsor"
+    ]
+   },
+   {
+    "table": "Research_Outcomes",
+    "column": "outcome_code",
+    "pattern": "enum",
+    "targets": [
+     "Paper",
+     "Patent"
+    ]
+   },
+   {
+    "table": "Research_Outcomes",
+    "column": "outcome_description",
+    "pattern": "enum",
+    "targets": [
+     "Published Research Paper",
+     "Research Patent"
+    ]
+   },
+   {
+    "table": "Staff_Roles",
+    "column": "role_code",
+    "pattern": "enum",
+    "targets": [
+     "leader",
+     "researcher"
+    ]
+   },
+   {
+    "table": "Staff_Roles",
+    "column": "role_description",
+    "pattern": "enum",
+    "targets": [
+     "Project Leader",
+     "Project Researcher"
+    ]
+   },
+   {
+    "table": "Organisations",
+    "column": "organisation_type",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "RES",
+     "res"
+    ]
+   },
+   {
+    "table": "Organisation_Types",
+    "column": "organisation_type_description",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Research",
+     "research"
+    ]
+   },
+   {
+    "table": "Research_Outcomes",
+    "column": "outcome_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Patent",
+     "patent"
+    ]
+   },
+   {
+    "table": "Research_Outcomes",
+    "column": "outcome_description",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%Published%",
+     "%ublished%",
+     "Published Research Paper%"
+    ]
+   },
+   {
+    "table": "Project_Outcomes",
+    "column": "outcome_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Patent",
+     "patent",
+     "Paper",
+     "paper"
+    ]
+   },
+   {
+    "table": "Grants",
+    "column": "grant_amount",
+    "pattern": "comparison_boundary",
+    "targets": [
+     61.9999,
+     62,
+     62.0001,
+     5999.9999,
+     6000,
+     6000.0001
+    ]
+   },
+   {
+    "table": "Grants",
+    "column": "grant_amount",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     5999,
+     6000,
+     6001,
+     6002
+    ]
+   },
+   {
+    "table": "Grants",
+    "column": "grant_end_date",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "1989-03-15 00:00:00",
+     "1989-03-16 00:00:00",
+     "1989-03-17 00:00:00",
+     "1989-03-16 18:27:16",
+     "1989-03-16 18:27:17"
+    ]
+   },
+   {
+    "table": "Project_Staff",
+    "column": "date_to",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "2016-03-14 00:00:00",
+     "2016-03-15 00:00:00",
+     "2016-03-16 00:00:00",
+     "2016-03-15 00:33:18",
+     "2016-03-15 00:33:19"
+    ]
+   },
+   {
+    "table": "Project_Staff",
+    "column": "date_from",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "2003-04-18 00:00:00",
+     "2003-04-19 00:00:00",
+     "2003-04-19 15:06:20",
+     "2003-04-19 15:06:21",
+     "2003-04-20 00:00:00"
+    ]
+   },
+   {
+    "table": "Project_Staff",
+    "column": "role_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "leader",
+     "researcher"
+    ]
+   },
+   {
+    "table": "Project_Staff",
+    "column": "staff_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Staff_Roles",
+    "column": "role_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Projects",
+    "column": "project_details",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "omnis",
+     "OMNIS"
+    ]
+   },
+   {
+    "table": "Projects",
+    "column": "project_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Project_Staff, Tasks"
+    ]
+   },
+   {
+    "table": "Project_Staff",
+    "column": "project_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Projects"
+    ]
+   },
+   {
+    "table": "Organisations",
+    "column": "organisation_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Research_Staff, Project_Staff"
+    ]
+   },
+   {
+    "table": "Organisations",
+    "column": "organisation_type",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Organisation_Types"
+    ]
+   },
+   {
+    "table": "Organisation_Types",
+    "column": "organisation_type",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Organisations"
+    ]
+   },
+   {
+    "table": "Project_Outcomes",
+    "column": "project_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Tasks, Projects"
+    ]
+   },
+   {
+    "table": "Tasks",
+    "column": "project_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Project_Outcomes, Projects"
+    ]
+   },
+   {
+    "table": "Research_Staff",
+    "column": "employer_organisation_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children in Organisations"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Documents.document_type_code",
+    "parent": "Document_Types.document_type_code",
+    "copied": []
+   },
+   {
+    "child": "Documents.grant_id",
+    "parent": "Grants.grant_id",
+    "copied": []
+   },
+   {
+    "child": "Grants.organisation_id",
+    "parent": "Organisations.organisation_id",
+    "copied": []
+   },
+   {
+    "child": "Organisations.organisation_type",
+    "parent": "Organisation_Types.organisation_type",
+    "copied": []
+   },
+   {
+    "child": "Project_Outcomes.project_id",
+    "parent": "Projects.project_id",
+    "copied": []
+   },
+   {
+    "child": "Project_Outcomes.outcome_code",
+    "parent": "Research_Outcomes.outcome_code",
+    "copied": []
+   },
+   {
+    "child": "Project_Staff.project_id",
+    "parent": "Projects.project_id",
+    "copied": []
+   },
+   {
+    "child": "Project_Staff.role_code",
+    "parent": "Staff_Roles.role_code",
+    "copied": []
+   },
+   {
+    "child": "Projects.organisation_id",
+    "parent": "Organisations.organisation_id",
+    "copied": []
+   },
+   {
+    "child": "Research_Staff.employer_organisation_id",
+    "parent": "Organisations.organisation_id",
+    "copied": []
+   },
+   {
+    "child": "Tasks.project_id",
+    "parent": "Projects.project_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Grants",
+    "column": "grant_amount",
+    "formula": "grant_amount >= 0"
+   },
+   {
+    "table": "Grants",
+    "column": "grant_end_date",
+    "formula": "grant_end_date >= grant_start_date"
+   },
+   {
+    "table": "Project_Staff",
+    "column": "date_to",
+    "formula": "date_to >= date_from"
+   },
+   {
+    "table": "Documents",
+    "column": "response_received_date",
+    "formula": "response_received_date >= sent_date"
+   },
+   {
+    "table": "Organisations",
+    "column": "organisation_type",
+    "formula": "organisation_type IN ('RES','SPON')"
+   },
+   {
+    "table": "Project_Outcomes",
+    "column": "outcome_code",
+    "formula": "outcome_code IN ('Paper','Patent')"
+   },
+   {
+    "table": "Project_Staff",
+    "column": "role_code",
+    "formula": "role_code IN ('leader','researcher')"
+   },
+   {
+    "table": "Document_Types",
+    "column": "document_type_code",
+    "formula": "document_type_code IN ('APP','REG')"
+   },
+   {
+    "table": "Organisation_Types",
+    "column": "organisation_type",
+    "formula": "organisation_type IN ('RES','SPON')"
+   },
+   {
+    "table": "Research_Outcomes",
+    "column": "outcome_code",
+    "formula": "outcome_code IN ('Paper','Patent')"
+   },
+   {
+    "table": "Staff_Roles",
+    "column": "role_code",
+    "formula": "role_code IN ('leader','researcher')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Document_Types": 2,
+   "Organisation_Types": 2,
+   "Research_Outcomes": 2,
+   "Staff_Roles": 2,
+   "Organisations": 15,
+   "Grants": 15,
+   "Projects": 15,
+   "Research_Staff": 15,
+   "Documents": 15,
+   "Project_Outcomes": 15,
+   "Project_Staff": 15,
+   "Tasks": 15
+  },
+  "null_targets": [
+   "Documents.document_type_code",
+   "Project_Outcomes.outcome_details",
+   "Project_Staff.date_from",
+   "Project_Staff.date_to",
+   "Project_Staff.other_details",
+   "Tasks.eg Agree Objectives"
+  ],
+  "supporting_evidence": {
+   "Grants.grant_amount >= 0": "All shown grant_amount values are positive (4094.542, 281.2446, 4515947.7015, ...).",
+   "Grants.grant_end_date >= grant_start_date": "Row 1: start 2016-11-20, end 2004-10-24 (violates); row 2: start 1985-10-09, end 1985-06-08 (violates); row 3: start 1970-09-19, end 1989-03-16 (holds). Rule dropped due to contradictions.",
+   "Project_Staff.date_to >= date_from": "Row 1: from 1981-10-04, to 1985-05-30 (holds); row 2: from 2003-04-19, to 2010-12-08 (holds); row 3: from 1981-10-09, to 2004-12-16 (holds).",
+   "Documents.response_received_date >= sent_date": "Row 1: sent 1986-11-30, received 1977-12-01 (violates); row 2: sent 2004-01-23, received 1979-12-08 (violates); row 3: sent 1999-03-03, received 1995-09-12 (violates). Rule dropped due to contradictions."
+  },
+  "uncertainty": "Date order rules for Grants and Documents are contradicted by shown rows and were dropped. Enum values are taken from the shown distinct values. NULL shares are estimated at 5% since observed null rates are 0 or 1.0."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "supporting_evidence drops 'Grants.grant_end_date >= grant_start_date' and 'Documents.response_received_date >= sent_date' as contradicted by compact rows, but the specification's semantic_rules_and_formulas still lists both. The program's _apply_formulas enforces them on generated rows only (compact rows are copied unchanged), so no integrity conflict arises; execution shows 0 not_null/fk/pk violations and 20/20 valid instances.",
+     "requested_revision": "Optional: mark these two formulas as 'generated-rows-only' in the spec, or move them to a separate 'uncertain' list, to avoid implying they hold on the compact data. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "nullable_columns shows 'Project_Outcomes.outcome_details: generated rows: NULL 300 / 300' and 'Project_Staff.other_details: NULL 211 / 211' and 'Tasks.eg Agree Objectives: NULL 300 / 300' \u2014 i.e. 100% NULL, no non-NULL rows. Per the interface rule (item 7) this is noted for the engineer but does not block. Cause: _null_share returns the compact share (1.0 for these columns), and _apply_null_rule sets k = round(share*n) = n, so every generated row is NULL.",
+     "requested_revision": "Optional: cap the planted NULL count at n-1 (or blend with the 5% floor) so at least one non-NULL row exists per nullable column, matching the 'rows with NULL and rows with non-NULL' wording. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "construction_pairs: eligible 60, separated 25, unknown_executions 0. The 35 unseparated pairs are not evidence of a generation bug: many are unmatched_join_rows / duplicates_for_distinct / ties_for_order_limit patterns whose separation depends on query shape, and the spec's boundary literals are planted via _apply_comparison_boundaries (e.g. grant_amount 5999.9999/6000/6000.0001, date_to 2016-03-15 00:33:18/19). Missing separation alone does not prove equivalence.",
+     "requested_revision": "None required; note that boundary planting is present in code and the remaining unseparated pairs are expected for these pattern families."
+    }
+   ],
+   "checks": {
+    "semantic_rules_evidence": "Supported: grant_amount >= 0 (all positive), Project_Staff.date_to >= date_from (rows hold), enum IN rules (values match shown distincts). Uncertain/dropped: grant_end_date >= grant_start_date and response_received_date >= sent_date are contradicted by compact rows; program enforces them only on generated rows, which is consistent with the 'compact rows preserved' contract.",
+    "value_domains_and_sampling": "Enums (Document_Types, Organisation_Types, Research_Outcomes, Staff_Roles) drawn only from enum pools with p=0 (make_spec_sampler enum branch). comparison_boundary literals planted via _apply_comparison_boundaries. like_near_variant expanded via _like_variants. aggregate_boundary values included as elements. integer_pk sequential above compact max; double_pk sequential from 0.0; datetime format %Y-%m-%d %H:%M:%S; decimal 4dp. Dependencies: all 11 FKs in spec.dependencies are read by schema.read_schema via pragma foreign_key_list and used in build_random_instance FK sampling from parent pools (compact + generated).",
+    "integrity": "fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0 across 20 instances; rows_skipped all 0.",
+    "dependent_value_consistency": "FKs draw from parent pools including compact rows; self-referencing FK repair present; _dedupe_against_compact prevents PK/UNIQUE collisions with compact rows.",
+    "compact_rows_preserved": "writer copies orig file then inserts only generated rows; compact rows never deleted/updated.",
+    "reproducible": "reproducible: true; seed = seed_base*100003 + i.",
+    "value_variation": "Boundary literals, near-variants, and duplicate-share injection present; 25/60 pairs separated with 0 unknown executions \u2014 variation remains possible."
+   },
+   "unresolved_checks": [
+    "Whether the 35 unseparated construction pairs are truly equivalent or merely not separated by the sampled queries cannot be determined without held-out labels; not treated as a defect.",
+    "The two dropped date-order formulas are enforced only on generated rows; whether the compact data's violations are intentional is a designer judgment, not a program error."
+   ]
+  }
+ ]
 }

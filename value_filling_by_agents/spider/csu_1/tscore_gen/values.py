@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -17,6 +19,7 @@ class ColumnSampler:
         self.max_l0 = max_l0
         self.rng = rng
         self.fresh: list = []
+        self.boundary: list = []
 
     def _fresh_or_reuse(self, draw):
         if len(self.fresh) > self.max_l0:
@@ -27,6 +30,12 @@ class ColumnSampler:
 
     def sample(self):
         raise NotImplementedError
+
+    def sample_boundary(self):
+        """A value from the specification boundary pool (or a normal sample)."""
+        if self.boundary:
+            return self.rng.choice(self.boundary)
+        return self.sample()
 
 
 def _num(x):
@@ -214,18 +223,53 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     return StringSampler(els, p, max_l0, rng)
 
 
+def _spec_pool(table: str, col: str) -> list:
+    """Specification value pools for a column (boundary / LIKE / case variants)."""
+    key = '%s.%s' % (table, col)
+    out = []
+    if key in spec.YEAR_BOUNDARY:
+        out += [str(v) for v in spec.YEAR_BOUNDARY[key]]
+    if key in spec.NUM_BOUNDARY:
+        out += [str(v) for v in spec.NUM_BOUNDARY[key]]
+    if key == 'Campuses.Campus':
+        out += spec.CAMPUS_LITERALS + spec.CAMPUS_CASE_VARIANTS
+    if key == 'Campuses.Location':
+        out += [p.replace('%', '') for p in spec.LOCATION_LIKE] + spec.LOCATION_VARIANTS
+    if key == 'Campuses.County':
+        out += spec.COUNTY_LITERALS
+    return out
+
+
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (+ spec pools)."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    els += _spec_pool(column.table, column.name)
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    s = make_column_sampler(column, els, p, max_l0, rng)
+    bkey = '%s.%s' % (column.table, column.name)
+    raw = []
+    if bkey in spec.YEAR_BOUNDARY:
+        raw += spec.YEAR_BOUNDARY[bkey]
+    if bkey in spec.NUM_BOUNDARY:
+        raw += spec.NUM_BOUNDARY[bkey]
+    if bkey == 'Campuses.Campus':
+        raw += spec.CAMPUS_LITERALS + spec.CAMPUS_CASE_VARIANTS
+    if bkey == 'Campuses.Location':
+        raw += [x.replace('%', '') for x in spec.LOCATION_LIKE] + spec.LOCATION_VARIANTS
+    if bkey == 'Campuses.County':
+        raw += spec.COUNTY_LITERALS
+    if isinstance(s, NumberSampler):
+        s.boundary = [s._cast(float(v)) for v in raw if _num(v) is not None]
+    else:
+        s.boundary = [str(v) for v in raw]
+    return s
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

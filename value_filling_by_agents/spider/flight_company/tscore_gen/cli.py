@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -10,15 +10,17 @@ import time
 from .instance import build_random_instance
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
+from .spec import load_specification, spec_from_schema
 from .writer import unit_path, write_instance_sqlite
 
 _G: dict = {}
 
 
-def _init(orig: str, pool: dict, args: dict) -> None:
+def _init(orig: str, pool: dict, spec: dict, args: dict) -> None:
     """Worker initializer: read the original ONCE per process."""
     _G['schema'] = read_schema(orig)
     _G['pool'] = pool
+    _G['spec'] = spec
     _G['args'] = args
 
 
@@ -30,12 +32,38 @@ def _one(i: int) -> str:
         return ''
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
+        inst = build_random_instance(_G['schema'], _G['pool'], None, rng, _G['spec'])
+        write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
         return type(e).__name__
+
+
+def _load_spec(orig: str, schema) -> dict:
+    """Read tscore_gen/specification.json next to the package if present, else derive from schema."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, 'specification.json')
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return load_specification(json.load(f), schema)
+        except Exception as e:
+            print('specification.json unusable: %r' % (e,), file=sys.stderr)
+    return spec_from_schema(schema)
+
+
+def _merge_pool(spec: dict, pool: dict) -> dict:
+    """Merge specification pools into the query-derived literal pool (per-column extension)."""
+    out = {k: list(v) for k, v in pool.items()}
+    for k, vals in spec.get('pools', {}).items():
+        seen = set(out.get(k, []))
+        for v in vals:
+            sv = str(v)
+            if sv not in seen:
+                out.setdefault(k, []).append(sv)
+                seen.add(sv)
+    return out
 
 
 def main(argv=None) -> None:
@@ -63,21 +91,39 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    spec = _load_spec(a.orig, schema)
+    pool = _merge_pool(spec, pool)
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base,
+            'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
+        _G.update(schema=schema, pool=pool, spec=spec, args=args)
         res = [_one(i) for i in idx]
     else:
-        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
+        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, spec, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
     for r in res:
         if r:
             errs[r] = errs.get(r, 0) + 1
+    added, skipped_rows = {}, {}
+    for i in idx:
+        p = unit_path(a.root, a.ds, a.db, i, a.tag)
+        if not os.path.exists(p):
+            continue
+        try:
+            import sqlite3
+            con = sqlite3.connect('file:%s?mode=ro' % p, uri=True)
+            for t in schema.tables:
+                n = con.execute('select count(*) from "%s"' % t.replace('"', '""')).fetchone()[0]
+                added[t] = added.get(t, 0) + max(0, n - schema.original_sizes.get(t, 0))
+            con.close()
+        except Exception:
+            pass
     print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows}))
 
 
 if __name__ == '__main__':

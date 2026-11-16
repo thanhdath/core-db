@@ -233,3 +233,272 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def _is_int_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return 'int' in t
+
+
+def _is_real_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return any(k in t for k in ('real', 'float', 'double', 'numeric', 'decimal'))
+
+
+def _is_date_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return 'date' in t or 'timestamp' in t
+
+
+def _is_text_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return any(k in t for k in ('char', 'text', 'clob')) or t in ('', 'blob')
+
+
+def _rand_token(rng, lo=3, hi=20) -> str:
+    k = rng.randint(lo, hi)
+    return ''.join(rng.choice(string.ascii_lowercase) for _ in range(k))
+
+
+def _rand_sentence(rng, lo=40, hi=250) -> str:
+    n = rng.randint(lo, hi)
+    words, cur = [], 0
+    while cur < n:
+        w = _rand_token(rng, 2, 9)
+        words.append(w)
+        cur += len(w) + 1
+    s = ' '.join(words)[:n]
+    return s[:1].upper() + s[1:] if s else s
+
+
+def _rand_date(rng, lo=dt.date(1900, 1, 1), hi=dt.date(2025, 12, 31)) -> str:
+    span = (hi - lo).days
+    return (lo + dt.timedelta(days=rng.randint(0, span))).isoformat()
+
+
+def _shift_date(s: str, days: int):
+    try:
+        d = dt.date.fromisoformat(str(s)[:10])
+        return (d + dt.timedelta(days=days)).isoformat()
+    except Exception:
+        return None
+
+
+def _like_variants(lit: str) -> list:
+    """Values that match a LIKE pattern but differ from the exact literal."""
+    out = []
+    if lit.endswith('%'):
+        base = lit[:-1]
+        out.append(base)
+        out.append(base + 'x')
+        out.append(base.lower())
+        out.append(base.upper())
+    else:
+        out.append(lit + 'x')
+        out.append(lit.lower())
+        out.append(lit.upper())
+        if "'" in lit:
+            out.append(lit.replace("'", ''))
+            out.append(lit.replace("'", '').lower())
+    return out
+
+
+def _case_variants(v: str) -> list:
+    out = [v]
+    if v.lower() != v:
+        out.append(v.lower())
+    if v.upper() != v:
+        out.append(v.upper())
+    if v[:1].isupper():
+        out.append(v[:1].lower() + v[1:])
+    else:
+        out.append(v[:1].upper() + v[1:])
+    return out
+
+
+class SpecColumnSampler:
+    """Wraps a base sampler and injects specification targets by construction."""
+
+    def __init__(self, column, base: ColumnSampler, rng, *, enum=None, num_range=None,
+                 boundary_values=None, boundary_dates=None, like_literals=None, equality_values=None,
+                 duplicate_share=None, tie_ranks=None, text_long=False):
+        self.column = column
+        self.base = base
+        self.rng = rng
+        self.enum = list(enum) if enum else None
+        self.num_range = num_range
+        self.boundary_values = list(boundary_values) if boundary_values else []
+        self.boundary_dates = list(boundary_dates) if boundary_dates else []
+        self.like_literals = list(like_literals) if like_literals else []
+        self.equality_values = list(equality_values) if equality_values else []
+        self.duplicate_share = duplicate_share
+        self.tie_ranks = tie_ranks
+        self.text_long = text_long
+        self._tie_pool: list = []
+        self._dup_pool: list = []
+        self._n = 0
+        self._planted: list = []
+        self._build_planted()
+
+    def _build_planted(self):
+        r = self.rng
+        planted = []
+        if self.enum:
+            for v in self.enum:
+                planted.append(v)
+            for v in self.enum:
+                for cv in _case_variants(v):
+                    if cv not in planted:
+                        planted.append(cv)
+        for v in self.boundary_values:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if _is_int_type(self.column.type_str):
+                for d in (-1, 0, 1):
+                    planted.append(int(f) + d)
+            else:
+                for d in (-1.0, 0.0, 1.0):
+                    planted.append(round(f + d, 6))
+        for v in self.boundary_dates:
+            for d in (-1, 0, 1):
+                s = _shift_date(v, d)
+                if s is not None:
+                    planted.append(s)
+        for lit in self.like_literals:
+            for v in _like_variants(lit):
+                planted.append(v)
+        for v in self.equality_values:
+            for cv in _case_variants(v):
+                planted.append(cv)
+        r.shuffle(planted)
+        self._planted = planted
+        if self.tie_ranks:
+            if self.enum:
+                self._tie_pool = list(self.enum[:max(1, min(3, len(self.enum)))])
+            elif _is_int_type(self.column.type_str):
+                self._tie_pool = [r.randint(1, 1000) for _ in range(3)]
+            elif _is_real_type(self.column.type_str):
+                self._tie_pool = [round(r.uniform(0.0, 200.0), 6) for _ in range(3)]
+            elif _is_date_type(self.column.type_str):
+                self._tie_pool = [_rand_date(r) for _ in range(3)]
+            else:
+                self._tie_pool = [_rand_token(r) for _ in range(3)]
+        if self.duplicate_share:
+            if self.enum:
+                self._dup_pool = list(self.enum)
+            elif _is_text_type(self.column.type_str):
+                self._dup_pool = [_rand_token(r) for _ in range(max(2, r.randint(3, 8)))]
+            elif _is_int_type(self.column.type_str):
+                self._dup_pool = [r.randint(1, 1000) for _ in range(3)]
+
+    def _clamp(self, v):
+        if self.num_range is None or v is None:
+            return v
+        lo, hi, is_int = self.num_range
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return v
+        if lo is not None and f < lo:
+            f = lo
+        if hi is not None and f > hi:
+            f = hi
+        return int(round(f)) if is_int else round(f, 6)
+
+    def _fresh(self):
+        r = self.rng
+        t = self.column.type_str or ''
+        if self.enum:
+            return r.choice(self.enum)
+        if _is_int_type(t):
+            if self.num_range:
+                lo, hi, _ = self.num_range
+                lo = 0 if lo is None else int(lo)
+                hi = 1000 if hi is None else int(hi)
+                if hi < lo:
+                    hi = lo
+                return r.randint(lo, hi)
+            return r.randint(1, 1000)
+        if _is_real_type(t):
+            if self.num_range:
+                lo, hi, _ = self.num_range
+                lo = 0.0 if lo is None else float(lo)
+                hi = 200.0 if hi is None else float(hi)
+                if hi < lo:
+                    hi = lo
+                return round(r.uniform(lo, hi), 6)
+            return round(r.uniform(0.0, 200.0), 6)
+        if _is_date_type(t):
+            return _rand_date(r)
+        if _is_text_type(t):
+            return _rand_sentence(r) if self.text_long else _rand_token(r)
+        return self.base.sample()
+
+    def sample(self):
+        r = self.rng
+        self._n += 1
+        if self._planted and self._n <= len(self._planted):
+            v = self._planted[self._n - 1]
+        elif self.tie_pool_hit():
+            v = r.choice(self._tie_pool)
+        elif self._dup_pool and r.random() < 0.35:
+            v = r.choice(self._dup_pool)
+        elif self.enum and r.random() < 0.6:
+            v = r.choice(self.enum)
+        elif r.random() < 0.5:
+            v = self._fresh()
+        else:
+            v = self.base.sample()
+            if self.enum and v not in self.enum:
+                v = r.choice(self.enum)
+        return self._clamp(v)
+
+    def tie_pool_hit(self) -> bool:
+        return bool(self._tie_pool) and self.rng.random() < 0.25
+
+
+def make_spec_sampler(column, base: ColumnSampler, rng, exceptions: list, enum=None, num_range=None) -> SpecColumnSampler:
+    """Build a SpecColumnSampler from the per-column exceptions of the specification."""
+    boundary_values, boundary_dates, like_literals, equality_values = [], [], [], []
+    duplicate_share, tie_ranks = None, None
+    for ex in exceptions or []:
+        pat = ex.get('pattern')
+        tg = ex.get('targets', {}) or {}
+        if pat == 'comparison_boundary':
+            for v in tg.get('values', []) or []:
+                if _is_date_type(column.type_str) and isinstance(v, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', v):
+                    boundary_dates.append(v)
+                elif _is_int_type(column.type_str) or _is_real_type(column.type_str):
+                    try:
+                        boundary_values.append(float(v))
+                    except (TypeError, ValueError):
+                        equality_values.append(str(v))
+                else:
+                    equality_values.append(str(v))
+        elif pat == 'like_near_variant':
+            for v in tg.get('literals', []) or []:
+                if _is_date_type(column.type_str):
+                    if isinstance(v, str) and v.endswith('%'):
+                        y = v[:-1]
+                        if re.fullmatch(r'\d{4}', y):
+                            boundary_dates.extend([y + '-01-01', y + '-12-31'])
+                    else:
+                        boundary_dates.append(str(v))
+                else:
+                    like_literals.append(str(v))
+            for v in tg.get('variants', []) or []:
+                if _is_date_type(column.type_str):
+                    boundary_dates.append(str(v))
+                else:
+                    equality_values.append(str(v))
+        elif pat == 'duplicates_for_distinct':
+            duplicate_share = tg.get('duplicate_share', '20-50 %')
+        elif pat == 'ties_for_order_limit':
+            tie_ranks = tg.get('tie_at_rank', [1])
+    text_long = _is_text_type(column.type_str) and column.name.lower() in ('overview', 'tagline', 'homepage')
+    return SpecColumnSampler(column, base, rng, enum=enum, num_range=num_range,
+                             boundary_values=boundary_values, boundary_dates=boundary_dates,
+                             like_literals=like_literals, equality_values=equality_values,
+                             duplicate_share=duplicate_share, tie_ranks=tie_ranks, text_long=text_long)

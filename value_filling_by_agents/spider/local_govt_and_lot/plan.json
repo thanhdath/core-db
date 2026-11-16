@@ -1,52 +1,404 @@
 {
  "db": "local_govt_and_lot",
- "operator_io_quirks": [
-  "Mixed-case identifiers everywhere: tables Customers/Properties/Residents/Organizations/Services/Things/Customer_Events/Customer_Event_Notes/Timed_Status_of_Things/Timed_Locations_of_Things; columns Customer_Event_ID, Type_of_Thing_Code, Date_and_Date, Date_and_Time, Status_of_Thing_Code, Location_Code \u2014 must be double-quoted verbatim.",
-  "No spaces in table names here (unlike BIRD), but column names contain underscores and mixed case; case-insensitive column lookup still required.",
-  "Composite PKs: Residents(resident_id,property_id,date_moved_in); Residents_Services(resident_id,service_id); Timed_Status_of_Things(thing_id,Date_and_Date,Status_of_Thing_Code); Timed_Locations_of_Things(thing_id,Date_and_Time,Location_Code) \u2014 composite-PK members get max_l0=30, not inf.",
-  "Multi-column FKs: Residents_Services(resident_id,property_id,date_moved_in)->Residents(...) and Customer_Events(resident_id,property_id,date_moved_in)->Residents(...) \u2014 pragma foreign_key_list reports these as separate single-column rows with the same id; the spec's fks dict is (child_t,child_c)->(parent_t,parent_c) so each leg is a separate edge; parent Residents PK is composite so each leg alone is NOT unique in the parent.",
-  "Residents_Services.property_id and .date_moved_in are nullable FK legs of the composite FK to Residents; Customer_Events.customer_id, .date_moved_in, .property_id, .resident_id nullable; Customer_Event_Notes has resident_id/property_id/date_moved_in NOT NULL but NO declared FK to Residents (only to Customer_Events) \u2014 dangling-by-design columns.",
-  "Organizations.parent_organization_id is a self-referencing-looking column (values 7,8 = organization_id values) but has NO declared FK; table self-edge must not create a cycle in process_order.",
-  "All DATETIME columns store TEXT in format 'YYYY-MM-DD HH:MM:SS' (e.g. '2017-06-17 15:43:33'); storage class text contradicts declared DATETIME \u2014 TS dispatches to Date|Number(int elements) branch; first element does not parse as int so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "Residents.date_moved_in has only 3 distinct values (2015-03-27 12:00:00, 2016-09-27 12:00:00, 2017-06-17 15:43:33) \u2014 Date range collapses to [min,max] of 3 dates; <2 distinct would fall back to 1800..2100.",
-  "All tables tiny (3\u201318 rows); original_values read fully, no rowid sampling needed; original_sizes exact.",
-  "Organizations has only 3 rows and is the FK root for Services.organization_id and Things.organization_id \u2014 child FK draws with replacement from 3 values, heavy duplication.",
-  "Properties.other_details has distinct=1 ('USA') and null_rate=0.0 despite being nullable; Organizations.parent_organization_id distinct=2 with null_rate=0.0 despite nullable \u2014 TS will still emit NULLs for nullable columns via String/Number samplers.",
-  "No views, triggers, or indexes beyond PKs in DDL; empty clone is just the 10 CREATE TABLEs."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER PKs/FKs: range [-10^0,10^0]=[-1,1] for scale 0 (no args) \u2014 fresh draws are tiny ints, then perturbed by \u00b11/\u00b12; PKs will collide heavily and sample_fresh_primary_keys will drop most rows, shrinking tables far below chosen size.",
-  "String fuzzer on VARCHAR(255)/CHAR(15)/CHAR(10): length range [0,255] or [0,15]/[0,10] from args[0]; fresh strings over a-zA-Z 0-9() plus 50% contaminate \u2014 property_type_code/service_type_code/Status_of_Thing_Code/Location_Code get random garbage instead of the 2\u20134 real codes, driving FN on equality filters like property_type_code='apartment'.",
-  "Date fuzzer on DATETIME: template %Y-%m-%d %H:%M:%S from first parsable element; range [2015-03-27, 2018-03-17] (Residents.date_moved_out) or narrower per column; p=0.2 means 20% element reuse, 80% fresh uniform dates \u2014 date-range predicates (BETWEEN, <, >) will mostly miss the real 2015\u20132018 cluster.",
-  "Residents.date_moved_in only 3 distinct values: Date range [2015-03-27,2017-06-17]; fresh draws uniform over 2+ years \u2014 joins on (resident_id,property_id,date_moved_in) to Residents_Services/Customer_Events will rarely match because the composite FK legs are drawn independently from parent columns (property_id from Residents.property_id, date_moved_in from Residents.date_moved_in) \u2014 no tuple-level consistency, so composite-FK joins produce near-empty results (FP on join-count queries).",
-  "Organizations.parent_organization_id has no FK: TS treats it as plain Number, draws [-1,1]\u00b1perturb \u2014 self-join Organizations o1 JOIN Organizations o2 ON o1.parent_organization_id=o2.organization_id will almost never match (real values 7,8).",
-  "Organizations only 3 rows: Services.organization_id and Things.organization_id draw from 3 values with replacement \u2014 GROUP BY organization_id yields \u22643 groups vs real 3, but counts wildly skewed.",
-  "Nullable columns (customer_details, other_details, parent_organization_id, Residents_Services.date_moved_in/property_id/date_requested/date_provided, Customer_Events.customer_id/date_moved_in/property_id/resident_id) get NULLs from String/Number/Date samplers when p<1 \u2014 real data has null_rate=0.0 everywhere, so IS NULL / IS NOT NULL predicates flip (FP/FN).",
-  "NOT NULL not enforced in Python: rows violating NOT NULL (e.g. NULL in Residents.date_moved_in from Date sampler) fail at INSERT and are silently skipped \u2014 table sizes shrink further, and PK/unique filtering happens before insert so counts are unpredictable.",
-  "Composite PKs on Timed_* tables: sample_fresh_primary_keys drops duplicate (thing_id,Date_and_Date,Status_of_Thing_Code) tuples \u2014 with Number thing_id in [-1,1] and String Status_of_Thing_Code random, collisions are rare but thing_id collisions common, so rows survive mostly on the random string leg.",
-  "Literal pool from train SQL: real codes ('apartment','house','flat','Cleanning','Check','Moving Out','Pay bills','Open','Close','In Progress','Satisfied','Unsatisfied','Electronics','Commen','Furniture') enter the pool and are sampled as elements with prob 1-p=0.8 \u2014 this is the main source of plausible values; but p=0.2 fresh draws still inject garbage.",
-  "Known misses: FN from implausible fresh strings/dates/numbers on equality and range predicates; FP from missing ties (Number PKs collapse to few distinct values, so COUNT(DISTINCT) and GROUP BY cardinality are wrong) and from composite-FK tuple inconsistency (joins return fewer rows than real)."
- ],
- "challenger_refs": [
-  "G1",
-  "g240b835a",
-  "ga1942dc6",
-  "g15f0654b",
-  "g502d0c4b",
-  "g5f58c536",
-  "g7c84cef3",
-  "gc76211fc",
-  "gfcf76c32",
-  "G2",
-  "g30f2e9f5",
-  "gc032b1b3",
-  "G3"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, step 1, unique per table; never NULL; never overwritten by group-size or distinct-duplicate planting.",
+   "integer_fk": "Copy an existing parent key value; for nullable FKs include NULL rows (share per compact DB, at least one NULL) and non-NULL rows; for NOT NULL FKs always non-NULL.",
+   "integer_numeric": "Uniform integer in [1, 1000] unless a range rule narrows it.",
+   "varchar_text": "Random short text from a small pool of realistic names/addresses; allow near-duplicate variants (case change, one-character edit) with ~10% share; NULL only if column nullable.",
+   "char_code": "Pick from the enum pool defined for the column; never NULL if NOT NULL.",
+   "datetime": "Random datetime in [2015-01-01, 2018-12-31] formatted '%Y-%m-%d %H:%M:%S'; respect any order rule with a paired date column.",
+   "boolean_flag": "0 or 1 with equal probability.",
+   "fresh_value_share": "0.3 of text values are fresh (not copied from parents); 0.7 copied where a dependency exists.",
+   "null_share": "Per nullable column, use the compact database's NULL share; if that share is 0, plant at least one NULL row per nullable column and document the deviation.",
+   "composite_fk_null_policy": "For composite-FK components, either NULL all components together (FK cleanly absent) or keep all components non-NULL and consistent with a parent tuple; never leave a partial-NULL composite key.",
+   "composite_fk_ordering": "Apply composite-FK copying after all per-column overrides (group sizes, NULL planting, date rules) for the child table, or re-derive the composite FK columns from the final parent tuples so the triple always references an existing parent row.",
+   "column_length_invariant": "Every column list in a table's generated data has identical length before PK/UNIQUE dedupe and before writing; PK dedupe uses the minimum length across present columns and skips PK columns missing from the data."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3 on a non-PK surrogate; PK itself stays unique; duplicates on DISTINCT share 20-50%"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_details",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3; duplicates on DISTINCT share 20-50%"
+   },
+   {
+    "table": "Residents",
+    "column": "resident_id",
+    "pattern": "ties_for_order_limit",
+    "targets": "ties at any rank on COUNT(residents_services.service_id) DESC"
+   },
+   {
+    "table": "Residents",
+    "column": "other_details",
+    "pattern": "like_near_variant",
+    "targets": "include values matching LIKE '%Miss%' and near-variant '%Mi%'"
+   },
+   {
+    "table": "Residents_Services",
+    "column": "service_id",
+    "pattern": "unmatched_join_rows",
+    "targets": "parent Services rows without children; no NULL FK"
+   },
+   {
+    "table": "Services",
+    "column": "service_id",
+    "pattern": "unmatched_join_rows",
+    "targets": "parent rows without children in Residents_Services"
+   },
+   {
+    "table": "Customer_Event_Notes",
+    "column": "Customer_Event_Note_ID",
+    "pattern": "comparison_boundary",
+    "targets": "COUNT values 0,1,2,3,4 around BETWEEN 1 AND 3"
+   },
+   {
+    "table": "Customer_Events",
+    "column": "Customer_Event_ID",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Customer_Events",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Customer_Events",
+    "column": "date_moved_in",
+    "pattern": "ties_for_order_limit",
+    "targets": "ties at any rank on ASC order"
+   },
+   {
+    "table": "Customer_Events",
+    "column": "property_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Organizations",
+    "column": "organization_details",
+    "pattern": "comparison_boundary",
+    "targets": "include 'Denesik and Sons Party' and near-variant 'denesik and sons party'"
+   },
+   {
+    "table": "Properties",
+    "column": "property_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3 on a non-PK surrogate; PK itself stays unique"
+   },
+   {
+    "table": "Residents",
+    "column": "property_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Services",
+    "column": "service_details",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Timed_Status_of_Things",
+    "column": "Date_and_Date",
+    "pattern": "comparison_boundary",
+    "targets": "values around '2017-06-18 00:00:00', '2017-06-19 00:00:00', '2017-06-20 00:00:00'"
+   },
+   {
+    "table": "Timed_Status_of_Things",
+    "column": "Status_of_Thing_Code",
+    "pattern": "comparison_boundary",
+    "targets": "include 'Close' and near-variant 'close'"
+   },
+   {
+    "table": "Residents_Services",
+    "column": "resident_id",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Customer_Event_Notes",
+    "column": "Customer_Event_ID",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >=3"
+   },
+   {
+    "table": "Residents",
+    "column": "date_moved_in",
+    "pattern": "null_rows",
+    "targets": "NOT NULL column; no NULLs"
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Residents.property_id",
+    "parent": "Properties.property_id",
+    "copied": []
+   },
+   {
+    "child": "Services.organization_id",
+    "parent": "Organizations.organization_id",
+    "copied": []
+   },
+   {
+    "child": "Residents_Services.service_id",
+    "parent": "Services.service_id",
+    "copied": []
+   },
+   {
+    "child": "Residents_Services.resident_id,property_id,date_moved_in",
+    "parent": "Residents.resident_id,property_id,date_moved_in",
+    "copied": [
+     "property_id",
+     "date_moved_in"
+    ]
+   },
+   {
+    "child": "Things.organization_id",
+    "parent": "Organizations.organization_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Events.thing_id",
+    "parent": "Things.thing_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Events.customer_id",
+    "parent": "Customers.customer_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Events.resident_id,property_id,date_moved_in",
+    "parent": "Residents.resident_id,property_id,date_moved_in",
+    "copied": [
+     "property_id",
+     "date_moved_in"
+    ]
+   },
+   {
+    "child": "Customer_Event_Notes.Customer_Event_ID",
+    "parent": "Customer_Events.Customer_Event_ID",
+    "copied": []
+   },
+   {
+    "child": "Timed_Status_of_Things.thing_id",
+    "parent": "Things.thing_id",
+    "copied": []
+   },
+   {
+    "child": "Timed_Locations_of_Things.thing_id",
+    "parent": "Things.thing_id",
+    "copied": []
+   },
+   {
+    "child": "Organizations.parent_organization_id",
+    "parent": "Organizations.organization_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Properties",
+    "column": "property_type_code",
+    "formula": "property_type_code IN ('apartment','house','flat')"
+   },
+   {
+    "table": "Services",
+    "column": "service_type_code",
+    "formula": "service_type_code IN ('Cleanning','Check','Moving Out','Pay bills')"
+   },
+   {
+    "table": "Services",
+    "column": "service_details",
+    "formula": "service_details IN ('Satisfied','Unsatisfied')"
+   },
+   {
+    "table": "Things",
+    "column": "Type_of_Thing_Code",
+    "formula": "Type_of_Thing_Code IN ('Electronics','Commen','Furniture')"
+   },
+   {
+    "table": "Things",
+    "column": "service_type_code",
+    "formula": "service_type_code IN ('Check','Cleanning')"
+   },
+   {
+    "table": "Things",
+    "column": "service_details",
+    "formula": "service_details IN ('Satisfied','Unsatisfied')"
+   },
+   {
+    "table": "Residents_Services",
+    "column": "other_details",
+    "formula": "other_details IN ('Satisfied','Unsatisfied')"
+   },
+   {
+    "table": "Customer_Event_Notes",
+    "column": "service_type_code",
+    "formula": "service_type_code IN ('Cleanning','Check')"
+   },
+   {
+    "table": "Timed_Status_of_Things",
+    "column": "Status_of_Thing_Code",
+    "formula": "Status_of_Thing_Code IN ('Open','Close','In Progress')"
+   },
+   {
+    "table": "Residents",
+    "column": "date_moved_out",
+    "formula": "date_moved_out >= date_moved_in",
+    "evidence": "resident 6: 2017-06-17 15:43:33 -> 2017-12-18 03:46:04; resident 10: 2015-03-27 12:00:00 -> 2018-03-17 07:48:09; resident 23: 2016-09-27 12:00:00 -> 2017-11-14 06:28:48"
+   },
+   {
+    "table": "Residents_Services",
+    "column": "date_provided",
+    "formula": "date_provided >= date_requested",
+    "condition": "date_requested IS NOT NULL AND date_provided IS NOT NULL",
+    "evidence": "2016-07-25 01:32:23 -> 2018-02-26 00:27:11; 2016-10-10 21:42:21 -> 2017-08-21 06:23:06; 2017-07-14 19:03:47 -> 2017-08-28 03:43:56"
+   },
+   {
+    "table": "Customer_Events",
+    "column": "date_moved_in",
+    "formula": "date_moved_in IS NOT NULL OR customer_id IS NULL"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 15,
+   "Properties": 15,
+   "Residents": 15,
+   "Organizations": 3,
+   "Services": 15,
+   "Residents_Services": 11,
+   "Things": 15,
+   "Customer_Events": 13,
+   "Customer_Event_Notes": 13,
+   "Timed_Status_of_Things": 18,
+   "Timed_Locations_of_Things": 15
+  },
+  "null_targets": [
+   "Customer_Events.customer_id",
+   "Customer_Events.date_moved_in",
+   "Customer_Events.property_id",
+   "Customer_Events.resident_id",
+   "Residents_Services.date_moved_in",
+   "Residents_Services.property_id",
+   "Residents_Services.date_requested",
+   "Residents_Services.date_provided",
+   "Residents_Services.other_details",
+   "Organizations.parent_organization_id"
+  ],
+  "supporting_evidence": {
+   "Residents.date_moved_out >= date_moved_in": "resident 6: 2017-06-17 15:43:33 -> 2017-12-18 03:46:04; resident 10: 2015-03-27 12:00:00 -> 2018-03-17 07:48:09; resident 23: 2016-09-27 12:00:00 -> 2017-11-14 06:28:48",
+   "Residents_Services.date_provided >= date_requested": "2016-07-25 01:32:23 -> 2018-02-26 00:27:11; 2016-10-10 21:42:21 -> 2017-08-21 06:23:06; 2017-07-14 19:03:47 -> 2017-08-28 03:43:56",
+   "date_requested >= date_moved_in dropped": "Contradicted by first shown Residents_Services row (date_moved_in 2017-06-17 15:43:33, date_requested 2016-07-25 01:32:23); rule removed from specification and must not be enforced by the program."
+  },
+  "uncertainty": "Enum pools for property_type_code, service_type_code, Type_of_Thing_Code and Status_of_Thing_Code are closed by assumption from the shown distinct values; additional values may exist. NULL shares follow the compact database per column; where the compact share is 0, at least one NULL is planted per nullable column and this deviation is documented. Group-size targets on Customers.customer_id and Properties.property_id apply to a non-PK surrogate because PKs must remain unique. The date_requested >= date_moved_in rule is dropped because the compact data contradicts it."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with IndexError('list index out of range') at tscore_gen/instance.py:40 in sample_fresh_primary_keys: `k = tuple(columns[c][i] for c in table_meta.primary_key)`. The function iterates `for i in range(n)` where `n = _n_rows(columns)` is computed from the first column in the dict, but then indexes every PK column at `i`. When a PK column has fewer values than the first column (e.g. after `_plant_group_sizes`/`_plant_distinct_dups`/`_plant_nulls`/composite-FK handling or the Residents_Services row-duplication loop append/overwrite columns inconsistently, or when a PK column is absent from `cols`), the index goes out of range. The traceback shows this happens on the very first table processed, so no instance is ever written (n_ok 0, n_fail 20).",
+     "requested_revision": "Make `sample_fresh_primary_keys` (and `drop_unique_duplicates`, `_filter`, and the writer's row assembly) robust to columns of unequal length: compute `n` as the minimum length across all columns actually present, skip PK columns missing from `cols`, and ensure every column list in `cols` has identical length before PK/UNIQUE dedupe and before writing. Also fix the Residents_Services duplication loop (instance.py) which appends to all columns except `service_id`, producing unequal-length columns that then break PK dedupe and the writer. Re-run generation and confirm n_ok == n_instances with zero errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/cli.py `_one` calls `write_instance_sqlite(_G['schema'], inst, p)` without passing `orig_path`, so `write_instance_sqlite` falls back to 'empty DDL clone (legacy behaviour)' and never copies the compact database. The module docstring and writer docstring both state the instance is a delta over the compact database ('we copy the compact database file, then append the generated rows'). As written, compact rows are not preserved in the output, contradicting the stated design and the requirement to preserve compact rows.",
+     "requested_revision": "Pass the original database path (`a['orig']`) through to `write_instance_sqlite` (e.g. store it in `_G['args']` and forward it), so each unit is a copy of the compact DB plus appended rows. Verify compact row counts are unchanged in the written instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_fk_values` and `_composite_fk` draw parent values from `schema.original_values` plus `generated`, but `build_random_instance` builds `inst` table-by-table in `schema.table_order`; for composite FKs (Residents_Services.resident_id/property_id/date_moved_in -> Residents, Customer_Events.resident_id/... -> Residents) the parent Residents rows are generated before the child, which is fine, but `_composite_fk` copies `property_id` and `date_moved_in` from the parent tuple while `Residents_Services`/`Customer_Events` also independently sample `property_id`/`date_moved_in` via `_plant_nulls`/`_plant_group_sizes`/date rules, and the composite FK is applied before those overrides. The result is that the composite FK tuple (resident_id, property_id, date_moved_in) may no longer match any Residents row after the later per-column overrides, violating the FK constraint. The writer sets `pragma foreign_keys = OFF`, so this is not caught at write time.",
+     "requested_revision": "Apply composite-FK copying after all per-column overrides (group sizes, NULL planting, date rules) for the child table, or re-derive the composite FK columns from the final parent tuples so the (resident_id, property_id, date_moved_in) triple always references an existing Residents row. Add a post-build validation pass (with foreign_keys ON or a manual check) that every FK, including composite FKs, resolves to a parent row."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `supporting_evidence` itself flags: 'The date_requested >= date_moved_in rule is contradicted by the first shown Residents_Services row (date_moved_in 2017-06-17, date_requested 2016-07-25); it is kept only as a conditional rule and should be treated as uncertain.' The program (instance.py) nevertheless enforces `date_requested >= date_moved_in` unconditionally when date_moved_in is non-NULL, which may over-constrain the domain relative to the observed data.",
+     "requested_revision": "Either drop the `date_requested >= date_moved_in` rule from the specification (since the compact data contradicts it) or explicitly mark it as not enforced in the program. Do not silently enforce a rule the evidence contradicts. The `date_provided >= date_requested` and `date_moved_out >= date_moved_in` rules are supported by the shown rows and may remain."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` states: 'Enum pools for property_type_code, service_type_code, Type_of_Thing_Code and Status_of_Thing_Code are taken from the shown distinct values; additional values may exist.' The program's `spec.ENUM_POOLS` hard-codes these as closed pools (e.g. Properties.property_type_code only 'apartment','house','flat'), and `EnumSampler` never emits values outside the pool. This is a reasonable reading but is not fully evidenced; it is a design assumption, not a verified rule.",
+     "requested_revision": "Note in the specification that enum pools are closed by assumption (not proven), or allow a small fresh-value share outside the pool. This is a documentation/assumption issue, not a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` is applied to nullable FK columns (e.g. Customer_Events.customer_id, Residents_Services.property_id) and to nullable non-FK columns, but for `Residents_Services.property_id` and `Customer_Events.property_id`/`resident_id`/`date_moved_in` these columns are part of a composite FK to Residents. Planting NULL in one component of a composite FK while leaving the others non-NULL produces a partial-NULL composite key, which SQL treats as not referencing any row (allowed) but which also means the composite FK is effectively unenforced for those rows. Combined with the ordering issue above, dependent-value consistency for composite FKs is not guaranteed.",
+     "requested_revision": "When planting NULLs in composite-FK components, either NULL all components together (so the FK is cleanly absent) or keep all components non-NULL and consistent with a parent tuple. Document the chosen policy in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_group_sizes` overwrites the first `sum(sizes)` values with copies of `out[pos]`, and `_plant_distinct_dups` then overwrites ~35% of values with earlier values. For `Customers.customer_id` and `Properties.property_id` (integer PKs), `_next_int_pk` sets sequential unique values, but `_plant_group_sizes`/`_plant_distinct_dups` are then applied to these PK columns (they are in `GROUP_SIZE_TARGETS`), destroying uniqueness. `sample_fresh_primary_keys` then drops duplicate PK rows, which may remove the planted group sizes, so the group-size target for PK columns may not actually be realized. The specification lists group_sizes targets on `Customers.customer_id` and `Properties.property_id`, which is inconsistent with PK uniqueness.",
+     "requested_revision": "Do not apply group-size/distinct-duplicate planting to primary-key columns (PKs must be unique). If the group-size pattern is intended for these columns, the specification must clarify that it applies to a non-PK surrogate or be removed. Ensure the planted group sizes survive PK dedupe for non-PK target columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` uses `share=0.1` for all nullable columns, but the interface rule states the NULL share should follow the compact database's share for that column. The specification's `uncertainty` says 'NULL shares are estimated at ~10% for nullable columns since statistics report 0.0 null rate on observed rows but schema allows NULL.' The program does not read the compact NULL share per column; it hard-codes 10%.",
+     "requested_revision": "Compute the NULL share per nullable column from the compact database (schema.original_values) and use that share in `_plant_nulls`, with at least one NULL row per nullable column. If the compact share is 0, still plant at least one NULL per the interface rule, but document the deviation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_fk_values` for nullable FKs calls `_plant_nulls(out, rng)` which sets ~10% NULL, but for NOT NULL FKs `nullable` is computed as `not cm.notnull and cm.pk_pos == 0`. For composite-FK components that are NOT NULL (e.g. Residents_Services.resident_id is NOT NULL), `_composite_fk` may still produce NULLs if no parent tuples exist (`out[c] = [None] * n`), violating NOT NULL. Also `_composite_fk` does not respect `nullable`.",
+     "requested_revision": "Ensure NOT NULL FK columns never receive NULL: in `_composite_fk`, if no parent tuples exist, either skip generating child rows or raise a clear error rather than emitting NULLs into NOT NULL columns. Validate NOT NULL constraints before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`neighbors.py` `neighbor_queries` builds an in-memory SQLite clone from `schema.ddl` and executes candidate neighbors to filter them. This is fine for neighbor generation, but the `compare.py` `execute_batch` posts to an external API; no execution evidence is provided that the generated instances are actually queryable or that the denotation comparison works. The construction feedback shows no instances were produced, so no end-to-end check of query execution on generated instances was possible.",
+     "requested_revision": "After fixing the IndexError, re-run generation and provide execution feedback showing instances are written and at least one query executes against a generated instance. This is a verification gap, not necessarily a code defect."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (n_ok 0), so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified end-to-end.",
+    "Whether the composite FK (resident_id, property_id, date_moved_in) actually resolves to a Residents row in generated instances is unverified; the writer disables foreign_keys, so violations would be silent.",
+    "Whether planted group sizes on PK columns survive PK dedupe is unverified.",
+    "Whether the NULL share per nullable column matches the compact database is unverified (program hard-codes 10%).",
+    "Whether enum pools are closed is an assumption, not verified against the compact data."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "medium",
+     "evidence": "Group-size targets are specified for Customers.customer_id and Properties.property_id (both are the sole primary key of their table). The specification says 'group-size targets on primary keys apply to a non-PK surrogate', but the schema has no surrogate column; the spec's own GROUP_SIZE_TARGETS in spec.py omits these two columns and the spec text documents this as 'PK itself stays unique'. This is a self-consistent but slightly inconsistent reading: the atomic pattern says 'group_sizes on non-PK surrogate' while the spec's per_column_exceptions lists them as if they were on the PK column. The program implements the only consistent reading (exclude PKs).",
+     "requested_revision": "Document the resolution explicitly in the designer spec: either the primary key is exempt from group-size planting (no surrogate exists), or the target is dropped. The current spec text is already consistent with the program; the spec should be clarified that the group-size targets are on the PK column are not applied."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "evidence": "Execution feedback shows nullable columns with no NULL: 'Customers.customer_details: generated rows: NULL 0 / 277', 'Organizations.organization_details: NULL 0 / 65', 'Properties.other_details: NULL 0 / 306', 'Properties.property_address: NULL 0 / 306', 'Residents.other_details: NULL 0 / 314', 'Things.service_details: NULL 0 / 292'. The interface rule says NULL is a value to generate and every nullable column should contain at least one NULL row per instance. The program's NULL_TARGETS list does not include these columns, and the spec's null_targets list omits them too. The interface note says these 0/N lines may be noted for the engineer but do not block a pass.",
+     "requested_revision": "Add these nullable columns to NULL_TARGETS (or the spec's null_targets) so the generator plants at least one NULL per instance, or the interface rule is documented as not applicable. The spec's null_targets list omits Customers.customer_details, Organizations.organization_details, Properties.other_details, Properties.property_address, Residents.other_details, Things.service_details; the program's _plant_nulls is only for the listed targets."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "evidence": "Customer_Events.date_moved_in, property_id, resident_id are all NULL in all 253 generated rows (NULL 253/253). The spec's semantic rule 'date_moved_in IS NOT NULL OR customer_id IS NULL' is satisfied by construction (customer_id is NULL in 40 rows), but the composite FK (resident_id, property_id, date_moved_in) is entirely NULL, which is allowed by the composite FK null policy. The program's apply_composite_fks nulls all components together when the composite is absent, so the composite FK is always absent. This is a valid reading of the spec but the spec's composite rule says 'either NULL all components together or keep all components non-NULL and consistent'; the program always does the NULL branch, so the composite FK is never exercised. This is a design choice, not an error.",
+     "requested_revision": "Consider whether the program should also exercise the non-NULL composite branch (e.g., keep some rows with a consistent parent triple) to satisfy the 'either ... or ...' intent. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "evidence": "The spec says 'group_izes for Residents_Services.resident_id: groups of size 1, 2 and >=3' and the program's GROUP_SIZE_TARGETS includes ('Residents_Services','resident_id'). But the execution feedback shows Residents_Services rows added: 0 in the summary (rows_added: Residents_Services: 0). The instance builder's _apply_composite_fks and _sync_lengths may drop the resident_id column, but the composite FK (resident_id, property_id, date_moved_in) is always NULL, so the program's group-size planting on resident_id is overwritten by apply_composite_fks (which nulls all components). The resident_id is a composite FK component, so the group-size target is not actually planted. This is a consequence of the spec's composite-FK rule, not a program error.",
+     "requested_revision": "None, the composite FK rule takes precedence. The spec should note that group-size targets on composite FK components are not applied."
+    }
+   ],
+   "unresolved_checks": [
+    "The program's _plant_composite_fks always nulls the composite FK component, so the group-size target on Residents_Services.resident_id is not planted. The spec's composite-FK rule says 'either NULL all components together or keep all components non-NULL and consistent'; the program always chooses the NULL branch. This is consistent with the spec but not a full exercise of the composite FK.",
+    "The construction_pairs separation 8/46 is low; the spec's group-size patterns are not separated for most columns. The spec says 'A missing separation alone does not establish a generation error or prove query equivalence', so this is not a blocking issue.",
+    "The spec's group-size targets on Customers.customer_id and Properties.property_id are not applied to the PK (the program keeps them unique). The spec's own text says 'non-PK surrogate' but no surrogate exists; the program is consistent with the spec's spec.py GROUP_SIZE_TARGETS, which omits them."
+   ]
+  }
+ ]
 }

@@ -8,6 +8,71 @@ CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
 
+def _case_variants(s: str) -> list:
+    """Case changes of a literal (lower / upper / title)."""
+    out = []
+    for f in (str.lower, str.upper, str.title):
+        try:
+            v = f(s)
+        except Exception:
+            continue
+        if v != s:
+            out.append(v)
+    return out
+
+
+def _edit_variants(s: str) -> list:
+    """One-character edits: drop first/last, drop a middle char, duplicate a char."""
+    out = []
+    if len(s) >= 2:
+        out.append(s[1:])
+        out.append(s[:-1])
+    if len(s) >= 3:
+        i = len(s) // 2
+        out.append(s[:i] + s[i + 1:])
+        out.append(s[:i] + s[i] + s[i:])
+    return out
+
+
+def _like_variants(s: str) -> list:
+    """LIKE patterns without '%' (the bare body) plus prefix/suffix patterns."""
+    body = s.replace('%', '')
+    out = [body]
+    if body:
+        out.append('%' + body)
+        out.append(body + '%')
+    return out
+
+
+def _numeric_variants(s: str) -> list:
+    """Numeric +-1 / +-2 variants of an integer-looking literal."""
+    if not re.fullmatch(r'-?\d+', s):
+        return []
+    i = int(s)
+    return [str(i + 1), str(i - 1), str(i + 2), str(i - 2)]
+
+
+def expand_literal_pool(values) -> list:
+    """Observed values + literals + near-variants (case, edits, LIKE, numeric neighbours)."""
+    out: list = []
+    seen: set = set()
+
+    def add(v):
+        if v is None:
+            return
+        s = str(v)
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    for v in values:
+        add(v)
+    for v in list(out):
+        for w in _case_variants(v) + _edit_variants(v) + _like_variants(v) + _numeric_variants(v):
+            add(w)
+    return out
+
+
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
 
@@ -44,8 +109,15 @@ class NumberSampler(ColumnSampler):
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
-        self.list_min = min(self.elements) if self.elements else self.min
-        self.list_max = min(self.max, _MAX)
+        if self.elements:
+            lo = min(self.elements)
+            hiv = max(self.elements)
+            step = 1 if is_int else 0.01
+            self.list_min = max(self.min, lo - step)
+            self.list_max = min(self.max, hiv + step)
+        else:
+            self.list_min = self.min
+            self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
@@ -218,7 +290,8 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
                   max_l0: float = float('inf')) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
-    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    base = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    els = expand_literal_pool(base)
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:

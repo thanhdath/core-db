@@ -1,48 +1,583 @@
 {
  "db": "sales",
- "operator_io_quirks": [
-  "Sales has 6,715,221 rows; read_schema must sample via rowid % k (max_rows_per_table=300000) and still report original_sizes=6715221.",
-  "Sales.SalesID distinct=200000 but rows=6715221: PK values repeat in the original (not a true unique key in practice); sample_fresh_primary_keys will drop many rows.",
-  "Sales FK columns (SalesPersonID/CustomerID/ProductID) have distinct 22/230/80 vs parent sizes 22/19759/504: FK values are heavily skewed, not uniform over parents.",
-  "All FKs are declared with ON UPDATE/DELETE CASCADE; writer must create DDL with foreign_keys pragma OFF (upstream default) so cascade never fires during insert.",
-  "Employees.MiddleInitial is TEXT with lowercase single-char samples ('e','l','a') while Customers.MiddleInitial is uppercase ('A','B','C'): same column name, different case convention across tables.",
-  "Customers.MiddleInitial null_rate=0.422 (nullable, 27 distinct); Employees.MiddleInitial null_rate=0.0 despite being declared null.",
-  "Products.Price is REAL, nullable, distinct=254, samples include 0.0 and 189.6: Number fuzzer with scale from 'real' (no args) -> default scale, range [-10^s,10^s].",
-  "All declared types are plain INTEGER/TEXT/REAL (no length args, no (a,b) args): Number scale defaults, String length defaults to 20.",
-  "Table/column names are mixed case (Customers, FirstName, SalesPersonID); generated SQL must double-quote with original spelling.",
-  "Sales.Quantity distinct=88 with samples up to 810: integer values well outside any small range; Number fuzzer will produce values in [-10^s,10^s].",
-  "No composite PKs, no self-FKs, no dangling FKs, no unique/check constraints beyond PKs: simplest possible schema shape.",
-  "Sales is the only child table; Customers/Employees/Products are all level-0 parents, Sales is level 1."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER PKs (CustomerID, EmployeeID, ProductID, SalesID) with default scale: fresh draws uniform in [-10^s,10^s] then +-1/+-2 perturbation; PKs will be large random ints, not 1..N.",
-  "String fuzzer on FirstName/LastName/MiddleInitial/Name: 5 original samples + literal pool, p=0.2 fresh random strings over a-zA-Z 0-9() with 50% contaminate; names become implausible gibberish -> likely FN on name-equality queries.",
-  "Number fuzzer on Products.Price (REAL, no args): scale defaults, values in [-10^s,10^s] with +-0.01/+-0.02 perturbation; original prices are 0..190, so TS prices are wildly out of range -> FN on price-range predicates.",
-  "Number fuzzer on Sales.Quantity: same wide range; original 1..~810, TS may emit negatives or huge ints -> FN on quantity predicates.",
-  "FK fill: Sales.SalesPersonID draws from Employees.EmployeeID final values (22 rows, PK-filtered); Sales.CustomerID from Customers.CustomerID (19759); Sales.ProductID from Products.ProductID (504). With replacement, so Sales rows concentrate on few parents -> join cardinalities skewed.",
-  "choose_table_sizes: w.p. 0.5 flat rand_lin (30*u + int(u2*200)) else level sizes (level0=1+30u, level1 x4 capped 2500); Sales (level 1) gets up to 2500 rows, parents up to ~30-2500 -> Sales may be smaller than Customers, inverting the original 6.7M vs 19k ratio.",
-  "PK dedup on Sales.SalesID: since Number fuzzer draws from a wide range, collisions rare, but max_l0 reuse after ~30 fresh draws can cause PK duplicates -> rows dropped, Sales shrinks further.",
-  "No NOT NULL/CHECK enforcement in Python: nullable MiddleInitial and Price may get NULLs from String/Number samplers (Base drops None elements but fresh draws never NULL) -> actually NULLs only via FK-to-empty-parent; here parents non-empty so NULLs rare.",
-  "Missing ties/duplicates: original Sales has 6.7M rows with only 200k distinct SalesID and 22/230/80 distinct FKs -> many ties; TS generates <=2500 rows with near-unique PKs -> FP on GROUP BY / DISTINCT / COUNT queries that depend on tie multiplicity.",
-  "Literal pool from train SQL will seed FirstName/LastName/Name with real names and Price/Quantity with real numbers; p=0.2 fresh means ~80% of values come from pool+originals -> some plausibility preserved, but contaminate and perturbation still inject noise."
- ],
- "challenger_refs": [
-  "G13",
-  "G7",
-  "G16",
-  "G9",
-  "G4",
-  "G8",
-  "G11",
-  "G14",
-  "G10",
-  "G5"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; strictly positive.",
+   "integer_fk": "Sample uniformly from the parent table's generated primary-key values, excluding the reserved set of parent PKs that are never referenced (see unmatched_join_rows); never NULL (all FKs are NOT NULL).",
+   "integer_numeric": "Uniform integer in the observed range; quantity-like columns > 0; price/amount >= 0.",
+   "real_numeric": "Uniform real in the observed range, rounded to 2 decimals; >= 0 for prices/amounts.",
+   "text_name": "Sample from a pool of realistic first/last names; allow near-variants (case changes, one-character edits) at ~5% of rows.",
+   "text_short_code": "Sample from a small pool of 1-2 character codes; allow case variants.",
+   "text_product_name": "Sample from a pool of product-like names; allow near-variants (case changes, suffix edits) at ~5% of rows.",
+   "nullable_text": "With probability equal to the column's null_rate emit NULL; otherwise sample from the text pool. At least one NULL row per nullable column.",
+   "boundary_values": "For each column with a listed boundary literal, plant rows at the literal and one step on each side (numeric step 1 or 0.001 for reals; text case variants) by overwriting the first positions of the column in place (never prepend+truncate, so rule-corrected and duplicate-planted values are preserved). Boundary literals that violate a semantic rule of the same column (e.g. 0 for a > 0 column, negative for a >= 0 column) are NOT planted; only the rule-consistent side is planted. For FK columns, plant boundary values AFTER fill_foreign_keys_consistently so they survive.",
+   "duplicates_for_distinct": "For DISTINCT-targeted columns, ensure 20-50% of values are duplicates of other rows.",
+   "ties_for_order_limit": "For ORDER/LIMIT-targeted columns, plant ties at the listed ranks.",
+   "unmatched_join_rows": "Reserve a subset of parent PKs (at least 1 per parent table, ~1-5% of parent rows) that are never drawn as FK values, so some parent rows have no child rows; child rows reference only existing, non-reserved parents (no NULL FKs since FKs are NOT NULL).",
+   "null_in_count_column": "NOT NULL columns never get NULL; nullable columns get NULL at the observed null_rate, with at least one NULL row per nullable column (enforced by an explicit _ensure_one_null pass after all other column transforms)."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Customers",
+    "column": "CustomerID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      79,
+      80,
+      81
+     ],
+     "note": "0 omitted: violates CustomerID > 0"
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "CustomerID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales.CustomerID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Products",
+    "column": "ProductID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      399,
+      400,
+      401,
+      499,
+      500,
+      501
+     ]
+    }
+   },
+   {
+    "table": "Products",
+    "column": "ProductID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales.ProductID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Blade",
+      "blade",
+      "ML Bottom Bracket",
+      "ml bottom bracket",
+      "HL Mountain Frame - Black, 42",
+      "hl mountain frame - black, 42"
+     ]
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "C%",
+      "HL Touring Frame%",
+      "%HL Touring Frame%"
+     ],
+     "variants": [
+      "C",
+      "D",
+      "C x",
+      "c",
+      "HL Touring Frame",
+      "HL Touring Framf",
+      "HL Touring Frame x",
+      "hl touring frame"
+     ]
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Price",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      0.001,
+      199.999,
+      200,
+      200.001
+     ],
+     "note": "-0.001 omitted: violates Price >= 0"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "SalesID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      9,
+      10,
+      11
+     ],
+     "note": "0 omitted: violates SalesID > 0"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "CustomerID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      79,
+      80,
+      81
+     ],
+     "note": "0 omitted: violates FK > 0; planted after FK fill"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "CustomerID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.CustomerID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "ProductID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      399,
+      400,
+      401,
+      499,
+      500,
+      501
+     ],
+     "note": "planted after FK fill"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "ProductID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.ProductID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "Quantity",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      499,
+      500,
+      501
+     ],
+     "note": "negative targets -221,-220,-219 omitted: violate Quantity > 0"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "SalesPersonID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2
+     ],
+     "note": "0 omitted: violates FK > 0; planted after FK fill"
+    }
+   },
+   {
+    "table": "Sales",
+    "column": "SalesPersonID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Employees.EmployeeID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Employees",
+    "column": "LastName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Ringer",
+      "ringer"
+     ]
+    }
+   },
+   {
+    "table": "Employees",
+    "column": "FirstName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Albert",
+      "albert",
+      "e",
+      "E"
+     ]
+    }
+   },
+   {
+    "table": "Employees",
+    "column": "MiddleInitial",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "I",
+      "i",
+      "e",
+      "E"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "FirstName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Albert",
+      "albert",
+      "madison",
+      "MADISON",
+      "Madison"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "LastName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Ringer",
+      "ringer",
+      "lopez",
+      "LOPEZ",
+      "Lopez"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "LastName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "MiddleInitial",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "L",
+      "l",
+      "I",
+      "i",
+      "M",
+      "m"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Sales",
+    "child_column": "SalesPersonID",
+    "parent_table": "Employees",
+    "parent_column": "EmployeeID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Sales",
+    "child_column": "CustomerID",
+    "parent_table": "Customers",
+    "parent_column": "CustomerID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Sales",
+    "child_column": "ProductID",
+    "parent_table": "Products",
+    "parent_column": "ProductID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Sales",
+    "column": "Quantity",
+    "formula": "Quantity > 0",
+    "evidence": "All shown Sales rows have Quantity > 0 (500, 810, 123, 437, 750, 60, 373, 687)."
+   },
+   {
+    "table": "Products",
+    "column": "Price",
+    "formula": "Price IS NULL OR Price >= 0",
+    "evidence": "All shown Products rows have Price >= 0 (1.6, 0.8, 2.4, 0.0, 189.6, 380.4, 190.8, 319.0)."
+   },
+   {
+    "table": "Customers",
+    "column": "CustomerID",
+    "formula": "CustomerID > 0",
+    "evidence": "All shown primary keys are positive integers."
+   },
+   {
+    "table": "Employees",
+    "column": "EmployeeID",
+    "formula": "EmployeeID > 0",
+    "evidence": "All shown primary keys are positive integers."
+   },
+   {
+    "table": "Products",
+    "column": "ProductID",
+    "formula": "ProductID > 0",
+    "evidence": "All shown primary keys are positive integers."
+   },
+   {
+    "table": "Sales",
+    "column": "SalesID",
+    "formula": "SalesID > 0",
+    "evidence": "All shown primary keys are positive integers."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 200,
+   "Employees": 22,
+   "Products": 200,
+   "Sales": 2000
+  },
+  "null_targets": [
+   "Customers.MiddleInitial",
+   "Employees.MiddleInitial"
+  ],
+  "supporting_evidence": {
+   "Sales.Quantity > 0": "All shown Sales rows have Quantity > 0 (500, 810, 123, 437, 750, 60, 373, 687).",
+   "Products.Price >= 0": "All shown Products rows have Price >= 0 (1.6, 0.8, 2.4, 0.0, 189.6, 380.4, 190.8, 319.0).",
+   "PK > 0": "All shown primary keys are positive integers."
+  },
+  "uncertainty": "Original Sales.SalesPersonID (17, 5, 8, 1, 14, 20, 11, 2) and CustomerID (10482, 1964, ...) values exceed the shown parent table sizes; generation uses compact parent sizes and draws FK values from generated parent PKs, not original values. This is an intentional deviation from the original FK distribution. Boundary targets that violate a column's semantic rule are intentionally not planted: 0 for PK/FK columns governed by > 0, -0.001 for Products.Price (>= 0), and -221/-220/-219 for Sales.Quantity (> 0); only the rule-consistent side of each boundary is planted. Employees.MiddleInitial has observed null_rate 0.0 but is nullable; per the interface rule at least one NULL row is planted, so its effective NULL share is small but positive. Customers.MiddleInitial null share follows the compact statistic (~0.42). Products.Price is treated as effectively NOT NULL (observed null_rate 0.0 in the compact DB) and is therefore removed from null_targets; if the compact DB is later found to contain NULL prices, add Products.Price back to null_targets with the observed share. table_sizes_per_instance are interpreted as ADDITIONAL rows to append per instance (writer must not subtract original_sizes); each instance therefore appends 200 Customers, 22 Employees, 200 Products and 2000 Sales rows on top of the compact rows, which are never deleted or changed. FK boundary values for Sales.CustomerID, Sales.ProductID and Sales.SalesPersonID are planted after fill_foreign_keys_consistently so they survive; boundary planting overwrites in place and never truncates the column."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'NoneType' object is not iterable\"), n_ok=0, n_instances=0. The traceback points into build_random_instance. In instance.py, build_random_instance calls `_init_sampler(tm, cm.name, spec_pool, spec_range, literal_pool.get(...), schema.original_values.get(...), p, rng, len(tm.primary_key))`. The signature in values.py is `_init_sampler(column, literal_pool, original_values, p, rng, n_pk, max_l0=..., spec_pool=None, spec_range=None, ...)`. The call passes `tm` (a TableMeta) as `column`, `cm.name` (a str) as `literal_pool`, `spec_pool` as `original_values`, `spec_range` as `p`, the literal pool as `rng`, the original values as `n_pk`, and `p` as `max_l0`. This is a positional-argument mismatch: `column.type_str` is then accessed on a TableMeta (AttributeError would be expected) and `original_values` becomes a list/None, so `list(original_values)` raises the observed TypeError. The program cannot produce any instance.",
+     "requested_revision": "Fix the call in instance.py to match the _init_sampler signature, e.g. `_init_sampler(cm, spec_pool or [], schema.original_values.get((t, cm.name), []), p, rng, len(tm.primary_key), spec_pool=spec_pool, spec_range=spec_range)`. Re-run and confirm n_ok>0 and rows_added>0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after fixing the call, the boundary-value planting is broken. In instance.py, `_apply_boundary` is defined but never called; instead the code does `bv = spec.get('boundary_values', ...); if bv: spec = dict(spec); spec_pool = bv`. This overwrites the whole spec dict with a shallow copy and sets spec_pool to the boundary list, but the boundary list is then passed as `spec_pool` to _init_sampler, which only unions it into the element pool. The boundary values are not guaranteed to appear at the start of the column, and the `_apply_boundary` helper (which would plant them) is dead code. The spec's `boundary_values` targets (e.g. CustomerID [0,1,2,79,80,81], Price [-0.001,0,0.001,...], Quantity [499,500,501]) are therefore not reliably planted.",
+     "requested_revision": "Call `_apply_boundary` on the sampled column values (or otherwise guarantee the boundary literals appear in each instance), and do not overwrite the spec dict inside the sampler loop. Confirm boundary values are present in generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicate_share` and `unmatched_parents` are never applied. `_apply_duplicates` is defined but never called; `duplicate_share` from the spec is not read in build_random_instance. `unmatched_parents` is not read anywhere. The spec requires 20-50% duplicate share for Products.Name and Customers.LastName, and parent rows without children for Customers/Products/Employees. The program does not implement these.",
+     "requested_revision": "Apply `_apply_duplicates` using spec['duplicate_share'] for the targeted columns, and ensure some parent rows have no child rows (e.g. by not drawing all parent keys into Sales, or by explicitly reserving unmatched parents)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule is not implemented. The spec's `null_targets` (Customers.MiddleInitial 0.422, Employees.MiddleInitial 0.0, Products.Price 0.0) are never read in build_random_instance; `_apply_null` is defined but never called. The program interface requires each nullable column to contain NULL rows at the compact DB's share and at least one NULL row per nullable column. Currently no NULLs are planted, and the samplers drop None elements (`[e for e in elements if e is not None]`), so NULLs cannot arise from the pool either.",
+     "requested_revision": "Read `null_targets` and call `_apply_null` on the sampled values for each nullable column, ensuring at least one NULL row per nullable column and the observed share. Do not let rules replace planted NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Semantic rules are not applied. `_apply_rule` is defined but never called in build_random_instance. The spec's `semantic_rules` (Quantity > 0, Price >= 0, PK > 0) are therefore not enforced. The spec's uncertainty note says negative Quantity boundary targets (-221,-220,-219) conflict with Quantity > 0 and should be dropped; the embedded spec correctly omits them, but the rule itself is still not applied.",
+     "requested_revision": "Apply `_apply_rule` to the sampled values for each column with a semantic rule, after NULL planting, and confirm the rule holds for non-NULL operands."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `table_sizes` are given as fixed integers (Customers 200, Employees 22, Products 200, Sales 2000), but `choose_table_sizes` treats them as `[lo, hi]` ranges: `lo = spec.get('table_sizes', {}).get(t) or [0,0])[0]`. With an integer value, indexing `[0]` on an int raises TypeError. The embedded spec in spec.py uses `[200,200]` etc., but the supplied generation specification uses plain integers. This is a spec/program mismatch.",
+     "requested_revision": "Either normalize the spec's `table_sizes` to `[lo, hi]` pairs in the loader, or make `choose_table_sizes` accept both forms. Confirm the generated table sizes match the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` note acknowledges that original Sales.SalesPersonID and CustomerID values exceed the shown parent table sizes, and that the generation uses compact parent sizes. This is a reasonable adaptation, but the spec does not state the compact parent sizes explicitly in `table_sizes` (it gives 200/22/200/2000). The FK sampling rule ('Sample uniformly from the parent table's generated primary-key values') is consistent with the program's `fill_foreign_keys_consistently`, but the spec should clarify that FK values are drawn from generated parent keys, not original values.",
+     "requested_revision": "Clarify in the spec that FK columns draw from generated parent PKs and that original out-of-range FK values are not reproduced. This is a documentation clarification, not a blocking error."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `boundary_values` for Sales.Quantity includes only [499,500,501] (negative values dropped per the uncertainty note), which is consistent with the Quantity > 0 rule. However, the spec's `comparison_boundary` targets for Sales.Quantity in the extracted atomic operations list [-221,-220,-219,499,500,501]; the spec correctly drops the negatives. This is consistent, but the spec should note that the negative boundary targets are intentionally not planted.",
+     "requested_revision": "Add a note in the spec that negative Quantity boundary targets are intentionally omitted due to the Quantity > 0 rule. This is a documentation clarification."
+    }
+   ],
+   "unresolved_checks": [
+    "The program did not run successfully (n_ok=0), so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified from execution evidence.",
+    "The writer's behavior of copying the compact DB is not exercised because no instance was produced; the writer creates a fresh DB from DDL rather than copying the compact DB, which may not preserve compact rows as the spec requires. This should be verified after the blocking errors are fixed.",
+    "The spec's `null_targets` for Employees.MiddleInitial is 0.0, which conflicts with the program interface requirement of at least one NULL row per nullable column. This should be reconciled (either the spec should set a positive rate or the interface rule should be clarified)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'<' not supported between instances of 'NoneType' and 'str'\"), n_ok=0, rows_added=0. The traceback originates in the sampler construction path. In values.py `_init_sampler`, `els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in (literal_pool or [])})`; then `if spec_pool: els = sorted(set(els) | {str(v) for v in spec_pool})`. The first `sorted(...)` is fine (all str), but the union `set(els) | {str(v) ...}` mixes the raw `ov` elements (which can be None or non-str, e.g. original_values from schema.original_values include None for nullable columns like Customers.MiddleInitial, Products.Price) with strings, and the subsequent `sorted(...)` compares None with str -> TypeError. This is triggered for every instance because at least one nullable column has None in its original values.",
+     "requested_revision": "Normalize the element pool to strings before sorting/union, e.g. `els = [str(v) for v in els if v is not None]` before the `sorted(set(els) | {str(v) for v in spec_pool})` step (and likewise guard the first `sorted({str(v) ...})`). Ensure `_init_sampler` never passes None into a `sorted()` over mixed types. Re-run generation and confirm n_ok>0 and rows_added>0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after the TypeError is fixed, the writer appends generated rows to a copy of the compact DB (`shutil.copyfile(orig, part)` then INSERT). The spec's `table_sizes_per_instance` (Customers 200, Employees 22, Products 200, Sales 2000) are the *total* intended sizes, but the compact DB already contains rows; appending 200/22/200/2000 more rows yields roughly double the intended sizes. The spec's `table_sizes` semantics (total per instance) are not honored by the append-to-copy approach.",
+     "requested_revision": "Either (a) generate into an empty schema clone (use `schema.ddl` to create tables, not copy the compact rows), or (b) subtract the compact row counts from the target sizes before appending, or (c) document that `table_sizes` means 'rows added' and adjust the spec accordingly. The current mismatch between spec intent and program behavior should be resolved."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `boundary_values` for `Products.Price` includes `-0.001` and `Sales.Quantity` boundary targets in the atomic ops include `-221,-220,-219`, but the spec's own `semantic_rules_and_formulas` require `Price >= 0` and `Quantity > 0`. The spec's `uncertainty` note acknowledges the Quantity conflict and says negatives are omitted, but the `boundary_values` dict in `spec.py` still lists `-0.001` for Price (and the per_column_exceptions list still lists the negative Quantity values). `_apply_boundary` plants these literals first, then `_apply_rule` overwrites them (Price -0.001 -> 0.0, Quantity negatives -> 1), so the planted boundary is destroyed and the boundary test for the negative side is not actually exercised.",
+     "requested_revision": "Remove `-0.001` from `Products.Price` boundary_values (or explicitly document that the negative boundary is intentionally not planted because it violates the semantic rule), and remove the negative Quantity boundary targets from the per_column_exceptions / spec so the spec is internally consistent. Alternatively, if the negative boundary is meant to be tested, relax the semantic rule \u2014 but the two cannot both hold."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_boundary` in instance.py: `out = list(spec); for v in values: if len(out) >= len(values): break; out.append(v); return out[:len(values)]`. This replaces the *first* len(spec) sampled values with the boundary literals, but for PK columns (e.g. Customers.CustomerID boundary [0,1,2,79,80,81]) the semantic rule `CustomerID > 0` is then applied by `_apply_rule`, which rewrites 0 -> 1, producing duplicate PKs. `sample_fresh_primary_keys` then drops the duplicate, so the planted boundary value 0 is silently removed. The boundary test for `CustomerID = 0` (and similarly `Sales.SalesID = 0`, `Sales.CustomerID = 0`, `Sales.SalesPersonID = 0`, `Sales.ProductID` boundary 399/400/401 vs rule >0 is fine, but 0-valued FK boundaries are dropped) is not actually present in the generated data.",
+     "requested_revision": "For PK/FK columns with a `> 0` semantic rule, either (a) do not list 0 in boundary_values (since it violates the rule and will be rewritten), or (b) apply boundary planting *after* the semantic rule and accept that the rule is violated for the boundary row (but then the rule is not enforced). The spec and program must agree on which boundary values are actually plantable. At minimum, remove 0 from the boundary lists for columns governed by a `> 0` rule, or document that 0-boundary rows are intentionally not generated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`fill_foreign_keys_consistently` draws FK values with replacement from the parent's generated PKs, but `sample_fresh_primary_keys` is applied to the child table *after* FK filling. For Sales, the PK is SalesID (single column), so FK columns are not affected. However, the `unmatched_join_rows` requirement ('parent rows without children') is not explicitly enforced: the spec's `unmatched_parents` dict is loaded into the internal spec but `build_random_instance` never reads it. With 2000 Sales rows drawn uniformly from 200 Customers / 200 Products / 22 Employees, the probability that a given parent has zero children is (1-1/200)^2000 \u2248 e^-10 \u2248 4.5e-5 for Customers/Products and (1-1/22)^2000 \u2248 0 for Employees \u2014 so essentially no parent rows are left without children, contradicting the `unmatched_join_rows` pattern (pairs=20 for Customers, 8 for Products, 5 for SalesPersonID).",
+     "requested_revision": "Implement `unmatched_parents` in `build_random_instance`: after filling FKs, explicitly reserve a subset of parent PKs that are never drawn as FK values (e.g. exclude them from the FK sampling pool), so that the 'parent rows without children' pattern is actually realized. Currently the spec key is parsed but unused."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_null` is only applied when `cm.name in nulls and not cm.notnull and cm.pk_pos == 0`. The spec's `null_targets` for `Employees.MiddleInitial` is 0.0 (from the compact stats), but the interface rule requires at least one NULL row per nullable column. `_ensure_one_null` is called, so this is satisfied. However, `Products.Price` null_targets is 0.0 and `Customers.MiddleInitial` is 0.422 \u2014 the latter is applied. The `null_targets` normalization in `normalize_spec` reads `stats[t]['columns'][c].get('null_rate', 0.0)`, but the provided `column_statistics` in the input is in 'fast mode' and does not contain a `null_rate` field per column (it contains `null_share` strings like 'none (NOT NULL column)'). So all null rates default to 0.0, and `Customers.MiddleInitial` gets 0.0 instead of the observed ~0.42 share. The embedded default (0.422) is overwritten by the normalized 0.0.",
+     "requested_revision": "Fix `normalize_spec` to parse the actual null share from the compact stats (the `null_share` field, e.g. 'none (NOT NULL column)' -> 0.0, or a numeric share), or fall back to the embedded default when the stat is unavailable rather than overwriting with 0.0. Verify that `Customers.MiddleInitial` gets a NULL share near 0.42 in generated instances."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: `Sales.Quantity > 0` is supported by 8 shown rows (500, 810, 123, 437, 750, 60, 373, 687) \u2014 sufficient. `Products.Price >= 0` is supported by 8 shown rows (1.6, 0.8, 2.4, 0.0, 189.6, 380.4, 190.8, 319.0) \u2014 sufficient. `PK > 0` for all four tables is supported by the shown positive PKs \u2014 sufficient. However, the spec's `uncertainty` note admits that original `Sales.SalesPersonID` (17, 5, 8, 1, 14, 20, 11, 2) and `CustomerID` (10482, 1964, ...) exceed the shown parent table sizes, meaning the compact DB's FK values are not consistent with the compact parent PKs. The spec resolves this by 'compact parent sizes and draws FK values from generated parent PKs', which is a reasonable design choice, but it means the generated instances do not preserve the original FK distribution. This is a design decision, not an error, but should be documented as a known deviation.",
+     "requested_revision": "Document in the spec that FK values are drawn from generated parent PKs (not original values) because the original FK values exceed the compact parent sizes, and that this is an intentional deviation from the original data distribution. No code change required if this is acceptable."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify reproducible generation (same seed -> same instance) because all units failed before writing.",
+    "Could not verify preservation of compact rows (writer copies orig then appends; compact rows are preserved by construction, but not exercised due to failure).",
+    "Could not verify dependent-value consistency (FK values drawn from parent PKs) in actual output due to failure.",
+    "Could not verify that boundary values are actually present in generated rows after semantic-rule rewriting (see issue 4).",
+    "Could not verify NULL share for Customers.MiddleInitial matches compact share (see issue 6)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 9 of 20 instances with reason 'no_rows_added'; rows_added=61, rows_skipped=53 across 20 instances. writer.py `_trim_to_targets` subtracts `schema.original_sizes[t]` from the generated target size, but the compact DB already contains rows for every table (Customers/Employees/Products/Sales). With spec table_sizes {Customers:200, Employees:22, Products:200, Sales:2000} and compact sizes already at/near those values, `keep = max(0, n - have)` collapses to 0 for most tables, so almost nothing is appended. This is why 9/20 instances add no rows and why the construction_pairs separated count is only 8/239.",
+     "requested_revision": "Fix the total-size semantics in writer.py: either (a) treat spec table_sizes as *additional* rows to append (do not subtract original_sizes), or (b) if total-size semantics is intended, ensure the spec's table_sizes are strictly larger than the compact sizes (e.g. Sales 2000 vs compact ~2823 is already smaller \u2014 the spec is inconsistent with the compact DB). Reconcile the spec's table_sizes_per_instance with the actual compact row counts so every instance appends a meaningful number of rows, and re-run to confirm validity.invalid drops to 0 and construction_pairs.separated rises well above 8."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py `_build_embedded` sets `null_targets: {'Products': {'Price': 0.0}}` and `normalize_spec` reads null rate from `column_statistics` only if present; the supplied statistics show `Products.Price` has `null_in_count_column` with `null_share` not given as a numeric rate (only 'none (NOT NULL column)' appears for other columns; Price's null share is not stated numerically). Execution feedback confirms `Products.Price: generated rows: NULL 0 / 30`. The interface rule requires at least one NULL row per nullable column per instance. `_ensure_one_null` is only invoked when `cm.name in nulls and not cm.notnull and cm.pk_pos == 0` \u2014 but the null rate 0.0 means `_apply_null` plants none, and `_ensure_one_null` is called, yet the feedback shows 0 NULLs, indicating the branch is not reached (likely because `nulls` dict for Products.Price is present but the `_ensure_one_null` call is gated behind the same `if cm.name in nulls` and the rate 0.0 path still calls it \u2014 the observed 0/30 shows it is not effective, or Price rows are trimmed away by the writer bug above).",
+     "requested_revision": "Designer: set a positive null rate for Products.Price consistent with the compact DB's actual null share (the statistics do not give a numeric share; use the observed share from the compact DB, and if it is 0, document that Price is effectively NOT NULL and remove it from null_targets). Engineer: verify `_ensure_one_null` actually fires for every nullable column after the writer fix, and add an assertion/log so the feedback line shows NULL >= 1 for each nullable column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_boundary` plants boundary values at the *start* of the column, then `sample_fresh_primary_keys` and `drop_unique_duplicates` run afterward and may drop rows (e.g. duplicate PKs from boundary planting on CustomerID/ProductID/SalesID). Also `fill_foreign_keys_consistently` is called *after* boundary planting for the same table, overwriting FK columns (Sales.CustomerID, Sales.ProductID, Sales.SalesPersonID) that had boundary values planted \u2014 so the Sales FK boundary targets [1,2,79,80,81] / [399..501] / [1,2] are discarded and replaced by random parent draws. This means the specified FK boundary values are not actually present in generated Sales rows.",
+     "requested_revision": "Reorder build_random_instance so FK columns are filled first (or boundary values for FK columns are planted after fill_foreign_keys_consistently), and ensure boundary values survive PK dedup/unique-drop (plant them after those filters, or reserve them). Confirm via a post-generation check that each listed boundary literal appears in the generated rows for its column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_reserved_parent_keys` is only called for tables in `spec.get('unmatched_parents')`, and `reserved` is updated *after* the table's own rows are built. But `fill_foreign_keys_consistently` for a child table uses `reserved` at the time the child is built. Since table_order places parents before children, this works for Customers/Products/Employees -> Sales. However `_reserved_parent_keys` samples `k = max(1, round(0.03 * len(vals)))` reserved PKs, and `fill_foreign_keys_consistently` falls back to the full pool if the reserved set empties the pool \u2014 with Employees size 22 and 3% reserved (~1), this is fine, but the spec's `unmatched_join_rows` targets claim joins with `Sales.SalesPersonID` and `Customers.CustomerID` for the *Customers* table, which is not a real FK relationship (Sales.SalesPersonID references Employees, not Customers). The spec's `unmatched_join_rows` targets for Customers.CustomerID list `['Sales.CustomerID','Sales.SalesPersonID']` \u2014 the second is spurious.",
+     "requested_revision": "Designer: correct the `unmatched_join_rows` targets so Customers.CustomerID only lists Sales.CustomerID (not Sales.SalesPersonID), and Products.ProductID only lists Sales.ProductID (not Employees.EmployeeID), and Sales.ProductID only lists Products.ProductID. Engineer: after the writer fix, verify at least one parent row per parent table has no child rows in each instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=239, separated=8. The low separation is consistent with the writer bug (few rows added) but also with `_apply_duplicates` and `_apply_boundary` interacting: `_apply_duplicates` overwrites the last k values with earlier ones, then `_apply_boundary` prepends boundary values and truncates to len(values), which can drop the duplicated tail. Also `_apply_rule` runs before `_apply_boundary`, so rule-violating sampled values are corrected but boundary values are planted after \u2014 good \u2014 yet the boundary planting truncation `out[:len(values)]` can drop the rule-corrected values at the tail.",
+     "requested_revision": "Engineer: make `_apply_boundary` preserve the total row count without dropping rule-corrected or duplicate-planted values (e.g. overwrite the first len(bv) positions in place rather than prepend+truncate). Re-run and confirm construction_pairs.separated increases substantially (target: most of the 239 eligible pairs separated)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's actual Products.Price null share is 0 (making it effectively NOT NULL) or positive \u2014 the supplied statistics do not give a numeric null_share for Price, so the designer must confirm from the compact DB.",
+    "Whether the spec's table_sizes_per_instance (Sales 2000) is intended as total or additional rows relative to the compact DB (compact Sales appears to already exceed 2000 rows given rows_skipped=53 and the trim logic).",
+    "Whether the 8 separated construction pairs are the intended boundary/duplicate pairs or incidental; a post-fix re-run is needed to confirm the intended value variation is realized."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "issue": "Semantic rule evidence is thin for several rules; they are inferred from a handful of shown rows rather than a stated constraint.",
+     "evidence": "semantic_rules_and_formulas cites 'All shown Sales rows have Quantity > 0 (500, 810, ...)' and 'All shown Products rows have Price >= 0 (1.6, 0.8, ...)' \u2014 these are sample-based inferences, not schema constraints. PK > 0 rules are likewise inferred from 'All shown primary keys are positive integers.' The schema itself declares only NOT NULL, PK, and FK constraints; no CHECK constraints exist.",
+     "requested_revision": "No blocking change required: the rules are plausible and the program only enforces them on non-NULL operands, consistent with the interface. If stricter fidelity is desired, the designer could mark these as 'uncertain' rather than 'supported' in the spec, but this does not block generation."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Products.Price is nullable in the schema but the spec removes it from null_targets, so generated rows never contain NULL prices.",
+     "evidence": "Execution feedback: 'Products.Price: generated rows: NULL 0 / 958'. The spec's uncertainty note explicitly says Price is 'treated as effectively NOT NULL ... and is therefore removed from null_targets'. Per the interface NULL rule, a nullable column with 'NULL 0 / n' may be noted but does not block a pass.",
+     "requested_revision": "Optional: add Products.Price to null_targets with the observed share (0.0 in compact DB, but at least one NULL per instance per the interface rule) if strict interface compliance is desired. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Employees.MiddleInitial has observed null_rate 0.0 but the program plants at least one NULL per instance, giving a small positive NULL share (10/132 \u2248 7.6%).",
+     "evidence": "Execution feedback: 'Employees.MiddleInitial: generated rows: NULL 10 / 132'. Spec uncertainty acknowledges this: 'per the interface rule at least one NULL row is planted, so its effective NULL share is small but positive.' This matches the interface rule (at least one NULL per nullable column).",
+     "requested_revision": "None \u2014 behavior is consistent with the stated interface rule."
+    },
+    {
+     "agent": "engineer",
+     "issue": "1540 rows were skipped during insertion (rows_skipped), likely due to PK collisions from boundary planting or duplicate-planting on PK columns.",
+     "evidence": "Execution summary: 'rows_added': 8976, 'rows_skipped': 1540. Integrity checks pass (pk_duplicates: 0, fk_violations: 0, not_null_violations: 0), so skipped rows are constraint-violating rows that were correctly rejected rather than corrupting the DB. The writer counts and skips them per its documented behavior.",
+     "requested_revision": "None blocking. The skip rate (~15%) is notable but the resulting instances are valid and the compact rows are preserved. If higher yield is desired, the engineer could reduce boundary-planting collisions on PK columns, but this is not an error."
+    },
+    {
+     "agent": "engineer",
+     "issue": "FK boundary values for Sales.CustomerID/ProductID/SalesPersonID are planted after FK fill, which can produce FK values that reference reserved (unmatched) parent PKs or values outside the parent PK set.",
+     "evidence": "instance.py plants boundary values after fill_foreign_keys_consistently; spec notes 'planted after FK fill'. However, execution feedback reports fk_violations: 0 across all 20 instances, so the planted boundary values (1, 2, 79, 80, 81 for CustomerID; 399-501 for ProductID; 1, 2 for SalesPersonID) all happen to fall within the generated parent PK ranges (Customers 1-200, Products 1-200, Employees 1-22). No integrity violation observed.",
+     "requested_revision": "None \u2014 empirically no FK violations. Note that if parent table sizes were smaller than the boundary literals, this could break; the current sizes (200/200/22) accommodate the planted values."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Construction pairs separated: only 34 of 239 eligible pairs were separated by the generated instances.",
+     "evidence": "construction_pairs: {eligible: 239, separated: 34, unknown_executions: 0}. Per instruction 4, a missing separation alone does not establish a generation error or prove query equivalence. The instances are valid (20/20), integrity holds, and generation is reproducible.",
+     "requested_revision": "None blocking. Separation rate is a property of the query pairs and instance diversity, not a correctness defect in the generator."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the inferred semantic rules (Quantity > 0, Price >= 0, PK > 0) reflect true database constraints or just observed data \u2014 the schema declares no CHECK constraints, so these are sample-based inferences.",
+    "Whether the 1540 skipped rows indicate a systematic issue with boundary planting on PK columns that could be improved, though it does not affect validity."
+   ]
+  }
+ ]
 }

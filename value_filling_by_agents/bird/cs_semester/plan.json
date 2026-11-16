@@ -1,50 +1,372 @@
 {
  "db": "cs_semester",
- "operator_io_quirks": [
-  "Table 'RA' is mixed-case; must be double-quoted as \"RA\" everywhere (sqlite is case-insensitive but the spec keeps original spelling).",
-  "No NOT NULL constraints anywhere (notnull=0 on every column) despite PKs; sqlite PK on INTEGER is rowid alias so NULL insert becomes autoincrement \u2014 TS may silently get fresh ids.",
-  "Composite PKs: RA(student_id,prof_id), registration(course_id,student_id) \u2014 sample_fresh_primary_keys must dedupe on the tuple, not single column.",
-  "FK RA.student_id -> student.student_id and RA.prof_id -> prof.prof_id; registration.course_id -> course, registration.student_id -> student. All parents exist and are unique PKs.",
-  "RA.prof_id distinct=13 but prof has only 10 rows: FK values in original reference prof_ids 11..13 that do NOT exist in prof \u2014 dangling FK values in the original data (FK pragma off).",
-  "registration.student_id distinct=36 vs student 38 rows; RA.student_id distinct=21 \u2014 child FK sets are subsets, not full coverage.",
-  "grade has 5% NULLs (only nullable column in practice); TS String fuzzer drops None elements so it will never emit NULL for grade \u2014 a known TS miss.",
-  "gpa is REAL with 16 distinct values in [2.4,3.9]; Number fuzzer with scale=0 (no args) will draw integers in [-1,1] then perturb \u2014 implausible gpa values.",
-  "credit distinct=2 (2,3), diff distinct=5 (1..5), sat distinct=5 (1..5), popularity distinct=2, teachingability distinct=5, intelligence distinct=5, capability distinct=4 \u2014 tiny ENUM-like integer domains that Number fuzzer ignores.",
-  "salary is TEXT with values {med,high,low,free} \u2014 a categorical stored as text; String fuzzer will produce random charset strings, not these.",
-  "phone_number format '(NNN) NNNNNNN' and email format 'x@hku.hk'/'x@cuhk.edu.hk' \u2014 String fuzzer has no format awareness.",
-  "type in {RPG,TPG,UG}, gender in {Male,Female} \u2014 small enums; TS String fuzzer will not respect them."
- ],
- "operator_ts_expectations": [
-  "All columns dispatch to Number (INTEGER/REAL) or String (TEXT); no Date/Time/Bool/Bit columns, so no date-template or bool quirks here.",
-  "Number fuzzer on INTEGER with no (a,b) args: scale=0, range [-1,1], int perturb +-1/+-2 \u2014 will produce values like -1,0,1,2,3, not the original 1..5 or 2..3 domains.",
-  "Number fuzzer on REAL gpa: scale=0, range [-1,1] floats, perturb +-0.01/+-0.02 \u2014 gpa values near 0, implausible (FN risk on gpa>3 style predicates).",
-  "String fuzzer on name/f_name/l_name/email/phone: random charset a-zA-Z 0-9() length 0..20 with 50% contaminate \u2014 no realistic names/emails/phones (FN on LIKE '%@hku%' etc.).",
-  "String fuzzer on enum-like TEXT (gender,type,salary,grade): random strings, so equality predicates on 'Male'/'UG'/'med'/'A' will mostly return empty \u2014 FP risk if gold also empty, FN if gold non-empty.",
-  "grade NULLs: String sampler drops None, so TS never produces NULL grade \u2014 queries with 'grade IS NULL' get empty result (FN).",
-  "Composite PK dedupe on (student_id,prof_id) and (course_id,student_id) will drop many rows; with small table sizes (level-0 = 1+30u, x4 per level) registration/RA may end up tiny.",
-  "FK fill draws from parent's FINAL filtered values with replacement; RA.prof_id will only reference prof_ids that survived prof's PK dedupe (10 rows) \u2014 no dangling FKs in generated units (unlike original).",
-  "Table order: level 0 = {course, prof, student}, level 1 = {RA, registration}; sizes x4 per level so children larger than parents \u2014 plausible.",
-  "No unique single-column constraints besides PKs, so drop_unique_duplicates is a no-op here.",
-  "No CHECK constraints, no NOT NULL, no triggers/views \u2014 write_instance_sqlite will rarely skip rows (only PK collisions, already deduped).",
-  "Literal pool from train SQL will seed course.name, prof.first_name/last_name/email, student.f_name/l_name/email/phone, salary, grade, type, gender with real values \u2014 String sampler will mix these with random strings (p=0.2 fresh)."
- ],
- "challenger_refs": [
-  "G19",
-  "G2",
-  "G8",
-  "G12",
-  "G6",
-  "G7",
-  "G4",
-  "G3",
-  "G20",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; unique; never NULL.",
+   "integer_fk": "Sample from the parent table's generated key pool; allow parent rows without children; never NULL unless the column is nullable.",
+   "integer_numeric": "Uniform integer within the column's range rule; include boundary values and one step on each side where a comparison literal exists.",
+   "real_numeric": "Uniform real within the column's range rule, rounded to 2 decimals.",
+   "text_short": "Sample from a small pool of realistic values; allow near-variants (case changes, one-character edits) and duplicates on DISTINCT columns.",
+   "text_email": "lower(first_name)||lower(last_name)||n||'@'||domain, n a small integer, domain from a small pool.",
+   "text_phone": "'('||ddd||') '||7 digits.",
+   "text_enum": "Sample uniformly from the enum value list.",
+   "text_nullable": "With probability equal to the column's null share emit NULL; otherwise sample a non-NULL value.",
+   "fresh_value_share": 0.3
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "columns": [
+      "registration.student_id",
+      "student.student_id",
+      "RA.student_id",
+      "registration.course_id",
+      "prof.prof_id",
+      "RA.prof_id"
+     ],
+     "rule": "NOT NULL columns; no NULLs generated."
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "columns": [
+      "registration.student_id",
+      "student.student_id",
+      "RA.student_id",
+      "registration.course_id",
+      "course.course_id"
+     ],
+     "rule": "Deterministically reserve parent rows (student, course) with no matching child rows; child foreign keys are never NULL."
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "course.name": [
+      "Machine Learning Theory",
+      "machine learning theory",
+      "Computer Network",
+      "computer network",
+      "Intro to BlockChain",
+      "intro to blockchain"
+     ],
+     "student.l_name": [
+      "Unsworth",
+      "unsworth",
+      "Antonio",
+      "antonio",
+      "Rechert",
+      "rechert"
+     ],
+     "student.f_name": [
+      "Rik",
+      "rik",
+      "Laughton",
+      "laughton",
+      "Willie",
+      "willie"
+     ],
+     "prof.first_name": [
+      "Ogdon",
+      "ogdon",
+      "Sauveur",
+      "sauveur"
+     ],
+     "prof.last_name": [
+      "Skyme",
+      "skyme",
+      "Zywicki",
+      "zywicki",
+      "Zhou",
+      "zhou"
+     ],
+     "registration.grade": [
+      "A",
+      "B",
+      "C",
+      "D"
+     ],
+     "RA.capability": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "columns": [
+      "course.name",
+      "student.l_name",
+      "student.f_name",
+      "prof.first_name",
+      "prof.last_name",
+      "registration.student_id",
+      "student.student_id",
+      "registration.course_id",
+      "course.course_id",
+      "registration.grade",
+      "RA.student_id"
+     ],
+     "rule": "Duplicate share 20-50% on DISTINCT columns; choose distinct source values and replicate them so the measured duplicate share falls in 20-50%."
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "columns": [
+      "course.name",
+      "student.l_name",
+      "student.f_name",
+      "prof.first_name",
+      "prof.last_name",
+      "registration.course_id",
+      "course.course_id",
+      "registration.sat",
+      "RA.capability",
+      "RA.prof_id",
+      "registration.student_id",
+      "student.student_id",
+      "RA.student_id"
+     ],
+     "rule": "Ensure ties at rank 1 (DESC) on COUNT(registration.student_id) per course.name; ties at listed LIMIT ranks on other ORDER columns."
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "registration.grade": "5-30% NULL; include at least one NULL row; non-NULL values only from {A,B,C,D}."
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "RA.student_id": "Deterministically construct groups with COUNT(DISTINCT ra.student_id) values 1, 2, 3 to satisfy HAVING > 2 boundary."
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "registration.sat": "At least 2 rows per group with different sat values.",
+     "RA.capability": "At least 2 rows per group with different capability values."
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "prof.first_name": "Group sizes 1, 2 and >= 3.",
+     "course.name": "Group size 3 for at least one name.",
+     "registration.course_id": "Group size 2 for at least one course_id.",
+     "course.course_id": "Group size 4 for at least one course_id.",
+     "RA.prof_id": "Group size 3 for at least one prof_id."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "RA.prof_id",
+    "parent_table": "prof",
+    "parent_column": "prof_id",
+    "copied_columns": []
+   },
+   {
+    "child": "RA.student_id",
+    "parent_table": "student",
+    "parent_column": "student_id",
+    "copied_columns": []
+   },
+   {
+    "child": "registration.course_id",
+    "parent_table": "course",
+    "parent_column": "course_id",
+    "copied_columns": []
+   },
+   {
+    "child": "registration.student_id",
+    "parent_table": "student",
+    "parent_column": "student_id",
+    "copied_columns": []
+   },
+   {
+    "unique": "course(course_id)"
+   },
+   {
+    "unique": "prof(prof_id)"
+   },
+   {
+    "unique": "student(student_id)"
+   },
+   {
+    "unique": "RA(student_id, prof_id)"
+   },
+   {
+    "unique": "registration(course_id, student_id)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "course",
+    "column": "credit",
+    "formula": "credit IN (2, 3)"
+   },
+   {
+    "table": "course",
+    "column": "diff",
+    "formula": "diff BETWEEN 1 AND 5"
+   },
+   {
+    "table": "prof",
+    "column": "gender",
+    "formula": "gender IN ('Male', 'Female')"
+   },
+   {
+    "table": "prof",
+    "column": "popularity",
+    "formula": "popularity BETWEEN 2 AND 3"
+   },
+   {
+    "table": "prof",
+    "column": "teachingability",
+    "formula": "teachingability BETWEEN 1 AND 5"
+   },
+   {
+    "table": "student",
+    "column": "intelligence",
+    "formula": "intelligence BETWEEN 1 AND 5"
+   },
+   {
+    "table": "student",
+    "column": "gpa",
+    "formula": "gpa BETWEEN 0.0 AND 4.0"
+   },
+   {
+    "table": "student",
+    "column": "type",
+    "formula": "type IN ('RPG', 'TPG', 'UG')"
+   },
+   {
+    "table": "registration",
+    "column": "grade",
+    "formula": "grade IS NULL OR grade IN ('A', 'B', 'C', 'D')"
+   },
+   {
+    "table": "registration",
+    "column": "sat",
+    "formula": "sat BETWEEN 1 AND 5"
+   },
+   {
+    "table": "RA",
+    "column": "capability",
+    "formula": "capability BETWEEN 1 AND 5"
+   },
+   {
+    "table": "RA",
+    "column": "salary",
+    "formula": "salary IN ('low', 'med', 'high', 'free')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "course": 13,
+   "prof": 10,
+   "student": 38,
+   "RA": 35,
+   "registration": 101
+  },
+  "null_targets": [
+   "registration.grade"
+  ],
+  "supporting_evidence": {
+   "course.credit": "Original rows show credit values 3 and 2 only.",
+   "course.diff": "Original rows show diff values 3,4,1,5,2.",
+   "prof.gender": "Original rows show Male and Female.",
+   "prof.popularity": "Original rows show 3 and 2.",
+   "prof.teachingability": "Original rows show 5,1,2,3,4.",
+   "student.intelligence": "Original rows show 5,2,1,3,4.",
+   "student.gpa": "Original rows show 2.4-3.9, within 0-4.",
+   "student.type": "Original rows show RPG, TPG, UG.",
+   "registration.grade": "Original rows show A,B,C,D and 5% null rate.",
+   "registration.sat": "Original rows show 5,4,3,2,1.",
+   "RA.capability": "Original rows show 2,5,4,3.",
+   "RA.salary": "Original rows show med, high, low, free."
+  },
+  "uncertainty": "No calculated-column formulas are supported by the shown rows; all rules are range/enum constraints derived from observed values and statistics. Null shares for nullable columns follow the compact database statistics (registration.grade 5%). RA.prof_id is NOT NULL per the DDL and is excluded from null_targets. Table sizes are fixed per instance as listed; the program must honor them (or the scale parameter applied to them) and append exactly the requested number of rows."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: returncode 2, stderr 'cli.py: error: unrecognized arguments: generate --orig ... --pool-sqls ... --i0 0 --i1 20 --seed-base 42 --procs 1', n_instances 0. The CLI in tscore_gen/cli.py only accepts --db/--ds/--root/--n/--seed/--tag/--queries/--scale; it has no 'generate' subcommand and no --orig/--pool-sqls/--i0/--i1/--seed-base/--procs options.",
+     "requested_revision": "Make the CLI accept the invocation actually used by the harness (a 'generate' subcommand with --orig, --pool-sqls, --i0, --i1, --seed-base, --procs), or align the harness invocation with the implemented interface. The program must run and produce instances without argument errors before a pass can be recommended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/sampler.py _gen_registration and _gen_ra build FK pairs by rng.choice over existing+new parent ids, but the spec's unmatched_join_rows rule requires 'parent rows (student, course) with no matching child rows'. Because pairs are drawn with replacement from all parents and the loop only retries on duplicate pairs, there is no mechanism guaranteeing that some parent rows remain childless; with n_new comparable to parent count, coverage is probabilistic at best. Also _gen_registration/_gen_ra never guarantee the aggregate_boundary rule for RA.student_id (COUNT(DISTINCT ra.student_id) values 1,2,3) nor the group_sizes rules (prof.first_name sizes 1,2,>=3; course.name size 3; registration.course_id size 2; course.course_id size 4; RA.prof_id size 3).",
+     "requested_revision": "Explicitly construct the required structural patterns: reserve some parent rows with no children; construct RA groups with COUNT(DISTINCT student_id) in {1,2,3}; and enforce the listed group-size targets for the named columns. These are stated per_column_exceptions and must be implemented deterministically, not left to random chance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/sampler.py _gen_registration sets grade values from ['A','B','C','D','a','b',''] and NULLs, but the spec's semantic rule is 'grade IS NULL OR grade IN (A,B,C,D)'. Lowercase 'a','b' and empty string '' violate the stated formula. Similarly _gen_course sets diff to base-j for j in 0..3 giving 5,4,3,2 and last=5, which is within 1..5, but the spec's comparison_boundary for course.name requires case variants of specific literals ('Machine Learning Theory'/'machine learning theory' etc.) \u2014 the code only lower/upper-cases sampled values, which may not hit those exact literals.",
+     "requested_revision": "Restrict grade to NULL or {A,B,C,D} per the semantic rule (drop 'a','b',''). Ensure course.name sampling includes the exact boundary literals listed in the spec (both cases) rather than relying on random case-flipping of arbitrary sampled values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas lists grade IN (A,B,C,D) but per_column_exceptions comparison_boundary for registration.grade lists ['', 'x', 'A', 'a', 'B', 'b'], and null_rows allows '5-30% NULL or empty string'. These are internally inconsistent: '' and lowercase 'a'/'b' are not in the semantic enum. The spec also lists RA.prof_id as nullable in null_rows but the schema declares RA.prof_id NOT NULL (foreign key, no NULL allowed); the spec's own null_targets includes RA.prof_id, contradicting the DDL.",
+     "requested_revision": "Reconcile the grade boundary literals with the semantic enum (either widen the enum or drop ''/'a'/'b' from boundaries). Remove RA.prof_id from null_targets/null_rows since the schema declares it NOT NULL; only registration.grade is nullable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/sampler.py _gen_student/_gen_prof/_gen_course apply duplicate injection by overwriting the first n_dup sampled values with copies of random values, but this can overwrite PK-adjacent or boundary values and does not guarantee the 20-50% duplicate share on DISTINCT columns as measured (it sets n_dup = int(n_new*share) copies but the source may itself be a duplicate, so effective distinct share is uncontrolled). Also _gen_prof sets cols[c.name][-1]=cols[c.name][0] for every integer column including popularity/teachingability, which may push values outside the spec ranges (popularity 2-3, teachingability 1-5) if the sampler produced out-of-range values.",
+     "requested_revision": "Implement duplicate injection so the measured duplicate share on DISTINCT text columns falls in 20-50% (e.g., choose distinct source values and replicate them). Clamp numeric columns to their spec ranges after tie injection (popularity in 2-3, teachingability in 1-5, intelligence 1-5, sat 1-5, capability 1-5, diff 1-5, credit in {2,3})."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/sampler.py _gen_registration and _gen_ra compute n_new via _table_size but then build 'pairs' as a set, so the actual number of appended rows can be less than n_new (duplicate pairs collapse). The spec's table_sizes_per_instance gives fixed sizes (course 13, prof 10, student 38, RA 35, registration 101); the program uses random sizes in [0.3*base, base+2], which does not match the specified per-instance sizes.",
+     "requested_revision": "Honor table_sizes_per_instance (or the scale parameter applied to those sizes) rather than random ranges, and ensure the number of appended rows equals the requested count (retry pair generation until n_new distinct pairs are produced, or document that sizes are appended counts)."
+    }
+   ],
+   "unresolved_checks": [
+    "No execution evidence was produced (n_instances=0), so integrity-constraint satisfaction, dependent-value consistency, preservation of compact rows, and reproducibility could not be verified from execution.",
+    "Whether the generated instances actually satisfy the atomic-operation patterns (unmatched joins, aggregate boundary, group sizes, ties) could not be confirmed because generation did not run."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's null_targets lists only registration.grade, and the per_column_exceptions 'null_rows' rule targets only registration.grade. The interface NULL rule (instruction 7) says every nullable column should get a NULL share following the compact DB's share. Execution feedback shows all other nullable columns (RA.capability, RA.salary, course.credit, course.diff, course.name, prof.*, student.*, registration.sat) generated with NULL 0 / n. Per instruction 7 this is a note for the engineer, not a blocker.",
+     "requested_revision": "Optionally extend null_targets / null_rows to cover all nullable columns with their compact-DB NULL shares, so the spec matches the interface NULL rule. Not required for pass."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "sampler.py only plants NULLs in registration.grade (_gen_registration sets grade_vals with None for the first n_null rows). All other nullable columns are filled with non-NULL values by _sample_text_col/_sample_int_col and the generic fallback in generate_instance_rows. Execution feedback confirms NULL 0 / n for every nullable column except registration.grade (356 / 2016).",
+     "requested_revision": "Optionally add a NULL-injection step for nullable non-PK columns (RA.capability, RA.salary, course.credit, course.diff, course.name, prof.*, student.*, registration.sat) using the compact DB's NULL share, with at least one NULL row per column. Per instruction 7 this does not block a pass."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution summary shows rows_skipped: RA 85, registration 248 across 20 instances (about 4.25 RA and 12.4 registration rows per instance). writer.append_rows_sqlite falls back to row-by-row insert and counts failures; the failures are almost certainly PK (student_id, prof_id) / (course_id, student_id) collisions from the 'while len(pairs) < n_new' fallback loops in _gen_ra and _gen_registration, which append duplicate pairs when distinct pairs cannot be found. Integrity checks still report 0 pk_duplicates and 0 fk_violations, so the DB is consistent, but the requested table_sizes_per_instance (RA 35, registration 101) are not fully honored.",
+     "requested_revision": "Optionally make the pair-construction loops guarantee n_new distinct pairs (e.g. expand the usable parent pool or relax the childless reservation) so rows_skipped is 0 and the appended row counts match table_sizes_per_instance exactly. Not a blocker since integrity is preserved."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's ties_for_order_limit rule requires ties at rank 1 (DESC) on COUNT(registration.student_id) per course.name. The program's _gen_course forces nm[0]=nm[1]=nm[2]='Machine Learning Theory' (group size 3) and _gen_registration ensures at least one course_id has exactly 2 rows, but there is no explicit construction that two course names share the same registration count at rank 1. construction_pairs shows 48/315 separated, which is consistent with the intended variation remaining possible, but the specific tie-at-rank-1 pattern is not directly evidenced.",
+     "requested_revision": "Optionally add an explicit construction in _gen_registration/_gen_course that gives two distinct course names the same COUNT(registration.student_id) at the top rank. Not required for pass; the separation count does not establish a generation error."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the ties_for_order_limit pattern (ties at rank 1 DESC on COUNT(registration.student_id) per course.name) is actually realized in generated instances was not directly verified from the execution feedback; only the aggregate separation count (48/315) is available.",
+    "The exact cause of the 85 RA and 248 registration skipped rows was inferred (PK collisions in the fallback pair loops) rather than confirmed by inspecting the failing rows."
+   ]
+  }
+ ]
 }

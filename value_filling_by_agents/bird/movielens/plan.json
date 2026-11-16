@@ -1,49 +1,613 @@
 {
  "db": "movielens",
- "operator_io_quirks": [
-  "Mixed-case table names: \"directors\", \"actors\", \"movies\", \"movies2actors\", \"movies2directors\", \"u2base\" quoted; users unquoted lowercase \u2014 keep original spelling, quote all.",
-  "Column names mixed case: isEnglish, u_gender, a_gender, d_quality, a_quality, avg_revenue, cast_num, runningtime \u2014 case-insensitive lookup needed.",
-  "u2base is huge (996159 rows) > max_rows_per_table 300000: rowid%k sampling required; original_sizes must still be full count(*).",
-  "movies2actors 138349 rows also near cap; actors 98690.",
-  "FKs declared inline via 'references movies' with no explicit parent column -> pragma parent col NULL -> same-name child column (movieid/actorid/userid/directorid).",
-  "Composite PKs: movies2actors(movieid,actorid), movies2directors(movieid,directorid), u2base(userid,movieid) \u2014 composite-PK members get max_l0=30.",
-  "No self-references; no dangling FKs; all parents exist and are unique PKs.",
-  "Two indexes on directors (avg_revenue, d_quality) \u2014 must be recreated in empty clone; no views/triggers.",
-  "Declared TEXT columns store numeric-looking strings: age ('1','56','25'), occupation ('2','3','4','1','5'), rating ('1','2','3') \u2014 String fuzzer will treat as int-like and add +-1 variants.",
-  "year INTEGER but only 4 distinct values (1..4) \u2014 Number fuzzer with tiny element set; not a real year.",
-  "isEnglish TEXT with 'T'/'F' (not bool type) -> String fuzzer, not Bool.",
-  "u2base.userid distinct 1233 < users 6039 and movieid distinct 3424 < movies 3832: FK child columns are sparse subsets of parents (not all parents referenced)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER columns: range [-10^0,10^0]=[-1,1] default scale 0 -> tiny ints, then +-1/+-2 perturbation; PKs get fresh draws (max_l0=inf) so userid/movieid/actorid/directorid become small random ints, not the original large ids.",
-  "String fuzzer on age/occupation/rating: elements are int-like strings so adds str(i+1),str(i-1); fresh strings from charset a-zA-Z 0-9() length 0..20 -> implausible values (FN risk: queries filtering age='25' or rating='3' may match by luck but mostly miss).",
-  "String fuzzer on u_gender/a_gender/isEnglish/country/genre: 5 original samples + pool literals, p=0.2 fresh random strings + 0.5 contaminate -> many garbage values; low-cardinality columns (2-9 distinct) get diluted -> FN on equality filters, FP on 'not in' style.",
-  "year INTEGER with 4 distinct values: Number list range quirk (list_max overwritten to full max) -> mostly fresh small ints, rarely 1..4 -> queries on year=1..4 mostly miss.",
-  "FK consistency: movies2actors.movieid drawn from movies.movieid final values, actorid from actors.actorid; u2base.userid from users.userid, movieid from movies.movieid \u2014 joins preserved, but since parents are small random ints, join cardinalities differ from original.",
-  "Composite PK dedup (sample_fresh_primary_keys) drops duplicate (movieid,actorid) rows -> movies2actors shrinks; u2base similarly.",
-  "Table sizes: choose_table_sizes gives 30..230 or level-based (level0=1+30u, x4 per level capped 2500) -> u2base/movies2actors may be much smaller than original 996k/138k -> FN on aggregate/count queries expecting large results.",
-  "No NOT NULL/CHECK enforcement in Python; all columns notnull=1 so NULLs unlikely but String fuzzer can emit empty strings.",
-  "No unique single-column constraints besides PKs -> drop_unique_duplicates no-op here.",
-  "Missing ties/duplicates: original u2base has 1233 users x 3424 movies sparse; TS random instance may create denser or sparser coverage -> FP/FN on 'users who rated >= N movies' style queries.",
-  "No Date/Time/Bool columns -> those fuzzers unused; no crash-fallback types."
- ],
- "challenger_refs": [
-  "G7",
-  "G8",
-  "G15",
-  "G11",
-  "G16",
-  "G17",
-  "G9",
-  "G1",
-  "G6",
-  "G12"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "integer_fk": "Copy from parent table's generated key pool; never NULL unless column is nullable. Boundary literals planted on FK columns must first be inserted as parent PKs so the reference resolves.",
+   "integer_range": "Uniform integer within [lo, hi] as stated in semantic_rules_and_formulas. Emit only values inside [lo, hi]; never emit lo-1 or hi+1 unless the stated range itself is widened to admit them. Boundary targets listed in per_column_exceptions are planted as exact literals within the stated range.",
+   "text_enum": "Uniform choice from the enum list in semantic_rules_and_formulas; case near-variants (lower/upper) only for columns named in per_column_exceptions, and only for the specific target literals listed there.",
+   "text_numeric": "Numeric string drawn from the stated value pool; include boundary and one-step values where listed.",
+   "text_free": "Short lowercase token; near-variants (case flips) only for columns named in per_column_exceptions.",
+   "null_share": "No nullable columns exist in this schema; NOT NULL columns never NULL. If a parent pool is empty, raise an error rather than emitting NULL into a NOT NULL FK column.",
+   "fresh_value_share": "~20% of rows get fresh values not seen in the original sample; remaining rows reuse the observed pool. Apply per row (fixed p=0.2), not per instance.",
+   "numeric_coercion": "When a numeric sampler receives stringified pool entries, coerce via int(float(e)) and skip non-integer-valued strings so values like '1.0' never raise.",
+   "composite_pk_dedup": "After FK re-pointing, re-run primary-key deduplication on every table so composite-PK collisions (movies2actors, movies2directors, u2base) are removed before writing; target rows_skipped near zero for FK-only reasons."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "movies.movieid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2312851,
+      2312852,
+      2312853
+     ],
+     "note": "plant as parent PKs before any child FK use"
+    }
+   },
+   {
+    "column": "movies.movieid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "movies.movieid",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "small"
+    }
+   },
+   {
+    "column": "movies.movieid",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "u2base.movieid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1695218,
+      1695219,
+      1695220,
+      2462958,
+      2462959,
+      2462960
+     ],
+     "note": "co-generate as movies.movieid PKs (plant into movies first), then draw from the resulting pool"
+    }
+   },
+   {
+    "column": "u2base.movieid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "u2base.movieid",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "movies2directors.movieid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "movies2directors.movieid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2312851,
+      2312852,
+      2312853
+     ],
+     "note": "co-generate as movies.movieid PKs"
+    }
+   },
+   {
+    "column": "movies2directors.movieid",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "small"
+    }
+   },
+   {
+    "column": "movies2directors.genre",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "drama",
+      "DRAMA",
+      "horror",
+      "HORROR",
+      "Horror"
+     ]
+    }
+   },
+   {
+    "column": "movies2directors.genre",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "column": "movies.country",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "France",
+      "france",
+      "USA",
+      "usa",
+      "UK",
+      "uk"
+     ]
+    }
+   },
+   {
+    "column": "u2base.userid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2462958,
+      2462959,
+      2462960
+     ],
+     "note": "co-generate as users.userid PKs"
+    }
+   },
+   {
+    "column": "u2base.userid",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "u2base.userid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "u2base.userid",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "u2base.rating",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+     ]
+    }
+   },
+   {
+    "column": "directors.directorid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "directors.directorid",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "users.userid",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "users.userid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "users.age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "17",
+      "18",
+      "19",
+      "24",
+      "25",
+      "26"
+     ]
+    }
+   },
+   {
+    "column": "movies2actors.actorid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "movies2directors.directorid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "directors.d_quality",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1,
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "column": "actors.a_gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "movies.runningtime",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "movies2actors.movieid",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2312851,
+      2312852,
+      2312853
+     ],
+     "note": "co-generate as movies.movieid PKs"
+    }
+   },
+   {
+    "column": "users.u_gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "F",
+      "f"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "movies2actors.movieid",
+    "parent": "movies.movieid",
+    "copied": []
+   },
+   {
+    "child": "movies2actors.actorid",
+    "parent": "actors.actorid",
+    "copied": []
+   },
+   {
+    "child": "movies2directors.movieid",
+    "parent": "movies.movieid",
+    "copied": []
+   },
+   {
+    "child": "movies2directors.directorid",
+    "parent": "directors.directorid",
+    "copied": []
+   },
+   {
+    "child": "u2base.userid",
+    "parent": "users.userid",
+    "copied": []
+   },
+   {
+    "child": "u2base.movieid",
+    "parent": "movies.movieid",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "users",
+    "column": "userid",
+    "formula": "userid > 0"
+   },
+   {
+    "table": "users",
+    "column": "age",
+    "formula": "CAST(age AS INTEGER) BETWEEN 1 AND 100"
+   },
+   {
+    "table": "users",
+    "column": "u_gender",
+    "formula": "u_gender IN ('F','M')"
+   },
+   {
+    "table": "users",
+    "column": "occupation",
+    "formula": "occupation IN ('1','2','3','4','5')"
+   },
+   {
+    "table": "directors",
+    "column": "directorid",
+    "formula": "directorid > 0"
+   },
+   {
+    "table": "directors",
+    "column": "d_quality",
+    "formula": "d_quality BETWEEN -1 AND 6"
+   },
+   {
+    "table": "directors",
+    "column": "avg_revenue",
+    "formula": "avg_revenue BETWEEN 0 AND 4"
+   },
+   {
+    "table": "actors",
+    "column": "actorid",
+    "formula": "actorid > 0"
+   },
+   {
+    "table": "actors",
+    "column": "a_gender",
+    "formula": "a_gender IN ('F','M')"
+   },
+   {
+    "table": "actors",
+    "column": "a_quality",
+    "formula": "a_quality BETWEEN 0 AND 5"
+   },
+   {
+    "table": "movies",
+    "column": "movieid",
+    "formula": "movieid > 0"
+   },
+   {
+    "table": "movies",
+    "column": "year",
+    "formula": "year BETWEEN 1 AND 5"
+   },
+   {
+    "table": "movies",
+    "column": "isEnglish",
+    "formula": "isEnglish IN ('T','F')"
+   },
+   {
+    "table": "movies",
+    "column": "country",
+    "formula": "country IN ('USA','France','UK','other')"
+   },
+   {
+    "table": "movies",
+    "column": "runningtime",
+    "formula": "runningtime BETWEEN 0 AND 3"
+   },
+   {
+    "table": "movies2actors",
+    "column": "cast_num",
+    "formula": "cast_num BETWEEN 0 AND 3"
+   },
+   {
+    "table": "movies2directors",
+    "column": "genre",
+    "formula": "genre IN ('Action','Adventure','Animation','Comedy','Crime','Documentary','Drama','Horror')"
+   },
+   {
+    "table": "u2base",
+    "column": "rating",
+    "formula": "rating IN ('0','1','2','3','4','5')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "users": 40,
+   "directors": 20,
+   "actors": 60,
+   "movies": 50,
+   "movies2actors": 120,
+   "movies2directors": 60,
+   "u2base": 200
+  },
+  "null_targets": [],
+  "supporting_evidence": {
+   "users.age": "Sample rows: '1','56','25','45','50','35','18' all numeric strings within 1-100.",
+   "users.u_gender": "Sample rows: 'F','M'.",
+   "users.occupation": "Sample rows: '2','3','4','1','5'.",
+   "directors.d_quality": "Sample rows: 0,1,2,3,4,5; range widened to -1..6 to admit boundary targets.",
+   "directors.avg_revenue": "Sample rows: 0,1,2,3,4.",
+   "actors.a_gender": "Sample rows: 'M','F'.",
+   "actors.a_quality": "Sample rows: 4,0,3,2,5,1.",
+   "movies.year": "Sample rows: 3,4,1,2; range widened to 1..5 to admit boundary target 5.",
+   "movies.isEnglish": "Sample rows: 'T','F'.",
+   "movies.country": "Sample rows: 'other','USA','France','UK'.",
+   "movies.runningtime": "Sample rows: 2,3,0,1.",
+   "movies2actors.cast_num": "Sample rows: 0,1,2,3.",
+   "movies2directors.genre": "Sample rows: Action,Adventure,Animation,Comedy,Crime,Documentary,Drama,Horror.",
+   "u2base.rating": "Sample rows: '1','2','3','4','5'; range widened to '0'..'5' to admit boundary target '0'."
+  },
+  "uncertainty": "No nullable columns exist in the schema, so null_targets is empty. No calculated columns or date pairs exist. Boundary targets on FK columns (movies2directors.movieid, movies2actors.movieid, u2base.movieid, u2base.userid) are only valid if the same literals are co-generated as parent PKs in movies.movieid / users.userid; the generator must insert those parent rows first and enable foreign_keys=ON. u2base.movieid targets 1695218..1695220 and 2462958..2462960 are co-generated as movies.movieid PKs (planted into movies first), then drawn from the resulting pool. Out-of-domain boundary targets (d_quality -1/6, year 5, rating '0') are handled by widening the stated ranges rather than dropping the targets; the sampler must not emit values outside the stated ranges. The atomic summary's type-mismatched predicates (e.g. movies2directors.movieid = movies2directors.genre) are treated as boundary literals on the numeric column only."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 17/20 units fail with ValueError(\"invalid literal for int() with base 10: '1.0'\"). The traceback originates in RangeSampler.sample() -> int(v) where v comes from self.elements. In values.py, RangeSampler.__init__ builds elements via [int(e) for e in elements if _num(e) is not None], but _init_sampler passes els that include stringified literal-pool values (sorted({str(v) for v in literal_pool})), so a pool value like '1.0' passes _num() and then int('1.0') raises. This is a hard crash that blocks generation (n_ok=3, n_fail=17).",
+     "requested_revision": "Fix RangeSampler to coerce elements safely (e.g. int(float(e)) or filter to integer-valued strings) so that numeric-string pool entries like '1.0' do not raise. Re-run and confirm n_fail=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: fk_violations=26 across the 3 produced instances, and validity reports new_integrity_failures=3 (all instances invalid). The writer disables foreign_keys (writer.py: 'pragma foreign_keys = OFF') and fill_foreign_keys_consistently draws from parent pools, but _plant_exceptions and _plant_ties overwrite FK columns (e.g. movies2actors.movieid, movies2directors.movieid, u2base.movieid, u2base.userid) with boundary literals such as 2312851/2312852/2312853 and 2462958-2462960 that are not present in the parent key pool, producing dangling FKs. The spec's per_column_exceptions list these boundary values for FK columns, but the program plants them without ensuring the referenced parent rows exist.",
+     "requested_revision": "Either (a) ensure boundary FK literals are also inserted as parent PKs (movies.movieid, users.userid) so the planted child rows reference existing parents, or (b) restrict boundary planting on FK columns to values that exist in the parent pool. Also enable foreign_keys=ON in the writer (or validate FKs before commit) so violations are caught rather than silently written. Confirm fk_violations=0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions assign comparison_boundary values to FK columns (movies2directors.movieid, movies2actors.movieid, u2base.movieid, u2base.userid) that are not guaranteed to exist in the parent tables, and the atomic summary itself flags these as type-mismatched ('movies2directors.movieid = movies2directors.genre'). The spec's uncertainty note acknowledges the mismatch but still lists them as sampling targets. This directly conflicts with the FK integrity constraint.",
+     "requested_revision": "Clarify that boundary literals on FK columns must be co-generated as parent PKs, or drop boundary targets on FK columns that cannot be satisfied by the parent key pool. Document the intended handling so the engineer's implementation is unambiguous."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: feedback reports reproducible=false. cli.py seeds rng per unit (random.Random(seed_base*100003+i)), but build_random_instance also consumes rng in choose_table_sizes and _init_sampler with rng.random()<0.5 branches; more importantly, the crash path means units are non-deterministically skipped (os.path.exists check returns '' for pre-existing files, and failed units leave no file). The combination of partial writes and the ValueError makes the run non-reproducible.",
+     "requested_revision": "After fixing the ValueError, verify that re-running with the same seed produces identical instances (byte-identical or identical row counts and values). Ensure failed units do not leave partial state that changes subsequent runs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Preservation of compact rows: writer.py copies the compact DB (shutil.copyfile) and appends rows, which is correct in principle. However, rows_skipped shows movies=61, movies2actors=49, u2base=310 skipped, and the FK violations indicate that appended rows reference non-existent parents. The compact rows themselves are preserved, but the appended rows violate integrity, so the instance is not a valid extension.",
+     "requested_revision": "Ensure appended rows satisfy all FK and PK constraints relative to the compact rows (see FK issue above). Confirm rows_skipped is only due to genuine constraint conflicts, not dangling FKs."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rule evidence: most rules are well-supported by sample rows (users.age numeric 1-100, u_gender F/M, occupation 1-5, d_quality 0-5, avg_revenue 0-4, a_quality 0-5, year 1-4, isEnglish T/F, country USA/France/UK/other, runningtime 0-3, cast_num 0-3, genre enum, rating 1-5). However, the atomic summary lists comparison_boundary targets that fall outside the stated domains: directors.d_quality targets include -1 and 6 (outside 0-5), movies.year targets include 3,4,5 (5 outside 1-4), u2base.rating targets include '0' (outside 1-5), users.age targets include 17,18,19,24,25,26 (within 1-100, fine). The spec's per_column_exceptions include these out-of-domain values, which conflicts with the semantic_rules_and_formulas ranges.",
+     "requested_revision": "Reconcile the boundary targets with the stated domains: either widen the domain ranges to include the boundary values (e.g. d_quality -1..6, year 1..5, rating 0..5) or remove out-of-domain boundary targets. Document which is intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Value variation: construction_pairs shows eligible=132, separated=31, unknown_executions=0. Only 31/132 pairs are separated, which is low but not by itself proof of a generation error (per instructions, missing separation alone does not establish an error). However, the low separation combined with the crash and FK violations means the intended variation (boundary values, ties, duplicates) is not reliably realized. The _plant_ties function only duplicates non-key values with 50% probability per column and does not specifically target rank-1 ties as the spec requires (ties_for_order_limit tie_at_rank [1]).",
+     "requested_revision": "After fixing crashes and FK issues, strengthen tie planting to explicitly create ties at rank 1 (e.g. ensure at least two rows share the max/min count for the relevant grouping) and verify separation improves. Re-run construction_pairs and report the new separated count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL rule: nullable_columns is empty and null_targets is empty, consistent with the schema (all columns NOT NULL). No NULL generation is required. This check passes.",
+     "requested_revision": "No change needed."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 31/132 separated construction pairs is acceptable after fixes; needs re-run.",
+    "Whether boundary FK literals can be satisfied by co-generating parent PKs without violating the spec's intent.",
+    "Whether out-of-domain boundary targets (d_quality -1/6, year 5, rating 0) are intentional domain widenings or spec errors."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py `_widen_ranges` widens integer ranges to admit boundary targets, but the spec's own semantic_rules_and_formulas state e.g. `d_quality BETWEEN -1 AND 6`, `year BETWEEN 1 AND 5`, `rating IN ('0'..'5')` already. More importantly, the spec's `integer_range` generic rule says boundary values and one step outside should be included 'only if the widened value is admitted by the stated range rule'. The program's RangeSampler (values.py) explicitly emits `self.lo - 1` and `self.hi + 1` (lines under `u < 0.25` / `u < 0.30`) \u2014 i.e. values OUTSIDE the stated range \u2014 for every range column. For d_quality this produces -2 and 7; for year 0 and 6; for runningtime -1 and 4; for a_quality -1 and 6; for avg_revenue -1 and 5; for users.age 0 and 101; for cast_num -1 and 4. These violate the stated domain rules (e.g. `d_quality BETWEEN -1 AND 6`, `year BETWEEN 1 AND 5`, `runningtime BETWEEN 0 AND 3`, `avg_revenue BETWEEN 0 AND 4`, `a_quality BETWEEN 0 AND 5`, `CAST(age AS INTEGER) BETWEEN 1 AND 100`, `cast_num BETWEEN 0 AND 3`). The spec's generic rule explicitly forbids this: 'include boundary values and one step outside ... only if the widened value is admitted by the stated range rule.'",
+     "requested_revision": "In RangeSampler.sample(), remove the `self.lo - 1` and `self.hi + 1` branches (or gate them behind an explicit spec flag that is false for all columns here). Only emit values within [lo, hi]. Alternatively, if the designer intends one-step-outside values, the designer must widen the stated ranges in semantic_rules_and_formulas to admit them \u2014 but the spec text as written does not."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `text_enum` generic rule states: 'include case near-variants (lower/upper) only for columns named in per_column_exceptions.' The per_column_exceptions list names case variants only for movies2directors.genre, movies.country, actors.a_gender, users.u_gender. However, spec.py `_CASE_VARIANT_COLUMNS` includes exactly those four \u2014 good \u2014 but EnumSampler applies case variants with probability 0.15 to ALL sampled values in those columns (not just exception rows), and the spec's per_column_exceptions for these columns list specific target values (e.g. genre: 'drama','DRAMA','horror','HORROR','Horror'; country: 'France','france','USA','usa','UK','uk'; a_gender/u_gender: 'F','f'). The spec's `text_enum` rule says near-variants are allowed 'only for columns named in per_column_exceptions' \u2014 which is satisfied \u2014 but the spec's per_column_exceptions targets are specific literals, and the program's EnumSampler generates arbitrary case flips (e.g. 'ACTION', 'usa' from 'USA', 'f' from 'M'? no \u2014 only flips of the chosen canonical value). This is arguably within the letter of the spec but the spec's `text_enum` rule also says 'Uniform choice from the enum list ... include case near-variants ... only for columns named in per_column_exceptions' \u2014 the program does this. Minor concern only; not blocking.",
+     "requested_revision": "Optional: restrict case-variant injection to the specific target literals listed in per_column_exceptions rather than arbitrary flips of any canonical value, to match the spec's intent more precisely."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows substantial rows_skipped: movies 408, movies2actors 373, movies2directors 128, u2base 976 \u2014 while users/directors/actors have 0 skipped. The writer's fallback row-by-row insert catches sqlite3.Error and counts as bad. The most likely cause is FK violations on child tables whose FK values were drawn from a parent pool that did not include the freshly generated parent PKs at draw time (fill_foreign_keys_consistently runs BEFORE _plant_parent_keys and BEFORE the final re-pointing loop). The final re-pointing loop in build_random_instance does fix child FKs against the final parent pool \u2014 but only for columns whose key is in schema.fks; it does NOT fix composite-PK duplicate collisions or NOT NULL issues. The high skip rate on u2base (976/2723 \u2248 36%) and movies2actors (373/2008 \u2248 19%) suggests many generated rows are being dropped, which reduces the effective variation and may prevent intended separations. The spec's `integer_fk` rule says 'Copy from parent table's generated key pool; never NULL unless column is nullable' \u2014 the program does copy from the pool, but the pool used at draw time excludes parent PKs planted later, so many draws reference values that only exist after _plant_parent_keys runs; the re-pointing loop should catch these, yet skips remain. This indicates the re-pointing is incomplete (e.g. composite PK collisions in movies2actors (movieid, actorid) and movies2directors (movieid, directorid) and u2base (userid, movieid) are not de-duplicated after re-pointing).",
+     "requested_revision": "After the final FK re-pointing loop in build_random_instance, re-run sample_fresh_primary_keys (and drop_unique_duplicates) on each table so composite-PK collisions introduced by re-pointing are removed before writing. Also verify that _plant_parent_keys runs before fill_foreign_keys_consistently for child tables, or that the re-pointing loop covers all FK columns including composite-PK members. Target: rows_skipped should be near zero for FK-only reasons."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `integer_fk` rule says 'Boundary literals planted on FK columns must first be inserted as parent PKs so the reference resolves.' The program's _plant_parent_keys does this. However, the spec's per_column_exceptions for u2base.movieid lists targets [1695218, 1695219, 1695220, 2462958, 2462959, 2462960] with note 'only plant values that exist in movies.movieid pool'. The program's _plant_parent_keys plants ALL integer boundary targets for every FK child column into the parent PK column \u2014 including 1695218..1695220 and 2462958..2462960 into movies.movieid \u2014 even though the spec's note says only plant values that exist in the pool. This means the program creates parent movie rows with PKs 1695218..1695220 and 2462958..2462960 that were not in the original compact pool. That is arguably acceptable (co-generation), but the spec's note is ambiguous: 'only plant values that exist in movies.movieid pool' could mean the pool after co-generation. The spec should clarify. Also, the spec's per_column_exceptions for movies2directors.movieid and movies2actors.movieid list [2312851, 2312852, 2312853] with note 'co-generate as movies.movieid PKs' \u2014 consistent with the program. The u2base.movieid note is the inconsistent one.",
+     "requested_revision": "Clarify in the spec whether u2base.movieid boundary targets 1695218..1695220 and 2462958..2462960 should be co-generated as movies.movieid PKs (as the program does) or only planted if already present in the compact pool. If the latter, the program must skip planting them and instead only draw them from the existing pool."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `fresh_value_share` rule says '~20% of rows get fresh values not seen in the original sample; remaining rows reuse the observed pool.' The program's _init_sampler (values.py) sets `els = rng.choices(ov, k=min(5, len(ov))) + sorted({str(v) for v in literal_pool})` and the samplers use `p` (0.0 or 0.2) to decide fresh vs. reuse. The `p` value is set in build_random_instance as `p = 0.0 if rng.random() < 0.3 else 0.2` \u2014 so 30% of instances use p=0.0 (always reuse observed pool, no fresh values) and 70% use p=0.2. This does not match '~20% of rows get fresh values' uniformly; it's per-instance all-or-nothing on the fresh share. Additionally, EnumSampler with p=0.0 always picks from elements (observed pool), so no fresh enum values are generated in those instances. The spec's rule is about rows, not instances.",
+     "requested_revision": "Set p per-row (or per-sampler-call) to ~0.2 rather than per-instance all-or-nothing. In build_random_instance, replace `p = 0.0 if rng.random() < 0.3 else 0.2` with a fixed `p = 0.2` (or draw p per row inside the sampler). This ensures ~20% fresh values across all instances, matching the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_share` rule says 'No nullable columns exist in this schema; NOT NULL columns never NULL.' The schema confirms all columns are NOT NULL or PK. The program's fill_foreign_keys_consistently returns `[None] * n` if the parent pool is empty \u2014 which would insert NULL into a NOT NULL FK column. In practice the parent pool is never empty (compact rows exist), so this branch is not hit in the execution feedback (0 not_null_violations). But it's a latent bug: if a parent table had 0 rows, child FK columns would get NULL and the writer would skip all rows. Not blocking given current data, but should be fixed.",
+     "requested_revision": "In fill_foreign_keys_consistently, if the parent pool is empty, raise an error or skip the child table's rows rather than emitting NULL into a NOT NULL column. Or assert the pool is non-empty."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `integer_range` rule says 'Uniform integer within the range stated in semantic_rules_and_formulas; include boundary values and one step outside where the atomic summary lists them, but only if the widened value is admitted by the stated range rule.' The atomic summary lists boundary targets for d_quality [-1,0,1,4,5,6], year [3,4,5], rating [0,1,2,3,4,5], age [17,18,19,24,25,26], a_quality [2,3,4], avg_revenue (via d_quality), etc. The spec's semantic_rules_and_formulas already widen d_quality to -1..6 and year to 1..5 and rating to '0'..'5'. But the spec's `integer_range` rule's phrase 'one step outside where the atomic summary lists them' is ambiguous: does it mean one step outside the atomic summary's listed targets, or one step outside the stated range? The program interprets it as one step outside the stated range (lo-1, hi+1), which violates the stated range. The designer should clarify.",
+     "requested_revision": "Rewrite the `integer_range` rule to say explicitly: 'Emit values within [lo, hi] as stated in semantic_rules_and_formulas. Do NOT emit lo-1 or hi+1 unless the stated range itself is widened to admit them.' This removes the ambiguity that led the engineer to emit out-of-range values."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 976 skipped u2base rows and 373 skipped movies2actors rows are due to composite-PK collisions after FK re-pointing (not directly observable from the summary; would need per-row error logging).",
+    "Whether the spec's u2base.movieid note 'only plant values that exist in movies.movieid pool' is intended to allow co-generation of 1695218..1695220 and 2462958..2462960 as new movies PKs.",
+    "Whether the 41/132 separated construction pairs is sufficient given the spec's intended variation; the summary does not break down which pairs failed to separate or why."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "title": "Boundary literals for FK columns on movies.movieid not guaranteed to be planted",
+     "evidence": "spec.py `_DEFAULT_BOUNDARY` lists movies.movieid -> [2312851,2312852,2312853], but the loaded spec's boundary table (from per_column_exceptions) does not include an entry for movies.movieid because the exception there targets only 'parent_rows_without_children' with no 'values'. instance.py `_plant_parent_keys` only walks over schema.fks (child FK columns), not over parent PK columns, so the movies.movieid boundary values [2312851..2312853] are never inserted unless some FK boundary references them. The FK exceptions (movies2actors.movieid, movies2directors.movieid, u2base.movieid) do list those literals, so they are co-generated via `_plant_parent_keys` for movies.movieid \u2014 but only because u2base/movies2*/\u2026 movieid FK targets mention them. In practice the construction ran without errors, so this dependence is satisfied by the FK-side co-generation.",
+     "requested_revision": "Either add movies.movieid itself to spec boundary planting (plant its target values as PKs even when no FK also lists them), or document in spec.py that movies.movieid boundary values inherit exclusively from child FK exceptions. A comment in `_plant_parent_keys` clarifying the transitively-covered case is sufficient."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "title": "High rows_skipped on movies and u2base",
+     "evidence": "Execution summary: rows_skipped {movies: 619, u2base: 1241} vs rows_added {movies: 488, u2base: 2377}. Every u2base row is inserted with a composite PK (userid, movieid); since userid and movieid pools are small (~40 users, ~50 movies), collisions dominate and many generated rows are rejected by the writer. Similarly movies: PK collisions against compact rows or re-pointing cause many skips.",
+     "requested_revision": "Increase the pre-write `sample_fresh_primary_keys`/`drop_unique_duplicates` effectiveness by generating smaller candidate sets but with a retry loop (or drawing without replacement from the cross product) so fewer rows are lost. Or reduce `table_sizes_per_instance.u2base` in the spec to a value that fits the PK space. Not blocking pass, but the effective instance size (e.g., ~1136 rows added for u2base instead of ~200) is materially below spec."
+    },
+    {
+     "agent": "designer",
+     "severity": "low",
+     "title": "Comparison-boundary target for movies.movieid not covered by a values-bearing exception",
+     "evidence": "per_column_exceptions has movies.movieid with only targets {parent_rows_without_children: true}, {duplicate_share: small}, {tie_at_rank: [1]} \u2014 no `values` list. The atomic operation for movies.movieid lists `PRED(movies.movieid = 2312852)` with targets [2312851,2312852,2312853]. Those literals are only injected because sibling FK exceptions happen to list them.",
+     "requested_revision": "Add `{'column':'movies.movieid','pattern':'comparison_boundary','targets':{'values':[2312851,2312852,2312853]}}` to per_column_exceptions so the boundary is generated intrinsically, independent of FK-side co-generation."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "title": "Case near-variants potentially over-generated on u_gender/a_gender country/genre",
+     "evidence": "EnumSampler with `allow_case_variant=True` (spec.case_variant covers (movies2directors,genre), (movies,country), (actors,a_gender), (users,u_gender)) flips case on ~15% of draws regardless of the exception row set. The spec rule (per `integer_fk`/`text_enum` notes) is: case near-variants allowed only in exception rows, and only for the specific target literals. E.g. 'fRance' or 'DRAMA' produced via `v.upper()/v.lower()` may not be in the exception target lists.",
+     "requested_revision": "Restrict case-variant emission to exception rows planted by `_plant_exceptions` (e.g., by disabling `allow_case_variant` inside EnumSampler and letting only boundary injection produce the near variants). Not blocking; execution succeeded and integrity held."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "title": "Semantic rule evidence strength",
+     "evidence": "The sample values in `supporting_evidence` confirm: u_gender/occupation/isEnglish/enum columns; d_quality, d_year, a_quality, runningtime, cast_num integer ranges; year widened from {1..4} to 1..5 to admit boundary 5, avg_revenue 0..4, d_quality widened -1..6. Rating widened '0'..'5'. All ranges are stated in `supporting_evidence` and `_DEFAULT_RANGES`; load_specification + _widen_ranges derives the same. The users.age rule `CAST(age AS INTEGER) BETWEEN 1 AND 100` is enforced by NumericTextSampler drawing from pool {17,18,19,24,25,26,\u2026} plus small \u00b12 perturbations; all values remain in 15..28, inside 1..100. Strongly supported.",
+     "requested_revision": "None \u2014 documented for the record."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "title": "No nullable columns \u2014 NULL rule trivially satisfied",
+     "evidence": "Schema has zero nullable columns (all columns NOT NULL and every non-PK column has a CHECK-independent domain). Program correctly raises rather than emitting NULL into FK columns (`fill_foreign_keys_consistently`).",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs separated 37/132 with 0 unknown \u2014 the remaining 95 pairs are either killed by the example neighbour or fail to separate; not investigated per-instance (fast mode). Not required for pass.",
+    "High skip rates on movies/u2base did not cause failures (worker n_fail=0) but reduce effective row counts; noted for the engineer."
+   ]
+  }
+ ]
 }

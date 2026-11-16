@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -22,20 +22,28 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int) -> tuple:
+    """Build and write unit i; returns ('' | exception name, rows_added dict, rows_skipped dict)."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return '', {}, {}
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        stats = write_instance_sqlite(_G['schema'], inst, p, _G['args']['orig'])
+        return '', stats.get('rows_ok', {}), stats.get('rows_failed', {})
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return type(e).__name__, {}, {}
+
+
+def _sum_dicts(ds: list) -> dict:
+    out: dict = {}
+    for d in ds:
+        for k, v in d.items():
+            out[k] = out.get(k, 0) + int(v)
+    return out
 
 
 def main(argv=None) -> None:
@@ -63,7 +71,7 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -73,11 +81,15 @@ def main(argv=None) -> None:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
     for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        if r[0]:
+            errs[r[0]] = errs.get(r[0], 0) + 1
+    added = _sum_dicts([r[1] for r in res])
+    failed = _sum_dicts([r[2] for r in res])
+    print(json.dumps({'db': a.db, 'n_ok': sum(1 for r in res if r[0] == ''),
+                      'n_fail': sum(1 for r in res if r[0] != ''),
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': failed}))
 
 
 if __name__ == '__main__':

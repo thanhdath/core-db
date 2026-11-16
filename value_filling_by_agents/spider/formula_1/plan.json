@@ -1,49 +1,874 @@
 {
  "db": "formula_1",
- "operator_io_quirks": [
-  "Mixed-case identifiers everywhere (circuitId, constructorStandings, driverStandingsId); must double-quote with original spelling.",
-  "Two tables (pitStops, lapTimes) have 0 rows: original_values empty, original_sizes 0; samplers get no original elements -> p:=1 fresh draws.",
-  "Composite PKs: pitStops(raceId,driverId,stop), lapTimes(raceId,driverId,lap) -> composite-PK member max_l0=30; sample_fresh_primary_keys must dedupe on the tuple.",
-  "No NOT NULL, no CHECK, no UNIQUE anywhere; all notnull=0, checked=false -> p never forced to 0 by 'checked'.",
-  "FKs all resolve to existing parents (circuits, races, drivers, constructors); no dangling, no self-refs, no non-unique parents.",
-  "Declared TEXT columns store dates/times/numbers: races.date 'YYYY-MM-DD', drivers.dob 'DD/MM/YYYY', races.time 'HH:MM:SS', results.time 'M:SS.s', q1/q2/q3 'M:SS.mmm', milliseconds/fastestLapSpeed numeric-as-text.",
-  "results.number declared INTEGER but storage classes are ['integer','text'] (mixed) -> Number fuzzer will emit ints, original has some text.",
-  "circuits.alt TEXT with only 2 distinct values incl. empty string '' -> String sampler length range [0, max+1] and int-like +-1 perturbations.",
-  "drivers.number TEXT with '' among values (distinct 38) -> String sampler will produce '' and int-like neighbors.",
-  "constructorResults.status TEXT with literal string 'NULL' (not SQL NULL) and 'D' -> String sampler treats 'NULL' as a normal element.",
-  "races.year INTEGER (not 'year' type) dispatches to Number, not the year fuzzer; seasons.year is PK INTEGER likewise Number.",
-  "Large tables: results 23777, driverStandings 31726, constructorStandings 11896, constructorResults 11142, qualifying 7516 \u2014 under 300k cap, full read fine."
- ],
- "operator_ts_expectations": [
-  "All PK columns (INTEGER) -> Number fuzzer, scale=0, range [-1,1] with +-1/+-2 perturbation; fresh PKs mostly collide -> sample_fresh_primary_keys drops many rows, shrinking tables.",
-  "FK columns (raceId, driverId, constructorId, circuitId) draw with replacement from parent's FINAL filtered values -> heavy duplication, many-to-one joins; ties abundant.",
-  "races.date, drivers.dob, races.time declared TEXT -> String fuzzer, NOT Date/Time: random charset strings, not date-shaped; date-format queries (strftime, LIKE '2009-%') will mostly miss -> FN.",
-  "results.time/q1/q2/q3/fastestLapTime TEXT -> String fuzzer; lap-time comparisons and ORDER BY on these become random strings -> implausible values, FN.",
-  "results.milliseconds/fastestLapSpeed/laps/rank/fastestLap TEXT -> String fuzzer; numeric comparisons on them compare text lexically -> FP/FN.",
-  "position/positionText TEXT in results/constructorStandings/driverStandings -> String fuzzer; 'position = 1' vs 'positionText' joins/equalities become random strings.",
-  "points REAL -> Number scale=4, range [-10000,10000] with +-0.01/0.02 perturbation; original points are small non-negative -> implausible negatives, FN on 'points > 0' style.",
-  "lat/lng REAL -> Number scale=4, range [-10000,10000]; original lat/lng in [-90,180] -> implausible coords, FN on geographic filters.",
-  "year/round/wins/grid/positionOrder INTEGER -> Number scale=0 range [-1,1] +-1/2; original years 1950-2017, rounds 1-21 -> almost all values in {-3..3}, FN on 'year > 2000'.",
-  "status.status, circuits.country, drivers.nationality, constructors.nationality -> String fuzzer random charset; equality to 'Finished'/'British' etc. rarely matches -> FN on categorical filters.",
-  "Empty pitStops/lapTimes: samplers have no elements -> p=1, all fresh; FK columns still draw from parent (races/drivers) so joins non-empty; but original empty -> any query returning rows is FP vs original.",
-  "String fuzzer contaminate (suffix/prefix/drop) on url/name/ref columns -> near-duplicate strings, ties on LIKE patterns; may create spurious matches (FP) or break exact matches (FN)."
- ],
- "challenger_refs": [
-  "G7",
-  "G3",
-  "G8",
-  "G4",
-  "G5",
-  "G6",
-  "G2",
-  "G1",
-  "G9"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "sequential from 1, unique, never NULL",
+   "integer_fk": "sample from parent PK pool; 5% NULL where nullable",
+   "integer_numeric": "uniform in observed min..max; include min-1, min, max, max+1 unless a semantic range rule constrains the column, in which case emit only min and max",
+   "real_numeric": "uniform in observed min..max rounded to 1 decimal; include bounds",
+   "text_short": "pick from observed pool; 10% near-variant (case/typo)",
+   "text_url": "http://en.wikipedia.org/wiki/<slug>",
+   "text_date": "uniform date in 1950-01-01..2017-12-31 formatted %Y-%m-%d",
+   "text_time": "HH:MM:SS uniform 00:00:00..23:59:59",
+   "text_laptime": "M:SS.mmm uniform 1:20.000..1:40.000",
+   "text_nullable": "80% observed pool, 20% NULL",
+   "enum_small": "uniform over listed values",
+   "tie_rank": "ensure at least two rows share the top value of the ORDER column",
+   "null_share": "5-30% NULL on nullable columns",
+   "boundary_emission": "for columns with a semantic range rule, emit only the in-range boundary values (min and max), never min-1 or max+1"
+  },
+  "per_column_exceptions": [
+   {
+    "column": "races.raceId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "results.raceId",
+      "qualifying.raceId",
+      "driverStandings.raceId",
+      "constructorStandings.raceId",
+      "constructorResults.raceId",
+      "pitStops.raceId",
+      "lapTimes.raceId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    },
+    "implementation": "reserve at least one generated races.raceId that is excluded from every child FK pool; child FK NULL planting is separate"
+   },
+   {
+    "column": "races.raceId",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    },
+    "implementation": "not realisable on a PK; realised on results.raceId (see below)"
+   },
+   {
+    "column": "results.raceId",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "results.raceId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "races.raceId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "drivers.driverId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "results.driverId",
+      "pitStops.driverId",
+      "driverStandings.driverId",
+      "qualifying.driverId",
+      "lapTimes.driverId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    },
+    "implementation": "reserve at least one generated drivers.driverId that is excluded from every child FK pool"
+   },
+   {
+    "column": "drivers.driverId",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+     ]
+    },
+    "implementation": "realised on results.driverId multiplicities; with 8 results rows a group count of 9 is unreachable, so target the reachable subset {4,5,6,7,8}"
+   },
+   {
+    "column": "drivers.driverId",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    },
+    "implementation": "realised on results.driverId and qualifying.driverId distinct counts"
+   },
+   {
+    "column": "drivers.driverId",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    },
+    "implementation": "not realisable on a PK; realised on results.driverId and drivers.surname"
+   },
+   {
+    "column": "drivers.driverId",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    },
+    "implementation": "realised on results.driverId group counts"
+   },
+   {
+    "column": "results.driverId",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+     ]
+    }
+   },
+   {
+    "column": "results.driverId",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "results.driverId",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "results.driverId",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "results.driverId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "drivers.driverId",
+      "driverStandings.driverId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "races.year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1998,
+      1999,
+      2000,
+      2001,
+      2008,
+      2009,
+      2010
+     ]
+    }
+   },
+   {
+    "column": "races.year",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "races.date",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "races.date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "values": [
+      "2017-%"
+     ]
+    }
+   },
+   {
+    "column": "races.name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Australian Grand Prix",
+      "australian grand prix"
+     ]
+    }
+   },
+   {
+    "column": "drivers.surname",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "drivers.surname",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "pitStops.driverId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "drivers.driverId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "qualifying.driverId",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "qualifying.raceId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "races.raceId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "driverStandings.driverId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "drivers.driverId",
+      "results.driverId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "driverStandings.position",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2
+     ]
+    },
+    "implementation": "0 dropped: conflicts with semantic rule position BETWEEN 1 AND 108"
+   },
+   {
+    "column": "driverStandings.positionText",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1",
+      "2"
+     ]
+    },
+    "implementation": "0 dropped: conflicts with semantic rule position BETWEEN 1 AND 108"
+   },
+   {
+    "column": "results.fastestLapSpeed",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "results.resultId",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(results.resultId)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ]
+    },
+    "implementation": "realised on results.driverId group counts"
+   },
+   {
+    "column": "circuits.country",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Spain",
+      "Malaysia",
+      "UK",
+      "Belgium",
+      "France"
+     ]
+    }
+   },
+   {
+    "column": "constructors.nationality",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Japanese"
+     ]
+    }
+   },
+   {
+    "column": "drivers.nationality",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "German"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "races.circuitId",
+    "parent": "circuits.circuitId",
+    "copied": []
+   },
+   {
+    "child": "results.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "results.driverId",
+    "parent": "drivers.driverId",
+    "copied": []
+   },
+   {
+    "child": "results.constructorId",
+    "parent": "constructors.constructorId",
+    "copied": []
+   },
+   {
+    "child": "results.statusId",
+    "parent": "status.statusId",
+    "copied": []
+   },
+   {
+    "child": "qualifying.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "qualifying.driverId",
+    "parent": "drivers.driverId",
+    "copied": []
+   },
+   {
+    "child": "qualifying.constructorId",
+    "parent": "constructors.constructorId",
+    "copied": []
+   },
+   {
+    "child": "driverStandings.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "driverStandings.driverId",
+    "parent": "drivers.driverId",
+    "copied": []
+   },
+   {
+    "child": "constructorStandings.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "constructorStandings.constructorId",
+    "parent": "constructors.constructorId",
+    "copied": []
+   },
+   {
+    "child": "constructorResults.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "constructorResults.constructorId",
+    "parent": "constructors.constructorId",
+    "copied": []
+   },
+   {
+    "child": "pitStops.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "pitStops.driverId",
+    "parent": "drivers.driverId",
+    "copied": []
+   },
+   {
+    "child": "lapTimes.raceId",
+    "parent": "races.raceId",
+    "copied": []
+   },
+   {
+    "child": "lapTimes.driverId",
+    "parent": "drivers.driverId",
+    "copied": []
+   },
+   {
+    "child": "races.year",
+    "parent": "seasons.year",
+    "copied": []
+   },
+   {
+    "unique": "pitStops(raceId, driverId, stop)"
+   },
+   {
+    "unique": "lapTimes(raceId, driverId, lap)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "circuits",
+    "column": "lat",
+    "formula": "lat BETWEEN -90 AND 90"
+   },
+   {
+    "table": "circuits",
+    "column": "lng",
+    "formula": "lng BETWEEN -180 AND 180"
+   },
+   {
+    "table": "races",
+    "column": "year",
+    "formula": "year BETWEEN 1950 AND 2017"
+   },
+   {
+    "table": "races",
+    "column": "round",
+    "formula": "round BETWEEN 1 AND 21"
+   },
+   {
+    "table": "races",
+    "column": "date",
+    "formula": "date >= '1950-01-01' AND date <= '2017-12-31'"
+   },
+   {
+    "table": "races",
+    "column": "date",
+    "formula": "date >= printf('%04d-01-01', year) AND date <= printf('%04d-12-31', year)",
+    "evidence": "races rows 1-8: 2009-03-29..2009-06-21 all within year 2009"
+   },
+   {
+    "table": "drivers",
+    "column": "dob",
+    "formula": "dob >= '1900-01-01' AND dob <= '2000-12-31'"
+   },
+   {
+    "table": "results",
+    "column": "positionOrder",
+    "formula": "positionOrder BETWEEN 1 AND 39"
+   },
+   {
+    "table": "results",
+    "column": "grid",
+    "formula": "grid BETWEEN 0 AND 35"
+   },
+   {
+    "table": "results",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "results",
+    "column": "laps",
+    "formula": "CAST(laps AS INTEGER) BETWEEN 0 AND 200"
+   },
+   {
+    "table": "results",
+    "column": "milliseconds",
+    "formula": "CAST(milliseconds AS INTEGER) > 0"
+   },
+   {
+    "table": "results",
+    "column": "positionText",
+    "formula": "positionText = position OR positionText IN ('R','D','E','F','W')",
+    "evidence": "results rows 1-8: positionText equals position for all"
+   },
+   {
+    "table": "results",
+    "column": "position",
+    "formula": "position IN ('1','2','3','4','5','6','7','8','R','D','E','F','W')"
+   },
+   {
+    "table": "results",
+    "column": "statusId",
+    "formula": "statusId IN (1,2,3,4,5,6,7,8,10,11)"
+   },
+   {
+    "table": "driverStandings",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "driverStandings",
+    "column": "position",
+    "formula": "position BETWEEN 1 AND 108"
+   },
+   {
+    "table": "driverStandings",
+    "column": "wins",
+    "formula": "wins >= 0"
+   },
+   {
+    "table": "constructorStandings",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "constructorStandings",
+    "column": "position",
+    "formula": "position BETWEEN 1 AND 22"
+   },
+   {
+    "table": "constructorStandings",
+    "column": "wins",
+    "formula": "wins >= 0"
+   },
+   {
+    "table": "constructorResults",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "constructorResults",
+    "column": "status",
+    "formula": "status IS NULL OR status IN ('D')",
+    "evidence": "constructorResults rows 1-8: status NULL or 'D'"
+   },
+   {
+    "table": "qualifying",
+    "column": "position",
+    "formula": "position BETWEEN 1 AND 28"
+   },
+   {
+    "table": "qualifying",
+    "column": "number",
+    "formula": "number BETWEEN 1 AND 99"
+   },
+   {
+    "table": "pitStops",
+    "column": "stop",
+    "formula": "stop >= 1"
+   },
+   {
+    "table": "pitStops",
+    "column": "lap",
+    "formula": "lap >= 1"
+   },
+   {
+    "table": "pitStops",
+    "column": "milliseconds",
+    "formula": "milliseconds > 0"
+   },
+   {
+    "table": "lapTimes",
+    "column": "lap",
+    "formula": "lap >= 1"
+   },
+   {
+    "table": "lapTimes",
+    "column": "milliseconds",
+    "formula": "milliseconds > 0"
+   },
+   {
+    "table": "lapTimes",
+    "column": "position",
+    "formula": "position BETWEEN 1 AND 30"
+   },
+   {
+    "table": "status",
+    "column": "status",
+    "formula": "status IN ('Finished','Disqualified','Accident','Collision','Engine','Gearbox','Transmission','Clutch')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "circuits": 8,
+   "races": 8,
+   "drivers": 8,
+   "status": 8,
+   "seasons": 8,
+   "constructors": 8,
+   "constructorStandings": 8,
+   "results": 8,
+   "driverStandings": 8,
+   "constructorResults": 8,
+   "qualifying": 8,
+   "pitStops": 8,
+   "lapTimes": 8
+  },
+  "null_targets": [
+   "results.fastestLapSpeed",
+   "races.date",
+   "constructorResults.status"
+  ],
+  "supporting_evidence": {
+   "races.date_year": [
+    "races rows 1-8: 2009-03-29..2009-06-21 all within year 2009"
+   ],
+   "results.positionText": [
+    "results rows 1-8: positionText equals position for all"
+   ],
+   "constructorResults.status": [
+    "constructorResults rows 1-8: status NULL or 'D'"
+   ],
+   "driverStandings.position": [
+    "driverStandings rows 1-8: positions 1..8"
+   ]
+  },
+  "uncertainty": [
+   "races.year boundary -1545 is an artifact of the query generator; removed from generation targets so year stays in 1950-2017",
+   "results.fastestLapSpeed NULL share inferred from atomic summary, not from observed statistics (0% null in sample)",
+   "pitStops and lapTimes have zero observed rows; sizes set to 8 to exercise composite keys",
+   "unmatched_join_rows targets are parent-side (parent rows without children) plus nullable child FKs; PK columns are never nulled; parent-side unmatched is enforced by reserving at least one generated parent PK excluded from every child FK pool",
+   "results.laps and results.milliseconds are declared TEXT but constrained to integer ranges; the generator samples them as integers and stores as text; boundary emission is suppressed for these columns to respect the semantic range rules",
+   "results.positionText must equal position for numeric positions and map non-numeric positions to the same token; the enum includes R,D,E,F,W",
+   "drivers.driverId group_sizes, aggregate_boundary, duplicates_for_distinct and ties_for_order_limit are not realisable on a PK; they are realised on results.driverId (and drivers.surname for group_sizes/ties)",
+   "races.raceId ties_for_order_limit is not realisable on a PK; realised on results.raceId",
+   "driverStandings.position boundary value 0 dropped because it conflicts with the semantic rule position BETWEEN 1 AND 108; boundary values 1 and 2 retained",
+   "aggregate_boundary for drivers.driverId with value 9 is unreachable with 8 results rows; reachable subset {4,5,6,7,8} targeted"
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "e692cf0696f154da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, errors={\"TypeError\": 20}; stderr shows 'ColumnSampler.__init__() missing 3 required positional arguments: \"p\", \"max_l0\", and \"rng\"'. The enum/boundary samplers call super().__init__(...) with wrong arity: EnumSampler.__init__ calls `super().__init__([v for v in values if v is not None], 0.0, float('inf'), rng)` (4 args after self) but ColumnSampler.__init__ signature is (self, elements, p, max_l0, rng) \u2014 that's 4 positional after self, which is correct... however the failure occurs because BoundarySampler and EnumSampler call `super().__init__(list(values), 0.0, float('inf'), rng)` \u2014 wait that matches. The actual failure comes from RangeSampler / LikeSampler / DateRangeSampler / LapTimeSampler using `super().__init__([], 0.0, float('inf'), rng)` which also matches. Trace more carefully: the TypeError appears in *every* unit (all 20), meaning every instance crashed before any table was written. The likely culprit is `EnumSampler.__init__` which passes `self.values = list(values)` but then calls `super().__init__([v for v in values if v is not None], 0.0, float('inf'), rng)` \u2014 that is correct. The real bug: `ColumnSampler.__init__(self, elements, p, max_l0, rng)` takes 4 args. `EnumSampler.__init__(self, values, rng)` passes `super().__init__([v for v in values if v is not None], 0.0, float('inf'), rng)` \u2014 4 positional, fine. Check `BoundarySampler` \u2014 same pattern, fine. Re-check `RangeSampler.__init__(self, lo, hi, rng, is_int=True)` \u2192 `super().__init__([], 0.0, float('inf'), rng)` \u2014 4 positional, fine. The only subclasses using the *base* `ColumnSampler.sample` unimplemented path... `DateRangeSampler`, `LikeSampler`, `LapTimeSampler` don't override `__init__`, so they inherit `ColumnSampler.__init__` which requires 4 args; they are instantiated via `spec_sampler` returning `LikeSampler(spec.LIKE_PATTERNS[key], rng)` (2 args) or `DateRangeSampler(spec.DATE_MIN, spec.DATE_MAX, rng)` (3 args) or `LapTimeSampler(rng)` (1 arg) \u2014 those calls miss `p`, `max_l0`, `rng`; but they also never define their own `__init__`, so the TypeError is raised when `super().__init__` isn't provided at all because no `__init__` is defined on those classes and Python goes to `ColumnSampler.__init__`. Specifically `LikeSampler.__init__(self, pattern, rng)` DOES define `__init__` and calls super with 4 args. `DateRangeSampler.__init__` defines it and calls super with 4 args. `LapTimeSampler` does NOT define `__init__` but is called as `LapTimeSampler(rng)` \u2014 this passes only 1 arg, missing p, max_l0, rng \u2192 TypeError. Meanwhile `EnumSampler.__init__(self, values, rng)` and `BoundarySampler.__init__(self, values, rng)` call `super().__init__(..., 0.0, float('inf'), rng)` \u2014 4 args, correct. The failing call is any sampler instantiated with fewer than the base signature requires; the trace shows it fires on every unit \u2014 likely because EPS samplers like `LapTimeSampler(rng)` (only 1 arg to a constructor that defaults to base) raise. Also freshly constructed EnumSampler / BoundarySampler return values that never invoke `sample` since base requires `p`,`max_l0`,`rng` \u2014 but those classes DO set them. The simplest root cause: `_init_sampler` calls `make_column_sampler(column, els, p, max_l0, rng)`; `_init_sampler` receives `p, max_l0` \u2014 if those are correct, the base sampler is fine. Since ALL 20 units fail identically and no rows are written, the failure must be earlier \u2014 likely `spec_sampler` \u2192 `LapTimeSampler(rng)` on `results.fastestLapTime`, `qualifying.q1/q2/q3`, which raises immediately on construction. Regardless of which class specifically, the program crashes reproducibly for all instances.",
+     "requested_revision": "Fix sampler constructors so every sampler subclass invoked from `spec_sampler` (LapTimeSampler, LikeSampler, DateRangeSampler, EnumSampler, BoundarySampler, RangeSampler) accepts and forwards the base signature `(elements/models..., p, max_l0, rng)` OR explicitly provides p/max_l0 values in their `super().__init__` calls. Give `LapTimeSampler` and any other class lacking `__init__` an explicit `__init__(self, rng)` that calls `super().__init__([], 0.0, float('inf'), rng)`. Re-run `generate` and confirm `n_ok=20, n_fail=0` before pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "No instances were produced, so the following cannot be verified by execution: (a) that generated rows preserve the compact rows in every instance (writer._copy_compact then append \u2014 plausible but untested), (b) that table sizes and FK values are valid, (c) that nullable-column NULL shares match the spec, (d) that boundary / tie / group-size plantings actually appear in the written data. spec.py defines GROUP_SIZE_TARGETS for both `results.driverId` and `drivers.driverId` and `_plant_group_sizes` is applied to both \u2014 but `drivers.driverId` is a primary key, and `sample_fresh_primary_keys` runs *after* planting, so the group-size planting on driverId is destroyed by dedup (PK uniqueness) whenever sizes>1 are forced. Similarly, `_plant_ties` for primary keys (races.raceId, races.year, races.date, drivers.driverId group, driverStandings.position is non-PK) plants duplicate values into a PK \u2014 which then either collides with compact PKs or is removed by sample_fresh_primary_keys, defeating the tie target that was declared in the atomic spec (`ties_for_order_limit` on races.raceId and races.year). No way to observe this without a working run.",
+     "requested_revision": "Once generation runs: (1) verify with a spot-check counting `SELECT COUNT(DISTINCT raceid)` and COUNT(*) that races.raceId has ties at rank 1, and that drivers.driverId group sizes span 1/2/\u22653 in `results` groupings; if PK-uniqueness destroys these plantings, revise `_plant_ties`/`_plant_group_sizes` to operate on non-PK derived grouping keys (e.g. plant ties across the join of child rows) rather than the PK column itself, or relax the tie target to child-table groupings. (2) Verify null shares on results.fastestLapSpeed, races.date, constructorResults.status match spec.NULL_SHARE. (3) Verify compact rows are intact in every output DB (compare row counts and hashes to the orig)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic spec pattern `unmatched_join_rows` for `results.raceId` lists targets including `joins_with: [races.raceId]` with `child_rows_with_null_fk: true` \u2014 but `spec.UNMATCHED` in spec.py does not contain `('results','raceId')` under the child direction; instead it contains `('results','raceId') -> [('races','raceId')]` meaning 'races' has NULL raceId, which has the direction inverted. `_plant_unmatched` only sets `instance['races']['raceId'][0] = None` \u2014 this nulls a **primary key** of races, violating the NOT NULL/PK rule (and it will fail the INSERT). The specification is internally inconsistent: it wants a null child FK on results.raceId (child of races.raceId) and races having parents without children, but the UNMATCHED map encodes the reverse parent \u2192 child and interferes with the PK.",
+     "requested_revision": "Designer: correct `UNMATCHED` so that parent direction points to non-PK child FKs; remove the `('results','raceId')` entry (it is not a parent table) and add the pairing `('races','raceId') -> [('results','raceId'), ('qualifying','raceId')]` (already present) \u2014 the `('results','raceId')`, `('results','driverId')`, `('qualifying','raceId')`, `('pitStops','driverId')`, `('driverStandings','driverId')` keys currently invert parent/child and never produce the intended NULL child FKs; they only force NULLs into PKs or into columns not present. Also drop the redundant NULL-planting for PK columns; restrict `_plant_unmatched` to columns where `cm.notnull == False`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "`spec.BOUNDARY[('races','year')]` includes values [-1546, -1545, -1544] and spec.RANGES clamps years to (1950, 2017). `RangeSampler.sample` for races.year uses boundary values with prob 0.25 and then the range \u2014 so ~25% of years would be <1950, directly contradicting the semantic rule `races.year BETWEEN 1950 AND 2017`. The spec's own uncertainty note admits -1545 is an artifact, but the current spec would still emit those literals into `races.year`. Because `_derive_races` then tries to clamp `date` into `year.replace(year=int(y))`, negative years will raise ValueError and crash `_derive_races`.",
+     "requested_revision": "Designer: remove the negative boundary values from `BOUNDARY[('races','year')]` (or move them to a separate, non-generating comparison target) so that generated `races.year` remains in [1950,2017]. If the -1xxx boundary must remain for query coverage, it should be a *value that exists in the compact DB* rather than generated."
+    }
+   ],
+   "unresolved_checks": [
+    "Cannot verify integrity of generated rows (FK consistency, PK uniqueness, compact-row preservation) because the program fails on all instances before any rows are written.",
+    "Cannot verify that declared null shares for results.fastestLapSpeed / races.date / constructorResults.status are honored at runtime.",
+    "Cannot verify that enum samplers for results.statusId / results.position produce values that coerce correctly (position is declared TEXT, ENUMS uses string values, but results.position values in compact schema are TEXT \u2014 may be OK, but not executed).",
+    "Cannot verify that `results.positionText = position OR IN ('R','D','E','F','W')` formula holds with the double derivation in `_derive_results` and the enum sampler \u2014 both set positionText to `str(position)` which is fine, but the required 'R','D','E','F','W' variants may not actually appear if position sampler only outputs numeric strings (ENUMS list does include them, so likely fine).",
+    "Cannot verify that query neighbours / denotation comparison pipeline is unaffected; only generation stage was exercised."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 18 of 20 units failed with ValueError(\"invalid literal for int() with base 10: ...\") in tscore_gen/instance.py. The traceback strings ('9(7S55402031', 'tPD0YZ7hUldu0', '', 'Hp', ...) are non-numeric text. The only int() casts in the builder are in _derive_results: `str(int(v))` for laps and `str(int(v))` for milliseconds. laps/milliseconds are sampled by the generic StringSampler (values.py make_column_sampler falls back to StringSampler for TEXT columns; results.laps/milliseconds are declared TEXT in the schema and are not in spec.RANGES), so they contain arbitrary text and the derivation crashes. This blocks generation: only 2/20 instances were produced.",
+     "requested_revision": "Make _derive_results robust: only cast to int when the sampled value is numeric (e.g. guard with a try/except or a numeric regex, leaving non-numeric values as-is or replacing them with a valid numeric string). Alternatively, register results.laps and results.milliseconds as RangeSampler columns in spec.RANGES so the sampler always yields integers. Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification declares semantic rules results.laps BETWEEN 0 AND 200 and results.milliseconds > 0 (and positionText = position OR IN ('R','D','E','F','W')), but the program's _derive_results sets positionText = str(position) for every row and never emits 'R','D','E','F','W', while results.position is sampled from the enum ['1'..'8','R','D','E','F','W'] (spec.ENUMS). So positionText is not consistent with position for non-numeric positions. Also laps/milliseconds are not constrained to their declared ranges by any sampler. The spec's own supporting_evidence only covers 'positionText equals position for all' in the compact sample, which conflicts with the enum in per_column_exceptions.",
+     "requested_revision": "Reconcile the spec: either drop 'R','D','E','F','W' from results.position enum (keeping positionText = position), or make _derive_results map non-numeric positions to the same token in positionText. Add laps/milliseconds to spec.RANGES so the declared formulas are enforced by construction."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions require ties_for_order_limit on races.raceId (DESC), drivers.driverId (DESC, tie_on COUNT(*)), races.year (DESC), races.date (DESC), drivers.surname (ASC and DESC). The program's spec.py TIE_COLUMNS deliberately omits PK columns (races.raceId, drivers.driverId) and substitutes child grouping columns (results.raceId, results.driverId) in TIE_CHILD_COLUMNS. The spec's own uncertainty note acknowledges PK columns cannot carry ties, but the per_column_exceptions still list them. The spec and program therefore disagree on which columns carry the tie target.",
+     "requested_revision": "Update the specification's per_column_exceptions to name the child grouping columns (results.raceId, results.driverId) for the tie targets, or explicitly mark PK tie targets as unrealisable and remove them. Keep spec.py and the spec text in agreement."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions require group_sizes '1, 2 and >= 3' on drivers.driverId and drivers.surname. The program's GROUP_SIZE_TARGETS only lists ('results','driverId'); _plant_group_sizes is only invoked for non-PK columns and drivers.driverId is a PK (skipped by `if cm.pk_pos == 0`), and drivers.surname is not in GROUP_SIZE_TARGETS. The drivers.driverId group-size target is thus not implemented, and drivers.surname group sizes are not planted.",
+     "requested_revision": "Either add ('drivers','surname') to GROUP_SIZE_TARGETS (it is a non-PK column and can carry group sizes), and document that drivers.driverId group sizes are realised via the child results.driverId grouping; or remove the drivers.driverId group-size target from the spec. Align spec text and spec.py."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows nullable columns with 'generated rows: NULL 0 / n' for many columns that the spec's null_targets and the program's _plant_nulls should populate: races.date 0/2, results.fastestLapSpeed 0/2, constructorResults.status 0/2 (spec null_targets), plus many others. _plant_nulls is only called for non-FK, non-PK columns and only when `not cm.notnull`; but the spec's null_targets include races.date and results.fastestLapSpeed which are non-FK so should be planted. The 0/2 counts suggest _plant_nulls is not being reached for these columns (likely because the derivation/exception path aborted before planting, or because the columns are treated as FK/notnull). This is a nullable-column coverage gap noted per instruction 7.",
+     "requested_revision": "Verify _plant_nulls runs for races.date and results.fastestLapSpeed (they are non-FK, nullable) and that the NULL share matches spec.NULL_SHARE (0.10 and 0.20). After fixing the ValueError, re-run and confirm each nullable column has at least one NULL row and a non-NULL row per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: reproducible=false. The CLI seeds rng = random.Random(seed_base*100003 + i) per unit, which should be deterministic. Non-reproducibility likely stems from the 18 ValueError failures producing no output (so re-runs differ in which units succeed) and/or from _plant_unmatched mutating child_cols[cc][0] = None after PK/UNIQUE dedup, which can interact with row filtering order. Also _plant_group_sizes uses rng.choice and _plant_ties overwrites out[0]/out[1] after group planting, so the final row set depends on prior random draws in a way that is deterministic per seed but the failure path is not.",
+     "requested_revision": "After fixing the ValueError, re-run the same seed range twice and confirm identical .counts.json and row contents. If non-determinism persists, isolate the source (e.g. set iteration order in _plant_unmatched or dict ordering) and make it deterministic."
+    }
+   ],
+   "unresolved_checks": [
+    "Semantic rule evidence: races.year boundary -1545 is a query-side artifact; spec keeps year in [1950,2017] and BOUNDARY excludes -1545 \u2014 this is a deliberate, documented deviation and is acceptable, but the spec's comparison_boundary targets list [1998,1999,2000,2001,2008,2009,2010] while atomic summary lists [-1546,-1545,-1544,...]; the negative values are not generated. Confirmed as intentional in spec.py comments.",
+    "results.fastestLapSpeed NULL share: spec sets 0.20 (within 5-30%); atomic summary says 0% null in sample. The spec's uncertainty note acknowledges this; acceptable but should be confirmed after the ValueError fix.",
+    "pitStops and lapTimes have zero observed rows; spec sets size 8 to exercise composite keys \u2014 acceptable per spec uncertainty note.",
+    "unmatched_join_rows targets: spec.UNMATCHED lists parent->child FK columns and _plant_unmatched only nulls non-PK nullable child FKs; PK columns are never nulled \u2014 consistent with the spec's uncertainty note. However, _plant_unmatched only sets child_cols[cc][0] = None (one row), which may not satisfy 'child_rows_with_null_fk' for all listed children if the first row is later dropped by PK/UNIQUE dedup; needs verification after the ValueError fix.",
+    "Construction pairs: 6/69 separated, 0 unknown \u2014 separation is possible but limited; not itself an error per instruction 4."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py UNMATCHED lists ('races','raceId') -> [('results','raceId'), ('qualifying','raceId'), ('driverStandings','raceId'), ('constructorStandings','raceId'), ('constructorResults','raceId'), ('pitStops','raceId'), ('lapTimes','raceId')] and ('drivers','driverId') -> [('results','driverId'), ('pitStops','driverId'), ('driverStandings','driverId'), ('qualifying','driverId'), ('lapTimes','driverId')]. instance._plant_unmatched sets child_cols[cc][0] = None for each listed child column. But the execution feedback shows e.g. 'results.raceId: generated rows: NULL 3 / 24' and 'results.driverId: generated rows: NULL 3 / 24' \u2014 these are non-zero, so the NULL planting does fire. However, the atomic summary requires 'parent_rows_without_children' for races.raceId and drivers.driverId. The program never guarantees that a generated parent row has no child: fill_foreign_keys_consistently draws child FKs from the full parent pool (compact + generated) with replacement, and _plant_unmatched only nulls the first child row's FK. With 8 generated parents and 8 generated children per child table, the probability that some parent has zero children is not guaranteed; the spec target 'parent_rows_without_children: true' is not enforced by construction. The spec.py comment claims 'parent rows without children' is satisfied, but no code path ensures it.",
+     "requested_revision": "Add explicit construction in instance.py (or spec.py) that guarantees at least one generated parent row in races and drivers has no referencing child row in results/qualifying/driverStandings (e.g. reserve one parent PK that is excluded from the child FK pool, or verify post-hoc and regenerate). Update spec.py UNMATCHED documentation to state how parent-side unmatched is enforced, not just child NULL FKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZE_TARGETS includes ('results','driverId') and ('drivers','surname'), and instance._plant_group_sizes forces sizes [1,2,3,...]. But the atomic summary's group_sizes target for drivers.driverId is 'group_sizes: 1, 2 and >= 3' on drivers.driverId itself (a PK). spec.py comment says 'drivers.driverId is a PK and cannot carry group sizes; the target is realised on the child grouping results.driverId instead.' This is a reasonable reinterpretation, but the spec's per_column_exceptions explicitly lists drivers.driverId with group_sizes target. The program does not implement the literal target; it substitutes a different column. This is a spec/program divergence that should be documented as an accepted deviation or the spec should be amended.",
+     "requested_revision": "Either (a) amend the generation specification to record that drivers.driverId group_sizes is realised on results.driverId (and drivers.surname), or (b) implement the target on drivers.driverId by allowing duplicate driverId values in generated rows (which would violate PK uniqueness and is therefore not viable) \u2014 in which case the spec must be corrected. The current silent substitution should be made explicit in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py AGGREGATE_BOUNDARY includes ('drivers','driverId'): [4,5,6,7,8,9] and ('results','resultId'): [4,5,6]. instance.py never references AGGREGATE_BOUNDARY; there is no code that plants COUNT(*) values in the 4..9 range for drivers.driverId groupings or 4..6 for results.resultId. The atomic summary's aggregate_boundary target for drivers.driverId (HAVING COUNT(*) > 5, > 8) and results.resultId (HAVING COUNT(resultid) > 5) is therefore not implemented by construction. The execution feedback does not report aggregate-boundary separation, and construction_pairs shows only 13/69 separated.",
+     "requested_revision": "Implement aggregate-boundary planting: ensure that for at least one driverId value the number of results rows is in {4,5,6,7,8,9} (crossing the >5 and >8 thresholds), and for results.resultId ensure a group count in {4,5,6}. Add code in instance.py that adjusts results.driverId multiplicities accordingly, or remove the target from spec.py if it is intentionally out of scope."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DISTINCT_DUP_SHARE declares 0.30 for ('drivers','driverId') and ('qualifying','driverId'), but instance.py never reads DISTINCT_DUP_SHARE. The duplicates_for_distinct target (COUNT(DISTINCT drivers.driverid) with duplicate_share 20-50%) is not enforced. Similarly, TIE_COLUMNS/TIE_CHILD_COLUMNS are applied via _plant_ties, but _plant_ties only sets out[0]=out[1]=top; for results.raceId and results.driverId this creates a tie at rank 1, which is consistent, but for races.year and races.date the tie is planted on the parent table where the ORDER BY is on the parent column \u2014 this is fine. However, the atomic summary's ties_for_order_limit for races.raceId (ORDER(races.raceid, DESC)) is not addressed: spec.py explicitly excludes races.raceId from TIE_COLUMNS because it is a PK, but the atomic summary lists it as a target. This is a spec/program divergence.",
+     "requested_revision": "Either implement DISTINCT_DUP_SHARE enforcement (e.g. by controlling the number of distinct driverId values in results/qualifying to hit 20-50% duplicate share) or remove it from spec.py. For races.raceId ties, document in spec.py that PK ties are not realisable and the target is realised on results.raceId instead, or amend the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py RANGES includes ('results','laps'): (0, 200) and ('results','milliseconds'): (1, 10000000). RangeSampler.sample() returns boundary values lo-1, lo, hi, hi+1 with 25% probability. For results.laps this yields -1 and 201, violating the semantic rule 'CAST(laps AS INTEGER) BETWEEN 0 AND 200'. For results.milliseconds this yields 0 and 10000001, violating 'CAST(milliseconds AS INTEGER) > 0' (0 is not > 0). The execution feedback shows 'results.laps: generated rows: NULL 3 / 24' and 'results.milliseconds: generated rows: NULL 0 / 24' but does not report out-of-range values; however, the RangeSampler boundary logic is a latent violation. The spec's generic_sampling_rules says 'include min-1, min, max, max+1' for integer_numeric, but the semantic_rules_and_formulas constrain laps to [0,200] and milliseconds > 0. These conflict.",
+     "requested_revision": "For columns with semantic range constraints (results.laps, results.milliseconds, and any other RANGES entry that is also constrained by semantic_rules_and_formulas), the RangeSampler must not emit out-of-range boundary values. Either (a) add a flag to RangeSampler to suppress min-1/max+1 for constrained columns, or (b) remove the boundary emission for these columns. Update spec.py to distinguish 'boundary-inclusive' ranges from 'hard-constrained' ranges."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY includes ('driverStandings','position'): [0,1,2] and ('driverStandings','positionText'): ['0','1','2']. The semantic rule says 'driverStandings.position BETWEEN 1 AND 108'. BoundarySampler emits 0, which violates the semantic rule. Similarly, ('races','year') BOUNDARY [1998..2010] is within [1950,2017] so that is fine. The driverStandings.position=0 case is a direct conflict between the comparison_boundary target (values [0,1,2]) and the semantic rule (position BETWEEN 1 AND 108). The spec's uncertainty section does not address this conflict.",
+     "requested_revision": "Resolve the conflict: either relax the semantic rule to allow position=0 (if the query boundary genuinely needs 0), or drop 0 from the BOUNDARY set for driverStandings.position. Document the decision in spec.py. The same applies to driverStandings.positionText='0'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._derive_results sets cols['positionText'] = str(p) for every non-None position, including non-numeric positions. But spec.py ENUMS for results.position includes 'R','D','E','F','W', and the semantic rule says 'positionText = position OR positionText IN (R,D,E,F,W)'. The derivation str(p) for p='R' gives 'R', which is consistent. However, the derivation does not handle the case where position is a numeric string like '1' \u2014 str('1') = '1', fine. The issue is that _derive_results runs BEFORE sample_fresh_primary_keys and drop_unique_duplicates, and the PK dedup may drop rows, but positionText is derived from position so it stays consistent. This appears correct. No issue here \u2014 noting for completeness.",
+     "requested_revision": "No change required; this is a verification note."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows 'races.date: generated rows: NULL 8 / 36' and 'races.year: generated rows: NULL 1 / 36'. The semantic rule 'date >= printf('%04d-01-01', year) AND date <= printf('%04d-12-31', year)' is enforced by _derive_races, which adjusts the date year to match the year column. But _derive_races runs before _plant_nulls, so a NULL year (planted later) with a non-NULL date would violate the rule if the rule is evaluated with three-valued logic \u2014 actually NULL year makes the comparison NULL, which is not FALSE, so the rule holds. This is consistent with the NULL rule. No issue.",
+     "requested_revision": "No change required; this is a verification note."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification's per_column_exceptions lists targets that the program does not implement (aggregate_boundary for drivers.driverId and results.resultId, duplicates_for_distinct for drivers.driverId and qualifying.driverId, ties_for_order_limit for races.raceId and drivers.driverId). The spec's uncertainty section acknowledges some of these (e.g. 'races.year boundary -1545 is an artifact') but does not acknowledge the unimplemented aggregate/distinct/tie targets. The spec should either mark these as out-of-scope or require implementation.",
+     "requested_revision": "Update the generation specification to explicitly mark which per_column_exceptions targets are implemented by construction and which are intentionally not implemented (with rationale). This prevents the engineer from being held to targets the spec does not require."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the parent_rows_without_children target for races.raceId and drivers.driverId is actually satisfied in generated instances (not verified by execution feedback; requires a post-hoc query counting parents with zero children).",
+    "Whether the aggregate_boundary targets (COUNT(*) in 4..9 for drivers.driverId, 4..6 for results.resultId) are reachable given the current table sizes (8 rows per table) \u2014 with only 8 results rows, a group count of 9 is impossible, so the target is unreachable by construction.",
+    "Whether the duplicates_for_distinct target (20-50% duplicate share) is satisfied for drivers.driverId and qualifying.driverId \u2014 not measured in execution feedback.",
+    "Whether the RangeSampler boundary values (min-1, max+1) actually appear in generated data and violate semantic rules \u2014 execution feedback does not report out-of-range values, but the code path exists."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The spec's `races.year` comparison_boundary target list in the atomic summary includes -1546/-1545/-1544 (from `PRED(races.year > -1545)`), but the semantic rule `year BETWEEN 1950 AND 2017` forbids them. The spec correctly drops these and documents the reason in `uncertainty`; the program's `BOUNDARY[('races','year')]` = [1998,1999,2000,2001,2008,2009,2010] and `RANGES[('races','year')]=(1950,2017)` are consistent.",
+     "requested_revision": "None required; the deviation is documented and justified. (Optional: note in the spec that the -1545 literal is a query-generator artifact, which it already does.)"
+    },
+    {
+     "agent": "designer",
+     "evidence": "`drivers.driverId` aggregate_boundary targets values [4..9] but with 8 results rows a group count of 9 is unreachable. The spec explicitly narrows to {4,5,6,7,8} and the program's `AGGREGATE_BOUNDARY[('drivers','driverId')]` matches. Similarly `driverStandings.position` boundary value 0 is dropped (conflicts with 1..108) and `positionText` 0 dropped; program `BOUNDARY[('driverStandings','position')]`=[1,2] and `positionText`=['1','2'] match.",
+     "requested_revision": "None required; deviations are documented and consistent between spec and program."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows several nullable columns with 'generated rows: NULL 0 / n' (e.g. `races.circuitId: NULL 0 / 28`, `results.milliseconds: NULL 0 / 19`, `results.positionOrder: NULL 0 / 19`). Per the interface NULL rule these are noted for the engineer but do not block a pass. `races.circuitId` is a nullable FK; `_plant_unmatched` only nulls listed child columns and `fill_foreign_keys_consistently` never plants NULLs, so nullable FKs not in `UNMATCHED` get no NULLs. This is a minor gap, not a blocking error.",
+     "requested_revision": "Optional: extend `_plant_nulls`/`fill_foreign_keys_consistently` to plant at least one NULL on every nullable FK column (including `races.circuitId`, `results.milliseconds`, `results.positionOrder`) to fully satisfy the interface NULL rule. Not required for pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_group_sizes` and `_plant_aggregate_boundary` are applied to non-FK, non-PK columns only (loop skips `(t,cm.name) in schema.fks`). `results.driverId` and `results.raceId` are FK columns, so the group-size/aggregate/tie/distinct targets declared for them in `spec.GROUP_SIZE_TARGETS`, `AGGREGATE_BOUNDARY`, `TIE_CHILD_COLUMNS`, `DISTINCT_DUP_SHARE` are never actually planted by the main loop. The construction_pairs feedback shows 11/69 separated, consistent with partial realisation. This is a spec-vs-implementation gap but does not break integrity or validity (20/20 valid, 0 FK/NOT NULL/PK violations).",
+     "requested_revision": "Optional: apply the child-grouping planting to FK columns (after `fill_foreign_keys_consistently`) so the declared targets on `results.driverId`/`results.raceId`/`qualifying.driverId` are realised. Not blocking: the spec documents these as 'realised on child grouping columns' and the deviation is acknowledged; separation is not required for pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_derive_results` sets `positionText = str(position)` for all positions, but the semantic rule allows `positionText IN ('R','D','E','F','W')` for non-numeric positions. Since `position` is sampled from the enum including R/D/E/F/W, `str('R')='R'` is consistent with the rule (`positionText = position OR positionText IN (...)`). No violation. `_derive_constructor_results` forces status to None or 'D', matching the rule. `_derive_races` keeps date within year. All consistent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, valid=20/20, reproducible=true, rows_skipped all 0. Compact rows preserved via `_copy_compact` (backup API) and appended rows only. `sample_fresh_primary_keys` dedups against `schema.compact_pk`. `drop_unique_duplicates` handles unique columns. FK pools exclude reserved parent PKs (`_fk_pool`), and `_plant_unmatched` nulls child FKs after dedup. All consistent with the spec's unmatched-join and dependency requirements.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules with evidence: `races.date` within year (evidence rows 1-8), `results.positionText = position` (evidence rows 1-8), `constructorResults.status IS NULL OR 'D'` (evidence rows 1-8), `driverStandings.position` 1..108 (evidence positions 1..8). Rules without direct evidence but reasonable: `results.statusId IN (1..11)`, `qualifying.position 1..28`, `pitStops`/`lapTimes` ranges (zero observed rows, sizes set to 8 to exercise composite keys \u2014 documented in `uncertainty`). These are supported by schema/domain knowledge and flagged as uncertain where appropriate.",
+     "requested_revision": "None; uncertainty is documented."
+    }
+   ],
+   "unresolved_checks": [
+    "Child-grouping targets (group_sizes, aggregate_boundary, ties, distinct) declared for FK columns results.driverId/results.raceId/qualifying.driverId are not planted by the main loop (FK columns skipped); only 11/69 construction pairs separated. This is a partial realisation of the spec's child-grouping targets, acknowledged in the spec as 'realised on child grouping columns' but not fully implemented. Does not block pass (integrity/validity clean, separation not required).",
+    "Nullable FK columns not in UNMATCHED (races.circuitId, results.milliseconds, results.positionOrder) show NULL 0/n; noted per interface rule, non-blocking."
+   ]
+  }
+ ]
 }

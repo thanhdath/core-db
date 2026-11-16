@@ -6,6 +6,7 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_FRESH_CAP = 2000
 
 
 class ColumnSampler:
@@ -19,8 +20,8 @@ class ColumnSampler:
         self.fresh: list = []
 
     def _fresh_or_reuse(self, draw):
-        if len(self.fresh) > self.max_l0:
-            return self.rng.choice(self.fresh)
+        if len(self.fresh) > self.max_l0 or len(self.fresh) >= _FRESH_CAP:
+            return self.rng.choice(self.fresh) if self.fresh else draw()
         v = draw()
         self.fresh.append(v)
         return v
@@ -182,9 +183,125 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+class DomainSampler(ColumnSampler):
+    """Specification-driven sampler: enum / range / numeric_text / pool + boundary + LIKE variants."""
+
+    def __init__(self, elements, p, max_l0, rng, domain: dict, boundaries: list, like_variants: list,
+                 duplicate_share=None, fallback=None):
+        super().__init__(elements, p, max_l0, rng)
+        self.domain = domain or {}
+        self.dup_share = duplicate_share
+        self.fallback = fallback
+        self.enum = list(self.domain.get('enum') or [])
+        self.rng_range = self.domain.get('range')
+        self.real = bool(self.domain.get('real'))
+        self.numeric_text = self.domain.get('numeric_text')
+        self.pool = [str(x) for x in (self.domain.get('pool') or [])]
+        self.is_text = bool(self.enum or self.pool) and self.rng_range is None and self.numeric_text is None
+        self.boundaries = []
+        for b in boundaries or []:
+            c = self._clamp(b)
+            if c is not None:
+                self.boundaries.append(c)
+        self.like_variants = []
+        for v in like_variants or []:
+            s = str(v)
+            body = s.strip('%')
+            self.like_variants.append(body)
+            if body:
+                self.like_variants.append(body.lower())
+                self.like_variants.append(body.upper())
+                if len(body) > 2:
+                    self.like_variants.append(body[:-1])
+                    self.like_variants.append(body[1:])
+        self._seen: dict = {}
+
+    def _clamp(self, b):
+        if self.rng_range is not None:
+            lo, hi = self.rng_range
+            try:
+                x = float(b)
+            except (TypeError, ValueError):
+                return None
+            x = max(lo, min(hi, x))
+            return x if self.real else int(round(x))
+        if self.enum:
+            for e in self.enum:
+                if str(e).lower() == str(b).lower():
+                    return e
+            return None
+        if self.numeric_text is not None:
+            lo, hi = self.numeric_text
+            try:
+                x = int(float(b))
+            except (TypeError, ValueError):
+                return None
+            return str(max(lo, min(hi, x)))
+        if self.pool:
+            if isinstance(b, (int, float)) and not isinstance(b, bool):
+                return None
+            s = str(b)
+            if s in self.pool:
+                return s
+            return None
+        return b
+
+    def _draw_domain(self):
+        r = self.rng
+        if self.enum:
+            return r.choice(self.enum)
+        if self.rng_range is not None:
+            lo, hi = self.rng_range
+            if self.real:
+                return round(r.uniform(lo, hi), 2)
+            return r.randint(int(lo), int(hi))
+        if self.numeric_text is not None:
+            lo, hi = self.numeric_text
+            return str(r.randint(int(lo), int(hi)))
+        if self.pool:
+            return r.choice(self.pool)
+        return None
+
+    def _has_domain(self) -> bool:
+        return bool(self.enum or self.rng_range is not None or self.numeric_text is not None or self.pool)
+
+    def sample(self):
+        r = self.rng
+        if not self._has_domain():
+            if self.fallback is not None:
+                return self.fallback.sample()
+            return r.choice(self.elements) if self.elements else ''
+        if self.dup_share and self._seen and r.random() < self.dup_share:
+            return r.choice(list(self._seen))
+        if self.boundaries and r.random() < 0.25:
+            v = r.choice(self.boundaries)
+        elif self.like_variants and r.random() < 0.15:
+            v = r.choice(self.like_variants)
+        elif self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+        else:
+            v = self._fresh_or_reuse(self._draw_domain)
+        if v is None:
+            v = self._draw_domain()
+        if v is None:
+            v = self.fallback.sample() if self.fallback is not None else ''
+        self._seen[v] = True
+        return v
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, domain=None,
+                        boundaries=None, like_variants=None, duplicate_share=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
+    if domain or boundaries or like_variants:
+        fb = _type_sampler(column, els, p, max_l0, rng)
+        return DomainSampler(els, p, max_l0, rng, domain or {}, boundaries or [], like_variants or [],
+                             duplicate_share, fallback=fb)
+    return _type_sampler(column, els, p, max_l0, rng)
+
+
+def _type_sampler(column, els: list, p: float, max_l0: float, rng) -> ColumnSampler:
+    """Concrete sampler chosen by declared type (fuzz/fuzz.py:40-80)."""
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
@@ -215,7 +332,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), domain=None, boundaries=None, like_variants=None,
+                  duplicate_share=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +343,13 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, domain, boundaries, like_variants, duplicate_share)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), domain=None, boundaries=None,
+                               like_variants=None, duplicate_share=None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0,
+                      domain, boundaries, like_variants, duplicate_share)
     return [s.sample() for _ in range(n)]

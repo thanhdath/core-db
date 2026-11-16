@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + append-only key offsets."""
 import math
 import sqlite3
 import warnings
@@ -15,6 +15,10 @@ class ColumnMeta:
     pk_pos: int
     unique: bool
     checked: bool
+
+    @property
+    def nullable(self) -> bool:
+        return not self.notnull and self.pk_pos == 0
 
 
 @dataclass
@@ -34,6 +38,10 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    max_ints: dict = field(default_factory=dict)
+    max_values: dict = field(default_factory=dict)
+    key_values: dict = field(default_factory=dict)
+    null_shares: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +66,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -123,6 +131,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
+        max_ints, max_values, key_values, null_shares = {}, {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +145,28 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                vals = [r[j] for r in rows]
+                ov[(t, c.name)] = vals
+                try:
+                    mx = con.execute('select max(%s) from %s' % (q(c.name), q(t))).fetchone()[0]
+                except sqlite3.Error:
+                    mx = None
+                if isinstance(mx, int) and not isinstance(mx, bool):
+                    max_ints[(t, c.name)] = mx
+                if isinstance(mx, (int, float)) and not isinstance(mx, bool):
+                    max_values[(t, c.name)] = float(mx)
+                try:
+                    kv = [r[0] for r in con.execute(
+                        'select distinct %s from %s where %s is not null' % (q(c.name), q(t), q(c.name))).fetchall()]
+                except sqlite3.Error:
+                    kv = [v for v in vals if v is not None]
+                key_values[(t, c.name)] = kv
+                try:
+                    nn = con.execute('select count(*) from %s where %s is null' % (q(t), q(c.name))).fetchone()[0]
+                except sqlite3.Error:
+                    nn = sum(1 for v in vals if v is None)
+                null_shares[(t, c.name)] = (nn / n) if n else 0.0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, max_ints, max_values,
+                  key_values, null_shares)

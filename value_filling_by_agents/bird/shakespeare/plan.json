@@ -1,50 +1,424 @@
 {
  "db": "shakespeare",
- "operator_io_quirks": [
-  "Mixed-case table/column names: 'Act','Scene','CharName','Abbrev','ParagraphNum','PlainText','LongTitle','GenreType','work_id','chapter_id','character_id' \u2014 must be double-quoted verbatim.",
-  "Column named 'Date' (works.Date) is INTEGER storing years (1589..1607), not a date string; declared type INTEGER so TS dispatches to Number, not Date fuzzer.",
-  "Column named 'Description' exists in BOTH chapters and characters with different value distributions (519 vs 467 distinct) \u2014 literal pool keyed by (table,col) must not merge them.",
-  "Column named 'id' is PK in all 4 tables; literal pool for (t,'id') will be polluted across tables via FK-root ancestor mapping (works.id is root of chapters.work_id, chapters.id root of paragraphs.chapter_id).",
-  "chapters.id and paragraphs.chapter_id share the SAME sample values (18704..18708) \u2014 FK values are drawn from parent's final column, so chapter_id must come from chapters.id after PK dedup.",
-  "paragraphs.chapter_id has 'default 0 not null' \u2014 default is irrelevant to TS (it always supplies a value) but NOT NULL means failed inserts are silently dropped.",
-  "paragraphs.id samples are large (630863+) while chapters.id are 18704+ \u2014 autoincrement sequences differ; TS Number fuzzer will generate small ints (scale from 'INTEGER' -> no args -> scale 0, range [-1,1]) that collide with PK dedup.",
-  "works has only 43 rows; chapters.work_id distinct=43 (full coverage); paragraphs.character_id distinct=1219 < characters 1266 (some characters unreferenced).",
-  "characters.CharName and Abbrev have nearly identical distinct counts (957 vs 964) and identical first samples \u2014 likely near-duplicate columns; TS String fuzzer treats them independently.",
-  "characters.Description contains empty string '' as a sample \u2014 String fuzzer's length range [0,20] and contaminate can produce ''; fine.",
-  "PlainText samples contain newlines ('\\n') and truncated text ('[Enter DUKE ORSINO, CURIO, and other Lor') \u2014 String fuzzer CHARSET has no newline, so fresh values differ in shape from originals.",
-  "No composite keys, no self-FKs, no dangling FKs, no non-unique parents, no storage-class/declared-type contradictions (all INTEGER->integer, TEXT->text)."
- ],
- "operator_ts_expectations": [
-  "All id/Act/Scene/ParagraphNum/work_id/chapter_id/character_id/Date columns -> Number fuzzer with scale=0 (INTEGER has no args), range [-1,1], int perturbation +-1/+-2; produces tiny ints unlike originals (Act 1-5, Scene 1-155, Date 1589-1607).",
-  "works.Date (INTEGER, values 1589-1607) gets Number fuzzer -> values in {-2..2} roughly; any query filtering Date BETWEEN 1590 AND 1610 returns empty on generated instances -> likely FN driver (implausible values).",
-  "Act/Scene/ParagraphNum small-range ints: Number fuzzer's list range [min(el), max(el)+1] overwritten to full range [-1,1] (upstream quirk) -> generated Act values mostly -1,0,1,2; queries 'Act = 3' or 'Scene > 10' miss -> FN.",
-  "TEXT columns (Title, LongTitle, CharName, Abbrev, Description, PlainText, GenreType) -> String fuzzer, length range from min/max of 5 sampled originals + pool; fresh strings over 'a-zA-Z 0-9()' with 50% contaminate -> implausible names, no real Shakespeare titles -> FN on LIKE '%Night%' style.",
-  "GenreType has only 5 distinct values (Comedy/Tragedy/History/Poem/Sonnet); String fuzzer with p=0.2 mostly fresh strings -> 'GenreType = Comedy' rarely matches -> FN; ENUM-like column not respected by TS.",
-  "FK columns (work_id, chapter_id, character_id) drawn from parent's FINAL filtered column with replacement -> duplicates in child FK values; joins produce many-to-many fan-out unlike original 1:many -> FP on COUNT/aggregate queries.",
-  "PK dedup (sample_fresh_primary_keys) drops duplicate id rows; with Number fuzzer producing few distinct small ints, many rows dropped -> small tables, empty results for queries expecting rows -> FN.",
-  "works has 43 rows; choose_table_sizes may give it 1+30*u (~1-31) or 30+int(u*200) rows; if smaller than chapters, FK fan-out from chapters.work_id to works.id still works but join cardinality differs.",
-  "characters.CharName vs Abbrev near-duplicate: TS generates independent strings -> queries comparing CharName=Abbrev (if any) behave differently -> potential FP/FN.",
-  "PlainText newlines absent from CHARSET -> queries with LIKE '%\\n%' or length(PlainText) thresholds miss -> FN.",
-  "No Date/Time/Bool/Bit fuzzers dispatched (no such declared types) \u2014 Date fuzzer template logic not exercised on this DB.",
-  "Empty-string Description sample: String fuzzer may emit '' matching original empty rows -> some queries on Description='' may accidentally match -> possible FP."
- ],
- "challenger_refs": [
-  "G11",
-  "G12",
-  "G2",
-  "G4",
-  "G8",
-  "G6",
-  "G10",
-  "G7",
-  "G1",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; parent tables filled before children.",
+   "integer_fk": "Populated exclusively from the parent table's primary-key values (compact + generated); never sampled from the numeric range/boundary pool; never NULL for the three FK columns of this schema.",
+   "integer_numeric": "Uniform integer within the column's range rule; boundary values at listed literals plus one step on each side, clamped to the column's range rule.",
+   "text_short": "Random token from a small pool of plausible names; near-variants (case flips) for listed equality literals.",
+   "text_long": "Random sentence-like string of 20-120 chars; near-variants for listed equality literals.",
+   "text_nullable": "80% non-NULL from the text rule, 20% NULL.",
+   "enum_text": "Uniform choice among the listed enum values.",
+   "date_integer": "Uniform integer year within the column's range; boundary values at listed literals plus one step on each side.",
+   "tie_and_duplicate": "For DISTINCT columns, allow 20-50% duplicate share; for ORDER columns, plant ties at the listed ranks.",
+   "boundary_perturbation": "Boundary literals are planted at the literal and at literal +/- one step; the perturbed value is clamped to the column's range rule so no semantic rule is violated.",
+   "null_planting_precedence": "NULL planting runs after FK filling; it skips FK columns whose target says 'no NULL FK' and skips NOT NULL / PK columns."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "works.id": [
+      6,
+      7,
+      8,
+      9,
+      10
+     ],
+     "chapters.work_id": [
+      6,
+      7,
+      8,
+      9,
+      10
+     ],
+     "chapters.id": [
+      18880,
+      18881,
+      18882
+     ],
+     "chapters.Scene": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "chapters.Act": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6
+     ],
+     "characters.id": [
+      1237,
+      1238,
+      1239
+     ],
+     "paragraphs.chapter_id": [
+      18708,
+      18709,
+      18710,
+      18880,
+      18881,
+      18882
+     ],
+     "works.Date": [
+      1592,
+      1593,
+      1594,
+      1598,
+      1599,
+      1600
+     ],
+     "works.Title": [
+      "Twelfth Night",
+      "twelfth night",
+      "Comedy of Errors",
+      "comedy of errors",
+      "Venus and Adonis",
+      "venus and adonis"
+     ],
+     "works.GenreType": [
+      "Tragedy",
+      "tragedy",
+      "Comedy",
+      "comedy",
+      "History",
+      "history"
+     ],
+     "characters.CharName": [
+      "antonio",
+      "ANTONIO",
+      "Sir Toby Belch",
+      "sir toby belch",
+      "(stage directions)",
+      "(STAGE DIRECTIONS)"
+     ],
+     "characters.Abbrev": [
+      "Aedile",
+      "aedile"
+     ],
+     "chapters.Description": [
+      "Florence. Without the walls. A tucket afar off.",
+      "florence. without the walls. a tucket afar off."
+     ],
+     "paragraphs.PlainText": [
+      "His name, I pray you.",
+      "his name, i pray you."
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "works.id": "parent rows without children (works with no chapters)",
+     "chapters.work_id": "child rows referencing existing works; no NULL FK",
+     "chapters.id": "parent rows without children (chapters with no paragraphs)",
+     "characters.id": "parent rows without children (characters with no paragraphs)",
+     "paragraphs.chapter_id": "child rows referencing existing chapters; no NULL FK",
+     "paragraphs.character_id": "child rows referencing existing characters; no NULL FK"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "works.id": "20-50% duplicate share",
+     "characters.CharName": "20-50% duplicate share",
+     "works.LongTitle": "20-50% duplicate share",
+     "characters.Description": "20-50% duplicate share"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "chapters.Scene": "tie at rank 1 on COUNT(chapters.scene), ASC and DESC",
+     "chapters.id": "tie at rank 1 on COUNT(chapters.id)",
+     "characters.CharName": "tie at rank 1 on COUNT(characters.charname)",
+     "works.Date": "tie at rank 1 on COUNT(works.date)",
+     "paragraphs.ParagraphNum": "tie at rank 1 on COUNT(paragraphs.paragraphnum)"
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "works.id": "NOT NULL; no NULLs",
+     "chapters.Scene": "NOT NULL; no NULLs",
+     "chapters.id": "NOT NULL; no NULLs",
+     "characters.id": "NOT NULL; no NULLs",
+     "paragraphs.ParagraphNum": "NOT NULL; no NULLs",
+     "paragraphs.id": "NOT NULL; no NULLs"
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "works.Date": ">=2 rows per group with different values",
+     "chapters.Act": ">=2 rows per group with different values",
+     "chapters.Scene": ">=2 rows per group with different values",
+     "paragraphs.ParagraphNum": ">=2 rows per group with different values"
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "works.Title": "near-variant 'Henry' in LongTitle",
+     "works.LongTitle": "near-variant 'Henry' in LongTitle",
+     "characters.Description": "near-variant of a listed description"
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "paragraphs.id": "HAVING COUNT(paragraphs.id) = 5"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "chapters.work_id",
+    "parent_table": "works",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "paragraphs.chapter_id",
+    "parent_table": "chapters",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "paragraphs.character_id",
+    "parent_table": "characters",
+    "parent_column": "id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "works",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "works",
+    "column": "Date",
+    "formula": "Date BETWEEN 1500 AND 1650"
+   },
+   {
+    "table": "works",
+    "column": "GenreType",
+    "formula": "GenreType IN ('Comedy','Tragedy','History','Poem','Sonnet')"
+   },
+   {
+    "table": "chapters",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "chapters",
+    "column": "Act",
+    "formula": "Act BETWEEN 0 AND 6"
+   },
+   {
+    "table": "chapters",
+    "column": "Scene",
+    "formula": "Scene BETWEEN 1 AND 8"
+   },
+   {
+    "table": "chapters",
+    "column": "work_id",
+    "formula": "work_id > 0"
+   },
+   {
+    "table": "characters",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "paragraphs",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "paragraphs",
+    "column": "ParagraphNum",
+    "formula": "ParagraphNum > 0"
+   },
+   {
+    "table": "paragraphs",
+    "column": "chapter_id",
+    "formula": "chapter_id > 0"
+   },
+   {
+    "table": "paragraphs",
+    "column": "character_id",
+    "formula": "character_id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "works": 43,
+   "chapters": 200,
+   "characters": 200,
+   "paragraphs": 500
+  },
+  "null_targets": [],
+  "supporting_evidence": {
+   "works.Date": "Sample rows show dates 1599, 1602, 1606, 1589, 1607, 1609, 1600, 1597; range 1500-1650 covers all.",
+   "chapters.Act": "Sample rows show Act values 1,2,3,4,5,0; range 0-6 covers all.",
+   "chapters.Scene": "Sample rows show Scene values 1-8; range 1-8 covers all.",
+   "works.GenreType": "Sample rows show Comedy, Tragedy, History, Poem, Sonnet; enum matches.",
+   "paragraphs.ParagraphNum": "Sample rows show ParagraphNum 3,4,19,20,21,22,30,39; all > 0.",
+   "fk_edges": "Schema declares chapters.work_id references works, paragraphs.chapter_id references chapters, paragraphs.character_id references characters (implicit PK targets); dependencies list resolves each to the parent's id."
+  },
+  "uncertainty": "The exact distribution of Act/Scene values and the share of NULLs in nullable text columns are not fully specified by the statistics; the rules use the observed ranges and enum values. The duplicate and tie patterns are approximated from the atomic-operation summary. FK columns are NOT NULL per schema; _plant_nulls must skip them. Boundary perturbation must be clamped to the column range rule (Act 0-6, Scene 1-8) to avoid latent rule violations."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 12182 across all 20 instances, validity.invalid = 20 with reason 'new_integrity_failures'. stderr shows schema.py:130 dropping dangling FKs: 'dropping dangling FK chapters.work_id -> works.work_id', 'paragraphs.chapter_id -> chapters.chapter_id', 'paragraphs.character_id -> characters.character_id'. The schema declares these as `references works`, `references chapters`, `references characters` (implicit PK target), but the program's `read_schema` resolves the parent column via `pragma foreign_key_list` r[4] (the referenced column name), which is NULL for implicit-PK references, then falls back to `r[3]` (the child column name) \u2014 producing `works.work_id`, `chapters.chapter_id`, `characters.character_id`, which do not exist, so the FK is dropped entirely. With `schema.fks` empty for these columns, `fill_foreign_keys_consistently` never runs, FK columns are sampled as ordinary integers (NumberSampler over the boundary/range pool), and `writer.py` sets `pragma foreign_keys = OFF`, so 12182 orphan child rows are written.",
+     "requested_revision": "Fix `read_schema` so that when `pragma foreign_key_list` returns r[4] = NULL (implicit reference to the parent's primary key), the parent column is resolved to the parent table's primary key (e.g. `tables[pt].primary_key[0]`), not to the child column name. After the fix, `schema.fks` must contain `(chapters, work_id)->(works, id)`, `(paragraphs, chapter_id)->(chapters, id)`, `(paragraphs, character_id)->(characters, id)`, and `fill_foreign_keys_consistently` must populate these columns from the parent's compact+generated PK values. Re-run and confirm `fk_violations = 0` and `validity.valid = 20`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because the FKs are dropped (see above), the `unmatched_join_rows` specification targets \u2014 'works.id: parent rows without children', 'chapters.id: parent rows without children', 'characters.id: parent rows without children', and 'child rows referencing existing works/chapters/characters; no NULL FK' \u2014 are not implemented at all. `fill_foreign_keys_consistently` (instance.py) is the only code path that consumes `unmatched_parents`, and it is never reached for these columns. The `dependencies` list in the specification (chapters.work_id->works.id, paragraphs.chapter_id->chapters.id, paragraphs.character_id->characters.id) is therefore also not honored.",
+     "requested_revision": "After fixing FK resolution, verify that generated `chapters.work_id`, `paragraphs.chapter_id`, `paragraphs.character_id` values are drawn from the parent's compact+generated PK set (with the `unmatched_parents` share leaving some parents childless), and that no generated child row has a NULL or orphan FK. Add an assertion or post-write check in the writer/CLI that reports FK violations per table so this regression cannot recur silently."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `per_column_exceptions` for `unmatched_join_rows` lists `works.id`, `chapters.id`, `characters.id` as 'parent rows without children' and the child columns as 'child rows referencing existing ...; no NULL FK'. The `dependencies` block lists the three FK edges. These are consistent with the schema's `references` clauses. However, the specification's `table_sizes_per_instance` (works 43, chapters 200, characters 200, paragraphs 500) combined with `unmatched_parents` shares of 0.10 is fine, but the specification does not state that FK columns must be excluded from the generic integer sampler \u2014 the program relies on `schema.fks` to do so, and that is the mechanism that failed. The specification should make explicit that FK columns are populated only from parent PK values (never from the boundary/range pool), so the engineer's fix is unambiguous.",
+     "requested_revision": "Add to the specification a rule: 'Foreign-key columns (chapters.work_id, paragraphs.chapter_id, paragraphs.character_id) are populated exclusively from the parent table's primary-key values (compact + generated); they are never sampled from the numeric range/boundary pool and never NULL.' This is already implied by `dependencies` but should be stated as a hard constraint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `null_targets` list in the specification is empty and `nullable_columns` in the feedback is empty, so the NULL rule is vacuous here \u2014 no issue. However, `_plant_nulls` in instance.py is applied to every column where `not cm.notnull and cm.pk_pos == 0`, including FK columns. If a nullable FK existed, `_plant_nulls` would overwrite FK values with NULL *after* `fill_foreign_keys_consistently`, which is correct per the interface rule (NULL is a value to generate), but the ordering means the FK consistency check must tolerate NULLs. This is not currently a bug for this schema (no nullable FKs), but it is a latent inconsistency with the `unmatched_join_rows` target 'no NULL FK' for the three FK columns \u2014 if those columns were ever declared nullable, the two rules would conflict.",
+     "requested_revision": "Clarify in the specification that the three FK columns are NOT NULL (they are, per the schema) and that `_plant_nulls` must skip FK columns whose specification target says 'no NULL FK'. No code change required for this schema, but document the precedence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction feedback: `construction_pairs.separated = 68` out of `eligible = 243`, with `construction_pairs_by_group` empty. This is a low separation rate, but per instruction 4 a missing separation alone does not establish a generation error. The dominant cause is the FK breakage: many of the 243 pairs involve joins on `chapters.work_id = works.id`, `paragraphs.chapter_id = chapters.id`, `paragraphs.character_id = characters.id`, and with orphan FKs those joins return empty or wrong results, so the planted boundary/duplicate/tie patterns cannot be observed. Once FKs are fixed, re-measure separation.",
+     "requested_revision": "Re-run construction after the FK fix and report `construction_pairs.separated` and `construction_pairs_by_group`. If separation remains low for specific groups (e.g. `comparison_boundary` on `works.id` vs `chapters.work_id`), investigate whether `_plant_boundaries` is planting the boundary literals on both sides of the join (it plants on `works.id` and `chapters.work_id` independently, which is correct) and whether the `boundary_share = 0.15` is high enough to guarantee at least one matching pair per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` include `chapters.Scene BETWEEN 1 AND 8` and `chapters.Act BETWEEN 0 AND 6`, and the `boundaries` for `chapters.Scene` are [1,2,3,4,5,6] and for `chapters.Act` are [0,1,2,4,5,6]. `_plant_boundaries` perturbs integer boundaries by \u00b11 (`v + rng.choice((-1, 1))`), which for `chapters.Scene` boundary 1 produces 0 (violating `Scene BETWEEN 1 AND 8`) and for `chapters.Act` boundary 0 produces -1 (violating `Act BETWEEN 0 AND 6`). The `NumberSampler` clamps to the spec range, but `_plant_boundaries` runs *after* sampling and does not clamp. This is a latent rule violation not caught by the current integrity check (which only checks FK/NOT NULL/PK).",
+     "requested_revision": "Either (a) clamp `_plant_boundaries` output to the column's specification range after perturbation, or (b) restrict the \u00b11 perturbation to boundaries that are strictly inside the range. Add a post-generation check that all `semantic_rules_and_formulas` hold on generated rows (non-NULL operands only)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether `construction_pairs.separated` improves to an acceptable level after the FK fix \u2014 cannot be assessed until the FK resolution bug is fixed and the generator re-run.",
+    "Whether the `_plant_boundaries` \u00b11 perturbation actually produces out-of-range values in the current 20 instances \u2014 the integrity check does not test `Act`/`Scene` ranges, so this needs a targeted query on the generated DBs.",
+    "Whether `_plant_aggregate_boundary` correctly plants exactly 5 paragraphs on one chapter \u2014 the feedback does not report per-chapter paragraph counts; needs a `GROUP BY chapter_id HAVING COUNT(*) = 5` check on generated instances."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=49 across 20 instances and validity.invalid=19 with reason 'new_integrity_failures'. The specification explicitly requires 'child rows referencing existing works/chapters/characters; no NULL FK' and the schema declares these as foreign keys. The writer's _fk_violations() counts orphans, and the counts file records them, yet the program still writes the instance and reports success (n_ok=20, n_fail=0).",
+     "requested_revision": "Make FK consistency a hard invariant: after building each instance, verify every generated FK value exists in the parent's final (compact+generated) key set, and either repair (re-draw from the parent set) or fail the unit. Do not emit instances with fk_violations>0. Investigate why fill_foreign_keys_consistently produces orphans \u2014 likely because parent rows are later dropped by sample_fresh_primary_keys/drop_unique_duplicates (e.g. characters/works PK dedupe) after children were already drawn from the pre-dedupe parent list, and because _plant_aggregate_boundary reassigns paragraphs.chapter_id to rng.choice(ch) where ch may include chapters later removed, or because unmatched_parents truncation interacts with dedupe. Recompute child FK pools from the final parent key sets (post-dedupe) before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: FK columns are filled via fill_foreign_keys_consistently(inst, ...) using inst[pt][pc] which at that point contains compact + already-appended generated parent rows. But sample_fresh_primary_keys and drop_unique_duplicates are applied to the child table's cols *after* FK fill, and for parent tables the dedupe happens in the parent's own iteration. Since tables are processed in topological order, parent dedupe occurs before children are built \u2014 good \u2014 but _plant_aggregate_boundary runs at the very end and reassigns paragraphs.chapter_id to rng.choice(ch) where ch = instance['chapters']['id'] (final), so that is safe; however the initial fill uses inst[pt][pc] which for 'chapters' includes compact+generated ids, and the generated chapter ids may later be dropped by drop_unique_duplicates on chapters (unique_tuples includes composite PKs). The 49 violations confirm orphans survive.",
+     "requested_revision": "After all tables are built and after _plant_aggregate_boundary, run a final FK reconciliation pass: for each FK column, replace any value not in the parent's final key set with a value drawn from that set (or drop the row). Add an assertion that _fk_violations==0 before returning the instance, and have the writer refuse to commit when fk_violations>0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions lists 'unmatched_join_rows' targets as 'parent rows without children' for works.id, chapters.id, characters.id, and the default spec sets unmatched_parents {works.id:0.10, chapters.id:0.10, characters.id:0.10}. This is consistent with the atomic-operation summary (parent_rows_without_children:true). However the spec's null_targets is empty and the interface NULL rule (instruction 7) requires every nullable column to get at least one NULL and a share following the compact DB. The schema has no nullable columns (all NOT NULL), so this is moot \u2014 but the spec should state explicitly that there are no nullable columns so the engineer's _plant_nulls path is a no-op, avoiding ambiguity.",
+     "requested_revision": "Add an explicit note in the specification that all columns are NOT NULL (nullable_columns=[]), so the NULL rule is vacuous; keep null_targets empty. This is a documentation clarification, not a behavioral change."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DEFAULT 'ranges' includes 'paragraphs.ParagraphNum': [1, 60], but the generation specification's semantic_rules_and_formulas only states 'ParagraphNum > 0' with no upper bound, and supporting_evidence cites observed values up to 39. The [1,60] upper bound is an invented constraint not present in the supplied database information. Similarly 'works.Date': [1500,1650] is justified by supporting_evidence, and Act/Scene ranges are justified \u2014 but ParagraphNum's 60 is not.",
+     "requested_revision": "Either remove the upper bound on paragraphs.ParagraphNum (use only >0, i.e. lo=1, hi=None) or document the 60 bound as an explicit design choice in the specification. As written, the program enforces a constraint the database information does not support, which could suppress legitimate boundary variation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_boundaries applies boundary literals to FK columns too: the loop 'for cm in tm.columns: ... if key in bnd: _plant_boundaries(cols, cm.name, bnd[key], ...)' runs for chapters.work_id, chapters.id, characters.id, paragraphs.chapter_id \u2014 all FK/PK columns. This directly overwrites FK values with boundary literals like 6,7,8,9,10 (works.id) or 18880-18882 (chapters.id), which are almost certainly not present in the parent key set, producing the observed fk_violations. The generic_sampling_rules explicitly say integer_fk must be 'Populated exclusively from the parent table's primary-key values ... never sampled from the numeric range/boundary pool'.",
+     "requested_revision": "Exclude FK columns (and PK columns) from _plant_boundaries. Boundary planting for FK columns must be achieved by ensuring the parent table actually contains those key values (e.g. seed parent PKs with the boundary literals), not by writing them into the child. This is the primary cause of the 49 FK violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_duplicates is applied to 'works.id' (duplicate_share includes works.id:0.30) and to characters.CharName. works.id is a primary key; planting duplicates on it would violate PK uniqueness, though sample_fresh_primary_keys later drops duplicate PK tuples. But the spec's duplicates_for_distinct target for works.id ('20-50% duplicate share') is itself questionable since works.id is a PK \u2014 the atomic summary lists it under duplicates_for_distinct, but a PK cannot have duplicates. The program's dedupe masks this, but the spec should not target a PK for duplication.",
+     "requested_revision": "Remove works.id from duplicate_share in the specification (PKs are unique by definition); the duplicates_for_distinct pattern for works.id in the atomic summary is likely a mis-attribution and should be treated as uncertain. Keep duplicate planting only on non-key DISTINCT columns (characters.CharName, works.LongTitle, characters.Description)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible=243, separated=64, unknown_executions=0, construction_pairs_by_group empty. Only 64/243 pairs separated, and the per-group breakdown is empty, so it is not possible to confirm which patterns (comparison_boundary, ties_for_order_limit, etc.) actually produce distinguishable instances. This is not by itself a generation error, but combined with the FK failures it means the intended value variation is not demonstrably realized.",
+     "requested_revision": "After fixing FK integrity, re-run and report construction_pairs_by_group so each pattern's separation can be verified. Ensure boundary/tie/duplicate planting actually changes query results (e.g. boundary literals present in the data, ties at rank 1 present)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 49 FK violations stem solely from _plant_boundaries on FK columns or also from parent dedupe after child fill \u2014 needs a targeted trace.",
+    "Whether construction_pairs separation of 64/243 is sufficient for the intended patterns; per-group breakdown is empty.",
+    "Whether paragraphs.ParagraphNum upper bound 60 is intended (not supported by supplied DB info).",
+    "Whether works.id duplicate planting is a spec error (PK cannot duplicate)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: returncode=2, stderr 'cli.py: error: the following arguments are required: --compact, --out', n_instances=0, construction_pairs_by_group=[]. The program never ran; no instances were produced.",
+     "requested_revision": "Fix the invocation so the generator actually runs end-to-end (supply --compact/--out/--ds/--db/--tag and any required spec path) and re-run to produce instances. The current run produced zero instances, so integrity, preservation and reproducibility cannot be verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "schema.py RANGES sets chapters.Scene to (1, 155) and spec.py DEFAULT ranges sets chapters.Scene to [1, 8], while the generation specification's semantic rule is 'Scene BETWEEN 1 AND 8'. sampler._build_chapters uses _pool.sample_int -> _schema.RANGES, so Scene values up to 155 can be generated, violating the stated rule. Also spec.py DEFAULT sets paragraphs.ParagraphNum range to [1, 60], but the specification explicitly leaves the upper bound open ('lo=1, hi=None') because the DB does not support a 60 bound.",
+     "requested_revision": "Make the two range sources consistent with the specification: chapters.Scene must be 1..8 everywhere (schema.RANGES and spec ranges), and paragraphs.ParagraphNum must be lo=1, hi=None (unbounded above) in both places. Remove the conflicting 155 and 60 bounds."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires boundary planting for many columns (works.id, chapters.work_id, chapters.id, characters.id, paragraphs.chapter_id, works.Title, works.GenreType, characters.CharName, characters.Abbrev, chapters.Description, paragraphs.PlainText, etc.) and duplicate/tie planting on characters.CharName, works.LongTitle, characters.Description, chapters.Scene, chapters.id, works.Date, paragraphs.ParagraphNum. But sampler.py only calls _plant_duplicates and _plant_boundaries, and _plant_boundaries only handles integer columns in schema.BOUNDARIES (Act, Scene, Date, ParagraphNum). There is no code path that plants text boundary literals (Title, GenreType, CharName, Abbrev, Description, PlainText), no tie planting at all, no LIKE near-variant planting, no aggregate-boundary planting (HAVING COUNT(paragraphs.id)=5), and no unmatched-parent handling (UNMATCHED_PARENTS is defined but never used).",
+     "requested_revision": "Implement the missing planting rules in sampler.py: text boundary literals per column, tie planting at rank 1 for the listed ORDER columns, LIKE near-variants for works.Title/LongTitle and characters.Description, the aggregate boundary (one chapter with exactly 5 generated paragraphs), and unmatched-parent shares so some parent rows have no children. Alternatively, if these are intentionally out of scope, remove them from the specification so spec and program agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state FK columns are 'never NULL' and boundary planting is 'skipped for PK and FK columns'. sampler._build_chapters/_build_paragraphs write placeholder 0 into FK columns then overwrite via _fill_fk, which is fine, but _plant_boundaries is called before _fill_fk and skips FK columns only via the fk_cols set \u2014 however _plant_duplicates is applied to chapters/paragraphs columns including work_id/chapter_id/character_id? DUPLICATE_COLUMNS does not list FK columns, so this is OK. The real gap: the specification requires 'parent rows without children' (unmatched_join_rows) for works.id, chapters.id, characters.id, but _fill_fk draws uniformly from the full parent key set, so every parent is likely to get a child. UNMATCHED_PARENTS is unused.",
+     "requested_revision": "In _fill_fk, exclude a share of parent keys (per UNMATCHED_PARENTS) from the sampling pool so the unmatched_join_rows pattern is realized, while keeping FK values within the parent set."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's duplicates_for_distinct target lists works.id with '20-50% duplicate share', which is impossible for a primary key. The specification itself notes this is 'treated as a mis-attribution', but the DEFAULT spec in spec.py still includes 'works.id': 0.30 in duplicate_share, and schema.DUPLICATE_COLUMNS does not include works.id (so it is not applied). The spec text and the code disagree on whether works.id is a duplicate target.",
+     "requested_revision": "Remove works.id from duplicate_share in spec.py DEFAULT (and from the specification's duplicate targets) so the spec and program agree that PKs are never duplicated."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions list comparison_boundary targets for works.id, chapters.work_id, chapters.id, characters.id, paragraphs.chapter_id, but the generic_sampling_rules say boundary planting is 'skipped for PK and FK columns' and 'boundary literals for FK columns are realized by seeding the parent PK set, never by writing them into the child'. The spec is internally inconsistent: it lists FK/PK columns as boundary targets while also saying they are skipped. The program (sampler._plant_boundaries) skips FK and PK columns, which matches the generic rule but not the per-column target list.",
+     "requested_revision": "Clarify the specification: either remove PK/FK columns from the comparison_boundary target list, or state explicitly that these targets are realized by seeding parent PK sets (as the generic rule says). Make the per-column exceptions consistent with the generic rules."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires 'reproducible generation' and the CLI accepts --seed, but the execution feedback shows the program did not run (returncode=2), so reproducibility cannot be verified. Additionally, sampler.build_instance uses random.Random(seed) but _load_compact reads the compact DB fresh each time; if the compact DB is mutated between runs, output differs. No evidence of a determinism check.",
+     "requested_revision": "After fixing the invocation, run the generator twice with the same seed and confirm identical output (row counts and values), and document that the compact DB is treated as read-only input."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets is empty and all columns are NOT NULL, so the NULL rule is vacuous. However, sampler._build_* never calls _plant_nulls, and schema.NULLABLE_COLUMNS is empty, so this is consistent. No issue here, but note that if any column were nullable, the NULL rule would not be implemented (no _plant_nulls call in sampler.py).",
+     "requested_revision": "No change required for this schema (all NOT NULL). If the schema changes to include nullable columns, add NULL planting per the interface rule."
+    }
+   ],
+   "unresolved_checks": [
+    "Integrity constraints (FK violations, PK uniqueness) could not be verified because the program produced zero instances (returncode=2).",
+    "Preservation of compact rows could not be verified for the same reason.",
+    "Reproducibility with a fixed seed could not be verified.",
+    "Whether the intended value variation (boundary, duplicate, tie, LIKE, aggregate) is realized could not be verified because the program did not run and the planting code is incomplete."
+   ]
+  }
+ ]
 }

@@ -1,50 +1,725 @@
 {
  "db": "address",
- "operator_io_quirks": [
-  "Table 'CBSA' is mixed-case; column 'CBSA' in zip_data shares the name of table CBSA (identifier vs table ambiguity in generated SQL).",
-  "Column '1st_quarter_payroll' starts with a digit; must be double-quoted everywhere.",
-  "Column 'type' is a SQL keyword; 'state' is both a column name and a table name; 'CBSA' likewise.",
-  "congress PK column is misspelled 'cognress_rep_id' (typo in DDL); FK from zip_congress.district references it.",
-  "zip_data.CBSA is a FK to CBSA.CBSA with 57.6% NULLs; parent has 465 rows, child 41563 \u2014 many-to-one, non-unique parent side is fine but child draws with replacement.",
-  "zip_data.state is TEXT FK to state.abbreviation (62 rows) but zip_data has 62 distinct state values; congress.abbreviation also FK to state.abbreviation (55 distinct).",
-  "country.state is a FK to state.abbreviation but has 0.7% NULLs and 57 distinct \u2014 NULL FK values must survive.",
-  "Composite PKs: area_code(zip_code,area_code), avoid(zip_code,bad_alias), country(zip_code,county), zip_congress(zip_code,district) \u2014 all also FK children of zip_data(zip_code).",
-  "zip_data is the hub: 41563 rows, 60 columns, referenced by alias, area_code, avoid, country, zip_congress; reading it dominates cost.",
-  "congress.District is INTEGER with 20.2% NULLs; zip_congress.district is TEXT storing values like 'NY-1','PR' \u2014 storage class contradicts declared type across the FK.",
-  "zip_data.zip_code samples start at 501 (not 1); Number fuzzer range [-10^scale,10^scale] with scale from 'INTEGER' (no args) => default scale, will produce values far outside [501,99950].",
-  "No NOT NULL constraints anywhere (notnull=0 on every column); CHECK/UNIQUE not declared in DDL text."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns dispatch to String fuzzer: random a-zA-Z 0-9() strings of length 0..20, plus 50% contaminate (prefix/suffix/drop char) \u2014 names like 'first_name','city','party' become gibberish.",
-  "All INTEGER/REAL columns dispatch to Number fuzzer: uniform in [-10^scale,10^scale] (scale from type args; INTEGER has none => default), then +-1/+-2 perturbation \u2014 zip_code, population, payroll all implausible magnitudes.",
-  "String fuzzer adds str(i+1)/str(i-1) for int-like elements, so 'zip_code' TEXT-ish values may appear; but zip_code is INTEGER so Number path.",
-  "FK columns (zip_data.CBSA, zip_data.state, congress.abbreviation, country.state, zip_congress.district, all zip_code FKs) draw from parent's FINAL filtered values with replacement \u2014 ties/duplicates guaranteed, but only among parent's generated values.",
-  "zip_data.CBSA has 57.6% NULLs in original; TS does not enforce NOT NULL, so NULLs appear only if parent column sampler emits them (Number sampler drops None) \u2014 likely 0% NULL in generated, unlike original.",
-  "Composite-PK members get max_l0=30 (fresh-draw cap), single-column PK gets inf \u2014 zip_code (PK of zip_data) will be all-fresh, area_code/avoid/country/zip_congress PK members capped.",
-  "String fuzzer on 'type','multi_county','daylight_savings','region','division','party','House' (2-9 distinct) will produce random strings, destroying the low-cardinality ENUM structure \u2014 likely FN driver for queries filtering on these.",
-  "Number fuzzer on 'latitude','longitude' (REAL, ~[-180,180]) produces values in [-10^scale,10^scale] with default scale \u2014 implausible coordinates, FN for range predicates.",
-  "Number fuzzer on 'population_2020','annual_payroll' (up to 10^8) with default scale may under- or over-shoot; list-range quirk (min(el)..full max) keeps some plausibility.",
-  "String fuzzer on 'cognress_rep_id' (values 'AK','AK-S1','AL-1') and 'district' ('NY-1','PR') produces random strings; joins zip_congress.district=congress.cognress_rep_id still work (FK consistency) but values implausible.",
-  "Empty parent (e.g. if state filtered to 0 rows) yields NULL FK values \u2014 but state has 62 rows and PK inf cap, so unlikely empty; still a risk for small tables.",
-  "No Date/Time/Bool/Bit columns in this DB \u2014 those fuzzers unused; all dispatch is String or Number."
- ],
- "challenger_refs": [
-  "G8",
-  "G13",
-  "G11",
-  "G16",
-  "G3",
-  "G4",
-  "G17",
-  "G9",
-  "G14",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential or random unique integers outside the range of natural keys; never NULL.",
+   "integer_fk": "Sample from parent primary-key pool; reserve ~2% of rows for NULL when column is nullable.",
+   "text_enum": "Pick uniformly from enumerated pool; add 2% case/whitespace near-variants where no constraint forbids.",
+   "text_free": "Reuse city/county names from a small pool; ~30% repeated values to produce duplicates on DISTINCT.",
+   "real_measure": "Positive real drawn from a log-normal-ish shape; round to 3 decimals for areas, 1 for ages.",
+   "integer_count": "Non-negative integer; skew small via geometric with mean 5; include 0 and boundary 1.",
+   "integer_amount": "Non-negative integer, rounded to nearest 1000; occasional large outlier.",
+   "boundary": "For each listed literal L: emit L, L-step, L+step (numeric) or one-char case/whitespace variants (text).",
+   "ties": "For ORDER/LIMIT rank 1: emit at least two rows sharing the top aggregate value; both ASC and DESC when specified.",
+   "nulls": "Each nullable column gets >=1 NULL row; share follows original null_rate.",
+   "table_size_sampling": "For each table, draw the generated row count uniformly from [0.5*base, 1.25*base] where base is table_sizes_per_instance; round to nearest integer; never exceed the original table size; parent tables are filled before children."
+  },
+  "per_column_exceptions": [
+   {
+    "columns": [
+     "zip_data.zip_code"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     1115,
+     1116,
+     1117,
+     19018,
+     19019,
+     19020
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.zip_code"
+    ],
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "COUNT(zip_data.zip_code)": [
+      0,
+      1,
+      2,
+      9,
+      10,
+      11
+     ]
+    }
+   },
+   {
+    "columns": [
+     "zip_data.zip_code"
+    ],
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "rank": 1,
+     "direction": [
+      "ASC",
+      "DESC"
+     ]
+    }
+   },
+   {
+    "columns": [
+     "alias.zip_code"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     1027,
+     1028,
+     1029,
+     19018,
+     19019,
+     19020
+    ]
+   },
+   {
+    "columns": [
+     "area_code.zip_code"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     1115,
+     1116,
+     1117
+    ]
+   },
+   {
+    "columns": [
+     "area_code.zip_code"
+    ],
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "COUNT(*)": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "columns": [
+     "country.zip_code"
+    ],
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "columns": [
+     "zip_data.zip_code",
+     "country.zip_code",
+     "area_code.zip_code",
+     "avoid.zip_code"
+    ],
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "columns": [
+     "country.county"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "CORYELL",
+     "coryell",
+     "GUAM",
+     "guam",
+     "SAINT CROIX",
+     "saint croix"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.city"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Aguada",
+     "aguada",
+     "Aguadilla",
+     "aguadilla",
+     "Hartford",
+     "hartford"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.city"
+    ],
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "rank": 1,
+     "direction": [
+      "DESC",
+      "unordered"
+     ],
+     "tie_on": [
+      "COUNT(avoid.zip_code)"
+     ]
+    }
+   },
+   {
+    "columns": [
+     "CBSA.CBSA_name"
+    ],
+    "pattern": "like_near_variant",
+    "targets": {
+     "literal": "New York-Newark-Jersey City, NY-NJ-PA",
+     "variants": [
+      "New York-Newark-Jersey City, NY-NJ-PB",
+      "New York-Newark-Jersey City, NY-NJ-PAx",
+      "new york-newark-jersey city, ny-nj-pa"
+     ]
+    }
+   },
+   {
+    "columns": [
+     "CBSA.CBSA_name"
+    ],
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "COUNT(*)": [
+      9,
+      10,
+      11
+     ]
+    }
+   },
+   {
+    "columns": [
+     "state.abbreviation"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "NY",
+     "ny"
+    ]
+   },
+   {
+    "columns": [
+     "state.name"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Guam",
+     "guam",
+     "New York",
+     "new york",
+     "Alabama",
+     "alabama"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.type"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Post Office",
+     "post office",
+     "P.O. Box Only",
+     "p.o. box only"
+    ]
+   },
+   {
+    "columns": [
+     "avoid.bad_alias"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "URB San Joaquin",
+     "urb san joaquin",
+     "Druid Hills",
+     "druid hills"
+    ]
+   },
+   {
+    "columns": [
+     "congress.first_name"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Smith",
+     "smith",
+     "Heck",
+     "heck"
+    ]
+   },
+   {
+    "columns": [
+     "CBSA.CBSA_type"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Micro",
+     "Metro"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.multi_county"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Yes",
+     "No"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.daylight_savings"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Yes",
+     "No"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.type"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Unique Post Office",
+     "Post Office",
+     "P.O. Box Only",
+     "Branch",
+     "Non Postal Community Name",
+     "Community Post Office",
+     "Branch-Unique",
+     "Non Postal Community Name-Unique"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.time_zone"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Eastern",
+     "Atlantic",
+     "Central",
+     "Mountain",
+     "Pacific",
+     "Hawaii-Aleutian Islands",
+     "American Samoa",
+     "Marshall Islands"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.region"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Northeast",
+     "South",
+     "Midwest",
+     "West"
+    ]
+   },
+   {
+    "columns": [
+     "zip_data.division"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Middle Atlantic",
+     "New England",
+     "South Atlantic",
+     "East South Central",
+     "East North Central",
+     "West North Central",
+     "Mountain",
+     "West South Central"
+    ]
+   },
+   {
+    "columns": [
+     "congress.party"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "Republican",
+     "Democrat",
+     "Independent"
+    ]
+   },
+   {
+    "columns": [
+     "congress.House"
+    ],
+    "pattern": "enum",
+    "targets": [
+     "House of Repsentatives",
+     "Senate"
+    ]
+   },
+   {
+    "columns": [
+     "congress.District"
+    ],
+    "pattern": "nullable_enum",
+    "targets": "NULL for senators (~20%); 1..53 for house members"
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "congress.abbreviation",
+    "parent": "state",
+    "parent_column": "abbreviation",
+    "copied": [
+     "state.name -> congress.state"
+    ]
+   },
+   {
+    "child": "zip_data.state",
+    "parent": "state",
+    "parent_column": "abbreviation",
+    "copied": []
+   },
+   {
+    "child": "zip_data.CBSA",
+    "parent": "CBSA",
+    "parent_column": "CBSA",
+    "copied": []
+   },
+   {
+    "child": "alias.zip_code",
+    "parent": "zip_data",
+    "parent_column": "zip_code",
+    "copied": []
+   },
+   {
+    "child": "area_code.zip_code",
+    "parent": "zip_data",
+    "parent_column": "zip_code",
+    "copied": []
+   },
+   {
+    "child": "avoid.zip_code",
+    "parent": "zip_data",
+    "parent_column": "zip_code",
+    "copied": []
+   },
+   {
+    "child": "country.zip_code",
+    "parent": "zip_data",
+    "parent_column": "zip_code",
+    "copied": []
+   },
+   {
+    "child": "country.state",
+    "parent": "state",
+    "parent_column": "abbreviation",
+    "copied": []
+   },
+   {
+    "child": "zip_congress.zip_code",
+    "parent": "zip_data",
+    "parent_column": "zip_code",
+    "copied": []
+   },
+   {
+    "child": "zip_congress.district",
+    "parent": "congress",
+    "parent_column": "cognress_rep_id",
+    "copied": []
+   },
+   {
+    "unique": [
+     "area_code.zip_code",
+     "area_code.area_code"
+    ],
+    "table": "area_code"
+   },
+   {
+    "unique": [
+     "avoid.zip_code",
+     "avoid.bad_alias"
+    ],
+    "table": "avoid"
+   },
+   {
+    "unique": [
+     "country.zip_code",
+     "country.county"
+    ],
+    "table": "country"
+   },
+   {
+    "unique": [
+     "zip_congress.zip_code",
+     "zip_congress.district"
+    ],
+    "table": "zip_congress"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "zip_data",
+    "column": "population_2010",
+    "formula": "population_2010 >= 0"
+   },
+   {
+    "table": "zip_data",
+    "column": "persons_per_household",
+    "formula": "persons_per_household >= 0 AND persons_per_household <= 10"
+   },
+   {
+    "table": "zip_data",
+    "column": "median_age",
+    "formula": "median_age >= 0 AND median_age <= 120"
+   },
+   {
+    "table": "zip_data",
+    "column": "elevation",
+    "formula": "elevation >= -100 AND elevation <= 9000"
+   },
+   {
+    "table": "zip_data",
+    "column": "latitude",
+    "formula": "latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "zip_data",
+    "column": "longitude",
+    "formula": "longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "zip_data",
+    "column": "land_area",
+    "formula": "land_area >= 0"
+   },
+   {
+    "table": "zip_data",
+    "column": "water_area",
+    "formula": "water_area >= 0"
+   },
+   {
+    "table": "zip_data",
+    "column": "annual_payroll",
+    "formula": "annual_payroll >= 0"
+   },
+   {
+    "table": "zip_data",
+    "column": "total_beneficiaries",
+    "formula": "total_beneficiaries >= 0"
+   },
+   {
+    "table": "congress",
+    "column": "land_area",
+    "formula": "land_area > 0"
+   },
+   {
+    "table": "congress",
+    "column": "District",
+    "formula": "District IS NULL OR District BETWEEN 1 AND 53"
+   },
+   {
+    "table": "area_code",
+    "column": "area_code",
+    "formula": "area_code BETWEEN 200 AND 999"
+   },
+   {
+    "table": "CBSA",
+    "column": "CBSA",
+    "formula": "CBSA > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "state": 62,
+   "CBSA": 200,
+   "congress": 200,
+   "zip_data": 400,
+   "alias": 400,
+   "area_code": 400,
+   "avoid": 400,
+   "country": 400,
+   "zip_congress": 400
+  },
+  "null_targets": [
+   "zip_data.organization",
+   "zip_data.time_zone",
+   "zip_data.latitude",
+   "zip_data.longitude",
+   "zip_data.elevation",
+   "zip_data.state_fips",
+   "zip_data.county_fips",
+   "zip_data.region",
+   "zip_data.division",
+   "zip_data.population_2020",
+   "zip_data.population_2010",
+   "zip_data.households",
+   "zip_data.avg_house_value",
+   "zip_data.avg_income_per_household",
+   "zip_data.persons_per_household",
+   "zip_data.white_population",
+   "zip_data.black_population",
+   "zip_data.hispanic_population",
+   "zip_data.asian_population",
+   "zip_data.american_indian_population",
+   "zip_data.hawaiian_population",
+   "zip_data.other_population",
+   "zip_data.male_population",
+   "zip_data.female_population",
+   "zip_data.median_age",
+   "zip_data.male_median_age",
+   "zip_data.female_median_age",
+   "zip_data.residential_mailboxes",
+   "zip_data.business_mailboxes",
+   "zip_data.total_delivery_receptacles",
+   "zip_data.businesses",
+   "zip_data.\"1st_quarter_payroll\"",
+   "zip_data.annual_payroll",
+   "zip_data.employees",
+   "zip_data.water_area",
+   "zip_data.land_area",
+   "zip_data.single_family_delivery_units",
+   "zip_data.multi_family_delivery_units",
+   "zip_data.total_beneficiaries",
+   "zip_data.retired_workers",
+   "zip_data.disabled_workers",
+   "zip_data.parents_and_widowed",
+   "zip_data.spouses",
+   "zip_data.children",
+   "zip_data.over_65",
+   "zip_data.monthly_benefits_all",
+   "zip_data.monthly_benefits_retired_workers",
+   "zip_data.monthly_benefits_widowed",
+   "zip_data.CBSA",
+   "congress.District"
+  ],
+  "supporting_evidence": {
+   "zip_data.persons_per_household": [
+    "observed values 2.5-2.9; bound [0,10] safe"
+   ],
+   "congress.land_area": [
+    "all shown land_area values > 3000"
+   ],
+   "zip_data.latitude": [
+    "observed 18.1-40.8; bound [-90,90] safe"
+   ],
+   "zip_data.longitude": [
+    "observed -73.0 to -66.7; bound [-180,180] safe"
+   ],
+   "zip_data.elevation": [
+    "observed 0-1039; bound [-100,9000] safe"
+   ],
+   "zip_data.median_age": [
+    "observed 35.9-39.2; bound [0,120] safe"
+   ]
+  },
+  "uncertainty": [
+   "Timestamp/date columns are absent, so no order rules apply.",
+   "Population proportions (race/sex categories) likely sum to city population but 0-valued rows violate; not enforced.",
+   "state table has 62 rows for 50 states + territories; territories included in enum implicitly.",
+   "zip_congress.district references congress IDs that may not all exist; ~5% orphan rows expected (no FK enforcement).",
+   "female_population + male_population = population_2010 and female_median_age >= male_median_age hold on the shown sample rows but are not schema constraints; not enforced.",
+   "Table sizes are sampled in [0.5x, 1.25x] of the base sizes in table_sizes_per_instance; the program must implement this range."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.valid = 0, validity.invalid = 20, reasons {no_rows_added: 20, compact_rows_missing: 20}; rows_added = {} and rows_skipped = {} in the summary. In writer.py, write_instance_sqlite is called from cli.py as write_instance_sqlite(_G['schema'], inst, p) with no orig_path, so the compact database is never copied and the generated rows are inserted into a freshly created schema. The stats side-channel (_bump_stats) is never called, so rows_added/rows_skipped stay empty. The spec's intent (append generated rows to a copy of the compact database, preserving compact rows) is not implemented.",
+     "requested_revision": "Pass the original database path (a['orig']) into write_instance_sqlite so the compact rows are copied and preserved, and call _bump_stats (or otherwise populate the stats file) so rows_added/rows_skipped are reported. Re-run and confirm validity.valid > 0 and compact_rows_missing = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py choose_table_sizes: for each table it draws sizes[t] = base*(0.5+rand) or base*(0.75+0.5*rand), i.e. 0.5x-1.25x of the spec's table_sizes_per_instance (state 62, CBSA 200, congress 200, zip_data 400, ...). The spec lists fixed table_sizes_per_instance; the program deliberately varies them. Combined with the writer bug above, this also means the generated instance is not the specified size.",
+     "requested_revision": "Either implement the spec's fixed table_sizes_per_instance exactly, or update the specification to state that sizes are sampled in a range and document the range. The two must agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_nulls: k = max(1, int(round(share*n))) and idx = rng.sample(range(n), min(k,n)). For a nullable column with share 0.02 and n=400 this plants ~8 NULLs, but the spec's generic_sampling_rules say 'reserve ~2% of rows for NULL when column is nullable' and the interface rule requires 'each instance contains generated rows with NULL and rows with non-NULL values'. The execution feedback shows NULL 0 / n for CBSA.CBSA_name, CBSA.CBSA_type, state.name \u2014 these are not in NULLABLE, so they get no NULLs, which is consistent with the schema (they are not nullable). However, the feedback also shows no NULLs were planted anywhere because no rows were added at all (see issue 1). Once issue 1 is fixed, verify that every nullable column actually receives NULLs and non-NULLs.",
+     "requested_revision": "After fixing issue 1, confirm per nullable column that generated rows contain both NULL and non-NULL values with the compact share. If the compact share is 0 for a nullable column, the spec's 'at least one NULL row per nullable column' still requires planting one; make _null_share return at least 1/n in that case (it already does via max(1.0/len(vals), ...)), and verify."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas includes 'female_population + male_population = population_2010' with evidence 'rows 544-606: 9492+9078=18570, 21124+20396=41520'. The uncertainty section itself says 'Population proportions (race/sex categories) likely sum to city population but 0-valued rows violate; not enforced.' The rule is therefore supported only by a small row sample and is contradicted by the stated uncertainty. Similarly 'female_median_age >= male_median_age' is supported by 'rows 544-606 show female_median_age > male_median_age' \u2014 a sample, not a schema constraint.",
+     "requested_revision": "Either provide stronger evidence (e.g. a CHECK constraint or a full-table verification) for these derived-column rules, or move them to 'uncertain patterns' and stop enforcing them in _apply_semantic_rules. Do not enforce a rule the spec itself flags as uncertain."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions lists comparison_boundary targets for zip_data.zip_code [1115,1116,1117,19018,19019,19020], alias.zip_code [1027,1028,1029,19018,19019,19020], area_code.zip_code [1115,1116,1117], and text boundaries for country.county, zip_data.city, state.abbreviation, state.name, zip_data.type, avoid.bad_alias, congress.first_name. instance.py BOUNDARY implements these, but build_random_instance only uses BOUNDARY for numeric keys ('elif key in BOUNDARY and not isinstance(BOUNDARY[key][0], str)'); text boundary literals are never emitted. The text boundary targets are therefore not implemented.",
+     "requested_revision": "Implement text boundary emission (case variants L, L.lower(), L.upper() as in _boundary_values) for the text columns listed in BOUNDARY, or remove those entries from the spec if they are not intended to be generated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_sizes forces vals[1]=vals[0], vals[3]=vals[2], vals[4]=vals[2], vals[5]=vals[2] for CBSA.CBSA_name, zip_data.city, state.name. This guarantees group sizes 1, 2, >=3 only for the first six rows; it does not guarantee the aggregate_boundary targets for CBSA.CBSA_name (COUNT(*) in [9,10,11]) or zip_data.zip_code (COUNT in [0,1,2,9,10,11]). The spec's aggregate_boundary targets are not implemented for these columns.",
+     "requested_revision": "Implement the aggregate_boundary targets explicitly (e.g. construct groups of the specified sizes for the listed columns), or remove the aggregate_boundary entries from the spec if they are not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_semantic_rules enforces female_population + male_population = population_2010 and female_median_age >= male_median_age, but the spec's uncertainty section says these are not enforced. The program is stricter than the spec. Also, _apply_semantic_rules runs after _apply_nulls, so it may overwrite a planted NULL in male_population/female_population (it skips when p is None, but if p is non-NULL and m is None it sets m, replacing a planted NULL). The interface rule says 'a planted NULL is never replaced to satisfy a rule'.",
+     "requested_revision": "Align the program with the spec: either drop the uncertain rules or update the spec to enforce them. In either case, ensure _apply_semantic_rules never replaces a planted NULL (check for None before assigning)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py fill_foreign_keys_consistently: 'out[cm.name] = [rng.choice(pv) for _ in range(n)] if pv else [None] * n'. The spec's generic_sampling_rules say 'reserve ~2% of rows for NULL when column is nullable' for integer FKs. The program does not reserve NULLs for nullable FKs; it only plants NULLs later via _apply_nulls, which uses the compact share. For zip_data.CBSA and congress.District (nullable FKs), the compact share may be 0, in which case no NULLs are planted. The interface rule requires at least one NULL per nullable column.",
+     "requested_revision": "Ensure nullable FK columns (zip_data.CBSA, congress.District) receive at least one NULL and non-NULL values per instance, consistent with the interface rule. Verify after fixing issue 1."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: 'order = [t for t in schema.table_order for t in t] if False else [t for lvl in schema.table_order for t in lvl]'. The dead 'if False' branch is harmless but indicates the table order is flattened from levels, which is correct. However, the FK fill uses instance.get(pt, {}).get(pc) \u2014 if the parent table has not been built yet (order violation), pv is empty and the child gets all NULLs. The topological order from schema.table_order should prevent this, but the code does not assert it.",
+     "requested_revision": "Add an assertion or check that parent tables are built before children, or document that schema.table_order guarantees this. This is a robustness request, not a blocking error."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification table_sizes_per_instance lists state: 62, but the schema has state.abbreviation as primary key and the compact database has 62 rows (50 states + territories). The spec's uncertainty says 'state table has 62 rows for 50 states + territories; territories included in enum implicitly.' The program's choose_table_sizes samples state size in 0.5x-1.25x of 62, which may produce fewer than 62 rows and thus miss some states. This is a spec/program mismatch (see issue 2).",
+     "requested_revision": "Clarify whether state must have exactly 62 rows (all states + territories) or a sampled size. If exactly 62, fix the program; if sampled, update the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction pairs: eligible 355, separated 62, unknown_executions 0. The separation rate (62/355) is low, but the instructions say a missing separation alone does not establish a generation error. The low rate may be due to the writer bug (no rows added) and the size sampling; re-evaluate after fixing issues 1 and 2.",
+    "Nullable columns feedback shows NULL 0 / n for CBSA.CBSA_name, CBSA.CBSA_type, state.name \u2014 these are not nullable per the schema, so this is expected. However, no nullable column shows any generated rows at all because no rows were added; re-check after fixing issue 1.",
+    "The spec's 'ties_for_order_limit' targets (zip_data.zip_code rank 1 ASC/DESC, zip_data.city rank 1 DESC/unordered on COUNT(avoid.zip_code)) are not explicitly implemented in the program. The program's _apply_group_sizes may incidentally create ties, but this is not guaranteed. Verify after fixing issue 1.",
+    "The spec's 'like_near_variant' for CBSA.CBSA_name is implemented in LIKE_VARIANTS but never used in build_random_instance (CBSA_name is in FREE_TEXT, which takes precedence). Verify whether the LIKE variants are actually emitted."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows nullable_columns with 'generated rows: NULL 0 / n' for CBSA.CBSA_name, CBSA.CBSA_type, congress.CID, congress.House, congress.abbreviation, congress.first_name, congress.land_area, congress.last_name, congress.party, congress.state, country.state, state.name. These are not in the spec's null_targets, so leaving them all non-NULL is consistent with the specification's null-target list; only congress.District (in null_targets) got NULLs (149/1643). Per interface rule 7 this is a note, not a blocker.",
+     "requested_revision": "No blocking change required. Optionally note in the spec that these columns are intentionally non-nullable in the generator's interpretation (they are absent from null_targets), matching observed NULL 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_added / rows_skipped are empty in the CLI summary ({}). writer.write_instance_sqlite computes the stats path via os.path.dirname(os.path.dirname(path)) and basename splits on '__', but the CLI reads stats from <root>/<ds>/<db>__<tag>_stats.json while the writer's db/tag split can mis-derive db and tag (tag stripped by rsplit('_',1) assumes a 4-digit index suffix). The stats file is likely never written to the location the CLI reads, so the rows_added/rows_skipped reporting is silently absent.",
+     "requested_revision": "Engineer: make the writer's stats path derivation match the CLI's (<root>/<ds>/<db>__<tag>_stats.json) and verify non-empty rows_added in a run. This is reporting-only; it does not block instance correctness."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules in the spec are mostly unbounded/loose (e.g., population_2010 >= 0, latitude BETWEEN -90 AND 90) with supporting_evidence showing sample ranges inside bounds; these are supported as safe bounds. Rules marked uncertain (female+male=population_2010, female_median_age>=male_median_age) are explicitly not enforced, which is correct. However the spec's semantic_rules_and_formulas list is the authority the program implements by construction; bounds like persons_per_household [0,10] and median_age [0,120] are consistent with observed values.",
+     "requested_revision": "No blocking change; the spec already flags the proportion/sex-sum rules as uncertain and the program correctly does not enforce them. Optionally tighten supporting_evidence documentation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity checks pass (fk_violations 0, not_null 0, pk_duplicates 0), 20/20 valid, reproducible. Dependencies are implemented: fill_foreign_keys_consistently draws FK children from generated parent values, choose_table_sizes samples within [0.5x,1.25x] capped at base, PK/unique/composite-unique dedup applied, planted NULLs applied after value generation and not overwritten. Boundary/enum/group-size/like-variant rules are implemented in instance.py by construction.",
+     "requested_revision": "No change; construction is consistent with the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs shows 53/355 separated, 0 unknown executions. Separation is present, so intended value variation exists; missing separation for many pairs is not evidence of a generation defect (per instruction 4).",
+     "requested_revision": "No change; value variation remains possible."
+    }
+   ],
+   "unresolved_checks": [
+    "rows_added/rows_skipped side-channel is empty in the summary; the writer and CLI appear to disagree on the stats file path/location, so row-count accounting is unverified (non-blocking).",
+    "Whether original compact rows are preserved in every output was inferred from the writer copying orig_path and using INSERT-only appends; not independently byte-verified in the provided feedback."
+   ]
+  }
+ ]
 }

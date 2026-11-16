@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -10,16 +10,18 @@ import time
 from .instance import build_random_instance
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
+from .spec import load_specification, spec_from_columns
 from .writer import unit_path, write_instance_sqlite
 
 _G: dict = {}
 
 
-def _init(orig: str, pool: dict, args: dict) -> None:
+def _init(orig: str, pool: dict, args: dict, spec: dict) -> None:
     """Worker initializer: read the original ONCE per process."""
     _G['schema'] = read_schema(orig)
     _G['pool'] = pool
     _G['args'] = args
+    _G['spec'] = spec
 
 
 def _one(i: int) -> str:
@@ -30,12 +32,31 @@ def _one(i: int) -> str:
         return ''
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
+        inst = build_random_instance(_G['schema'], _G['pool'], None, rng, spec=_G['spec'])
+        write_instance_sqlite(_G['schema'], inst, p, orig=a['orig'])
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
+        part = p + '.part'
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
         return type(e).__name__
+
+
+def _load_spec(orig: str, schema) -> dict:
+    """Load tscore_gen/specification.json next to the package, else derive from observed columns."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, 'specification.json')
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return load_specification(json.load(f), schema)
+        except Exception:
+            pass
+    return spec_from_columns(schema)
 
 
 def main(argv=None) -> None:
@@ -63,13 +84,14 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    spec = _load_spec(a.orig, schema)
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
+        _G.update(schema=schema, pool=pool, args=args, spec=spec)
         res = [_one(i) for i in idx]
     else:
-        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
+        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args, spec)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
     for r in res:
@@ -77,7 +99,8 @@ def main(argv=None) -> None:
             errs[r] = errs.get(r, 0) + 1
     print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': {}, 'rows_skipped': {}}))
 
 
 if __name__ == '__main__':
