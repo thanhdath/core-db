@@ -1,50 +1,836 @@
 {
  "db": "public_review_platform",
- "operator_io_quirks": [
-  "Mixed-case quoted table names: \"Business_Attributes\", \"Business_Categories\", \"Business_Hours\", \"Checkins\", \"Elite\", \"Reviews\", \"Tips\", \"Users_Compliments\", \"Business\", \"Users\" \u2014 must be double-quoted in generated SQL; unquoted lowercase lookups collide with unquoted tables Attributes/Categories/Compliments/Days/Years.",
-  "DDL declares FKs as bare `references Business` / `references Attributes` with no parent column; pragma foreign_key_list returns parent_col NULL -> parent column = child column name (business_id, attribute_id, etc.).",
-  "All FKs resolve to existing parents (parent_exists true everywhere); no dangling FKs, no self-references.",
-  "Composite PKs on 8 tables (Business_Attributes, Business_Categories, Business_Hours, Checkins, Elite, Reviews, Tips, Users_Compliments); single-column PKs on Attributes, Categories, Compliments, Days, Years, Business, Users.",
-  "Reviews is 322906 rows (> max_rows_per_table 300000) -> rowid % k sampling path exercised; Business_Attributes 206934, Users_Compliments 98810, Tips 87157, Checkins 80038, Business_Hours 47831, Business_Categories 43703, Elite 16366, Business 15585, Users 70817.",
-  "All columns notnull=0 (no NOT NULL constraints), no CHECK, no UNIQUE indexes beyond PKs; declared types only INTEGER/TEXT/REAL.",
-  "Storage class contradicts declared type: many TEXT columns hold numeric-looking strings (user_average_stars '4.0', review_count 'Low'/'Medium'/'High'/'Uber', number_of_compliments 'Medium', user_votes_* 'Low'/'None'/'Uber'); Years.year_id INTEGER holds 2005..2014 (year-like ints, not 1..N).",
-  "TEXT columns hold small closed vocabularies: active {true,false}, state {AZ,SC,CA}, review_length/tip_length {Short,Medium,Long}, label_time_* {None,Low,Medium,High,Uber}, attribute_value {none,full_bar,beer_and_wine,false,true}, opening_time/closing_time {8AM..12PM} style.",
-  "Business.stars is REAL with 9 distinct values (3.0,4.5,...) \u2014 Number fuzzer with scale from REAL (no args) will draw wide floats, not the 1..5 star grid.",
-  "Users.user_yelping_since_year INTEGER 2008..2013 and Years.actual_year 2005..2014 are year-valued INTEGERs; declared type INTEGER dispatches to Number, not Year fuzzer (no 'year' in type string).",
-  "Checkins has 24 label_time_N TEXT columns each with 3-5 distinct values; String fuzzer will generate random charset strings, not the label vocabulary.",
-  "All null_rate 0.0 in original; distinct counts small for lookup tables (Days 7, Compliments 11, Years 10, Attributes 80, Categories 591)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER/REAL columns: full range [-10^scale,10^scale] (scale 0 for INTEGER -> [-1,1] plus +-1/+-2 perturbation; REAL scale 0 too since no (a,b) args) \u2014 produces tiny ints for business_id/user_id, so joins still work but cardinalities collapse.",
-  "String fuzzer on all TEXT columns: random a-zA-Z 0-9() strings length 0..20 with 0.5 contaminate; will NOT reproduce 'Low'/'Medium'/'Uber'/'true'/'8AM' vocabularies unless literal pool supplies them.",
-  "Literal pool from train SQL will seed some TEXT columns (state, active, review_length, label_time_*) with real values via type_values_w_db loose anchoring; columns never compared in train SQL get pure random strings.",
-  "Composite-PK tables: sample_fresh_primary_keys drops duplicate (business_id,user_id) tuples; with tiny Number ranges on business_id/user_id, many rows collapse -> small tables, few distinct FK pairs.",
-  "FK child columns draw from parent's FINAL filtered values with replacement; parent Business.business_id after PK dedup is small (Number range ~[-1,1] perturbed) so all child business_id values cluster in a handful of ints -> joins trivially match, missing the real 1..15585 spread.",
-  "Years.year_id INTEGER gets Number fuzzer values ~[-1,1], not 2005..2014; Elite.year_id FK to Years then holds tiny ints; queries filtering year_id=2010 return empty -> FN.",
-  "Business.stars REAL gets Number scale 0 -> values in [-1,1] plus +-0.01/+-0.02, not 1..5; AVG(stars) comparisons against 4.0 fail -> FN.",
-  "review_stars INTEGER 1..5 gets Number [-1,1] perturbed -> mostly 0,1,2,-1; WHERE review_stars=5 returns empty -> FN.",
-  "likes INTEGER 0..3 gets Number [-1,1] -> 0,1,-1,2; WHERE likes>2 rare -> FN.",
-  "TEXT columns with numeric-looking content (user_average_stars '4.0') get String fuzzer random strings, so CAST/compare to 4.0 fails -> FN.",
-  "Small lookup tables (Days 7, Compliments 11, Years 10) get choose_table_sizes sizes 1..2500; if size < distinct original, FK children reference only generated subset -> some parent lookups miss -> FN.",
-  "Missing ties/duplicates: PK dedup + unique dedup removes duplicate rows that real data has (e.g. multiple Reviews per business), so GROUP BY/COUNT queries undercount -> FP on count comparisons."
- ],
- "challenger_refs": [
-  "G17",
-  "G40",
-  "G14",
-  "G22",
-  "G37",
-  "G43",
-  "G10",
-  "G30",
-  "G11",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; unique per table; never NULL; never mutated by duplicate/tie/group planting.",
+   "integer_fk": "Sample from the parent table's generated key pool; never NULL unless the column is nullable; never mutated by duplicate/tie/group planting after assignment; ~10% of parent rows have no child rows.",
+   "integer_quantity": "Uniform integer in [0, 10]; ~5% NULL when nullable.",
+   "integer_year": "Uniform integer in [2005, 2014].",
+   "real_rating": "Uniform real in [1.0, 5.0] rounded to 1 decimal; ~10% NULL when nullable.",
+   "text_enum": "Uniform choice from the column's enum pool; ~10% NULL when nullable.",
+   "text_short": "Uniform choice from a small pool of short labels; ~10% NULL when nullable.",
+   "text_time": "Uniform choice from ['12AM','1AM',...,'11PM'] (24 values); ~5% NULL when nullable.",
+   "text_near_variant": "For each listed literal L, with probability 0.15 emit a near-variant: L with last char changed, L + 'x', or lower(L); otherwise emit L.",
+   "text_boundary": "For each listed boundary literal L, emit L, lower(L), and one near-variant; ensure at least one row per literal.",
+   "text_null_share": "For nullable text columns appearing in COUNT/IS NULL/LEFT JOIN/COALESCE, plant NULL in 5-30% of rows (at least one NULL row).",
+   "duplicates_for_distinct": "On non-key columns flagged for DISTINCT, repeat 20-50% of values so COUNT(col) < COUNT(DISTINCT col). PK and FK columns are exempt.",
+   "ties_for_order_limit": "On ORDER/LIMIT columns, plant at least two rows sharing the rank-1 aggregate value (and rank-5/rank-10 where listed). PK and FK columns are exempt from direct mutation; ties are realized via aggregate expressions over them.",
+   "group_sizes": "Ensure groups of size 1, 2 and >=3 exist for the grouping column; PK and FK columns are exempt from direct mutation.",
+   "unmatched_join_rows": "Ensure some parent rows have no child rows and some child rows reference existing parents; no NULL FKs unless nullable.",
+   "fk_integrity": "After all planting, re-validate every FK value against the parent pool; remap any orphan to a valid parent key. Writer must run with pragma foreign_keys = ON and assert fk_violations = 0.",
+   "compact_rows": "Every instance is built from a byte copy of the compact database; generated rows are appended, never deleting or changing compact rows.",
+   "row_count": "Generated row counts per table must equal table_sizes_per_instance exactly; PK-collapse must not reduce counts."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Business",
+    "column": "business_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      11,
+      12,
+      13,
+      10681,
+      10682,
+      10683
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "business_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Business_Categories.business_id",
+      "Reviews.business_id",
+      "Business_Attributes.business_id"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "city",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Phoenix",
+      "Scottsdale",
+      "Anthem",
+      "Tolleson",
+      "Tempe",
+      "Yuma"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "city",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Scottsdale",
+      "scottsdale",
+      "Sun City Anthem",
+      "sun city anthem",
+      "Glendale",
+      "glendale",
+      "Mesa",
+      "mesa"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "state",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "AZ",
+      "AZ%",
+      "%AZ",
+      "%AZ%"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "state",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "AZ",
+      "az",
+      "Arizona",
+      "arizona"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "active",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "True",
+      "TRUE",
+      "False",
+      "true",
+      "%True"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "active",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "true",
+      "TRUE",
+      "false",
+      "FALSE"
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "stars",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2.9,
+      3,
+      3.1,
+      4.9,
+      5,
+      5.1
+     ]
+    }
+   },
+   {
+    "table": "Business",
+    "column": "stars",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Business",
+    "column": "review_count",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Low",
+      "High",
+      "Medium",
+      "%Low",
+      "%Low%"
+     ]
+    }
+   },
+   {
+    "table": "Categories",
+    "column": "category_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Automotive",
+      "Fashion",
+      "Food",
+      "Bars",
+      "Shopping",
+      "Accessories"
+     ]
+    }
+   },
+   {
+    "table": "Categories",
+    "column": "category_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Pets",
+      "pets",
+      "Women's Clothing",
+      "women's clothing",
+      "Men's Clothing",
+      "men's clothing",
+      "Stadiums & Arenas",
+      "stadiums & arenas"
+     ]
+    }
+   },
+   {
+    "table": "Categories",
+    "column": "category_name",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Users",
+    "column": "user_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2,
+      3,
+      4,
+      60775,
+      60776,
+      60777
+     ]
+    }
+   },
+   {
+    "table": "Users",
+    "column": "user_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Reviews.user_id",
+      "Elite.user_id",
+      "Users_Compliments.user_id"
+     ]
+    }
+   },
+   {
+    "table": "Users",
+    "column": "user_fans",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "None",
+      "High",
+      "Uber",
+      "Low",
+      "%None",
+      "None%"
+     ]
+    }
+   },
+   {
+    "table": "Users",
+    "column": "user_fans",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "High",
+      "high",
+      "None",
+      "none",
+      "Uber",
+      "uber"
+     ]
+    }
+   },
+   {
+    "table": "Users",
+    "column": "user_yelping_since_year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2008,
+      2009,
+      2010,
+      2011,
+      2012,
+      2013
+     ]
+    }
+   },
+   {
+    "table": "Business_Attributes",
+    "column": "attribute_value",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "none",
+      "TRUE",
+      "%none%",
+      "beer_and_wine",
+      "UE"
+     ]
+    }
+   },
+   {
+    "table": "Business_Attributes",
+    "column": "attribute_value",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "false",
+      "FALSE",
+      "no",
+      "NO",
+      "none",
+      "NONE",
+      "waiter service",
+      "WAITER SERVICE"
+     ]
+    }
+   },
+   {
+    "table": "Business_Attributes",
+    "column": "business_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3,
+      1140,
+      1141,
+      1142
+     ]
+    }
+   },
+   {
+    "table": "Business_Attributes",
+    "column": "attribute_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "Attributes",
+    "column": "attribute_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Alcohol",
+      "Open 24 Hours",
+      "waiter_service",
+      "Good for Kids",
+      "Caters",
+      "Wi-Fi"
+     ]
+    }
+   },
+   {
+    "table": "Attributes",
+    "column": "attribute_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Accepts Credit Cards",
+      "accepts credit cards",
+      "Alcohol",
+      "alcohol",
+      "Accepts Insurance",
+      "accepts insurance"
+     ]
+    }
+   },
+   {
+    "table": "Reviews",
+    "column": "review_length",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Long",
+      "Medium",
+      "long",
+      "Medium%",
+      "%long%",
+      "lng"
+     ]
+    }
+   },
+   {
+    "table": "Reviews",
+    "column": "review_length",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Reviews",
+    "column": "review_stars",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "Compliments",
+    "column": "compliment_type",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "cute",
+      "cool"
+     ]
+    }
+   },
+   {
+    "table": "Compliments",
+    "column": "compliment_type",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "photos",
+      "PHOTOS",
+      "cute",
+      "CUTE",
+      "profile",
+      "PROFILE"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Business_Attributes.attribute_id",
+    "parent": "Attributes.attribute_id",
+    "copied": []
+   },
+   {
+    "child": "Business_Attributes.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Business_Categories.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Business_Categories.category_id",
+    "parent": "Categories.category_id",
+    "copied": []
+   },
+   {
+    "child": "Business_Hours.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Business_Hours.day_id",
+    "parent": "Days.day_id",
+    "copied": []
+   },
+   {
+    "child": "Checkins.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Checkins.day_id",
+    "parent": "Days.day_id",
+    "copied": []
+   },
+   {
+    "child": "Elite.user_id",
+    "parent": "Users.user_id",
+    "copied": []
+   },
+   {
+    "child": "Elite.year_id",
+    "parent": "Years.year_id",
+    "copied": []
+   },
+   {
+    "child": "Reviews.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Reviews.user_id",
+    "parent": "Users.user_id",
+    "copied": []
+   },
+   {
+    "child": "Tips.business_id",
+    "parent": "Business.business_id",
+    "copied": []
+   },
+   {
+    "child": "Tips.user_id",
+    "parent": "Users.user_id",
+    "copied": []
+   },
+   {
+    "child": "Users_Compliments.compliment_id",
+    "parent": "Compliments.compliment_id",
+    "copied": []
+   },
+   {
+    "child": "Users_Compliments.user_id",
+    "parent": "Users.user_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Business",
+    "column": "active",
+    "formula": "active IN ('true','false','True','False','TRUE','FALSE')"
+   },
+   {
+    "table": "Business",
+    "column": "stars",
+    "formula": "stars BETWEEN 1.0 AND 5.0"
+   },
+   {
+    "table": "Business",
+    "column": "review_count",
+    "formula": "review_count IN ('Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Business",
+    "column": "state",
+    "formula": "state IN ('AZ','SC','CA','Arizona','arizona')"
+   },
+   {
+    "table": "Business_Hours",
+    "column": "opening_time",
+    "formula": "opening_time IN ('12AM','1AM','2AM','3AM','4AM','5AM','6AM','7AM','8AM','9AM','10AM','11AM','12PM','1PM','2PM','3PM','4PM','5PM','6PM','7PM','8PM','9PM','10PM','11PM')"
+   },
+   {
+    "table": "Business_Hours",
+    "column": "closing_time",
+    "formula": "closing_time IN ('12AM','1AM','2AM','3AM','4AM','5AM','6AM','7AM','8AM','9AM','10AM','11AM','12PM','1PM','2PM','3PM','4PM','5PM','6PM','7PM','8PM','9PM','10PM','11PM')"
+   },
+   {
+    "table": "Reviews",
+    "column": "review_stars",
+    "formula": "review_stars BETWEEN 1 AND 5"
+   },
+   {
+    "table": "Reviews",
+    "column": "review_length",
+    "formula": "review_length IN ('Short','Medium','Long')"
+   },
+   {
+    "table": "Tips",
+    "column": "likes",
+    "formula": "likes >= 0"
+   },
+   {
+    "table": "Tips",
+    "column": "tip_length",
+    "formula": "tip_length IN ('Short','Medium','Long')"
+   },
+   {
+    "table": "Users",
+    "column": "user_yelping_since_year",
+    "formula": "user_yelping_since_year BETWEEN 2005 AND 2014"
+   },
+   {
+    "table": "Users",
+    "column": "user_fans",
+    "formula": "user_fans IN ('None','Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Users",
+    "column": "user_votes_funny",
+    "formula": "user_votes_funny IN ('None','Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Users",
+    "column": "user_votes_useful",
+    "formula": "user_votes_useful IN ('None','Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Users",
+    "column": "user_votes_cool",
+    "formula": "user_votes_cool IN ('None','Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Users",
+    "column": "user_review_count",
+    "formula": "user_review_count IN ('Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Users_Compliments",
+    "column": "number_of_compliments",
+    "formula": "number_of_compliments IN ('Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Checkins",
+    "column": "label_time_0",
+    "formula": "label_time_0 IN ('None','Low','Medium','High')"
+   },
+   {
+    "table": "Checkins",
+    "column": "label_time_5",
+    "formula": "label_time_5 IN ('None','Low','Medium','High','Uber')"
+   },
+   {
+    "table": "Compliments",
+    "column": "compliment_type",
+    "formula": "compliment_type IN ('photos','cool','hot','note','more','funny','writer','plain','cute','profile','list')"
+   },
+   {
+    "table": "Days",
+    "column": "day_of_week",
+    "formula": "day_of_week IN ('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')"
+   },
+   {
+    "table": "Years",
+    "column": "actual_year",
+    "formula": "actual_year BETWEEN 2005 AND 2014"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Attributes": 80,
+   "Categories": 200,
+   "Compliments": 11,
+   "Days": 7,
+   "Years": 10,
+   "Business": 400,
+   "Users": 400,
+   "Business_Attributes": 800,
+   "Business_Categories": 800,
+   "Business_Hours": 800,
+   "Checkins": 800,
+   "Elite": 400,
+   "Reviews": 800,
+   "Tips": 800,
+   "Users_Compliments": 800
+  },
+  "null_targets": [
+   "Business.stars",
+   "Business.city",
+   "Business.state",
+   "Business.active",
+   "Business.review_count",
+   "Categories.category_name",
+   "Attributes.attribute_name",
+   "Compliments.compliment_type",
+   "Days.day_of_week",
+   "Years.actual_year",
+   "Business_Attributes.attribute_value",
+   "Business_Hours.opening_time",
+   "Business_Hours.closing_time",
+   "Checkins.label_time_0",
+   "Checkins.label_time_1",
+   "Checkins.label_time_2",
+   "Checkins.label_time_3",
+   "Checkins.label_time_4",
+   "Checkins.label_time_5",
+   "Checkins.label_time_6",
+   "Checkins.label_time_7",
+   "Checkins.label_time_8",
+   "Checkins.label_time_9",
+   "Checkins.label_time_10",
+   "Checkins.label_time_11",
+   "Checkins.label_time_12",
+   "Checkins.label_time_13",
+   "Checkins.label_time_14",
+   "Checkins.label_time_15",
+   "Checkins.label_time_16",
+   "Checkins.label_time_17",
+   "Checkins.label_time_18",
+   "Checkins.label_time_19",
+   "Checkins.label_time_20",
+   "Checkins.label_time_21",
+   "Checkins.label_time_22",
+   "Checkins.label_time_23",
+   "Reviews.review_stars",
+   "Reviews.review_votes_funny",
+   "Reviews.review_votes_useful",
+   "Reviews.review_votes_cool",
+   "Reviews.review_length",
+   "Tips.likes",
+   "Tips.tip_length",
+   "Users.user_yelping_since_year",
+   "Users.user_average_stars",
+   "Users.user_votes_funny",
+   "Users.user_votes_useful",
+   "Users.user_votes_cool",
+   "Users.user_review_count",
+   "Users.user_fans",
+   "Users_Compliments.number_of_compliments"
+  ],
+  "supporting_evidence": {
+   "Business.stars": "Sample rows show stars in {1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0}; statistics distinct=9, range 1.0-5.0.",
+   "Business.active": "Sample values 'true','false'; statistics distinct=2.",
+   "Business.state": "Sample values 'AZ','SC','CA'; statistics distinct=3; boundary values 'Arizona'/'arizona' added to enum pool to make comparison_boundary reachable.",
+   "Business.review_count": "Sample values 'Low','Medium','High','Uber'; statistics distinct=4.",
+   "Reviews.review_stars": "Sample values 1-5; statistics distinct=5.",
+   "Reviews.review_length": "Sample values 'Short','Medium','Long'; statistics distinct=3.",
+   "Tips.likes": "Sample values 0,1,2,3; statistics distinct=4, non-negative.",
+   "Tips.tip_length": "Sample values 'Short','Medium','Long'; statistics distinct=3.",
+   "Users.user_yelping_since_year": "Sample values 2006-2014; statistics distinct=11.",
+   "Users.user_fans": "Sample values 'None','Low','Medium','High','Uber'; statistics distinct=5.",
+   "Users_Compliments.number_of_compliments": "Sample values 'Low','Medium','High','Uber'; statistics distinct=4.",
+   "Compliments.compliment_type": "Sample values photos,cool,hot,note,more,funny,writer,plain; statistics distinct=11.",
+   "Days.day_of_week": "Sample values Sunday-Saturday; statistics distinct=7.",
+   "Years.actual_year": "Sample values 2005-2012; statistics distinct=10.",
+   "Business_Hours.opening_time/closing_time": "Sample values 4PM,5AM,7AM,8AM,9AM,10AM,11AM,12PM and 2PM,4PM,5PM,6PM,7PM,8PM,9PM,10PM; statistics distinct=24."
+  },
+  "uncertainty": {
+   "Business.stars": "Exact distribution unknown; uniform over 1.0-5.0 in 0.5 steps assumed; lower bound may be 1.5 per sample.",
+   "Business.review_count": "Semantic meaning of 'Uber' label unclear; treated as enum value.",
+   "Compliments.compliment_type": "Full 11-value list inferred from statistics distinct=11; sample shows 8.",
+   "Checkins.label_time_*": "Per-hour label pools vary; generic enum pool used for all 24 columns.",
+   "Users.user_average_stars": "Stored as TEXT but compared numerically; generated as text of a real in [1.0,5.0].",
+   "Business.state": "Enum pool extended with 'Arizona'/'arizona' to satisfy comparison_boundary; LIKE-pattern literals handled by near-variant sampler, not enum sampler."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 172677 across 20 instances, and validity.reasons includes 'new_integrity_failures' for all 20 instances. The writer (tscore_gen/writer.py) sets 'pragma foreign_keys = OFF' and inserts generated rows without validating FK targets; instance.py's fill_foreign_keys_consistently draws child FKs from _parent_pool, but _apply_spec then runs _plant_duplicates/_plant_ties/_plant_group_sizes/_plant_different_values on FK columns (e.g. Business_Attributes.business_id, Reviews.business_id, Business_Categories.business_id are all in DISTINCT_COLUMNS/TIE_COLUMNS/GROUP_COLUMNS), overwriting FK values with arbitrary values from the same column that may not exist in the parent. sample_fresh_primary_keys and drop_unique_duplicates also drop rows after FK assignment, and the self-FK remap loop only handles pt == t, so cross-table FK consistency is not re-established after spec planting.",
+     "requested_revision": "Ensure FK columns are never mutated by _plant_duplicates/_plant_ties/_plant_group_sizes/_plant_different_values (or re-validate/remap FK values to the parent pool after planting). Enable 'pragma foreign_keys = ON' (or explicitly verify FK targets) in writer.py so violations are caught, and re-run until fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons includes 'compact_rows_missing' for all 20 instances. writer.py copies the compact DB only when orig_path is passed, but cli.py calls write_instance_sqlite(_G['schema'], inst, p) without orig_path, so the instance is built from schema.ddl only and the compact rows are never present. The docstring claims 'The instance file starts as a byte copy of the compact database', contradicting the call site.",
+     "requested_revision": "Pass the original database path (a['orig']) through to write_instance_sqlite so the compact rows are preserved, or otherwise guarantee compact rows are present in every instance; re-run and confirm 'compact_rows_missing' no longer appears."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added shows Business: 280 and Users: 280 over 20 instances (~14 per instance), while TABLE_SIZES specifies Business: 400 and Users: 400. The cause is that Business.business_id and Users.user_id are in DISTINCT_COLUMNS and TIE_COLUMNS, so _plant_duplicates/_plant_ties collapse many PK values, and sample_fresh_primary_keys then drops the duplicate-PK rows. This also means the 'duplicates_for_distinct' rule is being applied to primary-key columns, which is semantically wrong (PKs must be unique) and destroys the intended table size.",
+     "requested_revision": "Exclude primary-key columns from DISTINCT_COLUMNS/TIE_COLUMNS/GROUP_COLUMNS planting (or apply duplicates only to non-PK columns), and ensure generated row counts match TABLE_SIZES per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists Business.business_id, Users.user_id, Categories.category_id, Attributes.attribute_id, Business_Attributes.attribute_id, Business_Categories.category_id, Business_Hours.business_id, Checkins.business_id, Reviews.business_id, Reviews.user_id, Elite.user_id, Elite.year_id, Users_Compliments.user_id under duplicates_for_distinct / ties_for_order_limit / group_sizes. These are primary-key or FK columns whose uniqueness is enforced by the schema (PK constraints) or whose duplication would violate FK integrity; the 'duplicates_for_distinct' rule as written is unsatisfiable for PK columns and conflicts with the integrity constraints.",
+     "requested_revision": "Restrict duplicates_for_distinct / ties_for_order_limit / group_sizes to non-key columns (or to aggregate expressions over them), and document that PK/FK columns are exempt. Keep the boundary/near-variant rules for these columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas includes Business.state IN ('AZ','SC','CA') and Business.review_count IN ('Low','Medium','High','Uber'), but the per-column exceptions and BOUNDARY/NEAR entries for Business.state include 'Arizona'/'arizona' and for Business.city include 'Sun City Anthem' etc. The state enum ('AZ','SC','CA') is inconsistent with the boundary values ('Arizona','arizona') and with the like_near_variant literals ('AZ%','%AZ','%AZ%'), which are LIKE patterns, not enum members. The program's EnumSampler for Business.state will never emit 'Arizona', so the comparison_boundary target for state is not satisfiable.",
+     "requested_revision": "Reconcile the state domain: either add 'Arizona'/'arizona' to the enum pool or remove them from BOUNDARY; similarly ensure LIKE-pattern literals are handled by the near-variant sampler rather than the enum sampler. Document which columns are enum vs. free-text."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specification.py NULL_SHARE includes ('Business','stars'): 0.15 and ('Business','city'): 0.10 etc., but the execution feedback 'nullable_columns' only reports NULLs for Attributes.attribute_name, Categories.category_name, Compliments.compliment_type, Days.day_of_week. Business.stars, Business.city, Business.state, Business.active, Business.review_count, Reviews.review_length, Users.user_fans, etc. show no NULL counts, indicating _plant_nulls is not effective for those columns (likely because the sampler for those columns is a BoundarySampler/EnumSampler whose values are overwritten by _plant_duplicates/_plant_ties after null planting, or because the column is not in the generated column set).",
+     "requested_revision": "Verify _plant_nulls runs after all other planting for every nullable column and that the resulting NULL share matches the compact database's share; add a per-column NULL assertion in the writer or a post-generation check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 824, separated 162, unknown_executions 0. The specification's per-column exceptions (e.g. Business.business_id comparison_boundary values 11,12,13,10681,10682,10683; Users.user_id 2,3,4,60775,60776,60777) are implemented via BoundarySampler, but because Business.business_id and Users.user_id are PKs and are then collapsed by _plant_duplicates/_plant_ties and dropped by sample_fresh_primary_keys, the boundary values are not reliably present. This is consistent with the low separation rate and the reduced row counts.",
+     "requested_revision": "After fixing the PK/duplicate issue, confirm that each boundary literal appears at least once per instance (add an assertion in the generator) and re-measure construction_pairs separation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'uncertainty' notes Business.stars distribution is assumed uniform over 1.0-5.0 in 0.5 steps, but the supporting_evidence says 'Sample rows show stars in {1.5,2.0,...,5.0}; statistics distinct=9, range 1.0-5.0'. The RANGES entry uses (1.0, 5.0, 0.5) which yields 9 values including 1.0, but the sample shows 1.5 as minimum. This is a minor inconsistency; the rule is supported but the exact lower bound is uncertain.",
+     "requested_revision": "Clarify whether Business.stars lower bound is 1.0 or 1.5 and align RANGES and supporting_evidence."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL share per column matches the hard-coded NULL_SHARE values (the specification says 'following the compact database's share' but the program uses fixed shares).",
+    "Whether the 162 separated construction pairs are the intended ones or whether the low separation is due to the PK-collapse bug; needs re-measurement after fixes.",
+    "Whether Business.state 'Arizona' boundary value is intended to be reachable (currently unreachable via EnumSampler)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows massive row loss: rows_skipped is large for nearly every table (e.g. Business_Attributes 1777 skipped, Business_Categories 1730, Business_Hours 1024, Checkins 2792, Elite 1515, Reviews 1298, Tips 2139, Users_Compliments 1089, Attributes 386, Categories 388, Compliments 103, Days 76, Years 128, Business 160, Users 120). The specification's generic_sampling_rules.row_count states: 'Generated row counts per table must equal table_sizes_per_instance exactly; PK-collapse must not reduce counts.' The writer's _insert_rows silently skips rows that violate constraints (fallback row-by-row with bad counter), and instance.py's sample_fresh_primary_keys / drop_unique_duplicates drop rows. The net effect is that generated row counts do not equal the specified table sizes.",
+     "requested_revision": "Make generation produce exactly TABLE_SIZES rows per table per instance. Either (a) generate PK/FK values that are guaranteed unique/valid so no rows are skipped, or (b) if the spec intends 'appended rows' to be exactly the table size, adjust the samplers so PK-collapse and constraint failures cannot occur (e.g. draw PKs from a disjoint range above the compact max, ensure FK pools are non-empty, and avoid planting NULLs on NOT NULL columns). Report rows_ok == TABLE_SIZES for every table, or explicitly reconcile the spec's row_count rule with the observed skipping."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` plants NULLs on any column listed in S.NULL_SHARE, including columns that are NOT NULL in the schema (e.g. Business.stars is REAL nullable? \u2014 but Business.active, Business.city, Business.state, Business.review_count are TEXT and nullable; however Business_Attributes.attribute_value is nullable; but the spec's null_targets includes Business.stars etc.). More importantly, `_plant_nulls` is applied to columns like Business.stars which is fine, but the writer then skips rows that violate NOT NULL. The feedback shows rows_skipped for Business (160) and Users (120) \u2014 these are PK tables where NULL planting on non-key columns should not cause skips unless a NOT NULL column got NULL. The spec's null_targets list includes columns that are NOT NULL in the DDL (e.g. Business.stars is REAL \u2014 nullable; but Business.active TEXT \u2014 nullable; however Business.business_id is PK and not in null_targets). The real issue: `_plant_nulls` is applied before `sample_fresh_primary_keys`, and NULLs planted on FK columns (e.g. Business_Attributes.business_id) would be remapped, but NULLs on NOT NULL non-key columns cause skips.",
+     "requested_revision": "Restrict NULL planting to columns that are actually nullable per the schema (ColumnMeta.notnull == False). Do not plant NULL on NOT NULL columns. This will eliminate the constraint-violation skips and align with the interface rule 'NOT NULL / primary-key columns never get NULL'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `unmatched_join_rows` rule requires 'some parent rows have no child rows and some child rows reference existing parents'. The program's `fill_foreign_keys_consistently` draws FK values uniformly from the parent pool with replacement, and `_remap_fks` remaps orphans. There is no explicit mechanism to guarantee that some parent rows have no children \u2014 it relies on random sampling. With 400 Business rows and 800 child rows, it is statistically likely but not guaranteed. More critically, the feedback shows `construction_pairs.separated = 130` out of 824 eligible, which is low but not necessarily an error. However, the `unmatched_join_rows` rule is not explicitly enforced.",
+     "requested_revision": "Add explicit planting for unmatched_join_rows: after FK assignment, verify that at least one parent row per listed child table has no child rows; if not, reassign some child FK values away from that parent. Document this in the specification as an enforced rule rather than a probabilistic outcome."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Business.state IN ('AZ','SC','CA','Arizona','arizona')` and `Business.active IN ('true','false','True','False','TRUE','FALSE')`, but the `like_near_variant` targets for Business.state include 'AZ%', '%AZ', '%AZ%' which are LIKE patterns, not enum values. The `text_near_variant` rule says 'For each listed literal L, with probability 0.15 emit a near-variant: L with last char changed, L + 'x', or lower(L)'. For 'AZ%', the near-variant would be 'AZ%x' or 'az%', which are not valid state values. The BoundarySampler for NEAR uses `like_variants` which strips '%' \u2014 this is a reasonable interpretation but the spec should clarify that LIKE-pattern literals are handled by the near-variant sampler, not the enum sampler (the uncertainty section does say this for state, but not consistently for all columns).",
+     "requested_revision": "Clarify in the specification that LIKE-pattern literals (containing '%') are handled exclusively by the near-variant sampler and are not required to appear as exact enum values. Ensure the enum pools and boundary lists are consistent with this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_plant_ties` function in instance.py uses `top = max(non_null) if all(isinstance(v, (int, float)) for v in non_null) else non_null[0]`. For text columns, it picks the first non-null value as the 'top', which may not correspond to the rank-1 aggregate value in any meaningful query. The spec's `ties_for_order_limit` says 'plant at least two rows sharing the rank-1 aggregate value'. For text columns ordered by COUNT(*), the tie should be on the count, not the value. The current implementation ties on the column value, which is a different thing.",
+     "requested_revision": "For ties_for_order_limit on text columns, ensure that at least two distinct values each appear the same number of times (so COUNT(*) ties at rank 1). The current value-based tie planting does not achieve this. Revise `_plant_ties` to plant frequency ties rather than value ties for non-numeric columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_plant_group_sizes` function sets out[idx[0]] = a, out[idx[1]] = b, out[idx[2]] = b, out[idx[3]] = a, out[idx[4]] = a, out[idx[5]] = a. This creates groups: a appears 4 times, b appears 2 times. It does not guarantee a group of size 1. The spec requires 'groups of size 1, 2 and >= 3'. The current implementation creates sizes 4 and 2, missing size 1.",
+     "requested_revision": "Revise `_plant_group_sizes` to explicitly create at least one group of size 1, one of size 2, and one of size >= 3. For example, set out[idx[0]] = a (size 1), out[idx[1]] = out[idx[2]] = b (size 2), out[idx[3]] = out[idx[4]] = out[idx[5]] = c (size 3), using three distinct values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `table_sizes_per_instance` lists Years: 10, but the feedback shows Years rows_added: 0 and rows_skipped: 128. This means all generated Years rows were skipped. The Years table has year_id as PK and actual_year. The RangeSampler for Years.year_id generates 2005-2014, but the compact database likely already has these year_ids, causing PK collisions. The spec says 'PK-collapse must not reduce counts', but the program's sample_fresh_primary_keys drops duplicates.",
+     "requested_revision": "Either (a) generate Years.year_id values outside the compact range (e.g. 2015-2024) to avoid PK collisions, or (b) clarify that table_sizes_per_instance refers to total rows including compact rows, and adjust the generation to append only non-colliding rows. The current behavior (0 added, 128 skipped) violates the row_count rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_remap_fks` function remaps orphan FK values to a random valid parent key. However, it does not handle the case where the parent pool is empty (it sets all to None). For NOT NULL FK columns, this would cause constraint violations and row skips. The feedback shows FK violations = 0, so this is not currently causing issues, but it's a latent bug.",
+     "requested_revision": "Ensure that FK columns that are NOT NULL never receive None. If the parent pool is empty, this should be a generation error (or the parent table should be guaranteed non-empty). Add an assertion or explicit handling."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` for Business.stars says 'Sample rows show stars in {1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0}; statistics distinct=9, range 1.0-5.0.' But the RANGES entry uses (1.0, 5.0, 0.5) which gives 9 values: 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0. This is consistent. However, the BOUNDARY for Business.stars includes 2.9, 3.0, 3.1, 4.9, 5.0, 5.1 \u2014 values like 2.9, 3.1, 4.9, 5.1 are outside the 0.5-step range and would not be generated by the RangeSampler. The BoundarySampler is only used if the column is in BOUNDARY, but the spec_sampler checks ENUMS first, then RANGES, then BOUNDARY. Since Business.stars is in RANGES, the BoundarySampler is never used, so the boundary values 2.9, 3.1, 4.9, 5.1 are never generated.",
+     "requested_revision": "Either (a) remove Business.stars from RANGES and use BoundarySampler with the boundary values plus range values, or (b) add the boundary values to the RangeSampler's output. The current priority order means boundary values for Business.stars are unreachable."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the low construction_pairs.separated (130/824) indicates a generation problem or is expected given the query set.",
+    "Whether the compact database's actual NULL shares match the specification's NULL_SHARE values (the feedback shows generated NULL shares, not compact shares).",
+    "Whether the `unmatched_join_rows` rule is satisfied in practice (not explicitly verified in feedback)."
+   ]
+  }
+ ]
 }

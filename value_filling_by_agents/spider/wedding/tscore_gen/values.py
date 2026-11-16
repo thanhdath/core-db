@@ -7,6 +7,11 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+_NAME_POOL = ['Mike Weir', 'Juli Hanson', 'Ricky Barnes', 'Summer Duval', 'Todd Hamilton',
+              'Annie Mediate', 'Lucas Glover', "Joe O'Hair", 'Wycam Clark', 'Hoton', 'Ezra Booth',
+              'Warren Parrish', 'Isaac Russell', 'William Chubby', 'George M. Hinkle', 'Hiram Page']
+_COUNTRY_POOL = ['Canada', 'Sweden', 'United States', 'Northern Ireland', 'Australia']
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -182,6 +187,120 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class IntRangeSampler(ColumnSampler):
+    """Integer sampler over an explicit [lo, hi] range with boundary values."""
+
+    def __init__(self, elements, p, max_l0, rng, lo, hi, boundaries=()):
+        super().__init__(elements, p, max_l0, rng)
+        self.lo, self.hi = int(lo), int(hi)
+        bset = set()
+        for b in boundaries:
+            for d in (-1, 0, 1):
+                v = int(b) + d
+                if self.lo <= v <= self.hi:
+                    bset.add(v)
+        self.boundaries = sorted(bset)
+
+    def seed_boundaries(self, n: int) -> list:
+        """Forced boundary draws: one per boundary value, then one step on each side."""
+        r = self.rng
+        out = []
+        if not self.boundaries or n <= 0:
+            return out
+        vals = list(self.boundaries)
+        r.shuffle(vals)
+        out.extend(vals[:n])
+        if len(out) < n and self.boundaries:
+            b = self.boundaries[0]
+            for d in (-1, 1):
+                if len(out) >= n:
+                    break
+                v = b + d
+                if self.lo <= v <= self.hi:
+                    out.append(v)
+        return out
+
+    def _draw(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.45:
+            return r.choice(self.boundaries)
+        return r.randint(self.lo, self.hi)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                return self._fresh_or_reuse(self._draw)
+            if r.random() < 0.25:
+                v += r.choice((-1, 1))
+            return max(self.lo, min(self.hi, v))
+        return self._fresh_or_reuse(self._draw)
+
+
+class EnumSampler(ColumnSampler):
+    """Explicit enum list (e.g. Is_Male IN ('T','F'))."""
+
+    def __init__(self, elements, p, max_l0, rng, values):
+        super().__init__(elements, p, max_l0, rng)
+        self.values = list(values) or ['T', 'F']
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return r.choice(self.values)
+
+
+class PoolTextSampler(ColumnSampler):
+    """Text sampler over a short pool of distinct values with a duplicate share."""
+
+    def __init__(self, elements, p, max_l0, rng, pool, dup_share=(0.2, 0.5)):
+        super().__init__(elements, p, max_l0, rng)
+        self.pool = [str(x) for x in pool if x is not None] or ['x']
+        self.dup_lo, self.dup_hi = dup_share
+        self.emitted: list = []
+
+    def _variant(self, base: str) -> str:
+        r = self.rng
+        u = r.random()
+        if u < 0.25:
+            return base + r.choice(string.ascii_lowercase)
+        if u < 0.5:
+            return base + ' ' + r.choice(['II', 'Jr', 'Sr', 'the', 'of'])
+        if u < 0.75 and len(base) > 1:
+            return base[:-1]
+        return base
+
+    def sample(self):
+        r = self.rng
+        share = r.uniform(self.dup_lo, self.dup_hi)
+        if self.emitted and r.random() < share:
+            return r.choice(self.emitted)
+        if self.elements and r.random() >= self.p:
+            v = str(r.choice(self.elements))
+        else:
+            v = self._variant(r.choice(self.pool))
+        self.emitted.append(v)
+        return v
+
+
+class NameSampler(PoolTextSampler):
+    """Distinct-ish person names with near-duplicate variants."""
+
+    def __init__(self, elements, p, max_l0, rng, pool=None):
+        super().__init__(elements, p, max_l0, rng, pool or _NAME_POOL, dup_share=(0.0, 0.15))
+
+
+class CountrySampler(PoolTextSampler):
+    """Small pool of countries."""
+
+    def __init__(self, elements, p, max_l0, rng, pool=None):
+        super().__init__(elements, p, max_l0, rng, pool or _COUNTRY_POOL, dup_share=(0.0, 0.2))
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +352,27 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def make_spec_sampler(column, spec: dict, literal_pool: list, original_values, p: float, rng,
+                      max_l0: float = float('inf')) -> ColumnSampler:
+    """Build the sampler for one column from its specification entry."""
+    kind = (spec or {}).get('kind')
+    ov = [v for v in original_values if v is not None]
+    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    if column.checked:
+        p = 0.0
+    if kind == 'int_quantity' or kind == 'int_year':
+        lo, hi = spec.get('range', (0, 100))
+        return IntRangeSampler(els, p, max_l0, rng, lo, hi, spec.get('boundaries', ()))
+    if kind == 'enum':
+        return EnumSampler(els, p, max_l0, rng, spec.get('values', ['T', 'F']))
+    if kind == 'text_name':
+        return NameSampler(els, p, max_l0, rng)
+    if kind == 'text_country':
+        return CountrySampler(els, p, max_l0, rng)
+    if kind == 'text':
+        pool = ov or ['x']
+        share = spec.get('duplicate_share', (0.2, 0.5))
+        return PoolTextSampler(els, p, max_l0, rng, pool, dup_share=share)
+    return _init_sampler(column, literal_pool, original_values, p, rng, 1 if column.pk_pos else 0, max_l0)

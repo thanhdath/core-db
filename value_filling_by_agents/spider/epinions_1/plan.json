@@ -1,65 +1,338 @@
 {
  "db": "epinions_1",
- "operator_io_quirks": [
-  "Tiny DB (item 8, review 7, useracct 7, trust 9 rows): original_values lists are short, so rng.choices(k=min(5,len)) often returns nearly all rows; no sampling cap matters.",
-  "Mixed quoting in DDL: item/review/useracct use backticks, trust uses double quotes; writer must replay sqlite_master text verbatim.",
-  "trust has NO primary key (pk=[]): sample_fresh_primary_keys must no-op on empty PK tuple, else all rows collapse to one.",
-  "trust has two FKs to the SAME parent useracct(u_id) (source_u_id, target_u_id): both draw from useracct.u_id final values; self-join semantics rely on overlap.",
-  "review.a_id is INTEGER PRIMARY KEY (rowid alias) but also has an explicit index idx_review_IDX_RATING_AID; harmless duplicate.",
-  "All declared types are INTEGER or varchar(N); no date/time/bool/bit/year columns, so Date/Time/Bool/Bit fuzzers never fire here.",
-  "varchar(20)/varchar(128) dispatch to String(length=20/128); title samples are short words, name samples are capitalized first names.",
-  "No NULLs anywhere (null_rate 0.0 on every column) despite nullable declarations; TS will still emit NULLs via String/Number dropout only if elements empty.",
-  "review.rating and review.rank are nullable INTEGER with small distinct sets (4 and 7); Number fuzzer will produce wide-range ints far outside [1,10].",
-  "FK graph is acyclic: useracct -> item -> review, useracct -> trust; table_order levels: [item,useracct] then [review,trust].",
-  "No views, no triggers, no CHECK constraints, no UNIQUE columns beyond PKs; drop_unique_duplicates is a no-op except on PKs.",
-  "All storage classes match declared types (integer/text); no affinity contradictions to survive."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on i_id/u_id/a_id (INTEGER, scale=0, precision unset): range [-1,1] full-range, list range [min(el), 1]; PKs get max_l0=inf so fresh draws dominate -> tiny ints like -1,0,1,2.",
-  "Number fuzzer on rating/rank/trust: same [-1,1] range, so values like 0,1,-1,2 appear; original 5..10 ratings never reproduced -> implausible values drive FN on rating predicates.",
-  "String fuzzer on title/name: 20% fresh random strings over a-zA-Z0-9() of length 0..20/0..128, 50% contaminate; names like 'Helen' rarely reproduced -> FN on name equality.",
-  "FK columns u_id/i_id/source_u_id/target_u_id draw from parent's FINAL filtered values with replacement; since parents are tiny, child FK values are a small subset -> join cardinalities shrink.",
-  "review.a_id PK filtered by sample_fresh_primary_keys; with max_l0=inf and range [-1,1], duplicates likely -> many rows dropped, review may end up with <7 rows.",
-  "trust has no PK, so no PK dedup; but source_u_id/target_u_id drawn from useracct.u_id (7 values) -> many duplicate (source,target) pairs, no uniqueness enforced.",
-  "choose_table_sizes: 50% branch gives int(30*u + u2*200) ~ 0..230 per table; other branch level0=1+30u, level1 x4 capped 2500 -> review/trust can be much larger than parents.",
-  "Number perturbation (+-1,+-2 sequential draws) on PKs makes consecutive a_id values collide -> PK dedup drops rows, shrinking review below parent item size.",
-  "No Date/Time/Bool fuzzers fire, so no template/format misses; all misses are numeric-range and string-content implausibility.",
-  "Literal pool from train SQL will seed rating/rank/trust with real values (5,6,7,10) but Number list_max quirk (overwrite with full-range max=1) discards them -> pool values ignored for INTEGER columns.",
-  "String pool values (names, titles) survive as elements and are returned w.p. 1-p=0.8, so name/title equality predicates have decent hit rate; contamination adds noise.",
-  "Empty parent (if useracct filtered to 0 rows) yields NULLs in child FK columns despite NOT NULL -> insert failures skipped, further shrinking review/trust."
- ],
- "challenger_refs": [
-  "G2",
-  "g47dca977",
-  "g47dca977",
-  "g47dca977",
-  "g47dca977",
-  "g47dca977",
-  "g47dca977",
-  "g47dca977",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "gc4b74558",
-  "g1bc04805",
-  "g1bc04805",
-  "gb3bae7de",
-  "g3f090c4a",
-  "g216b1f77",
-  "G3",
-  "G1",
-  "g938194ea",
-  "g938194ea"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, step 1, unique per table; never NULL; fresh PKs start after the compact max so compact rows are never overwritten.",
+   "integer_fk": "Copy from the parent table's final key pool (after PK dedup and unique-drop); include at least one parent row with no children; where the FK column is nullable, include at least one NULL child FK.",
+   "integer_numeric": "Uniform integer in [min, max] derived from statistics; include boundary values at each listed literal and one step on each side.",
+   "varchar_short": "Pick from a small pool of distinct short strings; allow near-duplicate variants (case/whitespace) when no constraint forbids it.",
+   "varchar_name": "Pick from a pool of distinct person-like names; allow near-duplicate variants.",
+   "nullable_column": "With probability equal to the compact database's observed null share for that column, emit NULL; if the compact share is 0.0, emit NULL only when the interface rule requires at least one NULL row; otherwise sample from the non-NULL domain.",
+   "distinct_column": "Ensure duplicate share in 20-50% for columns flagged with duplicates_for_distinct.",
+   "order_tie_column": "Ensure at least two rows tie at the listed LIMIT rank on the ORDER expression.",
+   "group_size_column": "Assign FK/group values so that groups of size 1, 2 and >= 3 exist for GROUP columns; best-effort when table size is small."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "item",
+    "column": "i_id",
+    "pattern": "group_sizes, unmatched_join_rows, comparison_boundary, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "joins_with": [
+      "review.i_id"
+     ],
+     "parent_rows_without_children": true,
+     "equal_and_one_step_from": [
+      "review.i_id"
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "AVG(review.rating)",
+      "AVG(review.rank)"
+     ]
+    }
+   },
+   {
+    "table": "item",
+    "column": "title",
+    "pattern": "group_sizes, duplicates_for_distinct, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "duplicate_share": "20-50 %",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "table": "review",
+    "column": "i_id",
+    "pattern": "group_sizes, unmatched_join_rows, comparison_boundary, null_rows, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "joins_with": [
+      "item.i_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "equal_and_one_step_from": [
+      "item.i_id"
+     ],
+     "null_share": "none (NOT NULL column)",
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "AVG(review.rating)",
+      "AVG(review.rank)"
+     ]
+    }
+   },
+   {
+    "table": "review",
+    "column": "u_id",
+    "pattern": "group_sizes, unmatched_join_rows, duplicates_for_distinct",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "joins_with": [
+      "useracct.u_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "review",
+    "column": "rating",
+    "pattern": "aggregate_boundary, ties_for_order_limit",
+    "targets": {
+     "aggregate": [
+      "AVG(review.rating)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "review",
+    "column": "rank",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "table": "useracct",
+    "column": "u_id",
+    "pattern": "group_sizes, unmatched_join_rows, duplicates_for_distinct",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "joins_with": [
+      "review.u_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "useracct",
+    "column": "name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "trust",
+    "column": "source_u_id",
+    "pattern": "group_sizes, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "table": "trust",
+    "column": "target_u_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "trust",
+    "column": "trust",
+    "pattern": "rows_with_different_values, ties_for_order_limit",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "review",
+    "child_column": "u_id",
+    "parent_table": "useracct",
+    "parent_column": "u_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "review",
+    "child_column": "i_id",
+    "parent_table": "item",
+    "parent_column": "i_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "trust",
+    "child_column": "source_u_id",
+    "parent_table": "useracct",
+    "parent_column": "u_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "trust",
+    "child_column": "target_u_id",
+    "parent_table": "useracct",
+    "parent_column": "u_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "item",
+    "column": "i_id",
+    "formula": "i_id >= 0"
+   },
+   {
+    "table": "review",
+    "column": "a_id",
+    "formula": "a_id > 0"
+   },
+   {
+    "table": "review",
+    "column": "rating",
+    "formula": "rating IS NULL OR rating BETWEEN 0 AND 10"
+   },
+   {
+    "table": "review",
+    "column": "rank",
+    "formula": "rank IS NULL OR rank > 0"
+   },
+   {
+    "table": "trust",
+    "column": "trust",
+    "formula": "trust >= 0"
+   },
+   {
+    "table": "useracct",
+    "column": "u_id",
+    "formula": "u_id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "item": 8,
+   "useracct": 7,
+   "review": 7,
+   "trust": 9
+  },
+  "null_targets": [
+   "review.rating",
+   "review.rank",
+   "item.title",
+   "useracct.name"
+  ],
+  "supporting_evidence": {
+   "review.rating": "Rows show ratings 10,5,7,6 within [0,10]; aggregate boundary values 4,5,6 cited.",
+   "review.rank": "Rows show ranks 1..7; comparison boundary values 2,3,4 cited.",
+   "trust.trust": "Rows show trust values 10,6,8,3,2,4,1,7 all >= 0.",
+   "item.i_id": "Rows 0..7; comparison boundary with review.i_id cited.",
+   "useracct.u_id": "Rows 1..7; duplicate share 20-50% cited."
+  },
+  "uncertainty": {
+   "review.rating": "Upper bound 10 inferred from observed max; schema has no CHECK.",
+   "review.rank": "No upper bound observed beyond 7; range left open above 0.",
+   "trust.trust": "No upper bound observed; only non-negativity asserted.",
+   "item.title": "Nullable per schema but observed null_rate 0.0; NULL emitted only if interface rule requires it.",
+   "useracct.name": "Nullable per schema but observed null_rate 0.0; NULL emitted only if interface rule requires it.",
+   "review.a_id": "a_id is the review primary key, not a foreign key; the JOIN(review.a_id=useracct.u_id) atomic op is a non-FK join pattern and is not modeled as a dependency."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 292 across 20 instances, and validity.reasons.new_integrity_failures = 20/20. The writer (tscore_gen/writer.py) sets 'pragma foreign_keys = OFF' and never re-enables/validates FKs, so FK violations are silently written. The FK fill in instance.py (fill_foreign_keys_consistently) draws from _parent_pool, but the pool is built from schema.original_values and instance[pt][pc] BEFORE the parent table's rows are finalized (PK dedup via sample_fresh_primary_keys and drop_unique_duplicates can drop parent rows, and self-referential FK fixups run after). Also, for review.a_id there is no FK in the schema (a_id is a plain PK), yet the spec's per_column_exceptions lists review.a_id with joins_with useracct.u_id and the atomic ops include JOIN(review.a_id=useracct.u_id); the program does not treat a_id as an FK, so this dependency is unimplemented.",
+     "requested_revision": "Ensure generated child FK values are drawn from the FINAL parent key set (after PK dedup and unique-drop), and validate FK integrity after insertion (or enable foreign_keys=ON and fail loudly). Reconcile the review.a_id dependency: either add it to schema.fks handling or remove it from the specification's per_column_exceptions/dependencies so spec and program agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.compact_rows_missing = 20/20 and no_rows_added = 7. The CLI (tscore_gen/cli.py) calls build_random_instance(...) then write_instance_sqlite(schema, inst, p) WITHOUT passing orig_path, so writer.py takes the 'orig_path is None' branch: it creates a fresh DB from schema.ddl and inserts only generated rows. The compact/original rows are therefore never copied, contradicting the module docstring ('The compact database is never modified: generated rows are appended after the compact rows') and the spec's intent of preserving compact rows. This also explains why 7 instances report no rows added (generated rows collide/are dropped) and why compact rows are missing everywhere.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the args dict and forward it), so the compact rows are copied and generated rows are appended, matching the documented behavior and the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows 'review.rating: generated rows: NULL 20 / 138', 'review.rank: NULL 20 / 138', 'item.title: NULL 20 / 154', 'useracct.name: NULL 20 / 147'. The NULL rule requires the NULL share to follow the compact database's share for that column. The spec's uncertainty notes state observed null_rate 0.0 for item.title and useracct.name, yet the program plants NULLs in every instance via NULLABLE_PLANT and _plant_nulls regardless of the compact share. The spec's null_targets and NULLABLE_PLANT force at least one NULL even where the compact share is 0.0, which is inconsistent with 'NULL share following the compact database's share'.",
+     "requested_revision": "Derive the per-column NULL probability from the compact database's observed null share (schema.original_values) rather than a fixed plant, and document in the specification that a 0.0 compact share still yields at least one NULL only if the interface rule requires it; otherwise align the spec's null_targets with the observed shares."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include review.a_id with 'joins_with': ['useracct.u_id'] and dependencies list only review.u_id, review.i_id, trust.source_u_id, trust.target_u_id. The schema has no FK from review.a_id to useracct.u_id (a_id is the review PK). The atomic ops also list JOIN(review.a_id=useracct.u_id) as an unmatched_join_rows pattern. This is a semantic inconsistency: a_id is a primary key, not a foreign key, so 'parent_rows_without_children' and 'child_rows_with_null_fk' targets for a_id are not meaningful.",
+     "requested_revision": "Remove review.a_id from per_column_exceptions/dependencies (or explicitly document it as a non-FK join pattern with a different target), so the specification matches the schema's actual constraints."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'item.i_id >= 0' and 'useracct.u_id > 0', but the program's _fresh_pk_values starts PKs at max(compact)+1 (>=1) and never enforces i_id >= 0 explicitly; more importantly, the spec's supporting_evidence says 'item.i_id: Rows 0..7' while the program generates fresh PKs starting after the compact max, so the boundary 'equal_and_one_step_from review.i_id' is not guaranteed. The comparison_boundary target for item.i_id (equal_and_one_step_from review.i_id) is not implemented in instance.py (only review.rank/rating boundaries are planted).",
+     "requested_revision": "Either implement the item.i_id comparison-boundary planting (ensure a generated item.i_id equals a review.i_id and one step from it) or remove that target from the specification; likewise reconcile the i_id >= 0 formula with the fresh-PK scheme."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires group_size_column targets '1, 2 and >= 3' for many columns (item.i_id, item.title, review.i_id, review.u_id, useracct.u_id, useracct.name, trust.source_u_id, trust.target_u_id). The program's choose_table_sizes uses SPEC_SIZES with jitter (-2..+2) and does not enforce group-size distributions; with review size ~7 and useracct ~7, group sizes of >=3 are not guaranteed, and the execution feedback does not report group-size satisfaction. The construction_pairs separated = 32/90 suggests many intended variations are not realized.",
+     "requested_revision": "Add explicit group-size construction (e.g., assign FK values so that groups of size 1, 2, and >=3 exist for each flagged column) or document that group-size targets are best-effort and adjust the specification accordingly."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 32/90 separated construction pairs are due to missing group-size/boundary planting or to genuine query equivalence; not resolvable without held-out labels.",
+    "Whether the compact null shares for review.rating/rank are nonzero (spec says observed 0.0 for title/name only); the program's fixed plant may over- or under-represent NULLs for rating/rank.",
+    "Whether the self-referential FK fixup in instance.py (pt == t branch) correctly handles trust.source_u_id/target_u_id after PK dedup; not directly evidenced by the feedback."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification lists review.rating range as [0,10] with 'Upper bound 10 inferred from observed max; schema has no CHECK' and review.rank as 'No upper bound observed beyond 7; range left open above 0'. These are correctly flagged as uncertain in the 'uncertainty' block, and the program clamps to these inferred bounds (_clamp_rating, _clamp_rank). The aggregate boundary values [4,5,6] and comparison boundary [2,3,4] are supported by the atomic ops.",
+     "requested_revision": "No change required; the uncertainty is already documented. Optionally note that rating/rank bounds are heuristic, not schema-enforced."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows item rows_skipped=109 (out of ~154 attempted) and review rows_skipped=11. The writer counts these as 'rows_failed' but the run still reports n_ok=20, n_fail=0, integrity fk_violations=0, pk_duplicates=0. The skips are consistent with PK collisions on item.i_id after _plant_item_comparison_boundary overwrites a fresh PK with a review i_id that may already exist, and with review.a_id PK collisions. This is handled gracefully (skipped, not corrupting), so it does not block.",
+     "requested_revision": "No blocking change. Optionally reduce item PK collisions by choosing a comparison-boundary target that does not collide with an existing item PK, to lower the skip rate."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The spec's per_column_exceptions for review.i_id and review.u_id require 'child_rows_with_null_fk: false', and the program's _plant_nulls skips NOT NULL columns (review.i_id, review.u_id are NOT NULL per schema), so no NULL FK is planted \u2014 consistent. The generic integer_fk rule mentions 'where the FK column is nullable, include at least one NULL child FK', but no FK column here is nullable, so no conflict.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Construction_pairs: eligible=90, separated=23, unknown_executions=0. Separation is partial but the instructions state a missing separation alone does not establish a generation error. All 20 instances are valid, reproducible, and integrity-clean.",
+     "requested_revision": "No change required; value variation remains possible (23/90 pairs separated, 0 unknown executions)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 23/90 separated construction pairs is sufficient for downstream query-equivalence testing is not determinable from the provided evidence; no held-out pairs were used.",
+    "The high item skip rate (109) is explained by PK collisions but the exact cause was not traced per-row; it does not affect integrity of written instances."
+   ]
+  }
+ ]
 }

@@ -1,57 +1,366 @@
 {
  "db": "tracking_share_transactions",
- "operator_io_quirks": [
-  "Backtick-quoted DDL identifiers (`Investors`, `Investor_details`); mixed case table/column names; must re-quote with \" in generated SQL.",
-  "Tiny DB (all tables <=20 rows); read_schema sampling trivial, no huge-table path exercised.",
-  "date_of_transaction declared DATETIME but storage class text with 'YYYY-MM-DD HH:MM:SS' values; ts_fuzzer dispatch: contains 'date' -> first element parses as int? no -> Date fuzzer.",
-  "amount_of_transaction DECIMAL(19,4): number family, scale=19 precision=4 -> Number(scale=19); storage mixed real/integer; values up to ~3e5.",
-  "share_count VARCHAR(40) but values are numeric strings ('8718572','9'); String fuzzer, int-like strings get +-1 neighbours.",
-  "other_details VARCHAR(255) 100% NULL, distinct 0, no samples -> String sampler with empty elements -> p:=1, all fresh random strings.",
-  "Purchases and Transactions_Lots have NO primary key (pk=[]); sample_fresh_primary_keys must no-op; drop_unique_duplicates no-op.",
-  "Sales.sales_transaction_id is PK AND FK to Transactions.transaction_id (1:1 child); FK drawn from parent's final values then PK dedup.",
-  "Purchases.purchase_transaction_id NOT NULL FK, no PK -> duplicates allowed, no dedup; NOT NULL not enforced in Python, insert failures skipped.",
-  "Ref_Transaction_Types has only 2 rows ('PUR','SALE'); FK children draw from 2 values -> heavy ties in transaction_type_code.",
-  "Investors.investor_id PK 20 rows, Lots.investor_id FK distinct 9 (subset); Transactions.investor_id distinct 10; FK fan-out uneven.",
-  "All FKs resolve to existing parents; no dangling/self FKs; no composite keys; no CHECK/UNIQUE column constraints beyond PKs."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on date_of_transaction: template from first parsable element, likely '%Y-%m-%d %H:%M:%S'; range from min/max parsed dates (~1977..2001); fresh dates uniform in that range.",
-  "Number fuzzer on amount_of_transaction: scale=19 -> range [-1e19,1e19], list_max overwritten to full max; fresh draws wildly larger than original ~3e5 -> implausible amounts (FN risk on SUM/AVG thresholds).",
-  "Number fuzzer on integer PKs/FKs: +-1/+-2 perturbation of elements; PK dedup keeps first occurrence; small tables -> many collisions, few surviving rows.",
-  "String fuzzer on transaction_type_code: elements 'PUR','SALE' plus pool literals; fresh random strings over a-zA-Z0-9() length 0..10 -> FK values not matching Ref table unless drawn from parent (they are, via fill_foreign_keys_consistently).",
-  "String fuzzer on share_count: int-like strings get str(i+1),str(i-1); contaminate 50% -> numeric comparisons on share_count may see non-numeric strings (FP/FN).",
-  "other_details all-NULL original: elements empty -> p:=1 -> all fresh random strings; queries filtering other_details IS NULL will find none (FN).",
-  "Ref_Transaction_Types only 2 rows: choose_table_sizes may give it 1..2500 rows; FK children draw with replacement from 2 values -> extreme ties; DISTINCT/GROUP BY counts implausible.",
-  "Purchases/Transactions_Lots no PK: no dedup, rows can repeat exactly; COUNT(*) inflated vs original 15.",
-  "Sales 1:1 with Transactions in original; TS draws sales_transaction_id from Transactions values with replacement then PK-dedups -> still 1:1-ish but may miss some transactions (FN on anti-join).",
-  "Small original sizes (15-20) vs TS sizes 1..2500: cardinality-based queries (COUNT comparisons) likely FP/FN.",
-  "Date fuzzer p-inversion: p=0.2 means element returned 20% of time, 80% fresh uniform dates -> dates spread over 24 years, not clustered like original.",
-  "No CHECK/UNIQUE/NOT NULL enforcement in Python: NOT NULL FK columns may get NULL if parent empty (not here) or insert-fail rows skipped -> row counts below target."
- ],
- "challenger_refs": [
-  "gd6e487ed",
-  "ge0707fab",
-  "gac4c7982",
-  "g93b1735a",
-  "g93b1735a",
-  "ge2bda54c",
-  "g2c7d6370",
-  "g986ade70",
-  "g1c7b3a8d",
-  "g38e8bf7d",
-  "g38e8bf7d",
-  "g38e8bf7d",
-  "g38e8bf7d",
-  "g38e8bf7d",
-  "g38e8bf7d",
-  "gffb3b850",
-  "gffb3b850"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1; unique per table; never NULL; length always equals table row count.",
+   "integer_fk": "Copy from parent table's primary key pool (compact + generated); allow parent rows without children; never NULL unless column is nullable; FK pool must be a superset of any enum/boundary targets listed for the child column.",
+   "varchar_short": "Random strings from ascii_letters + digits + ' ' + '()' with length 1-20; allow near-duplicate variants (case flips, one-char edits) for equality/LIKE literals; allow NULL only if column nullable.",
+   "varchar_details": "Random strings from ascii_letters + digits + ' ' + '()' with length 1-20; duplicates allowed; NULL only if nullable.",
+   "decimal_amount": "Random decimal with 4 fractional digits; range bounded by 2x the compact max (about 605015) and >= 0; include boundary values around 100, 2999, 3000 and one step on each side; allow 0; never negative.",
+   "datetime": "Random datetime between 1970-01-01 and 2010-12-31 formatted '%Y-%m-%d %H:%M:%S'; allow duplicates on DISTINCT columns.",
+   "share_count_text": "Numeric strings; include boundary values around 10, 100, 101, 102 and one step on each side; allow NULL only if nullable.",
+   "null_share": "For each nullable column, at least one NULL row per instance; NULL share follows compact database share, but when observed share is 0.0 and the column is a null target, force at least one NULL (share = max(1/table_size, observed)).",
+   "group_size_hint": "For columns with group_sizes targets, build a group-key list of length n whose group sizes include at least one 1, one 2, and one >=3 when n >= 6; assign keys to the column as [first[k] for k in keys] so the column list always has length n; apply to PK/FK columns too when the target is stated.",
+   "tie_hint": "For ORDER columns with tie_at_rank targets, ensure at least two rows share the same COUNT(transaction_id) value at ranks 1 and 3 in both ASC and DESC order."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Ref_Transaction_Types",
+    "column": "transaction_type_code",
+    "pattern": "enum",
+    "targets": [
+     "PUR",
+     "SALE"
+    ]
+   },
+   {
+    "table": "Ref_Transaction_Types",
+    "column": "transaction_type_description",
+    "pattern": "enum",
+    "targets": [
+     "Sale",
+     "Purchase"
+    ]
+   },
+   {
+    "table": "Transactions",
+    "column": "transaction_type_code",
+    "pattern": "enum",
+    "targets": [
+     "PUR",
+     "SALE"
+    ]
+   },
+   {
+    "table": "Transactions",
+    "column": "amount_of_transaction",
+    "pattern": "comparison_boundary",
+    "targets": [
+     99.9999,
+     100,
+     100.0001,
+     2998.9999,
+     2999,
+     2999.0001,
+     2999.9999,
+     3000,
+     3000.0001
+    ]
+   },
+   {
+    "table": "Transactions",
+    "column": "share_count",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "-12",
+     "-11",
+     "-10",
+     "9",
+     "10",
+     "11",
+     "99",
+     "100",
+     "101",
+     "102"
+    ]
+   },
+   {
+    "table": "Transactions",
+    "column": "date_of_transaction",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "duplicate_share 20-50%"
+    ]
+   },
+   {
+    "table": "Transactions",
+    "column": "investor_id",
+    "pattern": "group_sizes_and_ties",
+    "targets": [
+     "group_sizes 1,2,>=3",
+     "tie_at_rank 1,3 on COUNT(transaction_id)"
+    ]
+   },
+   {
+    "table": "Investors",
+    "column": "investor_id",
+    "pattern": "group_sizes_and_ties",
+    "targets": [
+     "group_sizes 1,2,>=3",
+     "tie_at_rank 1,3 on COUNT(transaction_id)",
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "Investors",
+    "column": "Investor_details",
+    "pattern": "group_sizes",
+    "targets": [
+     "group_sizes 1,2,>=3"
+    ]
+   },
+   {
+    "table": "Lots",
+    "column": "investor_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "Lots",
+    "column": "lot_id",
+    "pattern": "group_sizes_and_unmatched",
+    "targets": [
+     "group_sizes 1,2,>=3",
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "Transactions_Lots",
+    "column": "lot_id",
+    "pattern": "group_sizes_and_unmatched",
+    "targets": [
+     "group_sizes 1,2,>=3",
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "Sales",
+    "column": "sales_details",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "duplicate_share 20-50%"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Lots",
+    "child_column": "investor_id",
+    "parent_table": "Investors",
+    "parent_column": "investor_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Transactions",
+    "child_column": "investor_id",
+    "parent_table": "Investors",
+    "parent_column": "investor_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Transactions",
+    "child_column": "transaction_type_code",
+    "parent_table": "Ref_Transaction_Types",
+    "parent_column": "transaction_type_code",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Sales",
+    "child_column": "sales_transaction_id",
+    "parent_table": "Transactions",
+    "parent_column": "transaction_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Purchases",
+    "child_column": "purchase_transaction_id",
+    "parent_table": "Transactions",
+    "parent_column": "transaction_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Transactions_Lots",
+    "child_column": "transaction_id",
+    "parent_table": "Transactions",
+    "parent_column": "transaction_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Transactions_Lots",
+    "child_column": "lot_id",
+    "parent_table": "Lots",
+    "parent_column": "lot_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Transactions",
+    "column": "amount_of_transaction",
+    "formula": "amount_of_transaction >= 0"
+   },
+   {
+    "table": "Transactions",
+    "column": "transaction_type_code",
+    "formula": "transaction_type_code IN ('PUR','SALE')"
+   },
+   {
+    "table": "Ref_Transaction_Types",
+    "column": "transaction_type_code",
+    "formula": "transaction_type_code IN ('PUR','SALE')"
+   },
+   {
+    "table": "Ref_Transaction_Types",
+    "column": "transaction_type_description",
+    "formula": "transaction_type_description IN ('Sale','Purchase')"
+   },
+   {
+    "table": "Transactions",
+    "column": "date_of_transaction",
+    "formula": "date_of_transaction IS NULL OR date_of_transaction >= '1970-01-01 00:00:00'"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Investors": 20,
+   "Lots": 15,
+   "Ref_Transaction_Types": 2,
+   "Transactions": 15,
+   "Sales": 15,
+   "Purchases": 15,
+   "Transactions_Lots": 15
+  },
+  "null_targets": [
+   "Investors.Investor_details",
+   "Lots.lot_details",
+   "Transactions.date_of_transaction",
+   "Transactions.amount_of_transaction",
+   "Transactions.share_count",
+   "Transactions.other_details",
+   "Sales.sales_details"
+  ],
+  "supporting_evidence": {
+   "amount_of_transaction >= 0": [
+    "Transactions row 1: 302507.6996",
+    "Transactions row 2: 27.257",
+    "Transactions row 5: 0"
+   ],
+   "transaction_type_code IN ('PUR','SALE')": [
+    "Transactions rows 1-8 show only SALE and PUR",
+    "Ref_Transaction_Types rows show PUR and SALE"
+   ],
+   "transaction_type_description IN ('Sale','Purchase')": [
+    "Ref_Transaction_Types rows: Sale, Purchase"
+   ],
+   "date_of_transaction >= '1970-01-01'": [
+    "Transactions rows 1-8 all between 1977 and 2004"
+   ]
+  },
+  "uncertainty": "No calculated columns or date-pair order rules exist in the schema. The share_count column is VARCHAR but holds numeric strings; boundary values are treated as strings. NULL shares are observed as 0.0 but nullable columns still receive at least one NULL row per instruction 10. Group-size and tie targets are sampling-domain hints, not hard constraints. Sales and Purchases are populated independently with 15 rows each; whether they should partition Transactions is not constrained by the schema. Instances are fresh databases built from the schema DDL plus generated rows; compact rows are not copied (resolved per review issue 2)."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances fail with IndexError('list assignment index out of range') at tscore_gen/instance.py:168 (`cols[cm.name][i] = first[k]`). n_ok=0, n_fail=20, no instance directories written. The group-size hint block builds `keys` of length n, but `base = cols.get(cm.name) or [None]*n` may be shorter than n when the sampler produced fewer values (e.g. after `_filter`/dedup or when the column list was truncated), and `cols[cm.name]` is then indexed at i up to n-1 while its length is < n. The line `cols[cm.name] = [base[i] if i < len(base) else None for i in range(n)]` is followed by `cols[cm.name][i] = first[k]`, which assumes length n but the list comprehension only guarantees n entries when base is long enough \u2014 however the real failure is that `cols[cm.name]` was reassigned to a list of length n only in the comprehension, yet `first[k]` may be None and `cols[cm.name]` may still be the original shorter list if the comprehension path was skipped; regardless, the observed crash blocks all generation.",
+     "requested_revision": "Fix the group-size hint block in build_random_instance so that `cols[cm.name]` is always a list of length n before indexing: build the group-key list, then construct the column as `[first[k] for k in keys]` (or pad base to length n first). Ensure the same length invariant holds for every column before `sample_fresh_primary_keys`/`drop_unique_duplicates`/`_plant_nulls` run, and re-run the construction check until n_ok == n_instances with no errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py `write_instance_sqlite(schema, instance, path, orig_path=None)` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` without `orig_path`. The docstring and module comment claim 'the instance file is a copy of the compact database plus appended generated rows', but with orig_path=None the function creates a fresh DB from `schema.ddl` only and never copies compact rows. This contradicts the stated Round-1 design ('instances are copies of the compact database plus appended generated rows') and the preservation-of-compact-rows requirement.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add `orig_path` to the worker args and call `write_instance_sqlite(schema, inst, p, orig_path=a['orig'])`), or update the specification/design to state that instances are fresh databases. As written, compact rows are not preserved, which is a spec/program inconsistency."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `Transactions.transaction_type_code IN ('PUR','SALE')` and `Ref_Transaction_Types.transaction_type_code IN ('PUR','SALE')`, but `per_column_exceptions` for `Transactions.transaction_type_code` lists targets `['PUR','SALE','sale','pur','99','100','101']` and the program's StringSampler draws from `enum` (which includes 'sale','pur','99','100','101') with probability 0.5. This directly violates the stated semantic rule. The supporting_evidence only shows rows 1-8 with SALE/PUR, so the rule is supported for the compact data, but the exception targets contradict it.",
+     "requested_revision": "Either remove the non-enum targets ('sale','pur','99','100','101') from the Transactions.transaction_type_code exception (keeping only 'PUR','SALE' plus case variants if the rule is relaxed), or drop the `IN ('PUR','SALE')` semantic rule and document that the column is a free string with boundary values. The two must be consistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` includes `Transactions.amount_of_transaction` and `Transactions.share_count`, and `null_share` returns DEFAULT_NULL_SHARE=0.0 when observed is 0.0, so `_plant_nulls` is never invoked (share <= 0). The interface rule requires 'at least one NULL row per nullable column' per instance. With share 0.0, no NULLs are planted, violating the NULL rule. Same for all other null_targets (Investors.Investor_details, Lots.lot_details, Transactions.date_of_transaction, Transactions.other_details, Sales.sales_details).",
+     "requested_revision": "Change null_share (or _plant_nulls) so that when a column is in null_targets, at least one NULL is planted per instance even if the observed share is 0.0 (e.g. return max(1/table_size, observed) or have _plant_nulls force k>=1 when share==0 but column is a null target). Update the specification's null_share note accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `fill_foreign_keys_consistently` draws FK values from `_parent_pool` which includes compact + generated parent values, but for `Transactions.investor_id` the parent pool is built from `instance.get('Investors', {})` which at that point contains only the generated Investors rows (compact values are in `schema.original_values`). This is fine, but the FK for `Transactions.transaction_type_code` draws from `Ref_Transaction_Types.transaction_type_code` pool which includes the enum targets 'sale','pur','99','100','101' only if those were generated in Ref_Transaction_Types \u2014 but Ref_Transaction_Types enum is only ['PUR','SALE'], so Transactions.transaction_type_code FK values will be restricted to PUR/SALE, contradicting the exception targets. This is a dependency/spec inconsistency: the exception targets for Transactions.transaction_type_code cannot be realized because the FK constraint forces values from Ref_Transaction_Types.",
+     "requested_revision": "Either add the boundary values to Ref_Transaction_Types.transaction_type_code (so the FK pool contains them), or remove the boundary targets from Transactions.transaction_type_code. The FK dependency must be consistent with the per-column exception targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_assign_group_keys` returns random keys when `n < 6`, and `_group_size_plan` may produce sizes that don't sum to n exactly (truncated with `[:n]`), so group sizes 1, 2, >=3 are not guaranteed. The specification targets 'group_sizes 1,2,>=3' for Investors.investor_id, Transactions.investor_id, etc. With table sizes 15-20 and jitter, this is usually satisfiable, but the truncation can drop the >=3 group. Also `_assign_group_keys` is only applied to non-FK, non-PK columns, so `Investors.investor_id` (PK) and `Transactions.investor_id` (FK) never get group-size hints \u2014 the specification lists these columns with group_sizes targets, but the program only applies group-size hints to non-key columns.",
+     "requested_revision": "Apply group-size hints to the columns named in the specification (including PK/FK columns where the target is stated), or document that group-size targets on PK/FK columns are satisfied indirectly by the FK distribution. Ensure `_group_size_plan` produces sizes summing exactly to n and always includes at least one group of size >=3 when n >= 6."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `generic_sampling_rules.varchar_short` says 'Random lowercase letter strings of length 1-3', but the program's StringSampler uses CHARSET = ascii_letters + ' ' + digits + '()' and length up to 20 (or args[0]). This is a mismatch between the stated value domain and the implementation. Similarly `varchar_details` says length 1-3 but the program uses length up to 20.",
+     "requested_revision": "Either update the specification to match the program's charset/length (letters, digits, spaces, parentheses, length up to 20), or constrain StringSampler to lowercase letters of length 1-3 for varchar_short/varchar_details columns. The two must agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/values.py NumberSampler for `amount_of_transaction` uses `nonneg=True` and `_cast` clamps negatives to 0, but the boundary values include 99.9999 etc. and the sampler draws from `self.boundaries` with probability 0.35 \u2014 fine. However `scale=10, prec=4` gives `self.min=0, self.max=2*10**10` for unsigned=False (nonneg only clamps in _cast), so random draws can be up to 2e10, far beyond the compact range (max ~302507). The specification says 'include boundary values around 100, 2999, 3000' but does not forbid large values; still, the compact max is ~302507 and the program can generate 2e10, which is a value-domain mismatch with the observed data.",
+     "requested_revision": "Bound the NumberSampler range for amount_of_transaction to a reasonable multiple of the compact max (e.g. list_max * 2) rather than 2*10**scale, or document that large amounts are intentional. Ensure the boundary values are always reachable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_nulls` is called after `drop_unique_duplicates` and after FK consistency, but for `Transactions.date_of_transaction` the DateSampler already returns strings; `_plant_nulls` replaces with None, which is fine. However for `Transactions.share_count` (VARCHAR) the StringSampler may return numeric strings; `_plant_nulls` sets None, fine. The bigger issue: `_plant_nulls` uses `rng.sample(range(len(values)), k)` and sets `out[i]=None`, but if `values` contains None already (from sampler), the count of NULLs may exceed the intended share. Minor.",
+     "requested_revision": "Count existing NULLs before planting and only add up to the target share; ensure at least one NULL when the column is a null target (see issue 4)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `dependencies` lists `Sales.sales_transaction_id -> Transactions.transaction_id` and `Purchases.purchase_transaction_id -> Transactions.transaction_id`, but the schema shows `Purchases.purchase_transaction_id` is NOT NULL and `Sales.sales_transaction_id` is PK. The program's `fill_foreign_keys_consistently` handles these, but `Purchases` has no PK and `purchase_details` is NOT NULL \u2014 the program's StringSampler for `purchase_details` may return None? No, StringSampler never returns None. OK. But `Sales.sales_details` is nullable and in null_targets; `_plant_nulls` will plant NULLs, fine. The issue is that `Sales` and `Purchases` are populated with 15 rows each but `Transactions` has only 15 rows, so FK values are drawn with replacement \u2014 fine. No blocking issue here, but the specification's `table_sizes_per_instance` gives Sales=15, Purchases=15, Transactions=15, which means every transaction is both a sale and a purchase \u2014 semantically odd but not a constraint violation.",
+     "requested_revision": "Clarify whether Sales and Purchases should partition Transactions (each transaction is either a sale or a purchase, not both). If so, the program must enforce this; currently it does not."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether compact rows are preserved: the program does not pass orig_path to write_instance_sqlite, so instances are fresh DBs, not copies. This contradicts the stated Round-1 design and must be resolved (issue 2).",
+    "Whether the FK pool for Transactions.transaction_type_code can contain the boundary targets 'sale','pur','99','100','101' given Ref_Transaction_Types only has PUR/SALE (issue 5).",
+    "Whether group-size hints are actually realized for PK/FK columns (issue 6).",
+    "Whether the NULL rule is satisfied for all null_targets given null_share returns 0.0 (issue 4).",
+    "Whether the semantic rule transaction_type_code IN ('PUR','SALE') is violated by the exception targets (issue 3)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions for Transactions.investor_id and Investors.investor_id list 'tie_at_rank 1,3 on COUNT(transaction_id)' and 'group_sizes 1,2,>=3'. The program's _assign_group_keys (instance.py) only applies group-size hints to non-PK, non-FK columns; PK columns are overwritten with sequential integers (_pk_values) and FK columns are filled by fill_foreign_keys_consistently with rng.choice, so neither group-size nor tie hints are enforced on Investors.investor_id or Transactions.investor_id. The spec itself labels these as 'sampling-domain hints, not hard constraints' (uncertainty field), so this is a soft gap rather than a violation.",
+     "requested_revision": "Either (a) downgrade the group_sizes_and_ties exception for PK/FK columns to a non-binding hint in the specification, or (b) extend instance.py to apply group-size/tie plans to PK and FK columns (e.g. by choosing FK values from a group-size-planned key list). No change is strictly required for pass since the spec marks these as hints."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's generic_sampling_rules.decimal_amount says 'range bounded by 2x the compact max (about 605015) and >= 0'. The program's NumberSampler (values.py) sets self.max = min(self.max, 2.0*compact_max) only when compact_max is provided, and _compact_max in instance.py returns the max of original_values for the column. This is consistent, but the spec's 'about 605015' is a derived value; the program correctly derives it from the compact data rather than hard-coding. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows all 20 instances valid, 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, 0 DC rows changed, reproducible (returncode 0, n_ok 20, n_fail 0). Nullable columns all show NULL > 0 in generated rows (e.g. Investors.Investor_details NULL 20/405), satisfying the NULL rule. Semantic rules (amount >= 0, transaction_type_code IN ('PUR','SALE'), description IN ('Sale','Purchase'), date >= 1970) are enforced by construction in spec.py (ENUM_TYPES, ENUM_DESCRIPTIONS, nonneg flag for amount columns, DateSampler full range starting 1970-01-01).",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 107, separated 16, unknown_executions 0. 16/107 separated is low but the instructions state 'A missing separation alone does not establish a generation error or prove query equivalence.' The spec's uncertainty field explicitly notes group-size and tie targets are sampling-domain hints. The low separation rate is consistent with the soft-hint treatment of group_sizes_and_ties on PK/FK columns (see first issue).",
+     "requested_revision": "If higher separation is desired, address the first issue (apply group-size/tie plans to PK/FK columns). Otherwise no change required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions for Transactions.share_count lists comparison_boundary targets ['-12','-11','-10','9','10','11','99','100','101','102'] and the column is VARCHAR(40). The program's StringSampler (values.py) draws boundaries with 0.25 probability and enum with 0.5; share_count has no enum, so boundaries are drawn ~25% of the time, which is reasonable. The spec's generic_sampling_rules.share_count_text says 'Numeric strings; include boundary values around 10, 100, 101, 102 and one step on each side' \u2014 the program includes -12,-11,-10,9,10,11,99,100,101,102 which covers this. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies list Sales.sales_transaction_id and Purchases.purchase_transaction_id as FKs to Transactions.transaction_id, and the spec's uncertainty notes 'Sales and Purchases are populated independently with 15 rows each; whether they should partition Transactions is not constrained by the schema.' The program's fill_foreign_keys_consistently draws FK values from the parent pool with replacement, so Sales/Purchases may reference the same transaction multiple times. This is consistent with the spec's stated uncertainty and the schema (no UNIQUE constraint on these FKs). No issue.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the low construction-pair separation (16/107) is acceptable given the spec's soft-hint treatment of group_sizes_and_ties on PK/FK columns; this is a design choice, not a blocking error.",
+    "Whether the designer intends group_sizes_and_ties to be binding on Investors.investor_id and Transactions.investor_id (currently not enforced by the program)."
+   ]
+  }
+ ]
 }

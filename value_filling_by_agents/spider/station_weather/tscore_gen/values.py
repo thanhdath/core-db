@@ -6,6 +6,84 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+
+class ColumnDomain:
+    """Static domain of one column, derived from the specification / CHECK text."""
+
+    def __init__(self):
+        self.lo = None
+        self.hi = None
+        self.enum = None
+        self.boundaries = []
+        self.time_fmt = False
+        self.day_of_week = False
+        self.positive = False
+        self.le_column = None
+
+    def numeric(self, v):
+        if self.lo is not None and v < self.lo:
+            v = self.lo
+        if self.hi is not None and v > self.hi:
+            v = self.hi
+        return v
+
+
+def _num(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_domain(column, spec_rules: list) -> ColumnDomain:
+    """Build a ColumnDomain from the specification's semantic rules and the CHECK text."""
+    d = ColumnDomain()
+    t = (column.type_str or '').lower()
+    texts = list(spec_rules) + ([column.check_sql] if column.check_sql else [])
+    for txt in texts:
+        if not txt:
+            continue
+        s = txt
+        for m in re.finditer(r'between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)', s, re.I):
+            a, b = float(m.group(1)), float(m.group(2))
+            d.lo = a if d.lo is None else max(d.lo, a)
+            d.hi = b if d.hi is None else min(d.hi, b)
+        for m in re.finditer(r'(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)', s):
+            op, v = m.group(1), float(m.group(2))
+            if op in ('>=', '>'):
+                vv = v if op == '>=' else v + (1 if 'int' in t else 1e-9)
+                d.lo = vv if d.lo is None else max(d.lo, vv)
+            else:
+                vv = v if op == '<=' else v - (1 if 'int' in t else 1e-9)
+                d.hi = vv if d.hi is None else min(d.hi, vv)
+        for m in re.finditer(r'\bin\s*\(([^()]*)\)', s, re.I):
+            items = re.findall(r"'((?:[^']|'')*)'", m.group(1))
+            if items:
+                d.enum = [x.replace("''", "'") for x in items]
+        if re.search(r"glob\s*'\[0-2\]\[0-9\]:\[0-5\]\[0-9\]'", s, re.I):
+            d.time_fmt = True
+        for m in re.finditer(r"=\s*'((?:[^']|'')*)'", s):
+            lit = m.group(1).replace("''", "'")
+            if d.enum is None:
+                d.enum = [lit]
+            elif lit not in d.enum:
+                d.enum.append(lit)
+        for m in re.finditer(r'(?:>|>=|<|<=)\s*(-?\d+(?:\.\d+)?)', s):
+            v = float(m.group(1))
+            for b in (v - 1, v, v + 1):
+                if b not in d.boundaries:
+                    d.boundaries.append(b)
+    if column.name.lower() == 'day_of_week':
+        d.day_of_week = True
+        d.enum = list(DAYS)
+    if column.name.lower() == 'id' and column.pk_pos > 0:
+        d.positive = True
+        d.lo = 1 if d.lo is None else max(d.lo, 1)
+    if column.name.lower() == 'low_temperature':
+        d.le_column = 'high_temperature'
+    return d
 
 
 class ColumnSampler:
@@ -37,22 +115,33 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67) and adds domain bounds."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 domain: ColumnDomain = None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
+        self.domain = domain or ColumnDomain()
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if self.domain.lo is not None:
+            self.min = max(self.min, self.domain.lo)
+        if self.domain.hi is not None:
+            self.max = min(self.max, self.domain.hi)
+        if self.min > self.max:
+            self.min, self.max = self.max, self.min
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
+        self._boundary_pool = [b for b in self.domain.boundaries if self.min <= b <= self.max]
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
-        if not self.elements or r.random() < self.p:
+        if self._boundary_pool and r.random() < 0.25:
+            v = r.choice(self._boundary_pool)
+        elif not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
@@ -67,18 +156,22 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._cast(self.domain.numeric(v))
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped) + enumeration / near-variant handling."""
 
-    def __init__(self, elements, p, max_l0, rng, length=20):
+    def __init__(self, elements, p, max_l0, rng, length=20, domain: ColumnDomain = None):
+        self.domain = domain or ColumnDomain()
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
         for e in els:
             if re.fullmatch(r'-?\d+', e):
                 extra += [str(int(e) + 1), str(int(e) - 1)]
+        if self.domain.enum:
+            for e in self.domain.enum:
+                extra += [e, e.lower(), e.upper(), e + ' ', ' ' + e]
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
@@ -88,6 +181,16 @@ class StringSampler(ColumnSampler):
 
     def sample(self):
         r = self.rng
+        if self.domain.enum and r.random() < 0.6:
+            base = r.choice(self.domain.enum)
+            u = r.random()
+            if u < 0.5:
+                return base
+            if u < 0.7:
+                return base.lower()
+            if u < 0.85:
+                return base.upper()
+            return base + ' '
         if not self.elements or r.random() < self.p:
             v = self._fresh_or_reuse(lambda: self._rand(r.randint(self.lo, self.hi)))
         else:
@@ -153,7 +256,11 @@ class DateSampler(ColumnSampler):
 
 
 class TimeSampler(ColumnSampler):
-    """fuzz/time.py."""
+    """fuzz/time.py; HH:MM strings inside the allowed hour/minute range."""
+
+    def __init__(self, elements, p, max_l0, rng, hhmm=False):
+        super().__init__(elements, p, max_l0, rng)
+        self.hhmm = hhmm
 
     def sample(self):
         r = self.rng
@@ -166,7 +273,19 @@ class TimeSampler(ColumnSampler):
                 parts[i] = '%02d' % rngs[i][int(parts[i]) % len(rngs[i]) - 1]
                 e = ':'.join(parts)
             return e
+        if self.hhmm:
+            return '%02d:%02d' % (r.randrange(24), r.randrange(60))
         return '%02d:%02d:%02d' % (r.randrange(24), r.randrange(60), r.randrange(60))
+
+
+class DayOfWeekSampler(ColumnSampler):
+    """Enumeration sampler for day_of_week (Monday..Sunday)."""
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < self.p:
+            return r.choice(self.elements)
+        return r.choice(DAYS)
 
 
 class BoolSampler(ColumnSampler):
@@ -182,40 +301,44 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng,
+                        domain: ColumnDomain = None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    if domain is not None and domain.day_of_week:
+        return DayOfWeekSampler(els, p, max_l0, rng)
     if t == 'time':
-        return TimeSampler(els, p, max_l0, rng)
+        return TimeSampler(els, p, max_l0, rng, hhmm=bool(domain and domain.time_fmt))
     if t == '' or t == 'blob':
-        return StringSampler(els, p, max_l0, rng)
+        return StringSampler(els, p, max_l0, rng, domain=domain)
     if 'date' in t or 'timestamp' in t:
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
-            return NumberSampler(els, p, max_l0, rng, scale=4)
+            return NumberSampler(els, p, max_l0, rng, scale=4, domain=domain)
         return DateSampler(els, p, max_l0, rng)
     if 'bool' in t:
         return BoolSampler(els, p, max_l0, rng)
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
-        return NumberSampler(els, p, max_l0, rng, scale=4)
+        return NumberSampler(els, p, max_l0, rng, scale=4, domain=domain)
     if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
         is_int = 'int' in t
         scale, prec = 10, (0 if is_int else 4)
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, domain=domain)
     if any(k in t for k in ('char', 'text', 'blob')):
-        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
-    return StringSampler(els, p, max_l0, rng)
+        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20, domain=domain)
+    return StringSampler(els, p, max_l0, rng, domain=domain)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), domain: ColumnDomain = None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +348,13 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, domain=domain)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'),
+                               domain: ColumnDomain = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, domain=domain)
     return [s.sample() for _ in range(n)]

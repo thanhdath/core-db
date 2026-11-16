@@ -108,7 +108,8 @@ class StringSampler(ColumnSampler):
 
 
 def _parse_date(s: str):
-    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
+    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*',
+               lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
         try:
             return t, dt.datetime.strptime(s, t)
@@ -208,7 +209,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)

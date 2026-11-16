@@ -58,7 +58,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -112,7 +112,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
                 pt = tlow.get(str(r[2]).lower())
                 child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
+                if r[4] is not None:
+                    pcol_name = r[4]
+                elif pt is not None and tables[pt].primary_key:
+                    pcol_name = tables[pt].primary_key[0]
+                else:
+                    pcol_name = r[3]
                 pc = None
                 if pt is not None:
                     pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)

@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,6 +184,92 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform over a fixed enumeration (spec ENUMS)."""
+
+    def __init__(self, values, rng):
+        super().__init__([v for v in values if v is not None], 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class BoundarySampler(ColumnSampler):
+    """Values at a comparison boundary (spec BOUNDARY); includes both sides of > vs >=."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class RangeSampler(ColumnSampler):
+    """Uniform in a declared range."""
+
+    def __init__(self, lo, hi, rng, is_int=True, hard=False):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.lo, self.hi, self.is_int, self.hard = lo, hi, is_int, hard
+        self.boundary = [lo, hi] if hard else [lo - 1, lo, hi, hi + 1]
+
+    def sample(self):
+        r = self.rng
+        if r.random() < 0.25:
+            v = r.choice(self.boundary)
+        elif self.is_int:
+            v = r.randint(int(self.lo), int(self.hi))
+        else:
+            v = r.uniform(self.lo, self.hi)
+        if self.is_int:
+            return int(v)
+        return round(v, 1)
+
+
+class LikeSampler(ColumnSampler):
+    """Values matching a LIKE pattern but differing from the exact literal (spec LIKE_PATTERNS)."""
+
+    def __init__(self, pattern, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.pattern = pattern
+
+    def sample(self):
+        r = self.rng
+        if self.pattern.endswith('-%'):
+            year = self.pattern[:-2]
+            month = r.randint(1, 12)
+            day = r.randint(1, 28)
+            return '%s-%02d-%02d' % (year, month, day)
+        return self.pattern.replace('%', str(r.randint(0, 9)))
+
+
+class DateRangeSampler(ColumnSampler):
+    """Uniform date in a declared [min, max] range formatted %Y-%m-%d (spec DATE_MIN/MAX)."""
+
+    def __init__(self, lo, hi, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.lo = dt.datetime.strptime(lo, '%Y-%m-%d')
+        self.hi = dt.datetime.strptime(hi, '%Y-%m-%d')
+
+    def sample(self):
+        r = self.rng
+        d = self.lo + dt.timedelta(days=r.randint(0, (self.hi - self.lo).days))
+        return d.strftime('%Y-%m-%d')
+
+
+class LapTimeSampler(ColumnSampler):
+    """M:SS.mmm uniform 1:20.000..1:40.000 (spec text_laptime)."""
+
+    def __init__(self, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+
+    def sample(self):
+        r = self.rng
+        ms = r.randint(80000, 100000)
+        return '%d:%02d.%03d' % (ms // 60000, (ms // 1000) % 60, ms % 1000)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +321,31 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, col: str, column_meta, literal_pool: list, original_values, rng,
+                 p: float = 0.2, max_l0: float = float('inf')) -> ColumnSampler:
+    """Return the spec-driven sampler for (table, col) if one is declared, else the generic one."""
+    key = (table, col)
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], rng)
+    if key in spec.BOUNDARY:
+        return BoundarySampler(spec.BOUNDARY[key], rng)
+    if key in spec.LIKE_PATTERNS:
+        return LikeSampler(spec.LIKE_PATTERNS[key], rng)
+    if key in spec.HARD_RANGES:
+        lo, hi = spec.HARD_RANGES[key]
+        is_int = isinstance(lo, int) and isinstance(hi, int)
+        return RangeSampler(lo, hi, rng, is_int=is_int, hard=True)
+    if key in spec.RANGES:
+        lo, hi = spec.RANGES[key]
+        is_int = isinstance(lo, int) and isinstance(hi, int)
+        return RangeSampler(lo, hi, rng, is_int=is_int)
+    if key == ('races', 'date'):
+        return DateRangeSampler(spec.DATE_MIN, spec.DATE_MAX, rng)
+    if key == ('drivers', 'dob'):
+        return DateRangeSampler(spec.DOB_MIN, spec.DOB_MAX, rng)
+    if key in (('results', 'fastestLapTime'), ('qualifying', 'q1'), ('qualifying', 'q2'), ('qualifying', 'q3')):
+        return LapTimeSampler(rng)
+    return _init_sampler(column_meta, literal_pool, original_values, p, rng,
+                         1 if column_meta.pk_pos else 0, max_l0)

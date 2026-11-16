@@ -3,8 +3,7 @@ import datetime as dt
 import re
 import string
 
-# fuzz/number.py:5 MAX = 9223372036854775807 - epsilon (int64, no 2^31 clamp)
-MAX = 9223372036854775807 - 1e-9
+_MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
@@ -38,33 +37,25 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py: int64 MAX, list range [min, max+1] capped at MAX, type range [-10^scale, 10^scale]."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, MAX)) if unsigned else (-hi, hi)
-        if self.elements:
-            self.list_min = min(self.elements)
-            self.list_max = min(max(self.elements) + 1, MAX)
-        else:
-            self.list_min, self.list_max = self.min, self.max
+        hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        self.list_min = min(self.elements) if self.elements else self.min
+        self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        # number.py:88: integer columns truncate, float columns keep precision
-        return int(v) if self.is_int else (round(v, self.precision) if self.precision else v)
-
-    def _draw(self, lo, hi):
-        # number.py:79: random.random() * (end - start) + start
-        return self.rng.random() * (hi - lo) + lo
+        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: self._draw(lo, hi))
+            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
         d = 1 if self.is_int else 0.01
@@ -142,13 +133,20 @@ class DateSampler(ColumnSampler):
                 parsed.append(d)
         self.template = self.template or '%Y-%m-%d'
         self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
-        self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
-        self.n_parsed = len(set(parsed))
+        uniq = sorted(set(parsed))
+        self.rng_dates = (uniq[0], uniq[-1]) if len(uniq) >= 2 else self.full
+        self.n_parsed = len(uniq)
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
 
     def _draw(self):
         r = self.rng
         lo, hi = self.full if (r.random() < self.p or self.n_parsed <= 1) else self.rng_dates
+        if not isinstance(lo, dt.datetime):
+            lo = self.full[0]
+        if not isinstance(hi, dt.datetime):
+            hi = self.full[1]
+        if hi < lo:
+            lo, hi = hi, lo
         d = lo + dt.timedelta(seconds=r.randint(0, int((hi - lo).total_seconds())))
         s = d.strftime(self.template)
         if self.strip0:

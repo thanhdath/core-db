@@ -34,6 +34,8 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    null_share: dict = field(default_factory=dict)
+    distinct_values: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +60,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -122,7 +124,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, nshare, dvals = {}, {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +138,11 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                col = [r[j] for r in rows]
+                ov[(t, c.name)] = col
+                nn = [v for v in col if v is not None]
+                nshare[(t, c.name)] = (len(col) - len(nn)) / len(col) if col else 0.0
+                dvals[(t, c.name)] = {str(v) for v in nn}
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, nshare, dvals)

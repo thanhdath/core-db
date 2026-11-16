@@ -1,13 +1,4 @@
-"""Minimal row selection and referenced-row traversal (paper Section "Database Compaction").
-
-For every gold query the slicer maps a bounded part of the query's computation to source rows
-(row lineage): it re-runs the gold's FROM/JOIN/WHERE with the rowids of every source table projected,
-and adds bounded probes for ORDER BY extremes, GROUP BY groups, join fan-out and comparison
-boundaries.  Referenced rows are then added by following foreign keys from referencing to referenced
-tables until no new row is added or ``max_rounds`` is reached.
-
-The slicer only reads the original database; ``compact.write_compact_db`` writes the copy.
-"""
+"""Minimal row selection and referenced-row traversal (paper Section "Database Compaction")."""
 from collections import Counter, defaultdict
 import time
 
@@ -45,10 +36,10 @@ class Schema:
     """Tables, columns, primary keys, foreign keys and row counts of one SQLite database."""
 
     def __init__(self, connection):
-        self.tables = {}                 # lower name -> real name
-        self.columns = {}                # lower table -> {lower column -> real column}
-        self.primary_keys = {}           # lower table -> [real column]
-        self.foreign_keys = defaultdict(list)  # lower child -> [(lower parent, [(child col, parent col)])]
+        self.tables = {}
+        self.columns = {}
+        self.primary_keys = {}
+        self.foreign_keys = defaultdict(list)
         self.row_counts = {}
         names = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()

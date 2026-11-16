@@ -233,3 +233,108 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def _is_int_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return 'int' in t and 'point' not in t
+
+
+def _is_real_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return any(k in t for k in ('real', 'float', 'double', 'decimal', 'numeric', 'number'))
+
+
+def _is_date_type(type_str: str) -> bool:
+    t = (type_str or '').lower()
+    return 'date' in t or 'timestamp' in t
+
+
+def _round(v: float, nd: int) -> float:
+    return round(float(v), nd)
+
+
+class SpecSampler:
+    """Draws values for one (table, column) following the specification domains."""
+
+    def __init__(self, table: str, column, spec: dict, literal_pool: list, original_values: list,
+                 rng, n_rows: int):
+        self.table = table
+        self.column = column
+        self.name = column.name
+        self.spec = spec
+        self.rng = rng
+        self.n_rows = max(1, n_rows)
+        self.type_str = column.type_str or ''
+        self.key = '%s.%s' % (table, self.name)
+        self.base = _init_sampler(column, literal_pool, original_values, 0.2, rng,
+                                  1 if column.pk_pos else 0)
+
+    def _enum_pool(self) -> list:
+        spec = self.spec if isinstance(self.spec, dict) else {}
+        t, c = self.table, self.name
+        if c == 'Region':
+            if t in spec.get('superstore_region', {}):
+                return [spec['superstore_region'][t]]
+            return list(spec.get('regions', []))
+        if c == 'Segment':
+            return list(spec.get('segments', []))
+        if c == 'Category':
+            return list(spec.get('categories', []))
+        if c == 'Sub-Category':
+            return list(spec.get('sub_categories', []))
+        if c == 'Ship Mode':
+            return list(spec.get('ship_modes', []))
+        if c == 'Country':
+            return list(spec.get('countries', []))
+        if c == 'City':
+            return list(spec.get('cities', []))
+        if c == 'State':
+            return list(spec.get('states', []))
+        if c == 'Discount':
+            return list(spec.get('discounts', []))
+        return []
+
+    def _domain_value(self):
+        """Fresh value inside the specification domain of the column."""
+        spec = self.spec if isinstance(self.spec, dict) else {}
+        r = self.rng
+        t, c = self.table, self.name
+        enum = self._enum_pool()
+        if enum:
+            return r.choice(enum)
+        if c == 'Postal Code':
+            lo, hi = spec.get('postal_range', [10000, 99999])
+            return r.randint(int(lo), int(hi))
+        if c == 'Quantity':
+            lo, hi = spec.get('quantity_range', [1, 14])
+            return r.randint(int(lo), int(hi))
+        if c == 'Sales':
+            lo, hi = spec.get('sales_range', [0.0, 10000.0])
+            return _round(r.uniform(float(lo), float(hi)), 3)
+        if c == 'Profit':
+            lo, hi = spec.get('profit_range', [-5000.0, 5000.0])
+            return _round(r.uniform(float(lo), float(hi)), 4)
+        if _is_date_type(self.type_str):
+            lo, hi = spec.get('date_range', ['2013-01-01', '2014-12-31'])
+            d0 = dt.date.fromisoformat(str(lo))
+            d1 = dt.date.fromisoformat(str(hi))
+            return (d0 + dt.timedelta(days=r.randint(0, max(0, (d1 - d0).days)))).isoformat()
+        if _is_int_type(self.type_str):
+            return r.randint(1, 100000)
+        if _is_real_type(self.type_str):
+            return _round(r.uniform(0, 10000), 3)
+        return self.base.sample()
+
+    def sample(self):
+        """One value; NULL is a value to generate (NULL rule, applied in instance.py)."""
+        r = self.rng
+        if r.random() < 0.5:
+            return self._domain_value()
+        return self.base.sample()
+
+
+def make_spec_sampler(table: str, column, spec: dict, literal_pool: list, original_values: list,
+                      rng, n_rows: int) -> SpecSampler:
+    """Factory used by instance.py."""
+    return SpecSampler(table, column, spec, literal_pool, original_values, rng, n_rows)

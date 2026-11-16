@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -31,11 +31,11 @@ def _one(i: int) -> str:
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        stats = write_instance_sqlite(_G['schema'], inst, p, a['orig'])
+        return 'OK' + json.dumps(stats)
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return 'ERR' + type(e).__name__
 
 
 def main(argv=None) -> None:
@@ -63,7 +63,7 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -72,12 +72,26 @@ def main(argv=None) -> None:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
+    added: dict = {}
+    skip: dict = {}
+    n_ok = 0
     for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        if not r:
+            n_ok += 1
+        elif r.startswith('OK'):
+            n_ok += 1
+            st = json.loads(r[2:])
+            for t, n in (st.get('rows_ok') or {}).items():
+                added[t] = added.get(t, 0) + n
+            for t, n in (st.get('rows_failed') or {}).items():
+                skip[t] = skip.get(t, 0) + n
+        else:
+            k = r[3:]
+            errs[k] = errs.get(k, 0) + 1
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skip}))
 
 
 if __name__ == '__main__':

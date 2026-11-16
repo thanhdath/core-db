@@ -7,6 +7,41 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+_VOCAB = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'theta', 'kappa', 'lambda', 'sigma',
+          'network', 'learning', 'parsing', 'semantic', 'neural', 'graph', 'model', 'system', 'data',
+          'analysis', 'method', 'study', 'survey', 'review', 'theory', 'practice', 'language', 'vision',
+          'speech', 'search', 'ranking', 'cluster', 'kernel', 'matrix', 'tensor', 'vector', 'stream']
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _near_variant(s: str, rng) -> str:
+    """One near-variant: append 'x', drop last char, or one-char substitution."""
+    if not s:
+        return 'x'
+    u = rng.random()
+    if u < 0.34:
+        return s + 'x'
+    if u < 0.67:
+        return s[:-1] if len(s) > 1 else s
+    i = rng.randrange(len(s))
+    return s[:i] + rng.choice(string.ascii_lowercase) + s[i + 1:]
+
+
+def _like_variants(base: str, rng) -> list:
+    """like_variant rule: base token, one-char typo, upper-case, extra trailing char."""
+    b = base.replace('%', '')
+    if not b:
+        return []
+    i = rng.randrange(len(b))
+    typo = b[:i] + rng.choice(string.ascii_lowercase) + b[i + 1:]
+    return [b, typo, b.upper(), b + 'x']
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -29,21 +64,19 @@ class ColumnSampler:
         raise NotImplementedError
 
 
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_ = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_, hi_)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -82,14 +115,24 @@ class StringSampler(ColumnSampler):
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
+        self.length = length
 
     def _rand(self, k):
         return ''.join(self.rng.choice(CHARSET) for _ in range(k))
 
+    def _fresh_word(self):
+        r = self.rng
+        n = r.randint(1, 3)
+        words = [r.choice(_VOCAB) for _ in range(n)]
+        s = ' '.join(words)
+        if r.random() < 0.5:
+            s = s.title()
+        return s[:max(1, self.length)]
+
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
-            v = self._fresh_or_reuse(lambda: self._rand(r.randint(self.lo, self.hi)))
+            v = self._fresh_or_reuse(self._fresh_word)
         else:
             v = r.choice(self.elements)
         if r.random() < 0.5:
@@ -182,7 +225,7 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, lo=None, hi=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
@@ -201,21 +244,22 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
-        return NumberSampler(els, p, max_l0, rng, scale=4)
+        return NumberSampler(els, p, max_l0, rng, scale=4, lo=lo, hi=hi)
     if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
         is_int = 'int' in t
         scale, prec = 10, (0 if is_int else 4)
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, lo=lo, hi=hi)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), lo=None, hi=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,7 +269,7 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, lo=lo, hi=hi)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

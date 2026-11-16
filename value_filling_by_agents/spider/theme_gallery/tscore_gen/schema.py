@@ -34,6 +34,8 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: list = field(default_factory=list)
+    checks: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +60,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +77,37 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _parse_unique_tuples(create_sql: str, low: dict) -> list:
+    """Extract UNIQUE(...) / UNIQUE (col) column lists from a CREATE TABLE body."""
+    out = []
+    s = create_sql
+    i = 0
+    low_s = s.lower()
+    while True:
+        j = low_s.find('unique', i)
+        if j < 0:
+            break
+        k = low_s.find('(', j)
+        if k < 0:
+            break
+        depth, m = 0, k
+        while m < len(s):
+            if s[m] == '(':
+                depth += 1
+            elif s[m] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            m += 1
+        inner = s[k + 1:m]
+        cols = [c.strip().strip('"`[]').lower() for c in inner.split(',')]
+        cols = [low.get(c, c) for c in cols if c]
+        if cols:
+            out.append(cols)
+        i = m + 1
+    return out
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -85,6 +118,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        unique_tuples = []
+        checks: dict = {}
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -96,9 +131,17 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     uniq.add(tok)
                 if ('check (' in ll or 'check(' in ll) and tok in low:
                     chk.add(tok)
+                    checks[(t, low[tok])] = line
+            for cols in _parse_unique_tuples(create[t], low):
+                unique_tuples.append((t, cols))
+                if len(cols) == 1:
+                    uniq.add(cols[0].lower())
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                    names = [c[2] for c in cols if c[2]]
+                    if names:
+                        unique_tuples.append((t, names))
                     if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
                         uniq.add(cols[0][2].lower())
                         from_index.append((t, cols[0][2]))
@@ -139,4 +182,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_tuples, checks)

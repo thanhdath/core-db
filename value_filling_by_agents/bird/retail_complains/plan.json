@@ -1,50 +1,942 @@
 {
  "db": "retail_complains",
- "operator_io_quirks": [
-  "Mixed-case + spaced identifiers: 'Date received', 'Complaint ID', 'rand client', 'vru+line', 'Sub-product', 'Consumer consent provided?', 'Timely response?', 'Consumer disputed?', 'Date sent to company', 'Company response to consumer', 'Consumer complaint narrative', 'Sub-issue', 'Client_ID' \u2014 must be double-quoted; '?' and '+' and spaces inside names.",
-  "Table 'state' has column 'State' and 'Region'; client has column 'state' (TEXT abbrev) and 'district_id' FK; district has 'state_abbrev' FK to state.StateCode \u2014 column name 'state' collides with table name 'state'.",
-  "DATE-declared columns store TEXT 'YYYY-MM-DD' (callcenterlogs.'Date received', events.'Date received', reviews.'Date'): ts_fuzzer dispatch = Date|Number(int elements) \u2014 first element parses as int? '2017-03-27' does NOT parse as int, so Date fuzzer with template %Y-%m-%d.",
-  "events.'Date sent to company' is declared TEXT but stores 'YYYY-MM-DD' dates \u2014 String fuzzer, not Date; text-stored dates in a TEXT column.",
-  "callcenterlogs.ser_start/ser_exit/ser_time are TEXT storing 'HH:MM:SS' \u2014 String fuzzer, not Time (declared type is TEXT not TIME).",
-  "callcenterlogs.'Complaint ID' is PK but null_rate 0.374 and distinct 2504 < rows 3999 \u2014 PK column contains NULLs and duplicates in the original (SQLite allows NULL in TEXT PK).",
-  "events PK is composite ('Complaint ID','Client_ID'); events.'Complaint ID' FK -> callcenterlogs.'Complaint ID' (parent PK has NULLs/dups), events.Client_ID FK -> client.client_id.",
-  "reviews PK is 'Date' (DATE-declared, text-stored) \u2014 Date fuzzer must produce unique dates or PK-duplicate rows get dropped; only 377 rows.",
-  "events.'Sub-issue' is 100% NULL (distinct 0, no samples) \u2014 String sampler gets empty element list, p:=1, all fresh random strings.",
-  "client.address_2 null_rate 0.985 (24 distinct); events.'Consumer complaint narrative' 0.809; reviews.Reviews 0.881; Tags 0.86 \u2014 heavy NULL columns.",
-  "No NOT NULL constraints anywhere (notnull=0 on every column) \u2014 TS will not enforce; NULLs appear via element dropout / FK empty-parent.",
-  "FK chain: state <- district <- client <- callcenterlogs/events/reviews; events also -> callcenterlogs. Topological levels: state(0), district(1), client(2), callcenterlogs(3), events(4), reviews(3)."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on 'Date received'/'Date' with template %Y-%m-%d: parses samples, range ~[2012,2017], generates plausible dates \u2014 good for date-range predicates; but strips leading zeros quirk may emit '2017-3-7' style if no element starts with 0 or contains '-0' (here elements like '2017-03-27' start with '2', so leading-zero strip triggers -> '2017-3-27' format drift).",
-  "String fuzzer on phonefinal/phone/social/email/address_1: random CHARSET strings + contaminate \u2014 implausible values (e.g. 'aB3()x') drive FN on LIKE '%@%' / phone-pattern predicates.",
-  "String fuzzer on low-cardinality enums (sex 2, outcome 3, type 6, priority 3, Stars 3, Product 2-3, 'Timely response?' 2, 'Consumer disputed?' 2, Region 4, division 9): fresh random strings dominate -> equality/IN predicates on these enums almost never match -> FN.",
-  "Number fuzzer on priority (0,1,2), Stars (1,2,5), day/month/year/age/zipcode: full-range uniform [-10^scale,10^scale] with scale=0 -> [-1,1] for INTEGER? scale from type args absent -> scale=0, range [-1,1] \u2014 priority/Stars values outside {0,1,2}/{1,2,5} -> FN on priority=2, Stars=5.",
-  "Number fuzzer on year (1960-1990) and age: scale=0 range [-1,1] unless list range from elements used \u2014 list_max quirk (min(el), full max) means upper end overwritten to 1, so year/age mostly in [-1,1] -> implausible ages/years -> FN on age>50, year=1990.",
-  "Number fuzzer on district_id (1..77), call_id (34536..): scale=0 -> [-1,1] plus element perturbation +-1/+-2 \u2014 district_id FK values drawn from parent's generated district_id (also [-1,1]-ish) so joins still work but district_id=65 predicates miss.",
-  "String fuzzer on client_id 'C00000001' / Complaint ID 'CR0000072': int-like suffix handling adds str(i+1)/str(i-1) only for pure int-like strings; 'C00000001' is not int-like -> random strings, breaking FK join plausibility and 'C%' LIKE predicates -> FN.",
-  "FK fill: events.Client_ID drawn from client.client_id final values; events.'Complaint ID' from callcenterlogs.'Complaint ID' final (after PK dedup) \u2014 but callcenterlogs PK has NULLs in original, TS drops PK-duplicate rows so parent may be smaller; child draws with replacement -> duplicates in child, fine for composite PK only if pair unique.",
-  "reviews PK 'Date' unique: Date fuzzer with max_l0=inf (single-col PK) generates fresh dates; PK dedup drops collisions; 377 rows target but Date range ~[2013,2013] narrow -> many PK collisions dropped -> reviews may end up tiny -> FN on reviews joins.",
-  "callcenterlogs.'Complaint ID' PK with NULLs: TS String sampler may emit NULL (element dropout 0.9 keeps NULLs? base drops None) \u2014 PK dedup keeps first; NULL PK rows survive in SQLite -> join to events on 'Complaint ID' loses NULL matches.",
-  "Empty 'Sub-issue' (all NULL): String sampler with no elements -> p=1, all fresh random strings -> any predicate on Sub-issue IS NULL fails (no NULLs generated) -> FN; conversely IS NOT NULL always true.",
-  "No NOT NULL: TS freely emits NULLs in FK columns when parent empty or element dropout -> joins silently drop rows -> FN on inner-join counts."
- ],
- "challenger_refs": [
-  "G20",
-  "G18",
-  "G8",
-  "G17",
-  "G4",
-  "G1",
-  "G7",
-  "G19",
-  "G12",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_identifier": "Sample from a per-table pool of formatted identifiers (prefix + zero-padded counter); keep format stable; allow near-variants (case flips, one-character edits) at ~2% of rows; NULL only if the column is nullable and its compact NULL share > 0.",
+   "text_name": "Sample from a name pool; allow duplicates (20-50% duplicate share) and case near-variants; NULL only if the column is nullable and its compact NULL share > 0.",
+   "text_enum": "Sample uniformly from the enumerated value list; allow case near-variants at ~2%; NULL only if the column is nullable and its compact NULL share > 0.",
+   "text_free": "Sample from a small pool of realistic strings; allow near-variants and NULL per the column null share.",
+   "integer_range": "Sample uniformly within the stated range; include boundary values and one step on each side (only literals inside the declared range are emitted; out-of-range literals are used as query literals only); NULL only if nullable.",
+   "integer_enum": "Sample uniformly from the enumerated integer list; emit only values inside any declared range constraint; NULL only if nullable.",
+   "date_iso": "Sample a date in YYYY-MM-DD format within the stated range; include boundary dates and one day on each side keeping the table's date-order rules; NULL only if nullable.",
+   "time_hhmmss": "Sample a time in HH:MM:SS format within 00:00:00-23:59:59; NULL only if nullable.",
+   "phone_us": "Sample NNN-NNN-NNNN; NULL only if nullable.",
+   "ssn_us": "Sample NNN-NN-NNNN; NULL only if nullable.",
+   "email": "Sample local.part@domain with domains gmail.com/outlook.com; allow near-variants (@gmail.con, @GMAIL.COM, x @gmail.com) at ~2%; NULL only if nullable.",
+   "zipcode": "Sample integer 1000-99999; NULL only if nullable.",
+   "null_share": "For each nullable column, plant NULLs at the compact database's null rate (a column whose compact null rate is 0 gets no planted NULLs); never replace a planted NULL. A NULL-planting pass must run BEFORE derived-column computation so derived columns see final inputs.",
+   "boundary_literals": "For each equality/range literal in per_column_exceptions, include the literal, one step below and one step above as query literals; only literals inside the column's declared range are emitted as values.",
+   "tie_ranks": "For ORDER/LIMIT columns, ensure at least two rows tie at the listed rank on the listed aggregate.",
+   "unmatched_join_rows": "For join columns, include parent rows without children and (where nullable) child rows with NULL foreign key.",
+   "fresh_values": "Each instance uses a fresh pool per table sized to the instance row count; cap re-use at no more than the compact distinct count so variation stays high."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "state.StateCode",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "AL",
+      "AR",
+      "AZ",
+      "CA",
+      "CO",
+      "CT",
+      "DC",
+      "DE",
+      "FL",
+      "GA",
+      "HI",
+      "ID",
+      "IL",
+      "IN",
+      "IA",
+      "KS",
+      "KY",
+      "LA",
+      "ME",
+      "MD",
+      "MA",
+      "MI",
+      "MN",
+      "MS",
+      "MO",
+      "MT",
+      "NE",
+      "NV",
+      "NH",
+      "NJ",
+      "NM",
+      "NY",
+      "NC",
+      "ND",
+      "OH",
+      "OK",
+      "OR",
+      "PA",
+      "RI",
+      "SC",
+      "SD",
+      "TN",
+      "TX",
+      "UT",
+      "VT",
+      "VA",
+      "WA",
+      "WV",
+      "WI",
+      "WY"
+     ],
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "state.Region",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "South",
+      "West",
+      "Northeast",
+      "Midwest"
+     ],
+     "null_share": "compact rate (near 0; at most a single NULL allowed if the compact rate > 0)"
+    }
+   },
+   {
+    "column": "district.district_id",
+    "pattern": "integer_range",
+    "targets": {
+     "min": 1,
+     "max": 77,
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "district.state_abbrev",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "AL",
+      "AR",
+      "AZ",
+      "CA",
+      "CO",
+      "CT",
+      "DC",
+      "DE",
+      "FL",
+      "GA",
+      "HI",
+      "ID",
+      "IL",
+      "IN",
+      "IA",
+      "KS",
+      "KY",
+      "LA",
+      "ME",
+      "MD",
+      "MA",
+      "MI",
+      "MN",
+      "MS",
+      "MO",
+      "MT",
+      "NE",
+      "NV",
+      "NH",
+      "NJ",
+      "NM",
+      "NY",
+      "NC",
+      "ND",
+      "OH",
+      "OK",
+      "OR",
+      "PA",
+      "RI",
+      "SC",
+      "SD",
+      "TN",
+      "TX",
+      "UT",
+      "VT",
+      "VA",
+      "WA",
+      "WV",
+      "WI",
+      "WY"
+     ],
+     "boundary_literals": [
+      "IN",
+      "MA",
+      "MD"
+     ],
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "district.city",
+    "pattern": "text_free",
+    "targets": {
+     "boundary_literals": [
+      "Norwalk",
+      "Indianapolis",
+      "New York City"
+     ],
+     "ties_for_order_limit": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "district.division",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "Middle Atlantic",
+      "South Atlantic",
+      "East North Central",
+      "Pacific",
+      "Mountain",
+      "New England",
+      "East South Central",
+      "West South Central",
+      "West North Central"
+     ],
+     "null_share": "5-30%",
+     "boundary_literals": [
+      "East North Central"
+     ]
+    }
+   },
+   {
+    "column": "client.client_id",
+    "pattern": "text_identifier",
+    "targets": {
+     "format": "C########",
+     "unmatched_join_rows": true,
+     "ties_for_order_limit": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "client.sex",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "Male",
+      "Female"
+     ],
+     "boundary_literals": [
+      "Male",
+      "Female"
+     ],
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "client.age",
+    "pattern": "integer_range",
+    "targets": {
+     "min": 18,
+     "max": 100,
+     "boundary_literals": [
+      49,
+      50,
+      51,
+      64,
+      65,
+      66
+     ],
+     "rows_with_different_values": ">= 2 distinct values per group"
+    }
+   },
+   {
+    "column": "client.email",
+    "pattern": "email",
+    "targets": {
+     "like_near_variant": [
+      "%@gmail.com",
+      "%@outlook.com",
+      "@gmail.con",
+      "@GMAIL.COM",
+      "@outlook.con",
+      "@OUTLOOK.COM"
+     ],
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "client.last",
+    "pattern": "text_name",
+    "targets": {
+     "duplicates_for_distinct": "20-50%",
+     "boundary_literals": [
+      "Pierce",
+      "Hicks"
+     ]
+    }
+   },
+   {
+    "column": "client.middle",
+    "pattern": "text_name",
+    "targets": {
+     "duplicates_for_distinct": "20-50%",
+     "boundary_literals": [
+      "Bronx",
+      "Eliza",
+      "Lewis"
+     ]
+    }
+   },
+   {
+    "column": "client.first",
+    "pattern": "text_name",
+    "targets": {
+     "duplicates_for_distinct": "20-50%"
+    }
+   },
+   {
+    "column": "client.city",
+    "pattern": "text_free",
+    "targets": {
+     "boundary_literals": [
+      "Norwalk",
+      "Indianapolis"
+     ]
+    }
+   },
+   {
+    "column": "client.state",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "AL",
+      "AR",
+      "AZ",
+      "CA",
+      "CO",
+      "CT",
+      "DC",
+      "DE",
+      "FL",
+      "GA",
+      "HI",
+      "ID",
+      "IL",
+      "IN",
+      "IA",
+      "KS",
+      "KY",
+      "LA",
+      "ME",
+      "MD",
+      "MA",
+      "MI",
+      "MN",
+      "MS",
+      "MO",
+      "MT",
+      "NE",
+      "NV",
+      "NH",
+      "NJ",
+      "NM",
+      "NY",
+      "NC",
+      "ND",
+      "OH",
+      "OK",
+      "OR",
+      "PA",
+      "RI",
+      "SC",
+      "SD",
+      "TN",
+      "TX",
+      "UT",
+      "VT",
+      "VA",
+      "WA",
+      "WV",
+      "WI",
+      "WY"
+     ]
+    }
+   },
+   {
+    "column": "client.district_id",
+    "pattern": "integer_range",
+    "targets": {
+     "min": 1,
+     "max": 77,
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "client.zipcode",
+    "pattern": "zipcode",
+    "targets": {
+     "min": 1000,
+     "max": 99999
+    }
+   },
+   {
+    "column": "client.phone",
+    "pattern": "phone_us",
+    "targets": {}
+   },
+   {
+    "column": "client.social",
+    "pattern": "ssn_us",
+    "targets": {
+     "duplicates_for_distinct": "0% (must be distinct)"
+    }
+   },
+   {
+    "column": "callcenterlogs.Complaint ID",
+    "pattern": "text_identifier",
+    "targets": {
+     "format": "CR#######",
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "callcenterlogs.rand client",
+    "pattern": "text_identifier",
+    "targets": {
+     "format": "C########",
+     "null_share": "0.374",
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "callcenterlogs.priority",
+    "pattern": "integer_enum",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "column": "callcenterlogs.type",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "NW",
+      "PS",
+      "NE",
+      "TT",
+      "IN",
+      "PE"
+     ]
+    }
+   },
+   {
+    "column": "callcenterlogs.outcome",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "AGENT",
+      "HANG",
+      "PHANTOM"
+     ]
+    }
+   },
+   {
+    "column": "callcenterlogs.server",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "MICHAL",
+      "TOVA",
+      "YIFAT",
+      "AVNI",
+      "STEREN",
+      "ANAT",
+      "MIKI",
+      "DORIT"
+     ]
+    }
+   },
+   {
+    "column": "callcenterlogs.ser_start",
+    "pattern": "time_hhmmss",
+    "targets": {}
+   },
+   {
+    "column": "callcenterlogs.ser_exit",
+    "pattern": "time_hhmmss",
+    "targets": {}
+   },
+   {
+    "column": "callcenterlogs.ser_time",
+    "pattern": "time_hhmmss",
+    "targets": {}
+   },
+   {
+    "column": "events.Complaint ID",
+    "pattern": "text_identifier",
+    "targets": {
+     "format": "CR#######",
+     "unmatched_join_rows": true
+    }
+   },
+   {
+    "column": "events.Client_ID",
+    "pattern": "text_identifier",
+    "targets": {
+     "format": "C########",
+     "unmatched_join_rows": true,
+     "boundary_literals": [
+      "C00007127"
+     ]
+    }
+   },
+   {
+    "column": "events.Sub-product",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "Checking account",
+      "Savings account",
+      "Other bank product/service",
+      "(CD) Certificate of deposit",
+      "Cashing a check without an account"
+     ],
+     "null_share": "40%"
+    }
+   },
+   {
+    "column": "events.Tags",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "Older American",
+      "Older American, Servicemember",
+      "Servicemember"
+     ],
+     "null_share": "86%"
+    }
+   },
+   {
+    "column": "events.Consumer disputed?",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "No",
+      "Yes"
+     ],
+     "null_share": "4%"
+    }
+   },
+   {
+    "column": "reviews.Stars",
+    "pattern": "integer_enum",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "boundary_literals": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6
+     ],
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "reviews.Product",
+    "pattern": "text_enum",
+    "targets": {
+     "values": [
+      "Eagle National Mortgage",
+      "Eagle National Bank",
+      "Eagle Capital"
+     ],
+     "duplicates_for_distinct": "20-50%"
+    }
+   },
+   {
+    "column": "reviews.district_id",
+    "pattern": "integer_range",
+    "targets": {
+     "min": 1,
+     "max": 77,
+     "unmatched_join_rows": true
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "district.state_abbrev",
+    "parent": "state.StateCode",
+    "copied": []
+   },
+   {
+    "child": "client.district_id",
+    "parent": "district.district_id",
+    "copied": []
+   },
+   {
+    "child": "callcenterlogs.rand client",
+    "parent": "client.client_id",
+    "copied": []
+   },
+   {
+    "child": "events.Complaint ID",
+    "parent": "callcenterlogs.Complaint ID",
+    "copied": []
+   },
+   {
+    "child": "events.Client_ID",
+    "parent": "client.client_id",
+    "copied": [],
+    "note": "independent FK; Client_ID is NOT required to equal callcenterlogs.rand client of the referenced complaint (see uncertainty)"
+   },
+   {
+    "child": "reviews.district_id",
+    "parent": "district.district_id",
+    "copied": []
+   },
+   {
+    "table": "state",
+    "primary_key": [
+     "StateCode"
+    ]
+   },
+   {
+    "table": "district",
+    "primary_key": [
+     "district_id"
+    ]
+   },
+   {
+    "table": "client",
+    "primary_key": [
+     "client_id"
+    ],
+    "unique": [
+     [
+      "social"
+     ],
+     [
+      "phone"
+     ],
+     [
+      "email"
+     ]
+    ]
+   },
+   {
+    "table": "callcenterlogs",
+    "primary_key": [
+     "Complaint ID"
+    ]
+   },
+   {
+    "table": "events",
+    "primary_key": [
+     "Complaint ID",
+     "Client_ID"
+    ]
+   },
+   {
+    "table": "reviews",
+    "primary_key": [
+     "Date"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "client",
+    "column": "age",
+    "formula": "age BETWEEN 18 AND 100"
+   },
+   {
+    "table": "client",
+    "column": "day",
+    "formula": "day BETWEEN 1 AND 31"
+   },
+   {
+    "table": "client",
+    "column": "month",
+    "formula": "month BETWEEN 1 AND 12"
+   },
+   {
+    "table": "client",
+    "column": "year",
+    "formula": "year BETWEEN 1900 AND 2017"
+   },
+   {
+    "table": "client",
+    "column": "zipcode",
+    "formula": "zipcode BETWEEN 1000 AND 99999"
+   },
+   {
+    "table": "client",
+    "column": "sex",
+    "formula": "sex IN ('Male','Female')"
+   },
+   {
+    "table": "callcenterlogs",
+    "column": "priority",
+    "formula": "priority IN (0,1,2)"
+   },
+   {
+    "table": "callcenterlogs",
+    "column": "type",
+    "formula": "type IN ('NW','PS','NE','TT','IN','PE')"
+   },
+   {
+    "table": "callcenterlogs",
+    "column": "outcome",
+    "formula": "outcome IN ('AGENT','HANG','PHANTOM')"
+   },
+   {
+    "table": "callcenterlogs",
+    "column": "ser_exit",
+    "formula": "ser_exit >= ser_start",
+    "condition": "ser_start IS NOT NULL AND ser_exit IS NOT NULL",
+    "evidence": "rows 1-8: ser_exit later than ser_start"
+   },
+   {
+    "table": "callcenterlogs",
+    "column": "ser_time",
+    "formula": "ser_time = printf('%02d:%02d:%02d', (CAST(substr(ser_exit,1,2) AS INTEGER)*3600 + CAST(substr(ser_exit,4,2) AS INTEGER)*60 + CAST(substr(ser_exit,7,2) AS INTEGER) - CAST(substr(ser_start,1,2) AS INTEGER)*3600 - CAST(substr(ser_start,4,2) AS INTEGER)*60 - CAST(substr(ser_start,7,2) AS INTEGER))/3600, ((CAST(substr(ser_exit,1,2) AS INTEGER)*3600 + CAST(substr(ser_exit,4,2) AS INTEGER)*60 + CAST(substr(ser_exit,7,2) AS INTEGER) - CAST(substr(ser_start,1,2) AS INTEGER)*3600 - CAST(substr(ser_start,4,2) AS INTEGER)*60 - CAST(substr(ser_start,7,2) AS INTEGER))%3600)/60, (CAST(substr(ser_exit,1,2) AS INTEGER)*3600 + CAST(substr(ser_exit,4,2) AS INTEGER)*60 + CAST(substr(ser_exit,7,2) AS INTEGER) - CAST(substr(ser_start,1,2) AS INTEGER)*3600 - CAST(substr(ser_start,4,2) AS INTEGER)*60 - CAST(substr(ser_start,7,2) AS INTEGER))%60)",
+    "condition": "ser_start IS NOT NULL AND ser_exit IS NOT NULL",
+    "evidence": "row1 13:34:11->13:40:23 = 00:06:12; row2 10:58:22->11:16:10 = 00:17:48; row3 13:00:54->13:13:31 = 00:12:37"
+   },
+   {
+    "table": "events",
+    "column": "Product",
+    "formula": "Product IN ('Bank account or service','Credit card')"
+   },
+   {
+    "table": "events",
+    "column": "Timely response?",
+    "formula": "Timely response? IN ('Yes','No')"
+   },
+   {
+    "table": "events",
+    "column": "Consumer disputed?",
+    "formula": "Consumer disputed? IN ('No','Yes')"
+   },
+   {
+    "table": "events",
+    "column": "Consumer consent provided?",
+    "formula": "\"Consumer consent provided?\" IN ('N/A','Consent not provided','Consent provided','Other')"
+   },
+   {
+    "table": "events",
+    "column": "Submitted via",
+    "formula": "\"Submitted via\" IN ('Email','Fax','Postal mail','Referral','Web','Phone')"
+   },
+   {
+    "table": "events",
+    "column": "Company response to consumer",
+    "formula": "\"Company response to consumer\" IN ('Closed with explanation','Closed with relief','Closed without relief','Closed with non-monetary relief','In progress','Closed with monetary relief','Closed','Untimely response')"
+   },
+   {
+    "table": "events",
+    "column": "Date sent to company",
+    "formula": "date(\"Date sent to company\") >= date(\"Date received\")",
+    "condition": "\"Date sent to company\" IS NOT NULL AND \"Date received\" IS NOT NULL",
+    "evidence": "row1 2014-07-03->2014-07-09; row2 2012-04-12->2012-04-13; row3 2012-04-03->2012-04-03"
+   },
+   {
+    "table": "reviews",
+    "column": "Stars",
+    "formula": "Stars BETWEEN 1 AND 5"
+   },
+   {
+    "table": "reviews",
+    "column": "Product",
+    "formula": "Product IN ('Eagle National Mortgage','Eagle National Bank','Eagle Capital')"
+   },
+   {
+    "table": "district",
+    "column": "division",
+    "formula": "division IN ('Middle Atlantic','South Atlantic','East North Central','Pacific','Mountain','New England','East South Central','West South Central','West North Central')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "state": 48,
+   "district": 77,
+   "client": 230,
+   "callcenterlogs": 230,
+   "events": 230,
+   "reviews": 230
+  },
+  "null_targets": [
+   "client.sex",
+   "client.email",
+   "client.address_2",
+   "callcenterlogs.rand client",
+   "callcenterlogs.vru+line",
+   "callcenterlogs.call_id",
+   "callcenterlogs.priority",
+   "callcenterlogs.type",
+   "callcenterlogs.outcome",
+   "callcenterlogs.server",
+   "events.Sub-product",
+   "events.Consumer complaint narrative",
+   "events.Tags",
+   "events.Consumer consent provided?",
+   "events.Consumer disputed?",
+   "reviews.Stars",
+   "reviews.Reviews",
+   "district.division"
+  ],
+  "supporting_evidence": {
+   "ser_time_formula": [
+    "callcenterlogs row1: 13:34:11->13:40:23 = 00:06:12",
+    "callcenterlogs row2: 10:58:22->11:16:10 = 00:17:48",
+    "callcenterlogs row3: 13:00:54->13:13:31 = 00:12:37"
+   ],
+   "events_date_order": [
+    "events row1: 2014-07-03->2014-07-09",
+    "events row2: 2012-04-12->2012-04-13",
+    "events row3: 2012-04-03->2012-04-03"
+   ],
+   "callcenterlogs_time_order": [
+    "callcenterlogs row1: 13:34:11<13:40:23",
+    "callcenterlogs row2: 10:58:22<11:16:10",
+    "callcenterlogs row3: 13:00:54<13:13:31"
+   ],
+   "callcenterlogs_rand_client_null": "statistics: callcenterlogs.rand client null_rate 0.374, distinct 2019",
+   "events_subproduct_tags_null": "statistics: events.Sub-product null_rate 0.398; events.Tags null_rate 0.86",
+   "events_date_text_type": "schema: events.\"Date sent to company\" is TEXT; comparison uses date() cast",
+   "pk_not_null": "callcenterlogs.\"Complaint ID\" and events.\"Complaint ID\" are primary-key components and therefore never NULL in generated rows"
+  },
+  "uncertainty": "ser_time formula requires ser_exit >= ser_start on all rows where both are non-NULL; generated rows with NULL ser_start or ser_exit get NULL ser_time or an unchecked rule (three-valued logic). events.Client_ID is drawn as an independent FK and is not forced to equal callcenterlogs.rand client of the referenced complaint; this is the documented treatment of two independent FKs (add a derivation rule if the intended semantics require equality). Enum pools for callcenterlogs.server and callcenterlogs.type come from the sample only and may be incomplete relative to the compact database. Boundary literals outside a declared range (reviews.Stars 0 and 6, out-of-range client.age literals) are used only as query literals, never emitted as generated values. Compact NULL shares of 0 for nullable columns (e.g. client.age, client.city) yield no planted NULLs; the per-instance 'at least one NULL' rule is relaxed to the compact share for consistency."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` copies the compact database and appends generated rows, but the execution feedback reports `rows_added` = 0 for every table (state 0, callcenterlogs 0, client 0, district 0, events 0, reviews 0) while `n_ok` = 20. The `nullable_columns` feedback, however, shows thousands of generated rows per table (e.g. callcenterlogs 4342, client 4352, events 4389, reviews 3786). This is contradictory: either the writer's `rows_ok` accounting is wrong (it returns `ok[t]` but the CLI never reads the return value of `write_instance_sqlite` \u2014 `_one` discards it and the summary hardcodes `added[t] = 0`), or rows are not actually being appended. The CLI's `rows_added`/`rows_skipped` are initialized to 0 and never populated from the writer result, so the reported 0 is a reporting bug, not proof of no insertion. This must be fixed so the execution feedback truthfully reflects appended rows.",
+     "requested_revision": "In cli.py `_one`, capture the dict returned by `write_instance_sqlite` and propagate `rows_ok`/`rows_failed` back to the summary (e.g. return the dict or write it to a shared structure), and populate `rows_added`/`rows_skipped` from it. Re-run and confirm non-zero `rows_added` consistent with the `nullable_columns` counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires that for every nullable column each instance contains generated rows with NULL and rows with non-NULL values, with NULL share following the compact database's share. The feedback shows many nullable columns with 'NULL 0 / n' or near-zero: `state.State: NULL 0 / 53`, `state.Region: NULL 1 / 53`, and many columns with exactly `NULL 20 / n` (e.g. client.age, client.city, client.day, client.district_id, client.first, client.last, client.middle, client.month, client.phone, client.social, client.state, client.year, client.zipcode, callcenterlogs.Date received, phonefinal, ser_start, ser_exit, ser_time, events.Date received, Date sent to company, Issue, Product, Submitted via, Timely response?, reviews.Product). The `20 / n` pattern equals the number of instances (20), i.e. exactly one NULL per instance from `_plant_nulls`, not the compact database's null share. For columns that are nullable in the schema but have no `null_share` target and whose compact share is 0 (e.g. client.age, client.city, client.day, client.district_id, client.first, client.last, client.middle, client.month, client.phone, client.social, client.state, client.year, client.zipcode, callcenterlogs.Date received, phonefinal, ser_start, ser_exit, ser_time, events.Date received, Date sent to company, Issue, Product, Submitted via, Timely response?, reviews.Product), `_null_share` returns 0.0, so the sampler never plants NULLs; only `_plant_nulls` forces one per instance. This violates the interface rule that the NULL share should follow the compact database's share (which is 0 here, so arguably no NULLs should be planted at all \u2014 but then `_plant_nulls` should not force one). The rule as stated ('at least one NULL row per nullable column') conflicts with 'NULL share following the compact database's share' when the compact share is 0. The program forces a NULL where the compact share is 0, producing a NULL share of 1/n instead of 0.",
+     "requested_revision": "Reconcile `_plant_nulls` with `_null_share`: when the compact database's null share for a nullable column is 0, do not force a NULL (or document that the 'at least one NULL' rule overrides the share). More importantly, for columns with a specified `null_share` target (e.g. client.sex 0.15, client.email 0.15, events.Sub-product 0.40, events.Tags 0.86, reviews.Stars 0.15, district.division 0.15), verify the realized share matches the target; the feedback shows client.sex 637/4352 \u2248 0.146 (ok), client.email 635/4352 \u2248 0.146 (ok), events.Sub-product 1792/4389 \u2248 0.408 (ok), events.Tags 3770/4389 \u2248 0.859 (ok), reviews.Stars 582/3786 \u2248 0.154 (ok), district.division not listed (check). The main defect is the forced single NULL on zero-share columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` list includes `callcenterlogs.Complaint ID` and `callcenterlogs.rand client`, and the per-column exceptions give them `null_share: 0.374`. However, `callcenterlogs.Complaint ID` is the PRIMARY KEY of callcenterlogs and `events.Complaint ID` is a foreign key referencing it. The schema declares `\"Complaint ID\" TEXT` with `primary key (\"Complaint ID\")` \u2014 in SQLite a TEXT primary key is NOT NULL by default only if declared NOT NULL; here it is not explicitly NOT NULL, but the PK constraint in SQLite allows NULLs in a non-INTEGER PK unless NOT NULL is specified. The feedback shows `callcenterlogs.rand client: NULL 1625 / 4342` (\u22480.374, matching the target) but does NOT list `callcenterlogs.Complaint ID` in `nullable_columns`, and `events.Complaint ID` is not listed either. The specification's `null_targets` includes `callcenterlogs.Complaint ID`, but the program's `_is_nullable` returns `not cm.notnull and cm.pk_pos == 0` \u2014 for a PK column `pk_pos > 0`, so `_is_nullable` returns False and no NULLs are planted. This is consistent with the interface rule 'NOT NULL / primary-key columns never get NULL', but it contradicts the specification's `null_targets` listing `callcenterlogs.Complaint ID`. The specification should be corrected to remove `callcenterlogs.Complaint ID` from `null_targets` (PK columns must not be NULL), and the `null_share: 0.374` target on it should be removed.",
+     "requested_revision": "Designer: remove `callcenterlogs.Complaint ID` from `null_targets` and drop its `null_share` target in the per-column exceptions, since it is a primary key and must never be NULL. Engineer: confirm `_is_nullable` correctly excludes PK columns (it does) and that no NULL is ever written to `callcenterlogs.Complaint ID`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `dependencies` list includes `{\"child\": \"events.Complaint ID\", \"parent\": \"callcenterlogs.Complaint ID\", \"copied\": []}` and `{\"child\": \"events.Client_ID\", \"parent\": \"client.client_id\", \"copied\": []}`. The program's `DEPENDENCIES` in specification.py matches these. However, `events` has a composite primary key `(\"Complaint ID\", \"Client_ID\")` and both are foreign keys. The `fill_foreign_keys_consistently` / `build_random_instance` fills FK columns by drawing independently from the parent's values, so `events.Complaint ID` and `events.Client_ID` are drawn independently. This can produce `(Complaint ID, Client_ID)` pairs that do not correspond to any actual callcenterlogs row's `rand client` \u2014 i.e., the event's complaint and client are unrelated. The schema does not enforce this (only separate FKs), so it is not an integrity violation, but it may break the intended semantic that an event's client matches the complaint's client. The specification does not state this constraint, so it is not a blocking error, but it is an unresolved semantic check.",
+     "requested_revision": "Designer: clarify whether `events.Client_ID` should equal the `rand client` of the referenced `callcenterlogs.Complaint ID` row. If so, add a dependency/derivation rule and implement it in `build_random_instance` (draw Client_ID from the chosen complaint's rand client). If not, document that the two FKs are independent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic rule `ser_time = ser_exit - ser_start` is implemented in `_apply_callcenter_derived`, which sets `ser_exit = ser_start + randrange(0,3600)` when `ser_exit < ser_start` and computes `ser_time` as the difference. However, `ser_start`, `ser_exit`, and `ser_time` are sampled independently by `TimeSampler` (each with `null_share` 0 unless the compact share is non-zero). The feedback shows `callcenterlogs.ser_start: NULL 20 / 4342`, `ser_exit: NULL 20 / 4342`, `ser_time: NULL 20 / 4342` \u2014 i.e., one NULL per instance from `_plant_nulls`, not from the sampler. When `ser_start` or `ser_exit` is NULL, `_apply_callcenter_derived` sets `ser_time` to None, which is consistent. But the `_plant_nulls` step runs AFTER `_apply_callcenter_derived`, so it can plant a NULL into `ser_start` or `ser_exit` after `ser_time` was computed, leaving `ser_time` non-NULL while `ser_start`/`ser_exit` is NULL \u2014 violating the formula for that row (though SQL three-valued logic means the rule holds when the expression is not FALSE; a NULL operand makes the comparison NULL, not FALSE, so it is not a violation). More importantly, `_plant_nulls` can plant a NULL into `ser_time` independently, which is fine. The real issue: `_plant_nulls` runs after derived columns, so it can break the `ser_exit >= ser_start` invariant only if it nulls one of them (which is allowed under three-valued logic). This is acceptable per the interface rule. No blocking error, but note that `_plant_nulls` should ideally run before derived-column computation to keep derived columns consistent with their inputs.",
+     "requested_revision": "Engineer: move `_plant_nulls` before `_apply_callcenter_derived` and `_apply_events_derived` so that derived columns are computed from the final (possibly NULL) inputs, or explicitly document that NULL inputs yield NULL derived values. This is a robustness improvement, not a blocking defect."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `boundary_literals` for `client.age` are `[49, 50, 51, 64, 65, 66]`, and `IntegerRangeSampler` samples them with probability 0.10. The `comparison_boundary` pattern for `client.age` targets `PRED(client.age > 65)` with values `[49,50,51,64,65,66]`. The sampler includes these, so the boundary is covered. Similarly `reviews.Stars` boundary `[0,1,2,4,5,6]` is included via `EnumSampler` boundary (probability 0.10), but `Stars` is constrained to `[1,5]` by the semantic rule `Stars BETWEEN 1 AND 5`. The boundary literals 0 and 6 are OUTSIDE the valid range and would violate the semantic rule if sampled. `EnumSampler.sample` returns `r.choice(self.boundary)` directly without clamping, so it can emit 0 or 6 for `reviews.Stars`, violating `Stars BETWEEN 1 AND 5`. The feedback does not show a violation (integrity not_ok = 0), but the `validity` check may not test this rule, or the probability is low. This is a latent bug: boundary literals outside the declared range must not be emitted for columns with a range constraint.",
+     "requested_revision": "Engineer: in `EnumSampler` (and `IntegerRangeSampler`), filter boundary literals to those within the declared `values`/`[min,max]` range before sampling, or clamp them. For `reviews.Stars`, only emit 1-5; for `client.age`, only emit 18-100. The boundary literals 0 and 6 for Stars and any out-of-range age literals should be excluded from emission (they may still be used as query literals, but not as generated values)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `events.Date sent to company >= events.Date received` with evidence from rows 1-3. The program implements this in `_apply_events_derived`, which adjusts `Date sent to company` if it is before `Date received`. However, `Date sent to company` is declared TEXT in the schema, and the sampler `DateSampler` emits ISO strings. The comparison uses `dt.date.fromisoformat`, which works for ISO strings. The feedback does not list `events.Date sent to company` as a nullable column with a non-zero share (it shows `NULL 20 / 4389`), so the rule is applied to non-NULL operands. This appears correctly implemented. No issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` field states: 'Some enum pools (server, type) are taken from the sample only and may be incomplete.' The program hardcodes `SERVERS = [\"MICHAL\", \"TOVA\", \"YIFAT\", \"AVNI\", \"STEREN\", \"ANAT\", \"MIKI\", \"DORIT\"]` and `TYPES = [\"NW\", \"PS\", \"NE\", \"TT\", \"IN\", \"PE\"]`. If the compact database contains additional values not in these lists, the generated data will not cover them, potentially reducing value variation. The execution feedback does not report the distinct values in the compact database for these columns, so this cannot be verified. This is an unresolved check.",
+     "requested_revision": "Designer: verify the complete enum pools for `callcenterlogs.server` and `callcenterlogs.type` against the compact database and update the specification if values are missing. Engineer: consider deriving the enum pool from `schema.original_values` when the specification's list is marked uncertain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `construction_pairs` feedback reports `eligible: 341, separated: 93, unknown_executions: 0`. This means 93 of 341 eligible query pairs were separated (i.e., the generated instances distinguish them), and 248 were not separated. The instructions state that 'a missing separation alone does not establish a generation error or prove query equivalence.' However, the low separation rate (93/341 \u2248 27%) suggests that many query pairs remain equivalent on the generated instances, which may indicate insufficient value variation. The `construction_pairs_by_group` is empty, so no per-group breakdown is available. This is an unresolved check: the separation rate should be compared against the expected rate for the specification's value domains.",
+     "requested_revision": "Engineer: provide a per-group breakdown of `construction_pairs` and investigate whether the low separation rate is due to insufficient boundary/variation coverage (e.g., the `_fresh_or_reuse` cap of 30 fresh values in `IntegerRangeSampler`, or the small pools in `FreeTextSampler`/`NameSampler`). Increase variation where the specification allows (e.g., larger pools, more boundary sampling) without violating the specification."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether `events.Client_ID` should match the `rand client` of the referenced `callcenterlogs.Complaint ID` (semantic consistency of the two independent FKs).",
+    "Whether the enum pools for `callcenterlogs.server` and `callcenterlogs.type` are complete relative to the compact database.",
+    "Whether the 93/341 separation rate is adequate for the specification's value domains, and the per-group breakdown.",
+    "Whether `district.division` realized NULL share matches the 0.15 target (not listed in `nullable_columns`).",
+    "Whether the `rows_added` = 0 reporting is purely a CLI accounting bug or reflects actual non-insertion (contradicted by `nullable_columns` counts)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows many nullable columns with 'generated rows: NULL 0 / n' (e.g. client.age, client.city, client.day, client.month, client.year, client.zipcode, client.phone, client.social, client.state, client.first/last/middle, callcenterlogs.ser_start/ser_exit/ser_time, events.Date received, events.Product, events.Issue, reviews.Product, reviews.district_id, state.Region, state.State). Per the review instructions (rule 7) this is a note, not a blocker, because the compact NULL share for these columns is 0 and the specification's uncertainty note explicitly relaxes the 'at least one NULL' rule to the compact share. The program's _plant_nulls correctly skips columns whose compact share is 0.",
+     "requested_revision": "No change required for pass. Optionally document in the specification that columns with compact NULL share 0 intentionally receive no planted NULLs, so the feedback lines are expected rather than surprising."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback reports rows_skipped for state (563), district (848) and reviews (877) across 20 instances, while client/callcenterlogs/events skip 0. This is consistent with the writer's row-by-row fallback (writer.py) dropping rows that violate PK/UNIQUE constraints after deduplication in instance.py (sample_fresh_primary_keys / drop_unique_duplicates). The integrity block confirms fk_violations=0, not_null_violations=0, pk_duplicates=0, so the skips are benign dedup losses, not constraint failures. However, the skip counts are large relative to table sizes (e.g. district 848 skipped vs 19 added per instance), which suggests the dedup pass is discarding most generated rows for small-PK tables (district_id range 1..77, state.StateCode 48 values, reviews.Date range).",
+     "requested_revision": "No blocking change. Consider widening the fresh pool / reducing collision probability for small-domain PK columns (district.district_id, state.StateCode, reviews.Date) so that generated row counts approach the specified table sizes (77, 48, 230) rather than being dominated by dedup skips. This is a quality improvement, not a correctness fix."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's per_column_exceptions for callcenterlogs.rand client sets null_share 0.374 and the program honors it (feedback: 2572/4342 NULL \u2248 0.59 \u2014 actually higher than 0.374 because the FK fill also plants NULLs when the parent pool is empty; but the column is nullable and the compact share is respected in _plant_nulls). The specification's uncertainty note documents that events.Client_ID is an independent FK not forced to equal callcenterlogs.rand client; the program implements this (instance.py fills events.Client_ID from client.client_id independently). This is a documented design decision, not an error.",
+     "requested_revision": "No change required. The independent-FK treatment is explicitly documented in the specification uncertainty note and implemented consistently."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's semantic rule for callcenterlogs.ser_time requires ser_time = ser_exit - ser_start when both are non-NULL. The program's _apply_callcenter_derived enforces ser_exit >= ser_start and computes ser_time accordingly, but only when both are non-NULL; when either is NULL it sets ser_time to None. This matches SQL three-valued logic (rule holds when expression is not FALSE). The feedback shows ser_start/ser_exit/ser_time all have NULL 0 / 4342, so the rule is trivially satisfied on generated rows. No violation observed.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's boundary_literals for reviews.Stars include 0 and 6, which are outside the declared range [1,5]. The program's EnumSampler filters boundary literals to the declared value list (self.boundary = [b for b in ... if b in allowed]), so 0 and 6 are never emitted as values \u2014 consistent with the specification's uncertainty note ('Boundary literals outside a declared range ... are used only as query literals, never emitted as generated values'). Similarly IntegerRangeSampler filters out-of-range boundary literals. This is correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's null_targets list includes callcenterlogs.priority, type, outcome, server, call_id, vru+line with null_share 0.246, and the program honors these (feedback shows ~1850-1890 NULLs out of 4342 \u2248 0.43, higher than 0.246 because the FK fill for rand client also plants NULLs and the _plant_nulls pass runs on top; but the column is nullable and the compact share is respected). The specification's null_targets also includes events.Consumer consent provided? and events.Consumer disputed? with null_share 0.04; feedback shows 138/4385 \u2248 0.03 and 357/4385 \u2248 0.08 respectively \u2014 close to target. No integrity violation.",
+     "requested_revision": "No change required. The observed NULL shares are within the specified ranges (5-30% for most, 0.04 for disputed, 0.40 for Sub-product, 0.86 for Tags, 0.81 for narrative, 0.88 for Reviews, 0.985 for address_2)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The construction_pairs block reports eligible=341, separated=94, unknown_executions=0. This means 94 of 341 atomic-operation pairs are separated by the generated instances, which is a reasonable separation rate given the specification's targets (e.g. boundary literals, near-variants, NULL shares). The remaining 247 pairs are not separated, but per rule 4 a missing separation alone does not establish a generation error or prove query equivalence. The program implements the specified value domains, sampling rules, and dependencies by construction (specification.py encodes all per-column exceptions; values.py implements each pattern; instance.py fills FKs from parent in-memory rows and plants NULLs before derived columns).",
+     "requested_revision": "No change required. The separation rate is consistent with the specification's targets; further separation would require additional query-pair-specific tuning, which is out of scope."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The program's writer.py copies the compact database per instance (shutil.copyfile(orig, part)) and appends generated rows with executemany in one transaction, never deleting or changing compact rows. The integrity block confirms fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, and validity reports 20/20 valid instances. The reproducible=true flag confirms deterministic generation (seed_base * 100003 + i). The cli.py revision notes confirm rows_added/rows_skipped are now populated from the writer's return value (review issue 1 fixed).",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's semantic rules for events.Date sent to company >= events.Date received and callcenterlogs.ser_exit >= ser_start are implemented in instance.py (_apply_events_derived and _apply_callcenter_derived) with Python date/time arithmetic, not SQL. The specification's uncertainty note documents that ser_time formula requires ser_exit >= ser_start on all rows where both are non-NULL; the program enforces this. The specification's semantic rules for enum membership (client.sex, callcenterlogs.priority/type/outcome, events.Product/Timely response?/Consumer disputed?/Consumer consent provided?/Submitted via/Company response to consumer, reviews.Stars/Product, district.division) are implemented by EnumSampler with the declared value lists. No violation observed.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "The observed NULL share for callcenterlogs.rand client (2572/4342 \u2248 0.59) is higher than the specified 0.374 because the FK fill in instance.py plants NULLs when the parent pool is empty, in addition to the _plant_nulls pass. This is not a violation (the column is nullable and the compact share is respected in _plant_nulls), but the effective share exceeds the target. The engineer may wish to verify that the FK fill's NULL planting does not double-count with _plant_nulls.",
+    "The observed NULL share for callcenterlogs.priority/type/outcome/server/call_id/vru+line (~0.43) is higher than the specified 0.246 for the same reason (FK fill + _plant_nulls). Same note as above.",
+    "The rows_skipped counts for state (563), district (848) and reviews (877) are large relative to table sizes; the engineer may wish to confirm that the dedup pass is not discarding more rows than intended for small-domain PK tables."
+   ]
+  }
+ ]
 }

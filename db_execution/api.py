@@ -1,15 +1,4 @@
-"""SQLite execution service used by inference and by the training reward.
-
-POST /execute        {dataset_name: bird | spider, db_id, sql, mode: read_only | sandbox_rollback, timeout_ms, max_rows}
-                     -> {ok, rows, row_count, error, timed_out}
-POST /execute_batch  {dataset_name, db_id, sqls: [...], mode, timeout_ms, max_rows} -> [response, ...]
-
-``bird`` databases are looked up as $BIRD_TRAIN_DB_ROOT/<db_id>/<db_id>.sqlite, then under $BIRD_DEV_DB_ROOT;
-``spider`` databases under $SPIDER_DB_ROOT. read_only runs on an immutable connection with case-sensitive LIKE;
-sandbox_rollback runs SELECT-like statements on a plain connection and refuses everything else.
-
-Run: uvicorn api:app --app-dir db_execution --host 127.0.0.1 --port 8011 --workers 16
-"""
+"""SQLite execution service used by inference and by the training reward."""
 import os
 import sqlite3
 import threading

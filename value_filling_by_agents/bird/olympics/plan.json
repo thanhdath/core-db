@@ -1,49 +1,649 @@
 {
  "db": "olympics",
- "operator_io_quirks": [
-  "All identifiers lowercase, no spaces; still double-quote in generated SQL per spec.",
-  "person (128854) and games_competitor (180252) and competitor_event (260971) exceed 300k? No: all <300k, but person_region 130521 and competitor_event 260971 are large; rowid%k sampling still applies for safety.",
-  "All declared types are INTEGER or TEXT; no Date/Time/Bool/Bit/Year dispatch, no crash-fallback types.",
-  "games_year is INTEGER but semantically a year (1900-2012); TS Number fuzzer will emit values in [-10^0,10^0]? No: scale=0 -> [-1,1] plus perturbations, wildly implausible years.",
-  "height/weight INTEGER with 0 present (missing sentinel); TS Number will emit negatives and tiny values.",
-  "age INTEGER 0..~74; TS Number scale=0 gives [-1,1] range -> implausible ages.",
-  "games_city, person_region, competitor_event have NO primary key (pk=[]); TS sample_fresh_primary_keys is a no-op there, so duplicate rows survive.",
-  "games_city.games_id distinct=51 but rows=52 -> one duplicate pair exists; person_region has 130521 rows over 128854 persons -> many-to-many duplicates.",
-  "competitor_event.medal_id distinct=4 (1..4) with medal table 4 rows; FK to medal is fine but medal_id NULL rate 0 while column is nullable.",
-  "noc_region.region_name distinct=230 < rows=231 -> one duplicate region name; not unique-constrained.",
-  "All FKs point to existing parents with unique PKs; no dangling FKs, no self-references, no composite keys.",
-  "season and gender are 2-value TEXT enums; TS String fuzzer will emit random charset strings, destroying the enum."
- ],
- "operator_ts_expectations": [
-  "Every column dispatches to Number (INTEGER) or String (TEXT); no Date/Time/Bool fuzzers exercised.",
-  "Number fuzzer with scale=0: fresh draws uniform in [-1,1] then +-1/+-2 perturbation -> id, games_year, height, weight, age all get tiny/negative values; PK ids collide heavily -> sample_fresh_primary_keys drops most rows, shrinking tables far below chosen size.",
-  "String fuzzer: random 0-20 char strings over a-zA-Z 0-9() plus contamination; city_name, full_name, event_name, sport_name become gibberish; season/gender/medal_name/noc lose their enum semantics.",
-  "games_year as Number: TS emits -1,0,1,2 instead of 1900-2012 -> queries filtering games_year>=2000 return empty (FN) or wrong (FP).",
-  "height/weight as Number: negatives and 0/1 values -> implausible; queries with height>180 or weight between 60 and 80 mostly miss.",
-  "age as Number: -1..2 -> age>20 filters return empty.",
-  "FK columns (games_id, person_id, city_id, sport_id, event_id, competitor_id, medal_id, region_id) draw from parent's FINAL filtered values with replacement; since parent PKs collapse to few survivors, FK fan-out is skewed and many child rows reference the same tiny parent set.",
-  "No-PK tables (games_city, person_region, competitor_event) keep all drawn rows including duplicates -> duplicate-tie queries (COUNT DISTINCT vs COUNT) may behave differently than original.",
-  "String fuzzer on noc/region_name: joins on region_name equality still work (same gibberish reused via literal pool) but LIKE '%...%' patterns from gold literals rarely match -> FN.",
-  "medal_name 'NA' vs 'Gold'/'Silver'/'Bronze': TS String replaces with random strings; queries filtering medal_name='Gold' return empty unless literal pool seeds it.",
-  "Literal pool from train SQL will inject some real values (e.g. 'Gold', 'Summer', 'M', 'F', years) into samplers, partially rescuing enum/year columns; p=0.2 fresh-draw probability keeps some real values."
- ],
- "challenger_refs": [
-  "G17",
-  "G19",
-  "G22",
-  "G7",
-  "G15",
-  "G2",
-  "G6",
-  "G5",
-  "G14",
-  "G10"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table, unique, NOT NULL; never NULL; do not plant spec boundary values on PK columns (PKs stay sequential).",
+   "integer_fk": "Sample from the surviving parent PK pool after dedup; 5-30% NULL where nullable; leave some parent rows childless; never plant a FK value that is not in the surviving parent PK pool.",
+   "integer_numeric": "Uniform integer within stated range; include boundary values and one step outside where listed.",
+   "text_enum": "Pick from explicit enum list; include case variants (lower/upper) and near-variants (typo, trailing x, space) for listed literals.",
+   "text_free": "Synthetic names/strings; 5-30% NULL where nullable; include near-duplicate variants for LIKE/equality literals.",
+   "text_like_variant": "For each listed literal L: emit L, L with apostrophe removed, L with last char changed, L with trailing 'x', lowercase(L).",
+   "numeric_boundary": "For each listed boundary value v: emit v-1, v, v+1 (dates: one day each side).",
+   "null_share": "Every nullable column: 5-30% NULL rows per instance, at least one NULL row; planted NULLs are never replaced.",
+   "duplicates_distinct": "20-50% of rows share values on DISTINCT-targeted columns.",
+   "ties_order_limit": "Ensure at least two rows tie at rank 1 for the listed ORDER BY aggregate.",
+   "group_sizes": "Produce groups of size 1, 2, and >=3 on the listed grouping column.",
+   "fresh_values": "10% of text values are fresh synthetic values not in the pool."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "games_competitor.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "person.id",
+      "person_region.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "games_competitor.person_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "games_competitor.person_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "person.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "games_competitor.person_id",
+      "person_region.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "person.id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "person.id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2, >=3"
+    }
+   },
+   {
+    "column": "games.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "games_city.games_id",
+      "games_competitor.games_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "games.id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(games_competitor.person_id)"
+     ]
+    }
+   },
+   {
+    "column": "event.event_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Cross Country Skiing Men's 10/15 kilometres Pursuit",
+      "Shooting Women's Trap",
+      "Basketball Men's Basketball"
+     ]
+    }
+   },
+   {
+    "column": "event.event_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "event.event_name",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "games.games_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "games.games_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2016 Summer",
+      "2016 summer",
+      "2012 Summer",
+      "2012 summer",
+      "2014 Winter",
+      "2014 winter"
+     ]
+    }
+   },
+   {
+    "column": "games.games_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "1988 Winter%",
+      "2012 Summer%",
+      "%Summer%"
+     ]
+    }
+   },
+   {
+    "column": "games.games_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(games_competitor.person_id)"
+     ]
+    }
+   },
+   {
+    "column": "person_region.person_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "person_region.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "person.id",
+      "games_competitor.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "games_city.games_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "games.id",
+      "games_competitor.games_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "games_competitor.games_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "games.id",
+      "games_city.games_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "games_competitor.games_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "city.city_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "city.city_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(city.city_name)"
+     ]
+    }
+   },
+   {
+    "column": "games.games_year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1987,
+      1988,
+      1989,
+      1991,
+      1992,
+      1993
+     ]
+    }
+   },
+   {
+    "column": "games.games_year",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "games.games_year",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(games_competitor.person_id)"
+     ]
+    }
+   },
+   {
+    "column": "competitor_event.competitor_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "games_competitor.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "competitor_event.competitor_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "column": "games_competitor.age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      27,
+      28,
+      29,
+      34,
+      35,
+      36
+     ]
+    }
+   },
+   {
+    "column": "person.gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "M",
+      "m",
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "games_competitor.id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      90990,
+      90991,
+      90992
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "games_city.games_id",
+    "parent_table": "games",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "games_city.city_id",
+    "parent_table": "city",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "games_competitor.games_id",
+    "parent_table": "games",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "games_competitor.person_id",
+    "parent_table": "person",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "person_region.person_id",
+    "parent_table": "person",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "person_region.region_id",
+    "parent_table": "noc_region",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "event.sport_id",
+    "parent_table": "sport",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "competitor_event.event_id",
+    "parent_table": "event",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "competitor_event.competitor_id",
+    "parent_table": "games_competitor",
+    "parent_column": "id",
+    "copied": []
+   },
+   {
+    "child": "competitor_event.medal_id",
+    "parent_table": "medal",
+    "parent_column": "id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "person",
+    "column": "gender",
+    "formula": "gender IN ('M','F')"
+   },
+   {
+    "table": "person",
+    "column": "height",
+    "formula": "height = 0 OR height BETWEEN 120 AND 230"
+   },
+   {
+    "table": "person",
+    "column": "weight",
+    "formula": "weight = 0 OR weight BETWEEN 30 AND 200"
+   },
+   {
+    "table": "games",
+    "column": "season",
+    "formula": "season IN ('Summer','Winter')"
+   },
+   {
+    "table": "games",
+    "column": "games_year",
+    "formula": "games_year BETWEEN 1896 AND 2024"
+   },
+   {
+    "table": "medal",
+    "column": "medal_name",
+    "formula": "medal_name IN ('Gold','Silver','Bronze','NA')"
+   },
+   {
+    "table": "games_competitor",
+    "column": "age",
+    "formula": "age BETWEEN 10 AND 80"
+   },
+   {
+    "table": "games_competitor",
+    "column": "games_id",
+    "formula": "games_competitor.games_id = games.id VIA games_competitor.games_id"
+   },
+   {
+    "table": "games_competitor",
+    "column": "person_id",
+    "formula": "games_competitor.person_id = person.id VIA games_competitor.person_id"
+   },
+   {
+    "table": "games_city",
+    "column": "games_id",
+    "formula": "games_city.games_id = games.id VIA games_city.games_id"
+   },
+   {
+    "table": "games_city",
+    "column": "city_id",
+    "formula": "games_city.city_id = city.id VIA games_city.city_id"
+   },
+   {
+    "table": "person_region",
+    "column": "person_id",
+    "formula": "person_region.person_id = person.id VIA person_region.person_id"
+   },
+   {
+    "table": "person_region",
+    "column": "region_id",
+    "formula": "person_region.region_id = noc_region.id VIA person_region.region_id"
+   },
+   {
+    "table": "event",
+    "column": "sport_id",
+    "formula": "event.sport_id = sport.id VIA event.sport_id"
+   },
+   {
+    "table": "competitor_event",
+    "column": "event_id",
+    "formula": "competitor_event.event_id = event.id VIA competitor_event.event_id"
+   },
+   {
+    "table": "competitor_event",
+    "column": "competitor_id",
+    "formula": "competitor_event.competitor_id = games_competitor.id VIA competitor_event.competitor_id"
+   },
+   {
+    "table": "competitor_event",
+    "column": "medal_id",
+    "formula": "competitor_event.medal_id = medal.id VIA competitor_event.medal_id"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "city": 42,
+   "games": 51,
+   "games_city": 52,
+   "medal": 4,
+   "noc_region": 231,
+   "person": 230,
+   "games_competitor": 230,
+   "person_region": 230,
+   "sport": 66,
+   "event": 230,
+   "competitor_event": 230
+  },
+  "null_targets": [
+   "city.city_name",
+   "games.games_year",
+   "games.games_name",
+   "games.season",
+   "games_city.games_id",
+   "games_city.city_id",
+   "medal.medal_name",
+   "noc_region.noc",
+   "noc_region.region_name",
+   "person.full_name",
+   "person.gender",
+   "person.height",
+   "person.weight",
+   "games_competitor.games_id",
+   "games_competitor.person_id",
+   "games_competitor.age",
+   "person_region.person_id",
+   "person_region.region_id",
+   "event.sport_id",
+   "event.event_name",
+   "sport.sport_name",
+   "competitor_event.event_id",
+   "competitor_event.competitor_id",
+   "competitor_event.medal_id"
+  ],
+  "supporting_evidence": {
+   "person.gender": "Sample rows 1-8 show only 'M' and 'F'.",
+   "person.height": "Sample rows show 0 and 168-188; range 120-230 with 0 sentinel.",
+   "person.weight": "Sample rows show 0 and 60-96; range 30-200 with 0 sentinel.",
+   "games.season": "Sample rows show 'Summer' and 'Winter' only.",
+   "medal.medal_name": "Sample rows: Gold, Silver, Bronze, NA.",
+   "games_competitor.age": "Sample rows 21-34; range 10-80.",
+   "games.games_year": "Sample rows 1900-2012; range 1896-2024."
+  },
+  "uncertainty": "Exact NULL shares and duplicate shares are approximated from statistics; boundary values for height/weight sentinel 0 inferred from sample rows 3 and 4. PK boundary targets (games.id, games_competitor.games_id, games_city.games_id, medal.id, competitor_event.medal_id) are dropped because PKs are sequential and FK values must come from the surviving parent PK pool; games_competitor.id boundary targets 90990-90992 are kept only as a non-PK numeric range hint and must not override sequential PK assignment. No date pairs exist in schema. No calculated columns beyond FK copies."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite defines write_instance_sqlite(schema, instance, path, orig_path=None) and copies the compact DB only when orig_path is not None. The CLI calls write_instance_sqlite(_G['schema'], inst, p) without orig_path, so the branch that recreates the schema (for s in schema.ddl: con.execute(s)) runs instead of copying compact rows. Execution feedback confirms: validity.reasons.compact_rows_missing = 20/20 and n_instances shows no compact rows preserved. The docstring claims 'the compact database is copied by the writer', but the call path never passes orig_path, so compact rows are always missing.",
+     "requested_revision": "Pass the original compact DB path (a['orig']) from cli._one into write_instance_sqlite as orig_path, and ensure _copy_compact is invoked before insertion so compact rows are preserved on every unit. Alternatively, copy the compact DB directly in cli._one. Add a post-write assertion/counter that the compact row count per table matches the original; the CLI summary should fail the unit when compact rows are missing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 54 and validity.reasons.new_integrity_failures = 17/20. The DB schema declares FOREIGN KEY constraints on games_city, games_competitor, person_region, event, competitor_event. The instance.py fill_foreign_keys_consistently draws FK values from instance[pt][pc] generated PKs, but writer disables enforcement (pragma foreign_keys = OFF) and inserts compact rows plus generated rows without checking FK validity against the parent table. Because generated child rows can reference generated parent PKs that were subsequently dropped by sample_fresh_primary_keys / drop_unique_duplicates, dangling FKs appear. The 'self-referencing FK' fix in build_random_instance only covers self-joins; it does not repair the parent-PK set for cross-table FKs after dedup, and _repair_value leaves unexpected NULLs.",
+     "requested_revision": "After sample_fresh_primary_keys / drop_unique_duplicates, rebuild the FK value set: for each child FK column whose parent PK set was reduced, replace values pointing at removed parent PKs with a kept value or NULL (respecting the nullable-share). Do not disable foreign_keys pragma for verification; instead emit FK violations as a failure condition in the writer's return dict and surface them in cli summary so generation fails loudly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows many nullable columns never receive NULLs, e.g. city.city_name 0/1661, games_competitor.age 0/1781, person.gender 0/1078, medal.medal_name 0/1354, event.sport_id 0/1789, games.games_year 0/1163, etc. The spec's NULL_TARGETS in instance.py (and null_targets in the spec) only cover a subset (games_competitor.person_id, games_competitor.games_id, person_region.person_id, games_city.games_id, competitor_event.competitor_id, competitor_event.event_id, competitor_event.medal_id, event.event_name, person.full_name). Columns like games_competitor.age, person.gender, medal.medal_name, games.games_year, sport.sport_name, game_name, season are also NULL-able per the schema (CREATE TABLE ... default NULL). Generic rule 4 ('Nullable columns: 5-30% NULL rows') and interface rule 7 apply to every nullable column, not the spec subset.",
+     "requested_revision": "Extend NULL_TARGETS (and spec null_targets) to cover every nullable column that has no NOT NULL constraint, per the schema. Ensure _plant_nulls is called for each such column (with at least one NULL) and that _repair_value does not overwrite planted NULLs. Track the per-column NULL share in the writer output and log it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In instance.build_random_instance, spec values are planted via _apply_spec AFTER the semantic-rule repair step runs? Actually ordering is: rule repair (lines 'Enforce semantic rules'), then sample_fresh_primary_keys / drop_unique_duplicates. But _apply_spec IS called before repair, and _plant_spec_values uses _spec_values which includes BOUNDARIES that overlap spec rules like games.competitor.id = 90990 (which can end up smaller than _pk_start from compact values). For column ('games_competitor','id') BOUNDARIES includes 90990, but _assign_primary_keys overwrites cols[pk] with sequential IDs after _apply_spec? Look at order: cols computed with samplers, then PKs assigned sequentially, then FK fill, then _apply_spec, then rule repair, then dedup. _apply_spec for ('games_competitor','id') plants 90991 etc. OVER the sequential PKs. That produces PK values inside the spec but they may collide with parent PK space? More concretely, competitor_event.medal_id BOUNDARIES include [0,1,2,3,4,5] but medal PK starts above original max (max original medal id); so planted medal_id=0 will be dangling vs medal.id if 0 not in medal PK set. Execution feedback shows integrity.fk_violations=54, consistent with this. Same risk for competitor_event.medal_id (0..5), games_competitor.games_id (12,13,14) and games.id (2,3,4,...) \u2014 spec_bounds are in compact old-value space but fresh PKs start above the compact max.",
+     "requested_revision": "Do not plant spec boundaries that are PK/FK target values after primary key values have been reassigned; either (a) preserve the compact PK range so that boundary values can still exist (only generate PKs within the range [min_compact_pk, max_compact_pk] where possible) or (b) drop the 'medal_id \u2208 {0..5}', 'games.id \u2208 {..13,14}', 'games_competitor.games_id \u2208 {12,13,14}' boundary targets from the spec, since they are incompatible with fresh-PK-above-compact-max. If kept, FK-planted medal_id must be validated against the medal PK pool."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists comparison_boundary targets for games.id = [2,3,4,12,13,14], games_competitor.games_id = [12,13,14], games_city.games_id = [2,3,4], medal.id = [0,1,2,3,4,5], competitor_event.medal_id = [0,1,2,3,4,5], but generic_sampling_rules.integer_pk states 'Sequential 1..N per table, unique, NOT NULL; never NULL' and instance._assign_primary_keys starts at (max(original_pk)+1). The two rules conflict: PKs never hit the compact ids like 2 or 13. The spec's comparison_boundary for PK/FK targets cannot be satisfied simultaneously with fresh-PK-above-compact-max generation. Execution feedback fk_violations = 54 and unsupported construction_pairs confirm the generated FK values that were planted do not match surviving parent PKs.",
+     "requested_revision": "Reconcile: either (a) drop the fixed-id comparison_boundary targets from games.id / games_competitor.games_id / games_city.games_id / medal.id / competitor_event.medal_id (they belong to the compact IDs which the instance does not control), or (b) change generic_sampling_rules to keep PKs in the [1, max_compact] range and add an explicit rule that compact and generated PKs share ID space; in case (b), fk target values must be drawn from the shared pool. Also specify that games_competitor.id comparison targets (90990..) require keeping PKs typed INTEGER without range enforcement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._plant_spec_values uses k = min(len(spec), max(1, n // 4)) and zip(positions, spec) which means only the first k spec values are planted; if there are more spec values than k they are silently dropped. For event.event_name LIKE_LITERALS there are 3 literals each producing 5 variants = 15 values, but n \u2248 230, so k = 57 \u2014 fine. For games.id BOUNDARIES = 6 values, n \u2248 51, k = 12, so all get planted. But boundary values for medal.id = [0,1,2,3,4,5] conflict with generic rule 'integer_pk = Sequential 1..N'; _assign_primary_keys overwrites afterwards in the PK branch? Actually _apply_spec runs AFTER _assign_primary_keys, so sequential PKs are overwritten with 0..5 \u2014 but then sample_fresh_primary_keys won't dedupe since they're distinct. However, duplicate medal.id values might arise or FK child values pointing at dropped parents appear. Execution: fk_violations=54 plus construction_pairs separated=191 (out of 529) suggests value variation exists, but at the cost of FK integrity.",
+     "requested_revision": "Clarify that _plant_spec_values plants ALL mandatory spec values for the column (not just n//4), or document that only the first k are planted and re-express the spec to reduce the mandatory values below n//4 so that every mandatory boundary/literal appears. Ensure planting of FK columns' boundary values is preceded by a check that the value exists in the parent table (e.g., medal_id from actual medal.id values)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "validity.reasons.no_rows_added = 5/20 in execution feedback. writer.write_instance_sqlite silently swallows 'no columns' or 'row skipped' cases: rows = [] if no columns, and con.executemany is only called when rows non-empty. Also the fallback row-by-row inserts individual rows but the CLI still reports n_ok for units where all rows were skipped. Result is an instance that only copied the compact DB with no generated contribution \u2014 the generation for those units is effectively vacuous.",
+     "requested_revision": "In writer.write_instance_sqlite, if total ok[t] == 0 across all tables, return a failure signal; the CLI should treat this as a failed unit (add to errors). Also log rows_failed per table and count in the CLI summary so silent no-op instances are visible."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's null_targets lists only 9 columns; the DB schema has 15 nullable columns (city.city_name, event.sport_id, games.games_name, games.games_year, games.season, games_city.city_id, games_competitor.age, medal.medal_name, noc_region.noc, noc_region.region_name, person.gender, person.height, person.weight, person_region.region_id, sport.sport_name in addition to the listed ones). Generic rule 4 ('Nullable columns: 5-30% NULL rows per instance') is stated for 'Nullable columns' but the per-column exceptions only cover 9. The gap between spec and schema creates an under-specified generation of NULLs.",
+     "requested_revision": "Either (a) add every nullable column to null_targets with a 5-30% share, or (b) explicitly state in the spec that NULL generation is only required for the listed null_targets and that generic rule 4 applies only to those. Align with program interface rule 7 which says 'every nullable column ... at least one NULL row'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._is_text_column treats '' (empty type_str) as text and _is_int_column checks 'int' or 'year' in type. In _coerce for column ('games_competitor','id') if the schema type_str is 'INTEGER' this works, but for 'INTEGER not null' the schema reader stores exactly the advertised type string 'INTEGER'; fine. However for primary-key columns with NOT NULL, _apply_spec BOUNDARIES containing None-free integer list will plant boundary values like 90990; these are added to cols[ck] but PK assignment happens BEFORE _apply_spec, so planted 90990 overwrites sequential PKs, breaking 'Sequential 1..N' invariant and potentially violating 'at least two rows tie at rank 1' invariants driven by GROUP_TARGETS/TIE_TARGETS which operate on values after overwriting. Evidence: execution shows pk_duplicates=0 so no PK duplicates were produced, but the rules contract 'integer_pk = Sequential 1..N per table' is not honored by the program, because _apply_spec for (table, pk_column) overwrites PKs. Also, since _apply_spec for PK runs before dedupe, a single-column PK plant of e.g. [2,3,4,12,13,14] on games.id would collide with existing compact IDs in games; recommended cross-check.",
+     "requested_revision": "Skip _apply_spec for single-column PK columns entirely (or prevent PK override). For 'integer_pk' columns in _spec_values, do not add values. If comparison boundaries on PK columns are required, either document that PKs may not be sequential (changing generic_sampling_rules) or generate PK boundary values in a separate dedicated ID space and cross-check that FKs referencing those columns are updated."
+    }
+   ],
+   "unresolved_checks": [
+    "Exact NULL share per nullable column compared against compact-DB share: the execution feedback reports NULL = 0 for many nullable columns, but the spec is silent for those columns; specific comparison with the compact share was not possible without running the supplied original DB. Suggest re-running with the modified NULL_TARGETS to compare typed shares.",
+    "Whether the NULL share produced by _plant_nulls after dedup falls in 5-30% after drop of unique duplicates; not measured in feedback.",
+    "Whether the compact DB's own rows satisfy the same column rules (e.g., existing medal.medal_name values are within ENUMS) \u2014 original DB not supplied in the workspace.",
+    "Whether re-running the same seed yields byte-identical instances (reproducible: true reported, but that is at orchestration level; the RNG seeding in build_random_instance is per-unit with seed_base * 100003 + i and was not verified for equality across runs)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's per_column_exceptions list omits several patterns present in the extracted atomic operations, e.g. games.games_name comparison_boundary (values 2016 Summer/2012 Summer/2014 Winter with case variants), person.full_name comparison_boundary (Lee Chong Wei etc.), noc_region.region_name comparison_boundary (Tonga/Finland/Philippines), medal.medal_name comparison_boundary (Gold/Bronze), person.height comparison_boundary (169-176), games.season comparison_boundary (Summer/Winter), and the aggregate_boundary patterns (HAVING COUNT(...) = 1). The program nevertheless implements most of these (TEXT_LITERALS, BOUNDARIES, ENUM_VARIANTS in instance.py), so the omission is a documentation gap rather than a functional one.",
+     "requested_revision": "Add the missing comparison_boundary / aggregate_boundary entries to per_column_exceptions so the specification matches the atomic-operation list and the program's actual behavior."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's uncertainty note says PK boundary targets (games.id, medal.id, games_competitor.games_id, games_city.games_id, competitor_event.medal_id) are dropped because PKs are sequential. This is consistent with the generic_sampling_rules ('do not plant spec boundary values on PK columns'), but the atomic operations list still contains comparison_boundary entries for games.id (=13), medal.id (<>4), games_competitor.games_id (=13), games_city.games_id (>=games.id), competitor_event.medal_id (=1). The program correctly does not plant these on PKs and only plants FK boundaries when the value exists in the surviving parent pool (FK_BOUNDARIES + _plant_fk_boundaries).",
+     "requested_revision": "No functional change required; optionally document explicitly that FK boundary targets are conditional on parent-pool membership, which the program already enforces."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows all nullable columns have NULL shares within 5-30% (e.g. games_competitor.person_id 610/1841 \u2248 33%? actually 610/1841 \u2248 33.1% \u2014 slightly above 30%; competitor_event.competitor_id 1059/2963 \u2248 35.7%; competitor_event.event_id 1070/2963 \u2248 36.1%; competitor_event.medal_id 1043/2963 \u2248 35.2%; person_region.region_id 619/1838 \u2248 33.7%). These exceed the stated 5-30% band. The cause is that _plant_nulls is applied to FK columns in _fill_fk_column AND again in _apply_spec (nullable branch), so NULLs are planted twice on nullable FK columns, inflating the share above 30%.",
+     "requested_revision": "Avoid double-planting NULLs on nullable FK columns: either skip the nullable branch in _apply_spec for FK columns already handled by _fill_fk_column, or make _plant_nulls idempotent/targeted so the final share stays within 5-30%."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's null_targets list includes all nullable columns, and the program plants NULLs on every nullable column (schema-driven), which is consistent with the interface NULL rule. However, the interface rule also says 'NULL share following the compact database's share for that column'. The program uses a uniform rng.uniform(0.05, 0.3) rather than the compact share. This is a deviation from the stated interface rule, though the execution feedback shows NULLs are present on all nullable columns (no 'NULL 0 / n' lines).",
+     "requested_revision": "Optionally derive the NULL share per column from the compact database's observed NULL share (clamped to 5-30% with at least one NULL), to match the interface rule more closely."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's table_sizes_per_instance gives fixed sizes (e.g. city 42, games 51, person 230, event 230, competitor_event 230). The program's build_random_instance uses choose_table_sizes when size is None, which produces random sizes (execution feedback shows city 1661, games 1227, person 1080, event 1789, competitor_event 2963 \u2014 far above the specified sizes). The CLI calls build_random_instance(..., None, rng), so the fixed table_sizes_per_instance is never used.",
+     "requested_revision": "If the fixed table_sizes_per_instance is intended to be authoritative, pass it as the size argument in the CLI (or in build_random_instance when size is None). Otherwise, update the specification to state that sizes are randomized per the upstream fuzz driver."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's supporting_evidence and semantic_rules_and_formulas state person.height = 0 OR BETWEEN 120 AND 230 and person.weight = 0 OR BETWEEN 30 AND 200, with sentinel 0. The program's RANGES includes sentinel=True for both, and _in_range allows 0. However, _plant_spec_values for person.height plants BOUNDARIES [169,170,171,174,175,176] which are within range, and _repair_value for out-of-range values picks rng.randint(lo, hi) \u2014 never 0. So the sentinel 0 is allowed but never deliberately planted. This is acceptable (the rule is '0 OR range', not 'must include 0'), but worth noting.",
+     "requested_revision": "No change required; optionally plant the sentinel 0 occasionally to exercise the 'height = 0' branch."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's like_near_variant for games.games_name lists literals ['1988 Winter%', '2012 Summer%', '%Summer%'] (with % wildcards). The program's LIKE_LITERALS for games.games_name uses ['1988 Winter', '2012 Summer', 'Summer'] (without %), and _like_variants generates L, apostrophe-removed, last-char-changed, trailing-x, lowercase \u2014 but does not generate the %-prefixed/suffixed forms. The atomic operations list variants like '1988 Wintes', '1988 Winter x', '1988 winter', '2012 Summes', '2012 Summer x', '2012 summer' \u2014 these are covered by _like_variants (last-char change, trailing x, lowercase). The % forms are not explicitly generated but the base literals are present, so LIKE '1988 Winter%' will match.",
+     "requested_revision": "No functional change required; the base literals are present so the LIKE patterns match. Optionally add explicit %-variant generation for completeness."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's ties_for_order_limit for city.city_name says direction 'ASC and DESC and unordered', but the program's TIE_TARGETS only ensures a tie (duplicating a value at positions 0 and 1) without regard to direction. Since the tie is on COUNT(city.city_name) and the program plants duplicates via _plant_duplicates (DUP_TARGETS includes city.city_name) plus _plant_ties, ties at rank 1 are likely but not guaranteed for both ASC and DESC simultaneously. Execution feedback does not report per-pattern separation, so this is unverified.",
+     "requested_revision": "No blocking change; optionally verify that ties at rank 1 exist for both ASC and DESC on city.city_name by construction (e.g. ensure at least two distinct values each with the same count)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's group_sizes for person.id, games.id, games.games_name, city.city_name requires groups of size 1, 2, and >=3. The program's _plant_group_sizes sets values[0]=a, values[1]=b, values[2]=b, values[3]=c, values[4]=c, values[5]=c \u2014 but for PK columns (person.id, games.id) this is skipped because _apply_spec only calls _plant_group_sizes if key in GROUP_TARGETS, and GROUP_TARGETS includes ('person','id') and ('games','id'). However, PK columns are assigned sequentially by _assign_primary_keys AFTER _apply_spec? Let me check: in build_random_instance, PKs are assigned first (cols[pk] = _assign_primary_keys), then _apply_spec is called with is_pk=True. _apply_spec skips _plant_spec_values for PKs but still calls _plant_group_sizes and _plant_ties for PK columns in GROUP_TARGETS/TIE_TARGETS. This would overwrite sequential PKs with duplicate values, violating the 'PKs stay sequential' rule. But then sample_fresh_primary_keys dedups, and the writer inserts \u2014 execution feedback shows pk_duplicates: 0, so dedup catches it. Still, this means PKs are not strictly sequential (they get overwritten then deduped), which contradicts the generic_sampling_rules 'Sequential 1..N per table, unique, NOT NULL'.",
+     "requested_revision": "Skip _plant_group_sizes and _plant_ties for PK columns (is_pk=True) to preserve strictly sequential PKs, or document that PKs may be non-sequential after dedup."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether ties at rank 1 exist for both ASC and DESC on city.city_name (direction 'ASC and DESC and unordered') \u2014 not directly verifiable from the provided execution feedback.",
+    "Whether group sizes 1, 2, >=3 are achieved on PK columns (person.id, games.id) after dedup \u2014 the program plants them but dedup may collapse groups.",
+    "Whether the compact database's per-column NULL share is respected (program uses uniform 5-30% instead).",
+    "Whether the fixed table_sizes_per_instance is intended to be authoritative (program randomizes sizes)."
+   ]
+  }
+ ]
 }

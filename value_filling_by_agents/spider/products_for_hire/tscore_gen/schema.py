@@ -35,6 +35,43 @@ class Schema:
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
 
+    def _key(self, table: str):
+        """Schema stores tables by declared name; tolerate case."""
+        if table in self.tables:
+            return table
+        tl = table.lower()
+        for t in self.tables:
+            if t.lower() == tl:
+                return t
+        return None
+
+    def table(self, table: str):
+        k = self._key(table)
+        return self.tables[k] if k is not None else None
+
+    def column(self, table: str, column: str):
+        tm = self.table(table)
+        if tm is None:
+            return None
+        cl = column.lower()
+        for c in tm.columns:
+            if c.name.lower() == cl:
+                return c
+        return None
+
+    def fk_of(self, table: str, column: str):
+        """Return (parent_table, parent_column) for a FK child column, else None."""
+        t = self._key(table)
+        if t is None:
+            return None
+        for (ct, cc), (pt, pc) in self.fks.items():
+            if ct == t and cc.lower() == column.lower():
+                return pt, pc
+        return None
+
+    def is_fk(self, table: str, column: str) -> bool:
+        return self.fk_of(table, column) is not None
+
 
 def q(name: str) -> str:
     """Double-quote an SQL identifier."""
@@ -58,7 +95,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):

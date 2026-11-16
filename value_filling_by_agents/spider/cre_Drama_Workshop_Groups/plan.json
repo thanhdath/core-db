@@ -1,50 +1,725 @@
 {
  "db": "cre_Drama_Workshop_Groups",
- "operator_io_quirks": [
-  "Mixed-case table/column names everywhere (Ref_Payment_Methods, payment_method_code, Marketing_Region_Descriptrion typo) -> must double-quote identifiers; case-insensitive column lookup.",
-  "Type-affinity contradictions: Clients.Address_ID INTEGER FK to Addresses.Address_ID VARCHAR(100) (text '110','124'); Bookings.Workshop_Group_ID VARCHAR(100) FK to Drama_Workshop_Groups.Workshop_Group_ID INTEGER; Bookings.Customer_ID INTEGER FK to Clients.Client_ID INTEGER but Customers.Customer_ID is VARCHAR(100) and Customer_Orders.Customer_ID INTEGER FK to it; Order_Items.Product_ID INTEGER FK to Products.Product_ID VARCHAR(100); Invoices.Product_ID INTEGER FK to Products.Product_ID VARCHAR(100); Bookings_Services.Product_ID INTEGER FK to Services.Service_ID INTEGER; Invoice_Items.Order_ID/Product_ID INTEGER FK to Bookings_Services composite (Order_ID,Product_ID).",
-  "Invoices has TWO FKs on the same column Order_ID (to Bookings.Booking_ID and Customer_Orders.Order_ID) -> schema.fks dict keyed by (child_t,child_c) can only hold one; second is silently lost.",
-  "Invoice_Items has a composite FK (Order_ID,Product_ID) -> Bookings_Services(Order_ID,Product_ID); pragma foreign_key_list returns two rows with same id -> must be grouped, not treated as two independent single-column FKs.",
-  "Self-reference: Ref_Service_Types.Parent_Service_Type_Code CHAR(15) is NOT declared as FK but semantically points to Service_Type_Code (values '1'); no pragma FK, so TS will not fill it consistently.",
-  "DATETIME columns (Bookings/Customer_Orders Order_Date, Planned_Delivery_Date, Actual_Delivery_Date) store text 'YYYY-MM-DD HH:MM:SS' -> Date fuzzer with template %Y-%m-%d %H:%M:%S; first element is a string not int so Date branch (not Number) is taken.",
-  "DECIMAL(20,4) columns: Products.Product_Price stored as INTEGER (4448536), Services.Product_Price stored as REAL (58932775.8822) -> same declared type, different storage class; Number fuzzer scale=20 precision=4.",
-  "VARCHAR(288) Order_Quantity in Order_Items/Invoices stores '1','2' (int-like strings) -> String fuzzer will add str(i+1)/str(i-1) neighbours.",
-  "Many columns are 100% NULL in the original (Other_Details, Other_Order_Details, Other_Item_Details, Product_Description, Other_Product_Service_Details) -> original_values all None; Base drops None -> sampler falls back to p=1 fresh draws.",
-  "Tiny tables (Ref_Payment_Methods 3 rows, Ref_Service_Types 4, Invoice_Items 2) -> FK child draws from parent's FINAL filtered values; if parent PK dedup leaves <n rows, child gets repeats (fine) but if parent empty child gets NULLs.",
-  "Composite PKs: Performers_in_Bookings(Order_ID,Performer_ID), Bookings_Services(Order_ID,Product_ID) -> composite-PK member max_l0=30, sample_fresh_primary_keys drops duplicate tuples.",
-  "No views/triggers in DDL; all tables have UNIQUE on PK column (redundant) -> drop_unique_duplicates will re-drop PK duplicates harmlessly."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all CHAR/VARCHAR columns: random a-zA-Z0-9() strings length 0..20 (or args[0] for CHAR(10)/CHAR(15)/VARCHAR(100)/VARCHAR(255)/VARCHAR(288)), plus 5 original samples, plus int-like neighbours for '1','2','110' etc.",
-  "Date fuzzer for DATETIME columns with template %Y-%m-%d %H:%M:%S; range from min/max of 5 sampled originals (1971..2017) -> fresh dates stay in that window, plausible.",
-  "Number fuzzer for INTEGER and DECIMAL(20,4): scale=20 for DECIMAL -> range [-10^20,10^20], huge implausible prices (FP source: gold filters like price<1000 become trivially true/false).",
-  "Number fuzzer for INTEGER PKs: range [-10^0,10^0]=[-1,1] then +-1/+-2 perturbation -> tiny ints, colliding with FK values from other tables (e.g. Client_ID in {-1,0,1,2}) -> joins may match spuriously (FP) or miss (FN).",
-  "FK columns filled from parent's final values with replacement -> many-to-one joins preserved; but Invoices.Order_ID only follows ONE of its two FKs (dict collision) -> half the join semantics lost.",
-  "Composite FK Invoice_Items(Order_ID,Product_ID)->Bookings_Services: upstream treats as two independent single-col FKs -> tuple may not exist in parent -> join returns empty (FN).",
-  "Ref_Service_Types.Parent_Service_Type_Code not a declared FK -> String fuzzer random strings, breaks any hierarchical query (FN).",
-  "Tiny parent tables (3-4 rows) with p=0.2 fresh draws: FK child values mostly repeat parent values -> low cardinality, GROUP BY counts collapse (FP on HAVING count>k).",
-  "100%-NULL columns: sampler has no elements -> p=1 -> all fresh random strings, so 'IS NULL' predicates become false (FN) and 'IS NOT NULL' true (FP).",
-  "checked=False everywhere (no CHECK constraints) -> p stays 0.2, no forced fresh.",
-  "String fuzzer contaminate (0.5 prob) adds/drops chars -> email/phone columns get garbage, LIKE '%@example.com' predicates break (FN).",
-  "Bookings.Status_Code only 'good'/'stop' (2 distinct) -> String fuzzer generates random strings, 'status=good' predicates mostly false (FN)."
- ],
- "challenger_refs": [
-  "G2",
-  "G4",
-  "G1",
-  "G6",
-  "G3",
-  "G11",
-  "G13",
-  "G5",
-  "G9",
-  "G10"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table, never NULL.",
+   "integer_fk": "Sample uniformly from the parent table's final key pool (union of compact original keys and generated keys); allow NULL only if the column is nullable.",
+   "varchar_id": "Zero-padded numeric strings of length 3-6, unique per table, never NULL.",
+   "varchar_text": "Random words from a small pool of 20-40 tokens, length 3-30, with 5% near-duplicate variants (case/whitespace changes) of an existing value.",
+   "varchar_email": "firstname.lastname@example.(com|net|org) with random first/last names.",
+   "varchar_phone": "Random US-style phone formats: (###)###-####, ###-###-####, 1-###-###-####x####.",
+   "varchar_address_line": "Random street number + name + suffix, optional Apt/Suite.",
+   "varchar_city": "Random city-like tokens; 20-50% duplicate share on DISTINCT columns.",
+   "varchar_state": "One of 20 US state names; 20-50% duplicate share.",
+   "decimal_price": "Uniform in [0, 100000000] with 4 decimal places; 5% boundary values at 0, 100, 1000000, 1000001.",
+   "datetime": "Random datetime between 1970-01-01 and 2020-12-31, format %Y-%m-%d %H:%M:%S; 20-50% duplicate share on DISTINCT columns.",
+   "char_code": "Short uppercase code of length 2-15 from a fixed enum pool.",
+   "char_status": "One of a small enum pool (2-4 values).",
+   "nullable_text": "NULL with probability min(observed_null_rate, 0.95); otherwise a random text value; every nullable column gets at least one NULL row and at least one non-NULL row per instance.",
+   "quantity_varchar": "One of '1','2','3','4','5','6' as strings; 20-50% duplicate share.",
+   "quantity_int": "Integer in [1, 10]."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Ref_Payment_Methods",
+    "column": "payment_method_code",
+    "pattern": "enum",
+    "targets": [
+     "American E",
+     "MasterCard",
+     "Visa"
+    ]
+   },
+   {
+    "table": "Ref_Payment_Methods",
+    "column": "payment_method_description",
+    "pattern": "enum",
+    "targets": [
+     "credit",
+     "debit",
+     "Visa"
+    ]
+   },
+   {
+    "table": "Ref_Service_Types",
+    "column": "Service_Type_Code",
+    "pattern": "enum",
+    "targets": [
+     "1",
+     "2",
+     "3",
+     "4"
+    ]
+   },
+   {
+    "table": "Ref_Service_Types",
+    "column": "Parent_Service_Type_Code",
+    "pattern": "enum",
+    "targets": [
+     "1"
+    ]
+   },
+   {
+    "table": "Ref_Service_Types",
+    "column": "Service_Type_Description",
+    "pattern": "enum",
+    "targets": [
+     "provide photo service",
+     "provide dinning service",
+     "provide filming service",
+     "provide adv promoting service"
+    ]
+   },
+   {
+    "table": "Marketing_Regions",
+    "column": "Marketing_Region_Code",
+    "pattern": "enum",
+    "targets": [
+     "CA",
+     "CN",
+     "ES",
+     "FR",
+     "IN",
+     "MX",
+     "RU",
+     "US"
+    ]
+   },
+   {
+    "table": "Marketing_Regions",
+    "column": "Marketing_Region_Name",
+    "pattern": "enum",
+    "targets": [
+     "Canada",
+     "China",
+     "Spain",
+     "France",
+     "India",
+     "Mexico",
+     "Russia",
+     "United States"
+    ]
+   },
+   {
+    "table": "Marketing_Regions",
+    "column": "Marketing_Region_Descriptrion",
+    "pattern": "enum",
+    "targets": [
+     "Our target market",
+     "Our largest market",
+     "",
+     "Our main market"
+    ]
+   },
+   {
+    "table": "Drama_Workshop_Groups",
+    "column": "Currency_Code",
+    "pattern": "enum",
+    "targets": [
+     "EU",
+     "USD"
+    ]
+   },
+   {
+    "table": "Drama_Workshop_Groups",
+    "column": "Marketing_Region_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Drama_Workshop_Groups",
+    "column": "Store_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "Bookings",
+    "column": "Status_Code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie_at_rank 1, ASC and DESC, COUNT(*)"
+    ]
+   },
+   {
+    "table": "Bookings",
+    "column": "Order_Date",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "payment_method_code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with Ref_Payment_Methods.payment_method_code",
+     "parent_rows_without_children",
+     "child_rows_with_null_fk (NULL only; no fabricated non-NULL keys)"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "payment_method_code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1 and >= 2 (relaxed: only 3 parent values exist; >=3 impossible)"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "Order_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with Order_Items.Order_ID",
+     "parent_rows_without_children (no fabricated non-NULL keys)"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "Order_Quantity",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "Product_ID",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Invoices",
+    "column": "Invoice_ID",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "none (NOT NULL column)"
+    ]
+   },
+   {
+    "table": "Order_Items",
+    "column": "Order_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with Invoices.Order_ID",
+     "parent_rows_without_children (no fabricated non-NULL keys)"
+    ]
+   },
+   {
+    "table": "Order_Items",
+    "column": "Order_Quantity",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   },
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "AVG in [999999, 1000002]"
+    ]
+   },
+   {
+    "table": "Products",
+    "column": "Product_Name",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with Services.Product_Name",
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "Services",
+    "column": "Product_Price",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "-39.0001",
+     "-39",
+     "-38.9999",
+     "99.9999",
+     "100",
+     "100.0001"
+    ]
+   },
+   {
+    "table": "Services",
+    "column": "Product_Name",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with Products.Product_Name",
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "Services",
+    "column": "Service_Type_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "Services",
+    "column": "Service_ID",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "none (NOT NULL column)"
+    ]
+   },
+   {
+    "table": "Addresses",
+    "column": "City_Town",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "Addresses",
+    "column": "State_County",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "Performers",
+    "column": "Customer_Phone",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Clients.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Drama_Workshop_Groups.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Performers.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Customers.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Stores.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Stores.Marketing_Region_Code",
+    "parent": "Marketing_Regions.Marketing_Region_Code",
+    "copied": []
+   },
+   {
+    "child": "Bookings.Customer_ID",
+    "parent": "Clients.Client_ID",
+    "copied": []
+   },
+   {
+    "child": "Bookings.Workshop_Group_ID",
+    "parent": "Drama_Workshop_Groups.Workshop_Group_ID",
+    "copied": []
+   },
+   {
+    "child": "Performers_in_Bookings.Performer_ID",
+    "parent": "Performers.Performer_ID",
+    "copied": []
+   },
+   {
+    "child": "Performers_in_Bookings.Order_ID",
+    "parent": "Bookings.Booking_ID",
+    "copied": []
+   },
+   {
+    "child": "Customer_Orders.Customer_ID",
+    "parent": "Customers.Customer_ID",
+    "copied": []
+   },
+   {
+    "child": "Customer_Orders.Store_ID",
+    "parent": "Stores.Store_ID",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.Order_ID",
+    "parent": "Customer_Orders.Order_ID",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.Product_ID",
+    "parent": "Products.Product_ID",
+    "copied": []
+   },
+   {
+    "child": "Invoices.Order_ID",
+    "parent": "Customer_Orders.Order_ID",
+    "copied": []
+   },
+   {
+    "child": "Invoices.payment_method_code",
+    "parent": "Ref_Payment_Methods.payment_method_code",
+    "copied": []
+   },
+   {
+    "child": "Services.Workshop_Group_ID",
+    "parent": "Drama_Workshop_Groups.Workshop_Group_ID",
+    "copied": []
+   },
+   {
+    "child": "Services.Service_Type_Code",
+    "parent": "Ref_Service_Types.Service_Type_Code",
+    "copied": []
+   },
+   {
+    "child": "Bookings_Services.Order_ID",
+    "parent": "Bookings.Booking_ID",
+    "copied": []
+   },
+   {
+    "child": "Bookings_Services.Product_ID",
+    "parent": "Services.Service_ID",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Items.Order_Item_ID",
+    "parent": "Order_Items.Order_Item_ID",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Items.Invoice_ID",
+    "parent": "Invoices.Invoice_ID",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Items.Order_ID,Product_ID",
+    "parent": "Bookings_Services.Order_ID,Product_ID",
+    "copied": [],
+    "composite": true,
+    "note": "Both child columns must be taken from the same parent tuple; never mix columns from different parent rows."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "formula": "Product_Price >= 0"
+   },
+   {
+    "table": "Services",
+    "column": "Product_Price",
+    "formula": "Product_Price >= -39.0001"
+   },
+   {
+    "table": "Order_Items",
+    "column": "Order_Quantity",
+    "formula": "CAST(Order_Quantity AS INTEGER) > 0"
+   },
+   {
+    "table": "Invoices",
+    "column": "Order_Quantity",
+    "formula": "CAST(Order_Quantity AS INTEGER) > 0"
+   },
+   {
+    "table": "Invoice_Items",
+    "column": "Order_Quantity",
+    "formula": "Order_Quantity > 0"
+   },
+   {
+    "table": "Bookings",
+    "column": "Status_Code",
+    "formula": "Status_Code IN ('good','stop')"
+   },
+   {
+    "table": "Bookings",
+    "column": "Planned_Delivery_Date",
+    "formula": "Planned_Delivery_Date >= Order_Date"
+   },
+   {
+    "table": "Bookings",
+    "column": "Actual_Delivery_Date",
+    "formula": "Actual_Delivery_Date >= Order_Date"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "Planned_Delivery_Date",
+    "formula": "Planned_Delivery_Date >= Order_Date"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "Actual_Delivery_Date",
+    "formula": "Actual_Delivery_Date >= Order_Date"
+   },
+   {
+    "table": "Drama_Workshop_Groups",
+    "column": "Currency_Code",
+    "formula": "Currency_Code IN ('EU','USD')"
+   },
+   {
+    "table": "Ref_Payment_Methods",
+    "column": "payment_method_code",
+    "formula": "payment_method_code IN ('American E','MasterCard','Visa')"
+   },
+   {
+    "table": "Ref_Service_Types",
+    "column": "Service_Type_Code",
+    "formula": "Service_Type_Code IN ('1','2','3','4')"
+   },
+   {
+    "table": "Marketing_Regions",
+    "column": "Marketing_Region_Code",
+    "formula": "Marketing_Region_Code IN ('CA','CN','ES','FR','IN','MX','RU','US')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 20,
+   "Ref_Payment_Methods": 3,
+   "Ref_Service_Types": 4,
+   "Marketing_Regions": 8,
+   "Products": 15,
+   "Clients": 20,
+   "Drama_Workshop_Groups": 15,
+   "Performers": 20,
+   "Customers": 15,
+   "Stores": 10,
+   "Bookings": 15,
+   "Performers_in_Bookings": 18,
+   "Customer_Orders": 15,
+   "Order_Items": 15,
+   "Invoices": 15,
+   "Services": 15,
+   "Bookings_Services": 12,
+   "Invoice_Items": 2
+  },
+  "null_targets": [
+   "Invoices.payment_method_code",
+   "Invoices.Order_Quantity",
+   "Invoices.Other_Item_Details",
+   "Order_Items.Order_Quantity",
+   "Order_Items.Other_Item_Details",
+   "Invoice_Items.Order_Quantity",
+   "Invoice_Items.Other_Item_Details",
+   "Clients.Other_Details",
+   "Customers.Other_Details",
+   "Performers.Other_Details",
+   "Drama_Workshop_Groups.Other_Details",
+   "Stores.Other_Details",
+   "Addresses.Other_Details",
+   "Bookings.Other_Order_Details",
+   "Customer_Orders.Other_Order_Details",
+   "Products.Product_Description",
+   "Products.Other_Product_Service_Details",
+   "Services.Product_Description",
+   "Services.Other_Product_Service_Details",
+   "Services.Service_Type_Code",
+   "Marketing_Regions.Other_Details",
+   "Ref_Service_Types.Parent_Service_Type_Code"
+  ],
+  "supporting_evidence": {
+   "Products.Product_Price >= 0": "All shown Product_Price values are positive (4448536, 2302, 17622723, ...).",
+   "Services.Product_Price >= -39.0001": "Relaxed from >=0 to accommodate the comparison_boundary target values -39.0001, -39, -38.9999; shown values are positive but boundary targets require negative values.",
+   "Order_Items.Order_Quantity > 0": "Shown values are '1','2'.",
+   "Invoices.Order_Quantity > 0": "Shown values are '2','1'.",
+   "Invoice_Items.Order_Quantity > 0": "Shown values are 2, 6.",
+   "Bookings.Status_Code IN ('good','stop')": "Shown values are 'good','stop'.",
+   "Bookings.Planned_Delivery_Date >= Order_Date": "Not contradicted by shown rows; order rule per instruction 9.",
+   "Bookings.Actual_Delivery_Date >= Order_Date": "Not contradicted by shown rows; order rule per instruction 9.",
+   "Customer_Orders.Planned_Delivery_Date >= Order_Date": "Not contradicted by shown rows; order rule per instruction 9.",
+   "Customer_Orders.Actual_Delivery_Date >= Order_Date": "Not contradicted by shown rows; order rule per instruction 9.",
+   "Drama_Workshop_Groups.Currency_Code IN ('EU','USD')": "Shown values are 'EU','USD'.",
+   "Ref_Payment_Methods.payment_method_code IN (...)": "Shown values are 'American E','MasterCard','Visa'.",
+   "Ref_Service_Types.Service_Type_Code IN ('1','2','3','4')": "Shown values are '1','2','3','4'.",
+   "Marketing_Regions.Marketing_Region_Code IN (...)": "Shown values are CA,CN,ES,FR,IN,MX,RU,US."
+  },
+  "uncertainty": {
+   "date_order_rules": "The shown sample rows for Bookings and Customer_Orders have Planned/Actual dates that are not consistently after Order_Date; the order rules are stated per instruction 9 but may not hold on the original data. Generate dates by construction (draw Planned/Actual after Order_Date) rather than rewriting sampled values; do not compare datetimes as strings.",
+   "formulas": "No calculated columns (totals, offsets) are evident from the shown rows; no formula beyond range/enum/order rules is stated.",
+   "unmatched_join_rows": "For FK columns (Invoices.payment_method_code, Invoices.Order_ID, Order_Items.Order_ID) the pattern is realized only via NULL child rows (where nullable) and parent rows without children; no fabricated non-NULL keys are inserted, so generated instances introduce no new FK violations. Products.Product_Name / Services.Product_Name are not FKs and may carry unmatched non-NULL values.",
+   "group_sizes_relaxation": "Invoices.payment_method_code group_sizes relaxed to '1 and >= 2' because Ref_Payment_Methods has only 3 rows and payment_method_code is an enum of 3 values; a 1,2,>=3 distribution across 3 distinct values is impossible.",
+   "services_price_boundary": "Services.Product_Price >= 0 rule relaxed to >= -39.0001 to allow the comparison_boundary target values -39.0001, -39, -38.9999 to survive generation; all six boundary values must be present after null injection and clamping.",
+   "aggregate_boundary": "Products.Product_Price must keep a broad distribution while its per-instance AVG lands in [999999, 1000002]; adjust a small number of values to hit the target sum rather than collapsing all values to the midpoint.",
+   "enum_group_sizes": "Enum columns carrying a group_sizes exception (Services.Service_Type_Code, Drama_Workshop_Groups.Marketing_Region_Code) must be routed through the group-size allocator so the 1/2/>=3 distribution is realized.",
+   "fk_pool_union": "The parent key pool for every FK must be the union of compact original keys and generated keys, because the writer appends to a copy of the compact database; drawing only from generated keys produces FK violations against compact rows.",
+   "composite_fk": "Invoice_Items.(Order_ID,Product_ID) must be assigned from a single Bookings_Services parent tuple; assigning each column independently from a single-column list breaks the composite FK.",
+   "nullable_fk_null_rate": "For nullable FK columns (Invoices.payment_method_code) and nullable enum columns (Services.Service_Type_Code), compute the NULL share from the child column's own compact share, not the parent's, and guarantee at least one NULL and one non-NULL row per instance.",
+   "post_generation_checks": "After generation, assert per instance: AVG(Products.Product_Price) in [999999, 1000002]; all six Services.Product_Price boundary values present; at least one Ref_Payment_Methods row without Invoices children and at least one Invoices row with NULL payment_method_code; composite FK Invoice_Items.(Order_ID,Product_ID) matches a Bookings_Services tuple; no FK violations against the final written database."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with KeyError('Bookings') (n_ok=0, n_fail=20, errors={'KeyError': 20}). In instance.py, _check_rules is called as _check_rules(schema, inst, t, cm, vals, spec) for non-FK columns; when t == 'Bookings' and name == 'Status_Code' it does `out = [v if v in ('good','stop') else None for v in out]`, and for Bookings/Customer_Orders date columns it does `od = inst.get(t, {}).get('Order_Date') or []` and `vals = inst[t][name]`. But `inst[t]` is only populated at the end of the table loop (`inst[t] = {...}`), so during column processing `inst['Bookings']` does not exist yet -> KeyError('Bookings'). This aborts every unit before any rows are written.",
+     "requested_revision": "Fix _check_rules so it does not index inst[t] for the table currently being built. Pass the in-progress column dict (cols) or the already-built columns explicitly, and guard with inst.get(t, {}) / cols.get(...) instead of inst[t][name]. Re-run generation and confirm n_ok>0 and no KeyError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _fk_column_values: `if unmatched and rng.random() < 0.5: out.append(None)` \u2014 for Invoices.payment_method_code the spec requires unmatched_join_rows with 'child_rows_with_null_fk' AND 'parent_rows_without_children'. The unmatched branch only produces NULLs; it never produces non-NULL child values that are absent from the parent pool. Also _apply_null_share is applied to FK columns regardless of whether the column is a null_target, so NOT NULL FK columns (e.g. Invoices.Order_ID, Order_Items.Order_ID) can receive NULLs, violating NOT NULL constraints and the spec's 'child_rows_with_null_fk' only where nullable.",
+     "requested_revision": "For unmatched_join_rows columns, generate a mix of (a) NULLs when the column is nullable and (b) non-NULL values not present in the parent key pool (so parent_rows_without_children is satisfied). Do not inject NULLs into NOT NULL FK columns; only apply _apply_null_share when the column is nullable or listed in null_targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_sizes: `sizes[-1] += remaining` after building groups [1,2,min(n,3)]; when n is small or distinct count is small this can produce a group size that does not match the requested '1, 2 and >= 3' distribution, and `out[:n]` truncation can drop the >=3 group entirely. The spec targets for Invoices.payment_method_code, Invoices.Product_ID, Services.Service_Type_Code, Drama_Workshop_Groups.Marketing_Region_Code, Ref_Service_Types.Service_Type_Code/Description all require groups of size 1, 2 and >=3 to exist simultaneously. The truncation and the `distinct[k % len(distinct)]` cycling do not guarantee all three group sizes survive.",
+     "requested_revision": "Rework _apply_group_sizes to explicitly allocate at least one group of size 1, one of size 2, and one of size >=3 (when n permits), then distribute remaining rows, and only truncate after verifying the three group sizes are present. Add a post-check that raises/logs if the target distribution is not met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_aggregate_boundary: it only remaps values > 1000002 via `f % 1000002 + 500000.0`; it does not ensure AVG(Product_Price) lands in [999999, 1000002] as the spec's aggregate_boundary target requires. With 15+ random values uniform in [0,1e8], the mean will typically be ~5e7, far outside the boundary window. The spec target 'AVG in [999999, 1000002]' is therefore not implemented.",
+     "requested_revision": "Implement _apply_aggregate_boundary to construct values whose mean falls within [999999, 1000002] (e.g. draw most values near 1e6 and adjust one value to hit the target mean), and verify AVG after generation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_duplicates: `out.append(values.pop(0))` \u2014 when the duplicate branch fires more often than fresh draws remain, values.pop(0) on an empty list raises IndexError; also the loop runs len(values) times but pops from the same list being iterated, so the output length is not guaranteed to equal the input length. The spec's duplicates_for_distinct targets (Addresses.City_Town, Addresses.State_County, Bookings.Order_Date, Drama_Workshop_Groups.Store_Name, Performers.Customer_Phone) require a 20-50% duplicate share on DISTINCT columns.",
+     "requested_revision": "Rewrite _apply_duplicates to iterate over a fixed count (len of original list), drawing either a fresh value from a copy or a repeat of an already-emitted value, and guard against empty source. Verify duplicate share lands in 20-50%."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _fk_column_values: `pv = inst.get(pt, {}).get(pc) or []` \u2014 for tables whose parent is built later in table_order (or whose parent key column is a composite FK), pv is empty and the function returns [None]*n for a NOT NULL FK column. The spec dependencies list many FKs (e.g. Invoices.Order_ID -> Customer_Orders.Order_ID, Invoice_Items.Order_ID,Product_ID -> Bookings_Services composite). The composite-FK branch in build_random_instance only assigns child_cols[0] and leaves the second composite column unset, so composite FK tuples are not actually generated consistently.",
+     "requested_revision": "Ensure parent tables are fully built before children (verify table_order covers all FK edges, including composite), and for composite FKs assign all child columns from the same parent tuple. Do not emit NULL for NOT NULL FK columns when the parent pool is empty; instead skip or defer the row."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions lists Invoices.payment_method_code with both 'unmatched_join_rows' (parent_rows_without_children, child_rows_with_null_fk) and 'group_sizes' ('1, 2 and >= 3'), and the atomic operations report group_sizes pairs=6 for Invoices.payment_method_code and pairs=5 for Ref_Payment_Methods.payment_method_code. However Ref_Payment_Methods has only 3 rows (table_sizes_per_instance) and payment_method_code is an enum of 3 values; a group-size distribution of 1,2,>=3 across 3 distinct values is impossible. The spec is internally inconsistent for this column.",
+     "requested_revision": "Either relax the group_sizes target for Invoices.payment_method_code (e.g. allow '1 and >=2' given only 3 parent values) or increase Ref_Payment_Methods size / enum cardinality so the 1,2,>=3 distribution is achievable. Document the chosen resolution."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas states 'Services.Product_Price >= 0' and 'Products.Product_Price >= 0', but the comparison_boundary target for Services.Product_Price lists values -39.0001, -39, -38.9999 (negative). The program's _check_rules clamps Price to max(0.0, ...), which would erase the negative boundary values needed to exercise the comparison_boundary pattern. The spec's boundary targets and its non-negativity rule conflict.",
+     "requested_revision": "Resolve the conflict: either drop the negative comparison_boundary targets for Services.Product_Price (keeping >=0) or remove the >=0 rule for that column. Update the program's _check_rules accordingly so the intended boundary values survive."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty section admits 'date_order_rules ... may not hold on the original data' for Bookings/Customer_Orders Planned/Actual >= Order_Date. The program enforces these rules in _check_rules by replacing violating values with Order_Date. If the original data violates the rule, the generated instances will diverge from the compact distribution and the rule is not actually supported by evidence.",
+     "requested_revision": "Either provide evidence that the order rules hold on the compact data (so enforcement is justified) or mark them as uncertain and do not enforce them in the program. Do not silently rewrite values to satisfy an unverified rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` without orig_path, so the compact database is NOT copied; instead the DDL is recreated empty and only generated rows are inserted. The spec/instructions require preservation of compact rows (rows APPENDED to a copy of the compact database per instance.py docstring). The generated units therefore lack the original rows.",
+     "requested_revision": "Pass orig_path through to write_instance_sqlite (add it to the args dict and _one call) so each unit is a copy of the compact database with appended rows, matching the documented 'rows APPENDED to a copy' behavior."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify dependent-value consistency or preservation of compact rows because all 20 units failed with KeyError('Bookings') before writing.",
+    "Could not verify reproducible generation (seed_base*100003+i) end-to-end because no instances were produced.",
+    "Could not verify NULL-share behavior on nullable columns from execution feedback (no rows generated).",
+    "Could not verify that intended value variation (boundary/duplicate/group-size patterns) survives in written instances."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 3932 across 20 instances (all 20 invalid with reason 'new_integrity_failures'). The writer disables FK enforcement (`con.execute('pragma foreign_keys = OFF')` in writer.py) and inserts with `INSERT OR IGNORE`, so FK violations are silently accepted. The instance builder deliberately injects unmatched child values for `unmatched_join_rows` targets (e.g. `'X' + base_choice` / `int(base_choice) + 900000` in instance.py) into FK columns such as Invoices.payment_method_code, Invoices.Order_ID, Order_Items.Order_ID, Products.Product_Name/Services.Product_Name, without any mechanism to keep them referentially valid. The spec's `unmatched_join_rows` targets for FK columns (Invoices.payment_method_code, Invoices.Order_ID, Order_Items.Order_ID) are incompatible with the declared FOREIGN KEY constraints, and the program resolves this by producing actual FK violations rather than by relaxing the pattern to non-FK columns or by ensuring the 'unmatched' rows are still valid references.",
+     "requested_revision": "Reconcile the unmatched_join_rows targets with the schema's FK constraints. Either (a) restrict unmatched_join_rows to non-FK join columns (e.g. Products.Product_Name / Services.Product_Name, which are not FKs), and for FK columns (Invoices.payment_method_code, Invoices.Order_ID, Order_Items.Order_ID) implement the pattern only via NULL child rows (allowed by the nullable-FK rule) plus parent rows without children, never via non-existent non-NULL FK values; or (b) if the spec intends genuine orphan rows, the spec must explicitly state that FK enforcement is relaxed for those columns. In either case, the generated instances must not introduce new FK violations relative to the compact database (fk_violations must be 0 or equal to the original)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `unmatched_join_rows` branch in instance.py appends `'X' + base_choice` for string parents and `int(base_choice) + 900000` for numeric parents. For Invoices.payment_method_code (CHAR(15), FK to Ref_Payment_Methods.payment_method_code CHAR(10)) this both violates the FK and can exceed the declared CHAR(10) width of the parent column; for Invoices.Order_ID / Order_Items.Order_ID it produces integer values with no matching parent. This is the direct source of the 3932 FK violations.",
+     "requested_revision": "Remove the synthetic out-of-domain value injection for FK columns. For nullable FK columns, realize 'child_rows_with_null_fk' by planting NULLs (per the NULL rule) and 'parent_rows_without_children' by leaving some parent keys unreferenced; do not fabricate non-existent non-NULL keys."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec lists `Invoices.payment_method_code` group_sizes target as '1 and >= 2 (relaxed: only 3 parent values exist)' while the atomic-operation extraction states group_sizes '1, 2 and >= 3'. The program's `_group_sizes` requires n>=6 and >=3 distinct values to realize 1/2/>=3; with only 3 enum values and the relaxed target this is inconsistent. Similarly the spec's `unmatched_join_rows` for Invoices.payment_method_code demands both parent_rows_without_children and child_rows_with_null_fk, but the column is declared NOT NULL in the schema (Invoices.payment_method_code CHAR(15) with no NOT NULL, but the FK target Ref_Payment_Methods.payment_method_code is NOT NULL and the column is used as FK) \u2014 the nullable_columns feedback shows 'Invoices.payment_method_code: generated rows: NULL 0 / 333', i.e. the child_rows_with_null_fk target is not achievable because the column is effectively non-nullable in the generated data.",
+     "requested_revision": "Clarify the group_sizes target for Invoices.payment_method_code given only 3 distinct parent values (state the achievable distribution explicitly, e.g. '1 and >=2' with a note that >=3 is impossible), and drop or re-scope the child_rows_with_null_fk sub-target for Invoices.payment_method_code since the column cannot carry NULLs under the current schema/insert path. Ensure the spec's unmatched_join_rows targets are realizable without violating FKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires that for every nullable column each instance contains both NULL and non-NULL generated rows, with NULL share following the compact share. Feedback shows several nullable columns with 'NULL 0 / n' (e.g. Invoices.payment_method_code 0/333, Services.Service_Type_Code 0/334) and many columns fully NULL (e.g. Addresses.Other_Details 426/426, Bookings.Other_Order_Details 333/333, Products.Product_Description 331/331). The fully-NULL columns arise because `_inject_nulls` uses the compact null rate (which is 1.0 for these columns) and the sampler never produces non-NULL values for them; the 0-NULL columns arise because the FK path forces non-null values for NOT NULL FKs and the enum path for Services.Service_Type_Code does not inject NULLs. Per instruction 7 the 0-NULL lines are noted but not blocking; the fully-NULL columns are a stronger deviation from 'rows with non-NULL values'.",
+     "requested_revision": "For nullable columns whose compact null rate is 1.0, still generate at least one non-NULL row per instance (cap the injected null share below 1.0, e.g. min(rate, 0.95)) so the 'rows with non-NULL values' requirement holds. For nullable FK/enum columns currently at 0 NULLs, ensure at least one NULL row per instance where the column is genuinely nullable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `uncertainty.date_order_rules` states the Planned/Actual >= Order_Date rules may not hold on original data and should be enforced only if evidence supports them, otherwise marked uncertain and not silently rewritten. The program's `_safe_rule_check`/date block in instance.py silently rewrites values (`fixed.append(od[i])` when `str(v) < str(od[i])`) and compares datetimes as strings, which is fragile and constitutes silent rewriting rather than the requested 'mark uncertain, do not rewrite' behavior.",
+     "requested_revision": "Either (a) confirm the date-order rules from the compact data and enforce them with proper datetime comparison, or (b) follow the spec's uncertainty guidance: do not silently rewrite; instead generate dates that satisfy the rule by construction (draw Planned/Actual after Order_Date) or leave them unconstrained and record the uncertainty. Avoid string comparison of datetimes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_force_aggregate_mean` sets every Product_Price to the midpoint (~1000000.5) and perturbs a few entries, which collapses the value distribution and conflicts with the generic `decimal_price` rule (uniform in [0,100000000] with 5% boundary values). The aggregate_boundary target (AVG in [999999,1000002]) is satisfied but at the cost of destroying the intended variation; combined with the 5% boundary injection in DecimalSampler, the resulting AVG may drift outside the target band because `_force_aggregate_mean` is applied after sampling and ignores the boundary values it overwrites.",
+     "requested_revision": "Construct Product_Price so that the AVG lands in [999999,1000002] while preserving a broad distribution (e.g. draw most values uniformly and adjust a small number of values to hit the target sum, keeping boundary values intact). Verify the realized AVG per instance stays within the target band."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_comparison_boundary` places the boundary values (-39.0001, -39, -38.9999, 99.9999, 100, 100.0001) at the first positions of the list, but `_safe_rule_check` then clamps Services.Product_Price with `max(-39.0001, float(v))`, which is fine for the lower edge but the upper boundary values (99.9999, 100, 100.0001) are not guaranteed to survive if the sampler's `lo/hi` clamp (DecimalSampler lo=0.0) or later null injection removes them. The comparison_boundary target requires all six values to be present.",
+     "requested_revision": "Ensure all six comparison_boundary values for Services.Product_Price are present in every instance (place them after null injection and after any clamping, and verify presence)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_group_sizes` returns early for n<6 or <3 distinct values and otherwise rebalances, but for enum columns (e.g. Services.Service_Type_Code, Drama_Workshop_Groups.Marketing_Region_Code) the enum branch in instance.py bypasses `_group_sizes` entirely (`vals = [targets[i % len(targets)] for i in range(n)]`), so the group_sizes target '1, 2 and >= 3' is not actually enforced for those columns. The construction_pairs feedback shows only 15/96 pairs separated, consistent with several patterns not being realized.",
+     "requested_revision": "Route enum columns with a group_sizes exception through `_group_sizes` (or an equivalent allocator) so the 1/2/>=3 distribution is realized, and verify per-instance group-size distributions for all group_sizes targets."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database itself has FK violations (fk_violations baseline) \u2014 the feedback reports 3932 new violations but does not state the original count; the 'new_integrity_failures' reason implies these are new, but the baseline should be confirmed.",
+    "Whether the date-order rules hold on the compact data (spec marks them uncertain); the program's silent rewriting is flagged, but the correct resolution depends on evidence not provided here.",
+    "Whether the 15/96 separated construction pairs reflect genuine pattern realization or are limited by the small instance sizes; this is noted but not treated as a blocking error per instruction 4."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 3944 across 20 instances and validity.invalid: 20 with reason new_integrity_failures. The writer disables FK enforcement (writer.py: 'pragma foreign_keys = OFF') and uses 'INSERT OR IGNORE', so FK violations are silently introduced rather than prevented. The instance builder draws FK values from the parent's generated key pool, but the parent key pool is built from the *generated* rows of the parent table, while the writer appends to a *copy of the compact database*; the compact rows already present in the copy are not in the generated pool, and conversely generated parent keys may collide with or be absent from the copy. More importantly, the composite-FK handling in instance.py assigns child columns from a single parent column list (e.g. Invoice_Items.Order_ID,Product_ID from Bookings_Services.Order_ID only), and the 'unmatched_join_rows' handling for Invoices.Order_ID / Order_Items.Order_ID relies on parent rows without children, but the generated child rows still reference generated parent keys that may not exist in the copied compact DB.",
+     "requested_revision": "Ensure generated FK values reference keys that actually exist in the final written database (compact rows + appended rows). Either (a) build the parent key pool from the union of compact original values and generated values, or (b) keep foreign_keys=ON and let the writer reject/repair invalid rows, or (c) verify post-write FK integrity and fail the unit. Also fix composite-FK assignment so all child columns of a composite FK come from the same parent tuple (currently Invoice_Items.Order_ID,Product_ID is populated from a single column list)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback shows many columns with 'NULL 0 / n' where the interface NULL rule requires at least one NULL row per nullable column per instance: Invoices.payment_method_code (0/333), Services.Service_Type_Code (0/334). The spec's null_targets list does not include Services.Service_Type_Code, and Invoices.payment_method_code is a nullable FK whose NULL injection is gated on the parent's original NULL rate (instance.py: rate computed from schema.original_values of the *parent* column, not the child), so when the parent has no NULLs the child gets none. Per instruction 7 this is noted for the engineer and does not by itself block a pass, but combined with the FK issue it indicates the NULL/FK handling is not aligned with the interface rule.",
+     "requested_revision": "For nullable FK columns (Invoices.payment_method_code) and nullable enum columns (Services.Service_Type_Code), compute the NULL rate from the child column's own compact share and guarantee at least one NULL and one non-NULL row per instance, consistent with the interface NULL rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for Invoices.payment_method_code group_sizes is relaxed to '1 and >= 2' with the note that '>=3 impossible' because Ref_Payment_Methods has only 3 rows. However the extracted atomic operation for Invoices.payment_method_code group_sizes targets '1, 2 and >= 3' (pairs:6). The relaxation is justified (3 distinct values cannot yield a >=3 group plus a 1 and a 2 group across only 3 values), so this is a documented, defensible deviation rather than an error. Similarly Services.Product_Price comparison_boundary requires negative boundary values (-39.0001 etc.) which conflicts with the semantic rule Product_Price >= 0; the spec relaxes to >= -39.0001 and the program enforces this in _safe_rule_check and the post-pass. These are consistent with the spec but the spec should explicitly state that the negative boundary values are intentional and that the >= 0 rule is superseded.",
+     "requested_revision": "Document in the spec that Services.Product_Price >= 0 is intentionally relaxed to >= -39.0001 to preserve the comparison_boundary targets, and that Invoices.payment_method_code group_sizes is relaxed to '1 and >= 2'. No code change required for these two items."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's aggregate_boundary for Products.Product_Price requires AVG in [999999, 1000002]. The program's _force_aggregate_mean adjusts values to hit the target sum, but the post-pass in build_random_instance only guarantees Services.Product_Price boundary values; there is no post-pass verifying Products.Product_Price AVG lands in band after null injection. The execution feedback does not report per-instance AVG checks, so this is an unresolved check.",
+     "requested_revision": "Add a post-generation assertion (or repair step) that Products.Product_Price non-NULL AVG falls in [999999, 1000002] per instance, and surface it in the execution feedback. Similarly verify the Services.Product_Price comparison_boundary values survive null injection (the post-pass sets them but null injection may overwrite indices 0..5)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's unmatched_join_rows for Invoices.payment_method_code requires 'parent_rows_without_children' and 'child_rows_with_null_fk (NULL only; no fabricated non-NULL keys)'. The program draws FK values uniformly from the parent pool and injects NULLs only when the parent's original NULL rate > 0; it does not guarantee parent rows without children (i.e., some Ref_Payment_Methods rows with no matching Invoices row) nor a controlled NULL share. The execution feedback shows Invoices.payment_method_code NULL 0/333, so the 'child_rows_with_null_fk' half of the pattern is not realized.",
+     "requested_revision": "Implement the unmatched_join_rows pattern explicitly: ensure at least one parent row has no child rows and at least one child row has NULL FK (where nullable), per the spec's target. Do not fabricate non-NULL keys outside the parent pool."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance AVG(Products.Product_Price) in [999999, 1000002] not verified in execution feedback.",
+    "Survival of all six Services.Product_Price comparison_boundary values after null injection not verified.",
+    "Parent-rows-without-children for Invoices.payment_method_code / Order_ID not verified.",
+    "Composite FK Invoice_Items.(Order_ID,Product_ID) -> Bookings_Services.(Order_ID,Product_ID) consistency not verified; the builder assigns both child columns from a single parent column list."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  }
+ ]
 }

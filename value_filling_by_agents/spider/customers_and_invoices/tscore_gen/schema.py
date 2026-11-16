@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    null_share: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -137,6 +138,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+        null_share = {}
+        for (t, c), vals in ov.items():
+            if vals:
+                null_share[(t, c)] = sum(1 for v in vals if v is None) / float(len(vals))
+            else:
+                null_share[(t, c)] = 0.0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, null_share)

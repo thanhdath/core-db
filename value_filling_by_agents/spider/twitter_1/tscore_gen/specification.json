@@ -1,0 +1,264 @@
+{
+ "generic_sampling_rules": {
+  "integer_pk": "Sequential integers starting at max(compact)+1; unique per table; never NULL; for composite PKs generate tuples that do not collide with pre-existing compact tuples; never apply aggregate/group/dup transforms to PK columns.",
+  "integer_fk": "Draw from the parent table's FINAL key pool (compact + generated, after all parent-side dedup/PK assignment); never NULL for NOT NULL FK columns; for nullable FK columns ~10% NULL (>=1 row per instance). At least one parent PK value is excluded from the draw pool per (parent, child-FK) pair so it stays childless in that child table. FK values are filled AFTER parent keys are final and are never overwritten by later re-planting; if a later step must change an FK column, re-fill from the final parent pool. FK columns are populated in a dedicated fill phase that runs after all non-FK columns exist; the row count for a table whose columns are all FKs (e.g. follows) is taken from table_sizes_per_instance, not from any column array.",
+  "integer_numeric": "Uniform integer in [min,max] from statistics; plant each listed boundary literal and one step on each side; boundary literals are guaranteed to appear (not probabilistic).",
+  "varchar_text": "Short strings; for LIKE columns plant the exact literal, a prefix variant, a case variant, and one near variant (~30% of fresh rows carry a planted match); literals are per-column (see per_column_exceptions), never a global default.",
+  "char_text": "Padded to declared length; plant exact and near-variant matches for LIKE literals; length <= declared length.",
+  "datetime": "Random timestamps within the column's declared range (see semantic rules); force at least two rows to share one timestamp (tie) for ORDER columns; NULL ~10% for nullable date columns.",
+  "null_share": "For nullable columns ~10% NULL (>=1 row per column per instance); plant NULLs after all dedup/filter steps; never NULL primary keys or NOT NULL columns; a planted NULL is never replaced to satisfy a rule.",
+  "duplicates": "For distinct-share columns target 20-50% duplicate share among non-null rows; verify post-write and adjust by adding/removing duplicates; never apply to primary-key columns."
+ },
+ "dependencies": [
+  {
+   "table": "follows",
+   "column": "f1",
+   "references": "user_profiles.uid",
+   "copied_columns": []
+  },
+  {
+   "table": "follows",
+   "column": "f2",
+   "references": "user_profiles.uid",
+   "copied_columns": []
+  },
+  {
+   "table": "tweets",
+   "column": "uid",
+   "references": "user_profiles.uid",
+   "copied_columns": []
+  },
+  {
+   "table": "follows",
+   "columns": [
+    "f1",
+    "f2"
+   ],
+   "unique": true,
+   "note": "composite PK; must not duplicate compact tuples; enforce uniqueness in the plan before insert so planned child counts survive"
+  },
+  {
+   "table": "tweets",
+   "column": "id",
+   "unique": true,
+   "note": "PK; sequential from max(compact)+1; never mutated by aggregate/group/dup transforms"
+  }
+ ],
+ "per_column_exceptions": [
+  {
+   "table": "user_profiles",
+   "column": "uid",
+   "pattern": "group_sizes",
+   "targets": "child-count histogram over tweets.uid and follows.f1 contains groups of size 1, 2 and >=3; enforce on final arrays after FK fill"
+  },
+  {
+   "table": "user_profiles",
+   "column": "uid",
+   "pattern": "unmatched_join_rows",
+   "targets": "at least one parent user_profiles.uid has zero children in tweets.uid AND at least one has zero children in follows.f1, independently per (parent, child-FK) pair; implement by excluding that parent key from the corresponding FK draw pool, never by nulling the child FK"
+  },
+  {
+   "table": "user_profiles",
+   "column": "uid",
+   "pattern": "aggregate_boundary",
+   "targets": "COUNT(*) per parent group in {0,1,2,3}; 0 comes from unmatched_join_rows, 1/2/3 from child-count distribution"
+  },
+  {
+   "table": "user_profiles",
+   "column": "uid",
+   "pattern": "duplicates_for_distinct",
+   "targets": "not applicable to PK; do not enforce duplicate share on uid"
+  },
+  {
+   "table": "tweets",
+   "column": "uid",
+   "pattern": "group_sizes",
+   "targets": "groups of size 1, 2 and >=3; enforce on final array after FK fill, do not re-plant after"
+  },
+  {
+   "table": "tweets",
+   "column": "uid",
+   "pattern": "unmatched_join_rows",
+   "targets": "child FK column contains no reference to >=1 parent (user_profiles.uid); do NOT implement by nulling child FK; achieved by excluding a parent key from the draw pool"
+  },
+  {
+   "table": "tweets",
+   "column": "uid",
+   "pattern": "aggregate_boundary",
+   "targets": "COUNT(*) per group in {0,1,2,3}; 0 from childless parent, 1/2/3 from child-count distribution"
+  },
+  {
+   "table": "tweets",
+   "column": "uid",
+   "pattern": "duplicates_for_distinct",
+   "targets": "20-50% duplicate share among non-null; achieved by repeating existing parent keys, not inventing new ones"
+  },
+  {
+   "table": "tweets",
+   "column": "id",
+   "pattern": "aggregate_boundary",
+   "targets": "COUNT(tweets.id) per user group in {0,1,2,3}; interpreted as tweets-per-user, not values in id column; do not re-plant on PK; never mutate the id array"
+  },
+  {
+   "table": "tweets",
+   "column": "id",
+   "pattern": "null_in_count_column",
+   "targets": "no NULL (NOT NULL column counts all rows)"
+  },
+  {
+   "table": "tweets",
+   "column": "id",
+   "pattern": "null_rows",
+   "targets": "no NULL (NOT NULL)"
+  },
+  {
+   "table": "user_profiles",
+   "column": "name",
+   "pattern": "group_sizes",
+   "targets": "groups of size 1, 2 and >=3; enforce on final array after NULL planting"
+  },
+  {
+   "table": "user_profiles",
+   "column": "name",
+   "pattern": "like_near_variant",
+   "targets": "literal '%Swif%' plus near variants (Swif, Swif x, SWIF, Swift, Swiftt); do not use %int%/%intern% on name"
+  },
+  {
+   "table": "user_profiles",
+   "column": "name",
+   "pattern": "comparison_boundary",
+   "targets": "include exact string 'Iron Man' and a near-typo variant (e.g. 'Iron Man ', 'Iron-Man', 'Iron Manx'); no numeric boundaries on varchar"
+  },
+  {
+   "table": "user_profiles",
+   "column": "email",
+   "pattern": "like_near_variant",
+   "targets": "literals '%edu%' and '%supers%' plus near variants (edu, edux, EDU, supers, supersx, SUPERS); do not use %int%/%intern% on email"
+  },
+  {
+   "table": "user_profiles",
+   "column": "email",
+   "pattern": "duplicates_for_distinct",
+   "targets": "20-50% duplicate share among non-null; enforce on final array"
+  },
+  {
+   "table": "user_profiles",
+   "column": "followers",
+   "pattern": "rows_with_different_values",
+   "targets": "for each group by partitionid, >=2 rows with different followers values; implement per partitionid group (not globally); verify post-write"
+  },
+  {
+   "table": "user_profiles",
+   "column": "followers",
+   "pattern": "comparison_boundary",
+   "targets": "plant 999, 1000 and 1001 explicitly (at least one row each per instance) in addition to followers >= 0"
+  },
+  {
+   "table": "user_profiles",
+   "column": "partitionid",
+   "pattern": "aggregate_boundary",
+   "targets": "COUNT(*) per partitionid group in {1,2,3}; plant NULLs in rows outside the boundary blocks or count NULL as its own group; verify post-write"
+  },
+  {
+   "table": "follows",
+   "column": "f1",
+   "pattern": "group_sizes",
+   "targets": "groups of size 1, 2 and >=3; enforce on final array after FK fill, do not re-plant after"
+  },
+  {
+   "table": "follows",
+   "column": "f2",
+   "pattern": "comparison_boundary",
+   "targets": "domain restricted to {-1, 1}; both values must appear in every instance; never emit 0; verify post-write that f2 values are a subset of {-1,1} and both occur; reconcile with FK by ensuring user_profiles.uid includes -1 and 1 so the f2 pool restricted to {-1,1} is nonempty"
+  },
+  {
+   "table": "tweets",
+   "column": "createdate",
+   "pattern": "ties_for_order_limit",
+   "targets": "at least two generated rows share a createdate value within 2018 (tie at ORDER BY createdate ASC); keep tie when re-planting other targets"
+  },
+  {
+   "table": "tweets",
+   "column": "text",
+   "pattern": "like_near_variant",
+   "targets": "literals '%int%' and '%intern%' plus near variants inu, int x, INT, intero, intern x, INTERN"
+  }
+ ],
+ "semantic_rules_and_formulas": [
+  {
+   "table": "user_profiles",
+   "column": "uid",
+   "formula": "uid > 0",
+   "evidence": "uids 1-7 positive"
+  },
+  {
+   "table": "user_profiles",
+   "column": "followers",
+   "formula": "followers >= 0",
+   "evidence": "followers 100..99999998"
+  },
+  {
+   "table": "tweets",
+   "column": "id",
+   "formula": "id > 0",
+   "evidence": "ids 1-9 positive"
+  },
+  {
+   "table": "tweets",
+   "column": "text",
+   "formula": "length(text) <= 140",
+   "evidence": "all sample texts fit char(140)"
+  },
+  {
+   "table": "follows",
+   "column": "f2",
+   "formula": "f2 <> 0",
+   "evidence": "f2 values 1-6, none zero"
+  },
+  {
+   "table": "tweets",
+   "column": "createdate",
+   "formula": "createdate >= '2018-01-01 00:00:00' AND createdate < '2019-01-01 00:00:00'",
+   "evidence": "compact createdate values 2018-03-09 20:00:14, 2018-03-12 02:30:30 fall in 2018; rule is inferred from two compact values and marked uncertain"
+  }
+ ],
+ "table_sizes_per_instance": {
+  "user_profiles": 8,
+  "tweets": 9,
+  "follows": 10
+ },
+ "null_targets": [
+  "user_profiles.name",
+  "user_profiles.email",
+  "user_profiles.partitionid",
+  "user_profiles.followers",
+  "tweets.createdate"
+ ],
+ "supporting_evidence": [
+  {
+   "formula": "user_profiles.uid > 0",
+   "rows": "uid 1..7"
+  },
+  {
+   "formula": "user_profiles.followers >= 0",
+   "rows": "100, 890, 6662425, 94375428"
+  },
+  {
+   "formula": "tweets.id > 0",
+   "rows": "1,2,4,5,6,7,8,9"
+  },
+  {
+   "formula": "follows.f2 <> 0",
+   "rows": "f2 1..6"
+  },
+  {
+   "formula": "length(tweets.text) <= 140",
+   "rows": "all 8 sample texts"
+  },
+  {
+   "formula": "tweets.createdate in 2018",
+   "rows": "2018-03-09 20:00:14, 2018-03-12 02:30:30"
+  }
+ ],
+ "uncertainty": "No calculated columns and no date pairs exist; createdate range rule is inferred from two compact values (2018) and is marked uncertain (not a hard constraint). NULL shares estimated at ~10% for nullable columns; compact rows kept and never deleted or modified. table_sizes_per_instance is a fixed per-instance size (8/9/10); the program must generate exactly these counts and ensure per-column targets remain achievable at that size. Sampling must plant NULLs, ties, duplicates, group-size histograms, boundary literals and childless parents on the FINAL arrays after dedup and FK fill; FK columns are filled from the final parent key pool and never overwritten by later re-planting; follows composite PK collisions must be avoided against compact tuples in the plan before insert. The follows table has only FK columns; its row count must come from table_sizes_per_instance and its column dict must be initialized empty before FK fill. Aggregate/group/dup transforms must never be applied to primary-key columns (tweets.id, user_profiles.uid). The f2 domain {-1,1} conflicts with the FK reference to user_profiles.uid; resolution: ensure user_profiles.uid includes -1 and 1 so the f2 pool restricted to {-1,1} is nonempty and both values appear. Post-write verification must confirm: every non-NULL FK value exists in the parent table; at least one parent has zero children in tweets.uid and at least one has zero children in follows.f1 (independently); child-count histogram contains 1, 2 and >=3; f2 subset of {-1,1} with both present; followers contains 999/1000/1001; createdate ties within 2018; duplicate shares 20-50% on email and tweets.uid; followers-per-partition distinct values. Fail the unit or replant on non-FK columns only when a target is unmet."
+}

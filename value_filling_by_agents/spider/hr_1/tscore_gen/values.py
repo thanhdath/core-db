@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -132,7 +134,7 @@ class DateSampler(ColumnSampler):
                 self.template = self.template or t
                 parsed.append(d)
         self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.full = (dt.datetime(1980, 1, 1), dt.datetime(2010, 12, 31))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -214,11 +216,47 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     return StringSampler(els, p, max_l0, rng)
 
 
+def _dup_shape(shape: str, rng) -> str:
+    """Type-aware duplicate value for a duplicate-distinct column."""
+    if shape == 'phone':
+        return '%03d.%03d.%04d' % (rng.randint(200, 999), rng.randint(100, 999), rng.randint(0, 9999))
+    if shape == 'name':
+        return rng.choice(['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis'])
+    if shape == 'title':
+        return rng.choice(['Manager', 'Analyst', 'Clerk', 'Representative', 'Assistant', 'Specialist'])
+    return 'Dup'
+
+
+def _spec_elements(table: str, col: str, column, rng) -> list:
+    """Planted values for a column, derived from the specification (by construction)."""
+    key = (table, col)
+    out: list = []
+    if key in spec.ENUMS:
+        out += list(spec.ENUMS[key])
+    if key in spec.BOUNDARY_NUM:
+        out += list(spec.BOUNDARY_NUM[key])
+    if key in spec.BOUNDARY_DATE:
+        out += list(spec.BOUNDARY_DATE[key])
+    if key in spec.NEAR_TEXT:
+        for s in spec.NEAR_TEXT[key]:
+            out += [s, s.lower(), s.upper()]
+            if s:
+                out.append(s[:-1] + ('x' if s[-1] != 'x' else 'y'))
+    if key in spec.TIE_ORDER:
+        out += ['Ontario', 'Ontario', 'Yukon']
+    if key in spec.DUP_DISTINCT:
+        shape = spec.DUP_DISTINCT[key][2]
+        dup = _dup_shape(shape, rng)
+        out += [dup, dup, dup]
+    return out
+
+
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), table: str = '') -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224, plus spec-planted values."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    els = _spec_elements(table, column.name, column, rng) + els
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
@@ -229,7 +267,8 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), table: str = '') -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, table)
     return [s.sample() for _ in range(n)]

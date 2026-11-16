@@ -34,6 +34,9 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: dict = field(default_factory=dict)
+    checks: dict = field(default_factory=dict)
+    orig_path: str = ''
 
 
 def q(name: str) -> str:
@@ -58,7 +61,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +78,19 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _parse_checks(create_sql: str, low: dict) -> dict:
+    """Collect (column -> raw text) for inline CHECK constraints."""
+    out: dict = {}
+    for line in create_sql.split('\n'):
+        ll = line.lower()
+        if 'check (' not in ll and 'check(' not in ll:
+            continue
+        tok = _first_token(line).lower()
+        if tok in low:
+            out.setdefault(low[tok], []).append(line.strip())
+    return out
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -85,6 +101,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        uniq_tuples: dict = {}
+        checks: dict = {}
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -106,6 +124,17 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
+            ut = []
+            for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
+                if idx[2]:
+                    cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                    names = frozenset(c[2] for c in cols if c[2])
+                    if len(names) > 1:
+                        ut.append(names)
+            if ut:
+                uniq_tuples[t] = ut
+            for name, _ in _parse_checks(create[t], low).items():
+                checks[(t, name)] = _parse_checks(create[t], low)[name]
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -139,4 +168,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, uniq_tuples, checks, orig_path)

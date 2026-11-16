@@ -1,49 +1,724 @@
 {
  "db": "college_2",
- "operator_io_quirks": [
-  "All identifiers lowercase, no spaces; but DDL uses backticks around `department` in course FK and commented-out FK lines \u2014 sqlparse/pragma must tolerate backticks and `--` comments inside CREATE TABLE.",
-  "Composite FKs: section(building,room_number)->classroom(building,room_number) and teaches/takes(course_id,sec_id,semester,year)->section(...) \u2014 pragma foreign_key_list returns them as separate single-column rows (id groups), so read_schema must group by fk id to recover the composite edge.",
-  "teaches/takes have 5-column composite PKs; each FK column is also a PK member \u2014 fill_foreign_keys_consistently must draw each column independently from the parent's final column, not as a tuple, or PK dedup will collapse rows.",
-  "advisor.s_ID is PK and FK to student.ID; advisor.i_ID FK to instructor.ID \u2014 parent PK is single-column, fine, but advisor has 2000 rows = student count, so s_ID is effectively a 1:1 copy of student.ID.",
-  "prereq has two FKs both to course.course_id (course_id and prereq_id) \u2014 self-ish reference to same parent table, two distinct child columns; process_order must not treat as cycle.",
-  "section.year numeric(4,0) but values 2001-2010; check (year>1701 and year<2100) \u2014 Number fuzzer with scale=4 will produce values in [-10^4,10^4] mostly failing the CHECK, rows dropped at insert.",
-  "time_slot.start_hr/start_min/end_hr/end_min numeric(2) with CHECK 0<=x<24 / <60 \u2014 Number scale=2 gives [-100,100], most rows fail CHECK.",
-  "department.budget numeric(12,2) check(budget>0); instructor.salary numeric(8,2) check(salary>29000) \u2014 Number fuzzer range [-10^12,10^12] / [-10^8,10^8] mostly violates; salary>29000 rarely met.",
-  "course.credits numeric(2,0) check(credits>0) with only 2 distinct values (3,4); student.tot_cred numeric(3,0) check(>=0) 130 distinct \u2014 Number fuzzer will scatter widely, CHECK drops many.",
-  "section.semester varchar(6) check(semester in ('Fall','Winter','Spring','Summer')) \u2014 String fuzzer produces random strings, CHECK drops most rows; only 2 distinct in original (Fall,Spring).",
-  "takes.grade varchar(2) samples include 'A ' (trailing space) and 'C-','B+' \u2014 String fuzzer with length range [0,2] will produce 1-2 char strings, some matching, many not.",
-  "All declared types are varchar/numeric; no date/time/bool/bit/year types \u2014 no Date/Time/Bool fuzzer dispatch, no crash-fallback columns; storage classes match declared (text/integer/real)."
- ],
- "operator_ts_expectations": [
-  "String fuzzer (length from varchar(n) arg, default 20) for all varchar columns: building, room_number, dept_name, course_id, title, name, ID, sec_id, semester, time_slot_id, day, grade \u2014 random a-zA-Z0-9() strings, so joins on these keys mostly fail to match across tables unless FK fill copies parent values.",
-  "Number fuzzer for numeric(p,s): scale=s, precision=p; capacity numeric(4,0)->[-10^4,10^4] ints; budget numeric(12,2)->[-10^12,10^12] floats; salary numeric(8,2)->[-10^8,10^8]; year numeric(4,0)->[-10^4,10^4] \u2014 CHECK constraints (budget>0, salary>29000, year 1701-2100, credits>0, tot_cred>=0, start_hr<24 etc.) reject most rows at insert, so tables end up much smaller than chosen size.",
-  "FK fill copies parent column values with replacement, so section.course_id matches course.course_id, teaches/takes.course_id matches section.course_id \u2014 but composite FK columns drawn independently means (course_id,sec_id,semester,year) tuples in teaches/takes rarely exist in section, so joins on full composite key return few/no rows.",
-  "advisor.s_ID drawn from student.ID (2000 values) with replacement then PK-deduped -> ~2000 rows but many duplicates dropped; advisor.i_ID from instructor.ID (50 values) -> heavy repetition, so 'students advised by instructor X' counts inflated.",
-  "section.semester String fuzzer produces random strings failing CHECK -> most section rows dropped; surviving rows have semester from literal pool (Fall/Spring) only if pool seeded, else random 6-char strings that fail CHECK -> section may end up near-empty, cascading to teaches/takes FK fill giving NULLs.",
-  "String fuzzer contaminate (0.5 prob) adds/drops chars, so course_id '101' may become '101x' or '10' \u2014 breaks equality joins with section.course_id even when FK fill intended a match (FK fill uses parent's final values so this is consistent, but literal-pool values in WHERE clauses won't match).",
-  "Number fuzzer perturb (+-1,+-2 for int; +-0.01,+-0.02 for float) applied after sampling, so year 2009 may become 2011 or 2007 \u2014 still in CHECK range sometimes, but budget/salary perturbed values often cross the CHECK boundary.",
-  "Literal pool from train SQL: values like 'Fall','Spring','A','B','C','D','F','M','W','R','T','1','2','3','A-','B+','C-' get injected into String samplers, so semester/day/grade/sec_id may match original domain \u2014 this is the main source of plausible values.",
-  "Known FN driver: CHECK constraints silently drop rows, so tables like section, time_slot, department, instructor, course, student end up with far fewer rows than chosen size; queries counting these tables get implausibly small results, and joins through dropped rows return empty.",
-  "Known FP driver: FK fill with replacement creates many-to-one duplicates (e.g. many takes rows share same (course_id,sec_id,semester,year) but different ID), so COUNT(DISTINCT ID) vs COUNT(*) distinctions may be preserved but ties/duplicates in non-key columns (dept_name, building) are over-represented vs original.",
-  "No Date/Time/Bool/Year fuzzer dispatch and no crash-fallback columns on this DB \u2014 TS behaviour is purely String+Number, so date/time-specific misses do not apply here."
- ],
- "challenger_refs": [
-  "G13",
-  "G7",
-  "G4",
-  "G3",
-  "G2",
-  "G6",
-  "G8",
-  "G5",
-  "G1",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "varchar_short": "Sample from a pool of realistic short strings; 10% near-variants (case change, trailing space, one-char edit) of an existing value; never exceed declared length.",
+   "varchar_id": "Sample from a pool of digit strings of length 5 (or 8 for course_id) with leading zeros allowed; ensure uniqueness within the table's key.",
+   "varchar_name": "Sample from a pool of surnames; 20% duplicate share; 5% near-variants (case change, one-char edit).",
+   "varchar_title": "Sample from a pool of course-title-like phrases; 30% duplicate share; 5% near-variants.",
+   "varchar_building": "Sample from a pool of building names; 20% duplicate share.",
+   "varchar_room": "Sample from a pool of 3-digit room numbers; 20% duplicate share.",
+   "varchar_semester": "Sample from {'Fall','Spring','Summer','Winter'} exactly; no case variants (CHECK forbids).",
+   "varchar_grade": "Sample from {'A+','A','A-','B+','B','B-','C+','C','C-','D','F'}; plant NULL on a subset for nullable handling.",
+   "varchar_day": "Sample from {'M','T','W','R','F'}.",
+   "varchar_time_slot_id": "Sample from {'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'}.",
+   "numeric_int_small": "Uniform integer in the column's CHECK range; include boundary values and one step on each side where a CHECK exists.",
+   "numeric_money": "Uniform decimal with 2 fractional digits in the column's CHECK range; include boundary values.",
+   "numeric_credits": "Sample from {3,4} for bulk rows; 10% of rows draw CHECK-boundary probes {1,2} (both satisfy credits > 0).",
+   "numeric_capacity": "Uniform integer in [10,120].",
+   "numeric_year": "Bulk draws uniform integer in [2001,2010]; 15% of rows draw from boundary probes {1702,1703,2008,2009,2010,2011,2098,2099} (all satisfy 1701 < year < 2100).",
+   "numeric_hour": "Uniform integer in [8,16].",
+   "numeric_minute": "Sample from {0,30,45,50}.",
+   "composite_fk_null": "For a composite foreign key whose columns are jointly nullable (section.building + section.room_number), plant NULL in all columns of the tuple together or none; never a partial NULL. The non-NULL branch draws a valid parent tuple.",
+   "null_rule": "The NULL rule applies only to the columns listed in null_targets (the spec's NULLABLE list); other nullable columns may remain NULL-free. For each listed column, each instance contains at least one NULL row and non-NULL rows; NULL share is computed on the final written row count (after dedup/filtering) and follows the compact database's share for that column (0.0 observed, so use 2-5% planted NULLs). NOT NULL and primary-key columns never get NULL. Rules, lookups and formulas constrain only non-NULL operands (SQL three-valued logic).",
+   "fk_validation": "All foreign keys are validated against the FINAL written parent rows (post-dedup, post-filter, post-NULL-planting, post-group-size-realization). Any row whose FK target is absent from the final written parent set is dropped or re-pointed to an existing parent value before writing. pragma foreign_keys is ON during write; a post-write integrity check must report fk_violations = 0.",
+   "group_size_realization": "Group-size targets are constructed explicitly on the final written set: for department.dept_name, child rows (course/instructor/student dept_name) are assigned so that at least one dept has exactly 1 child, one has exactly 2, and one has >=3, using only dept values present in department; for prereq.course_id, course_id values are assigned so that some course appears once, some twice, and some >=3 times, while keeping (course_id, prereq_id) unique and both FKs valid (prereq_id drawn only from existing course ids). Group-size realization never overwrites a planted NULL with a non-NULL value; if it would, the NULL is re-planted afterward. Verification runs on the final written rows and reports group_sizes_ok: true.",
+   "null_planting_order": "NULL planting runs after all row-dropping (FK validation, dedup, formula filtering) and after group-size realization, or the share is recomputed on the post-write count and adjusted. Each listed null_target has >=1 NULL and a 2-5% share on the final written rows; NOT NULL/PK columns have zero NULLs."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "department",
+    "column": "dept_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Physics",
+     "physics",
+     "Comp. Sci.",
+     "comp. sci.",
+     "Statistics",
+     "statistics"
+    ]
+   },
+   {
+    "table": "department",
+    "column": "dept_name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     ">=3"
+    ],
+    "note": "dept_name is PK; group sizes 1/2/>=3 must be realized across the final written set (compact + appended) via child tables (course/instructor/student dept_name), not by duplicating dept_name values. At least one dept with exactly 1 child, one with exactly 2, one with >=3, using only dept values present in department."
+   },
+   {
+    "table": "department",
+    "column": "dept_name",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "ID",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "dept_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Comp. Sci.",
+     "comp. sci.",
+     "Statistics",
+     "statistics"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "dept_name",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Soisalon%",
+     "%Soisalon%",
+     "Soisalon",
+     "Soisaloo",
+     "Soisalon x",
+     "soisalon"
+    ]
+   },
+   {
+    "table": "instructor",
+    "column": "name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "dept_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Physics",
+     "physics"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "dept_name",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "dept_name",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}",
+     "COUNT(DISTINCT course.dept_name) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "title",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Differential Geometry",
+     "differential geometry",
+     "International Finance",
+     "international finance"
+    ]
+   },
+   {
+    "table": "course",
+    "column": "title",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "advisor",
+    "column": "i_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "advisor",
+    "column": "i_ID",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "advisor",
+    "column": "s_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "advisor",
+    "column": "s_ID",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(advisor.s_ID) in {0,1,2}",
+     "COUNT(DISTINCT advisor.s_ID) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "teaches",
+    "column": "ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "teaches",
+    "column": "ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "section",
+    "column": "semester",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Fall",
+     "Spring"
+    ],
+    "note": "Targets 'fall','spring','g','G' from the atomic summary are unreachable under CHECK (semester IN ('Fall','Winter','Spring','Summer')) and are intentionally not generated."
+   },
+   {
+    "table": "section",
+    "column": "year",
+    "pattern": "comparison_boundary",
+    "targets": [
+     2008,
+     2009,
+     2010,
+     2011,
+     2099
+    ],
+    "note": "2011 is included in CHECK_BOUNDARIES for section.year so it is generated at the 15% boundary rate; 2099 is a CHECK-boundary probe."
+   },
+   {
+    "table": "student",
+    "column": "ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "prereq",
+    "column": "course_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     ">=3"
+    ],
+    "note": "course_id is part of composite PK (course_id, prereq_id); group sizes must be realized across the final written set (compact + appended) by varying prereq_id, not by duplicating (course_id, prereq_id) tuples. Some course appears once, some twice, some >=3 times; prereq_id drawn only from existing course ids."
+   },
+   {
+    "table": "prereq",
+    "column": "course_id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) in {0,1,2}"
+    ]
+   },
+   {
+    "table": "takes",
+    "column": "grade",
+    "pattern": "null_rows",
+    "targets": [
+     "NULL"
+    ]
+   },
+   {
+    "table": "department",
+    "column": "budget",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "course.dept_name",
+    "parent": "department",
+    "parent_column": "department.dept_name",
+    "copied": []
+   },
+   {
+    "child": "instructor.dept_name",
+    "parent": "department",
+    "parent_column": "department.dept_name",
+    "copied": []
+   },
+   {
+    "child": "student.dept_name",
+    "parent": "department",
+    "parent_column": "department.dept_name",
+    "copied": []
+   },
+   {
+    "child": "section.course_id",
+    "parent": "course",
+    "parent_column": "course.course_id",
+    "copied": []
+   },
+   {
+    "child": "section.(building,room_number)",
+    "parent": "classroom",
+    "parent_column": "classroom.(building,room_number)",
+    "copied": [],
+    "composite_null": true
+   },
+   {
+    "child": "teaches.(course_id,sec_id,semester,year)",
+    "parent": "section",
+    "parent_column": "section.(course_id,sec_id,semester,year)",
+    "copied": []
+   },
+   {
+    "child": "teaches.ID",
+    "parent": "instructor",
+    "parent_column": "instructor.ID",
+    "copied": []
+   },
+   {
+    "child": "takes.(course_id,sec_id,semester,year)",
+    "parent": "section",
+    "parent_column": "section.(course_id,sec_id,semester,year)",
+    "copied": []
+   },
+   {
+    "child": "takes.ID",
+    "parent": "student",
+    "parent_column": "student.ID",
+    "copied": []
+   },
+   {
+    "child": "advisor.s_ID",
+    "parent": "student",
+    "parent_column": "student.ID",
+    "copied": []
+   },
+   {
+    "child": "advisor.i_ID",
+    "parent": "instructor",
+    "parent_column": "instructor.ID",
+    "copied": []
+   },
+   {
+    "child": "prereq.course_id",
+    "parent": "course",
+    "parent_column": "course.course_id",
+    "copied": []
+   },
+   {
+    "child": "prereq.prereq_id",
+    "parent": "course",
+    "parent_column": "course.course_id",
+    "copied": []
+   },
+   {
+    "child": "section.(course_id,sec_id,semester,year)",
+    "parent": "section",
+    "parent_column": "section.(course_id,sec_id,semester,year)",
+    "copied": [],
+    "note": "PK uniqueness: generated PK tuples must be checked against the full composite PK set of compact rows, not just the first PK column."
+   },
+   {
+    "child": "department.dept_name",
+    "parent": "department",
+    "parent_column": "department.dept_name",
+    "copied": [],
+    "note": "PK uniqueness: appended department rows must not duplicate compact dept_name values; group-size targets are realized via child tables."
+   },
+   {
+    "child": "prereq.(course_id,prereq_id)",
+    "parent": "prereq",
+    "parent_column": "prereq.(course_id,prereq_id)",
+    "copied": [],
+    "note": "Composite PK uniqueness: appended prereq rows must not duplicate compact (course_id, prereq_id) tuples; group-size targets are realized by varying prereq_id among existing course ids."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "department",
+    "column": "budget",
+    "formula": "budget > 0"
+   },
+   {
+    "table": "course",
+    "column": "credits",
+    "formula": "credits > 0"
+   },
+   {
+    "table": "instructor",
+    "column": "salary",
+    "formula": "salary > 29000"
+   },
+   {
+    "table": "section",
+    "column": "semester",
+    "formula": "semester IN ('Fall','Winter','Spring','Summer')"
+   },
+   {
+    "table": "section",
+    "column": "year",
+    "formula": "year > 1701 AND year < 2100"
+   },
+   {
+    "table": "student",
+    "column": "tot_cred",
+    "formula": "tot_cred >= 0"
+   },
+   {
+    "table": "time_slot",
+    "column": "start_hr",
+    "formula": "start_hr >= 0 AND start_hr < 24"
+   },
+   {
+    "table": "time_slot",
+    "column": "start_min",
+    "formula": "start_min >= 0 AND start_min < 60"
+   },
+   {
+    "table": "time_slot",
+    "column": "end_hr",
+    "formula": "end_hr >= 0 AND end_hr < 24"
+   },
+   {
+    "table": "time_slot",
+    "column": "end_min",
+    "formula": "end_min >= 0 AND end_min < 60"
+   },
+   {
+    "table": "time_slot",
+    "column": "end_hr",
+    "formula": "end_hr > start_hr OR (end_hr = start_hr AND end_min > start_min)",
+    "condition": "start_hr IS NOT NULL AND start_min IS NOT NULL AND end_hr IS NOT NULL AND end_min IS NOT NULL",
+    "evidence": "Shown rows: start 8:00 end 8:50; start 9:30 end 11:30; start 11:00 end 13:45; start 13:30 end 15:30; start 10:00 end 12:30; start 14:00 end 16:45; start 16:00 end 16:50. Formula holds on every shown row; NULL operands pass under SQL three-valued logic."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "department": 20,
+   "classroom": 30,
+   "course": 200,
+   "instructor": 50,
+   "student": 2000,
+   "section": 100,
+   "teaches": 100,
+   "takes": 30000,
+   "advisor": 2000,
+   "prereq": 100,
+   "time_slot": 20
+  },
+  "null_targets": [
+   "course.dept_name",
+   "instructor.dept_name",
+   "student.dept_name",
+   "section.building",
+   "section.room_number",
+   "section.time_slot_id",
+   "advisor.i_ID",
+   "takes.grade",
+   "time_slot.end_hr",
+   "time_slot.end_min"
+  ],
+  "supporting_evidence": {
+   "department.budget": "Shown budgets 255041.46, 647610.55, 699140.86, 942162.76, 210627.58, 573745.09, 611042.66, 441840.92 all > 0.",
+   "course.credits": "Shown credits 4 and 3, both > 0.",
+   "instructor.salary": "Shown salaries 94333.99, 59303.62, 119921.41, 88791.45, 61387.56, 32570.5, 89805.83, 108011.81 all > 29000.",
+   "section.semester": "Shown semesters Fall, Spring; CHECK allows Fall/Winter/Spring/Summer.",
+   "section.year": "Shown years 2002, 2003, 2005, 2006, 2007, 2008, 2009, 2010 all satisfy CHECK 1701 < year < 2100.",
+   "student.tot_cred": "Shown tot_cred 4, 100, 116, 73, 91, 15, 108, 58 all >= 0.",
+   "time_slot": "Shown start_hr 8-16, start_min 0/30, end_hr 8-16, end_min 30/45/50; end after start in every shown row."
+  },
+  "uncertainty": "No sample formula relates columns across tables (e.g., tot_cred vs takes). The year domain is ambiguous between the declared CHECK (1702-2099) and observed values (2001-2010); both domains are listed (observed-style draws plus CHECK-boundary probes including 2011). The semester case-variant boundary values ('fall', 'spring', 'g', 'G') from the atomic-operation summary are omitted because the CHECK constraint forbids them and would filter every plant; 'g' and 'G' are unreachable under the CHECK and are intentionally not generated. Composite-FK NULL handling for section.(building,room_number) must be co-nulled; partial-NULL tuples are invalid against classroom. Group-size targets on department.dept_name and prereq.course_id cannot be realized by duplicating PK values; they must be realized across the final written set (compact + appended) via child tables (course/instructor/student dept_name for department; varying prereq_id among existing course ids for prereq) and verified post-generation. The NULL rule applies only to the columns listed in null_targets; other nullable columns may remain NULL-free. The time_slot end-after-start formula holds under SQL three-valued logic when operands are NULL. table_sizes_per_instance describes the compact database's row counts (copied as-is); appended rows are governed by the program's EXTRA_ROWS caps. course.credits uses EnumSampler {3,4} for bulk rows with 10% CHECK-boundary probes {1,2}; the RANGES entry (1,4) is superseded by this rule. FK validation is performed against the final written parent rows (post-dedup, post-filter, post-NULL-planting, post-group-size-realization); pragma foreign_keys is ON during write and a post-write integrity check must report fk_violations = 0 and validity.invalid = 0. Group-size realization never overwrites a planted NULL with a non-NULL value; if it would, the NULL is re-planted afterward. construction_pairs_by_group must be populated with per-group eligible/separated counts so the reviewer can confirm boundary/near-variant/group-size targets are exercised."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons shows 'compact_rows_missing': 20 and 'no_rows_added': 20 for all 20 instances; integrity.fk_violations = 3324. In cli.py `_one` calls `build_random_instance(_G['schema'], _G['pool'], None, rng)` and then `write_instance_sqlite(_G['schema'], inst, p)` \u2014 note `orig_path` is never passed, so writer.py takes the `if not (orig_path and os.path.exists(orig_path))` branch and builds a DDL-only clone instead of copying the compact database. The compact rows are therefore absent, and the appended generated rows reference parent values (from `schema.original_values`) that do not exist in the empty clone, producing 3324 FK violations.",
+     "requested_revision": "Pass the original database path through to the writer (e.g. `write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])` in cli.py `_one`, and thread `orig` into the worker args). Verify that each instance contains the compact rows plus the appended rows and that `fk_violations` drops to 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets `pragma foreign_keys = OFF` before inserting, so FK violations are not caught at write time; combined with the missing compact copy above, the generated child rows (drawn from `schema.original_values` of the parent) are inserted into a database whose parent tables are empty. The integrity check reports 3324 fk_violations, confirming dependent-value consistency is broken.",
+     "requested_revision": "After fixing the compact-copy issue, either enable `pragma foreign_keys = ON` during insertion (so inconsistent rows are skipped and counted rather than silently written) or validate FK consistency in Python before insert. Ensure the reported `rows_skipped`/`rows_failed` reflect any dropped rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `NULLABLE` includes `('section','building')` and `('section','room_number')` as independent nullable columns, and instance.py `_plant_nulls` plants NULLs independently in each. But `section.(building,room_number)` is a composite FK to `classroom`; planting NULL in only one of the two columns yields a partial-key FK tuple that is neither fully NULL (allowed) nor a valid reference. Similarly `advisor.i_ID` NULL is fine, but the composite section FK needs both-or-neither NULL handling. The execution feedback shows `nullable_columns: []` (no per-column NULL evidence was produced), so this is unverified but the code path is clearly wrong for composite FKs.",
+     "requested_revision": "Treat composite foreign keys as a unit in the NULL rule: plant NULL in all columns of the composite key together (or none), and ensure the non-NULL case draws a valid (building, room_number) pair from classroom. Update `_plant_nulls`/`fill_foreign_keys_consistently` accordingly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py `RANGES` for `('section','year')` is `(2001, 2010, 0)` and `BOUNDARY_VALUES[('section','year')] = [2008, 2009, 2010, 2011]`. The schema CHECK is `year > 1701 and year < 2100`, so 2011 is valid, but the boundary pool is narrower than the declared range and the `RangeSampler` boundary list `[lo, hi, lo-1, hi+1]` = `[2001, 2010, 2000, 2011]` \u2014 2000 is below the spec's stated range but still passes the CHECK. This is a minor inconsistency between the stated range and the boundary values, not a blocking error, but the spec should state the intended year domain explicitly.",
+     "requested_revision": "Clarify whether the year domain is the CHECK range (1702\u20132099) or the observed 2001\u20132010; align `RANGES` and `BOUNDARY_VALUES` with the chosen domain so boundary queries are exercised against the actual declared constraint."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py `BOUNDARY_VALUES[('section','semester')]` includes `'fall'`, `'spring'`, `'g'`, `'G'`, but the schema has `check (semester in ('Fall','Winter','Spring','Summer'))`. The spec's own `semantic_rules_and_formulas` lists `semester IN ('Fall','Winter','Spring','Summer')`, and `check_formulas` rejects any non-enum value. So the boundary pool values `'fall'`, `'spring'`, `'g'`, `'G'` will always be filtered out by `_apply_formulas`, making those boundary targets unreachable. The spec is internally inconsistent: it asks for near-variants that the CHECK forbids.",
+     "requested_revision": "Remove the case-variant semester boundary values (or document that they are intentionally unreachable because the CHECK forbids them). The generic rule already says near-variants only 'where no CHECK forbids'; the per-column exception should follow the same rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_group_sizes` overwrites `cols[c][0..5]` for `department.dept_name` and `prereq.course_id` after `_plant_nulls` and after FK fill, but before PK dedup. For `prereq.course_id` (a PK column of the composite PK `(course_id, prereq_id)`), overwriting course_id values can create duplicate PK tuples that are then dropped by `sample_fresh_primary_keys`, potentially destroying the intended group sizes. Also `_enforce_group_sizes` runs before `_apply_formulas`, and for `department.dept_name` the overwritten values are not re-checked against any formula (none applies), but the interaction with dedup is fragile.",
+     "requested_revision": "Enforce group sizes after PK/UNIQUE dedup, or verify post-dedup that the group-size targets (1, 2, >=3) still hold; add an assertion or re-application step so the construction guarantee is actually met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` computes `taken_ids` from `schema.original_values.get((t, tm.primary_key[0] ...))` \u2014 only the first PK column. For composite PKs (e.g. `section`, `teaches`, `takes`, `advisor`, `prereq`, `time_slot`) this is insufficient to guarantee uniqueness against compact rows, and `IdSampler` only tracks single-column ids. The execution feedback shows `pk_duplicates: 0`, but that is because the compact rows were missing entirely (see issue 1); once the compact copy is restored, PK collisions with compact rows become possible.",
+     "requested_revision": "Seed `taken_ids` from the full PK tuple of compact rows (or at least all PK columns), and ensure generated PK tuples are checked against the compact PK set, not just single-column ids."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli.py `_one` returns `''` on success and the summary prints `'rows_added': {}` and `'rows_skipped': {}` as hard-coded empty dicts, discarding the `write_instance_sqlite` return value. The execution feedback therefore cannot confirm how many rows were added or skipped per table, and the `no_rows_added` validity reason cannot be distinguished from a writer bug.",
+     "requested_revision": "Propagate the `write_instance_sqlite` return dict (`rows_ok`, `rows_failed`) back through `_one` and aggregate it into the summary so `rows_added`/`rows_skipped` reflect actual counts."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database is actually copied once orig_path is threaded through (issue 1) \u2014 needs re-run.",
+    "Whether composite-FK NULL handling (issue 3) produces valid instances \u2014 needs re-run with nullable_columns evidence.",
+    "Whether group-size targets survive PK dedup (issue 6) \u2014 needs post-dedup verification.",
+    "Whether PK uniqueness holds against compact rows once they are present (issue 7) \u2014 needs re-run.",
+    "Semantic rules: budget>0, credits>0, salary>29000, tot_cred>=0, time_slot ordering are implemented in check_formulas and appear consistent with the schema; no evidence of violation, but not independently exercised because no rows were added."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZE_COLUMNS = [('department','dept_name'), ('prereq','course_id')] and instance.py _enforce_group_sizes only reassigns the first six rows to three distinct values (sizes 1,2,>=3). But the spec's group_sizes target for department.dept_name is '1, 2 and >= 3' and for prereq.course_id likewise. The enforcement runs *after* PK/UNIQUE dedup on the appended rows only; the compact rows already present in the copied database are not considered. Since department.dept_name is a PK (unique), appended rows cannot create groups of size >=3 within the appended set unless duplicates exist \u2014 but sample_fresh_primary_keys drops duplicate dept_name tuples, so _enforce_group_sizes runs on a column whose values are already unique. The reassignment sets cols[c][1]=cols[c][2]=vals[1], creating a duplicate PK value that is then NOT re-deduped (dedup already happened), so the writer will skip those rows as PK duplicates (rows_skipped department=31, prereq=71 in feedback). Net effect: the group-size target is not actually realized in the written instances.",
+     "requested_revision": "Enforce group sizes on the final written row set (compact + appended) or re-run PK/UNIQUE dedup after _enforce_group_sizes while preserving the 1/2/>=3 group structure; verify post-write that department.dept_name and prereq.course_id exhibit group sizes 1, 2 and >=3 in the actual instance. Alternatively drop these columns from GROUP_SIZE_COLUMNS if PK uniqueness makes the target unsatisfiable, and document that in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py declares GROUP_SIZE_COLUMNS for prereq.course_id, but prereq.course_id is part of the composite PK (course_id, prereq_id). _enforce_group_sizes reassigns rows 0..5 to three values, producing duplicate (course_id, prereq_id) tuples only if prereq_id also collides; more importantly the enforcement is applied to appended rows only and the writer's rows_skipped prereq=71 indicates many appended rows are rejected. The spec's uncertainty note explicitly says 'Whether all patterns survive PK/UNIQUE dedup must be verified post-generation (in particular, group-size targets on department.dept_name and prereq.course_id)' \u2014 the program does not perform this verification.",
+     "requested_revision": "Add a post-generation verification step (in writer.py or a check module) that confirms group-size targets survive dedup for department.dept_name and prereq.course_id, and report failures in the summary JSON. If the target cannot survive PK uniqueness, revise the spec to remove or relax it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE includes ('section','building'),('section','room_number') and COMPOSITE_NULL_FKS co-nulls them. instance.py _plant_nulls plants NULLs before dedup and _apply_formulas filters rows; but _apply_formulas does not check composite-FK co-nulling, and the writer's _composite_fk_ok rejects partial-NULL tuples. Feedback shows section.building NULL 20/217 and section.room_number NULL 20/217 \u2014 consistent counts suggest co-nulling works. However, the spec's null_rule says 'each instance contains at least one NULL row and non-NULL rows' for every nullable column; feedback shows several nullable columns with 'NULL 0 / n' (classroom.capacity, course.credits, course.title, department.budget, department.building, instructor.salary, student.tot_cred). These columns are not in spec.NULLABLE, so the program correctly does not plant NULLs there \u2014 but the spec's null_rule text is broader than the NULLABLE list. This is a spec/program mismatch in wording, not a blocking error.",
+     "requested_revision": "Clarify in spec.py that the NULL rule applies only to the columns listed in NULLABLE (the spec's null_targets list), and that other nullable columns may remain NULL-free. No code change required if the NULLABLE list is authoritative."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py BOUNDARY_VALUES for ('section','semester') = ['Fall','Spring'] and the spec's uncertainty note says semester case-variants ('fall','spring','g','G') are omitted because the CHECK forbids them. The atomic-operation summary lists comparison_boundary targets for section.semester including 'Fall','fall','Spring','spring','g','G'. The spec correctly omits the forbidden variants, but the atomic summary's targets are not fully covered. This is a deliberate, justified omission \u2014 not an error \u2014 but the spec should record that the 'g'/'G' targets are unreachable under the CHECK.",
+     "requested_revision": "Document in spec.py that section.semester comparison-boundary targets 'g' and 'G' are unreachable due to the CHECK constraint and are intentionally not generated; note this in the uncertainty field."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_group_sizes uses rng.sample(sorted(set(pool)), 3) and assigns vals[0], vals[1], vals[1], vals[2]... to rows 0..5. If the column is a PK (department.dept_name), this creates duplicate PK values that the writer skips (rows_skipped department=31). The spec's group_sizes target for department.dept_name is therefore not achieved in written rows. Additionally, _enforce_group_sizes is called before _apply_formulas; if _apply_formulas filters out some of the reassigned rows (e.g., due to budget formula on department), the group structure may be lost.",
+     "requested_revision": "Reorder: apply _apply_formulas first, then _enforce_group_sizes on the surviving rows, and ensure the reassigned values do not violate PK/UNIQUE (for PK columns, use distinct values per row and achieve group sizes via non-PK columns or via the compact rows). Verify group sizes on the final written set."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py _fk_ok checks single-column FKs against parent_sets built from compact + generated values. For composite FKs, _composite_fk_ok checks parent_tuples. However, parent_tuples is built by zipping columns of the parent table from original_values and instance \u2014 but original_values for a parent table may have different row counts per column if the compact table has NULLs or if max_rows_per_table sampling was applied (schema.py samples every k-th row for large tables, which can misalign columns across tables if rowid modulo differs). For takes (30000 rows) and student (2000 rows), original_values are sampled independently per column with the same modulo, so alignment is preserved within a table. But _parent_tuples in instance.py and writer.py zips columns from original_values and instance without guaranteeing row alignment when instance columns have different lengths after filtering. This can produce invalid parent tuples and cause false FK rejections (rows_skipped takes=10, advisor=171).",
+     "requested_revision": "Build parent tuples from actual row-aligned data (e.g., query the compact database per table with rowid, or store original rows as tuples rather than per-column lists). Ensure _parent_tuples and writer's parent_tuples use aligned rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py EXTRA_ROWS caps appended rows (e.g., takes (0,60), student (0,40)), but TABLE_SIZES lists takes=30000, student=2000. The spec's table_sizes_per_instance says these are the compact database sizes; the program appends only 0..60 extra rows to takes. The spec's intent (per table_sizes_per_instance) is that each instance has ~30000 takes rows; the program's instances have ~30000 compact + up to 60 appended. This matches the 'copy compact + append' design, but the spec's table_sizes_per_instance is ambiguous about whether it describes total or appended rows. The feedback shows rows_added takes=625 over 20 instances (~31/instance), consistent with EXTRA_ROWS.",
+     "requested_revision": "Clarify in spec.py that table_sizes_per_instance describes the compact database's row counts (copied as-is) and EXTRA_ROWS describes appended rows; or adjust EXTRA_ROWS if larger appended volumes are intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls plants NULLs for spec.NULLABLE columns, but the spec's null_rule says 'NULL share follows the compact database's share (0.0 observed, so use 2-5% planted NULLs)'. The program uses NULL_SHARE=(0.02,0.05) uniformly, ignoring per-column compact shares. Feedback shows advisor.i_ID NULL 13/242 (~5.4%), course.dept_name 18/156 (~11.5%), instructor.dept_name 19/91 (~20.9%), student.dept_name 23/495 (~4.6%), takes.grade 22/634 (~3.5%) \u2014 some exceed the 2-5% band because the share is computed on pre-dedup n and dedup/filtering changes the denominator. This is a minor deviation from the stated share.",
+     "requested_revision": "Compute the NULL share on the final row count (after dedup/filtering) or document that the share is approximate on pre-dedup rows. Optionally use per-column compact shares where non-zero."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py RANGES for ('section','year') = (2001,2010) and CHECK_BOUNDARIES includes 1702,1703,2098,2099. The spec's uncertainty note acknowledges the ambiguity between declared CHECK (1702-2099) and observed values (2001-2010). The program's RangeSampler draws bulk from 2001-2010 and 15% from boundaries \u2014 reasonable. But the spec's comparison_boundary targets for section.year include 2008,2009,2010,2099; BOUNDARY_VALUES includes these. The atomic summary lists targets [2008,2009,2010,2011] \u2014 2011 is not in BOUNDARY_VALUES and not in RANGES (hi=2010), so 2011 is unreachable. This is a spec gap.",
+     "requested_revision": "Add 2011 to BOUNDARY_VALUES for section.year or extend RANGES hi to 2011; document the choice."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py spec_sampler for ('course','credits') uses EnumSampler(spec.CREDITS) = [3,4], but spec.RANGES also lists ('course','credits'): (1,4,0) with CHECK_BOUNDARIES [1,2]. The EnumSampler branch takes precedence (elif chain), so credits are always 3 or 4; the CHECK boundary probes 1 and 2 are never generated. The spec's comparison_boundary/aggregate targets for course.credits are not listed in BOUNDARY_VALUES, so this may be acceptable, but the spec's RANGES entry is dead code.",
+     "requested_revision": "Remove the redundant RANGES entry for course.credits or wrap the EnumSampler in a BoundarySampler with [1,2] to exercise CHECK boundaries; document which is intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_formulas filters rows failing spec.check_formulas. For time_slot, check_formulas requires end_hr > start_hr or (end_hr == start_hr and end_min > start_min) when all four are non-NULL. But _plant_nulls plants NULLs in end_hr/end_min for time_slot; rows with NULL end_hr/end_min pass the formula (three-valued logic). The writer then inserts them. This is correct per the NULL rule. However, the spec's semantic_rules_and_formulas lists the time_slot end-after-start formula without noting NULL handling; the program's behavior is consistent with SQL three-valued logic but the spec should state it.",
+     "requested_revision": "Document in spec.py that the time_slot end-after-start formula holds when operands are NULL (three-valued logic), matching the program's check_formulas."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py _fk_ok and _composite_fk_ok validate FKs in Python, but the connection sets 'pragma foreign_keys = OFF' and relies on Python checks. If a row passes Python checks but violates a CHECK constraint (e.g., budget > 0, salary > 29000), executemany raises and the fallback per-row insert catches it (bad[t]++). Feedback shows rows_skipped department=31, advisor=171, prereq=71 \u2014 these are likely PK/UNIQUE/FK rejections. The spec's semantic formulas are checked in _apply_formulas before writing, so CHECK violations should be rare. But _apply_formulas runs before _enforce_group_sizes in some paths? No \u2014 _enforce_group_sizes runs before _apply_formulas. If _enforce_group_sizes assigns a value violating a CHECK (e.g., department.budget not affected; but for other columns), _apply_formulas would filter it. This ordering is correct. No blocking issue here.",
+     "requested_revision": "None; note that rows_skipped counts should be monitored to ensure they do not indicate systematic FK/PK failures."
+    }
+   ],
+   "unresolved_checks": [
+    "Post-generation verification that group-size targets (department.dept_name, prereq.course_id) survive PK/UNIQUE dedup in the written instances \u2014 not implemented.",
+    "Row alignment of original_values per table when building composite parent tuples \u2014 potential misalignment for large tables sampled by rowid modulo.",
+    "Whether the 2-5% NULL share is measured on pre-dedup or post-dedup row counts \u2014 feedback shows shares outside the band for some columns.",
+    "Whether section.year target 2011 is reachable \u2014 not in BOUNDARY_VALUES or RANGES.",
+    "Whether course.credits CHECK boundaries 1 and 2 are intended to be generated \u2014 EnumSampler overrides RANGES."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Foreign-key violations written into instances (174 FK violations, 18/20 instances invalid)",
+     "evidence": "Execution feedback: integrity.fk_violations = 174, validity.invalid = 18 with reason 'new_integrity_failures'. The writer disables enforcement (`pragma foreign_keys = OFF`) and validates FKs in Python via `_fk_ok`/`_composite_fk_ok`, but the parent sets are built from `schema.original_values` and the in-memory `instance` columns. Because `_plant_nulls` and `_realize_group_sizes` run *after* `fill_foreign_keys_consistently`, and because `_realize_group_sizes` for prereq rewrites `course_id` values to arbitrary sampled values (and rewrites `prereq_id` to random 100-999 strings) without re-checking that the new `course_id`/`prereq_id` exist in `course`, generated prereq rows can reference non-existent courses. Similarly, `_realize_group_sizes`/`_plant_nulls` can leave FK columns pointing at values that were later filtered out. The Python FK check in the writer uses `parent_sets` that include the *generated* parent values, but the generated parent rows themselves may have been dropped by `_apply_formulas`/dedup, so the check passes while the actual written parent set is smaller. Net effect: rows are written whose FK targets do not exist in the final database.",
+     "requested_revision": "Validate FKs against the *final written* parent rows (post-dedup, post-filter, post-NULL-planting), not the pre-filter in-memory columns. Either (a) re-run FK validation after all mutations (NULL planting, group-size realization) and drop/replace offending rows, or (b) reorder so group-size realization and NULL planting cannot introduce dangling FKs (e.g. for prereq, only reassign `course_id` to values already present in `course`, and only vary `prereq_id` among existing course ids). Also enable `pragma foreign_keys = ON` (or re-verify with a post-write integrity check) so the writer cannot silently emit violations. The execution feedback must show fk_violations = 0 and validity.invalid = 0."
+    },
+    {
+     "agent": "engineer",
+     "title": "Group-size targets not realized (group_sizes_ok = false; department.dept_name fails 16/20, prereq.course_id fails 6/20)",
+     "evidence": "Execution feedback: `group_sizes_ok: false`, `group_sizes_fail: {\"department.dept_name\": 16, \"prereq.course_id\": 6}`. The spec requires group sizes 1, 2 and >=3 for `department.dept_name` (realized via child tables) and `prereq.course_id`. `verify_group_sizes` checks these on compact + generated rows, but `_realize_group_sizes` only handles `prereq` (and only when `n >= 6` and `len(set(pool)) >= 3`), and does nothing for `department.dept_name` (comment says 'realized via child tables' but no code forces child tables to produce size-1, size-2 and size->=3 groups). The compact database's child-table dept_name distribution is not guaranteed to contain all three sizes, and appended child rows draw dept_name from the parent pool uniformly, so the target is not enforced. For prereq, the reassignment of `course_id` to `vals[0..2]` can be undone by the subsequent `prereq_id` rewrite or by dedup, and the check runs on the pre-write instance, not the final written set.",
+     "requested_revision": "Implement explicit construction of the group-size targets on the final written set: for `department.dept_name`, deliberately assign child rows (course/instructor/student) so that at least one dept has exactly 1 child, one has exactly 2, and one has >=3 (choosing dept values that exist in `department`); for `prereq.course_id`, assign `course_id` values so that some course appears once, some twice, and some >=3 times, while keeping `(course_id, prereq_id)` unique and both FKs valid. Verify on the final written rows (after dedup/filter/NULL planting) and report `group_sizes_ok: true` in the summary. The spec's note that these are 'realized across the final written set' must be honored by code, not just by comment."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule not applied to several listed null_targets; NULL share not computed on final written count for some columns",
+     "evidence": "Execution feedback nullable_columns shows `course.dept_name: NULL 18/156`, `instructor.dept_name: NULL 19/91`, `student.dept_name: NULL 22/495`, `section.building/room_number/time_slot_id: NULL 20/218`, `advisor.i_ID: NULL 8/231`, `takes.grade: NULL 24/631`, `time_slot.end_hr/end_min: NULL 17/44` \u2014 these are present, but the shares are computed on the *pre-write* in-memory row count (`_plant_nulls` runs before the writer's FK/composite checks drop rows). The writer then skips rows (e.g. advisor 178 skipped, prereq 75 skipped, takes 30 skipped), so the final written NULL share differs from the 2-5% target and, more importantly, the spec requires the share be computed on the final written row count. Additionally, `_plant_nulls` is called before `_realize_group_sizes`, and `_realize_group_sizes` can overwrite NULLs (e.g. prereq `course_id` reassignment) or introduce non-NULL values, further perturbing the share. The spec's `null_targets` also includes `section.time_slot_id`, which is planted, but the composite-FK co-nulling for `section.(building, room_number)` is applied via `spec.COMPOSITE_NULL_FKS` \u2014 however `_plant_nulls` iterates `spec.NULLABLE` and skips columns already in `done`, so if the composite group is planted first the individual entries are skipped (correct), but the share is still computed pre-write.",
+     "requested_revision": "Compute and plant NULLs on the final written row set: either move NULL planting after all row-dropping (FK validation, dedup, formula filtering) and after group-size realization, or recompute the share on the post-write count and adjust. Ensure `_realize_group_sizes` never overwrites a planted NULL with a non-NULL value (or re-plant after). Confirm each listed null_target has >=1 NULL and a 2-5% share on the final written rows, and that NOT NULL/PK columns have zero NULLs (currently satisfied)."
+    },
+    {
+     "agent": "designer",
+     "title": "Specification's group-size note is not actionable / inconsistent with program capability",
+     "evidence": "The spec's per_column_exceptions for `department.dept_name` says group sizes 'must be realized across the final written set (compact + appended) via child tables (course/instructor/student dept_name), not by duplicating dept_name values', and for `prereq.course_id` says 'realized by varying prereq_id'. The program's `_realize_group_sizes` does not implement the department case at all and only partially implements prereq. The spec also lists `section.year` boundary targets `[2008, 2009, 2010, 2011, 2099]` but `RANGES[('section','year')]` is `(2001, 2010)` and `CHECK_BOUNDARIES[('section','year')]` is `[1702, 1703, 2098, 2099]` \u2014 2011 is only in `BOUNDARY_VALUES`, which is applied via `BoundarySampler` with `BOUNDARY_P = 0.15`, so 2011 is generated but the spec's `CHECK_BOUNDARIES` omits it (minor inconsistency).",
+     "requested_revision": "Make the group-size requirement explicit and testable: state the exact target (e.g. 'at least one dept with 1 child, one with 2, one with >=3, using only dept values present in department') and the exact prereq target, and align `CHECK_BOUNDARIES[('section','year')]` with the spec's boundary list (include 2011) or document why 2011 is only a `BOUNDARY_VALUES` entry. This is a spec-clarity issue, not a blocker by itself, but it should be fixed alongside the engineer's group-size implementation."
+    },
+    {
+     "agent": "engineer",
+     "title": "Unresolved: construction_pairs separated = 36/165 with no per-group breakdown",
+     "evidence": "Execution feedback: `construction_pairs: {eligible: 165, separated: 36, unknown_executions: 0}`, `construction_pairs_by_group: []`. The empty per-group breakdown means the reviewer cannot tell which atomic-operation groups (comparison_boundary, group_sizes, unmatched_join_rows, etc.) are separated and which are not. A missing separation alone does not prove an error, but the absence of the breakdown prevents verifying that the intended value variation (e.g. boundary values, near-variants, group sizes) is actually reachable in the generated instances.",
+     "requested_revision": "Populate `construction_pairs_by_group` with per-group eligible/separated counts so the reviewer can confirm that boundary/near-variant/group-size targets are exercised. This is a reporting gap, not a generation error, but it is needed to close the review."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 174 FK violations are concentrated in prereq (likely, given 75 skipped prereq rows and the course_id reassignment) or spread across other tables \u2014 the feedback does not break down fk_violations by table.",
+    "Whether the compact rows are preserved exactly (the writer copies the file and only appends, so this is expected to hold, but no explicit row-count comparison is reported).",
+    "Whether the reproducible flag (true) holds across the 20 instances given the multiprocessing seed scheme \u2014 the summary reports reproducible: true, but the per-instance seeds are not shown.",
+    "Whether `section.year` 2011 is actually generated in the 20 instances (BOUNDARY_P = 0.15 over ~218 section rows should produce some, but not verified)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Group-size targets are not realized (group_sizes_ok=false)",
+     "evidence": "Execution feedback: \"group_sizes_ok\": false, \"group_sizes_fail\": {\"prereq.course_id\": 19, \"department.dept_name\": 14} out of 20 instances. The spec (per_column_exceptions for department.dept_name and prereq.course_id, and generic_sampling_rules.group_size_realization) requires that on the FINAL written set at least one group has size 1, one size 2, and one size >=3, and that verification reports group_sizes_ok: true. The program's own verify_group_sizes returns False for 19/20 (prereq) and 14/20 (department) instances, so the construction is not achieving the target.",
+     "requested_revision": "Fix the realization so the targets hold on the final written set. For prereq.course_id, _realize_group_sizes only rewrites the first 6 rows of the *generated* rows and then _plant_nulls/_revalidate_fks can drop or re-point them; also the compact prereq rows already dominate the counts, so appending a few rows cannot force a size-1 group when every compact course_id already appears >=2 times. The realization must account for compact counts (e.g. pick course_ids whose compact count is 0/1/2 and add rows to reach 1/2/>=3, or verify against compact+generated and iterate). For department.dept_name, _realize_department_group_sizes assigns only generated child rows and ignores that compact child rows already give every dept >=3 children; it must compute compact child counts and add/route generated children so that some dept ends at exactly 1, some at exactly 2, some >=3 \u2014 which may be impossible if compact data already forces >=3 for all depts, in which case the spec's target must be reconciled (see designer issue). Verification must run on the actual written rows (post FK-drop), not the in-memory instance, since rows_skipped shows advisor 194 and prereq 156 rows dropped."
+    },
+    {
+     "agent": "engineer",
+     "title": "verify_group_sizes checks in-memory instance, not final written rows",
+     "evidence": "instance.verify_group_sizes(schema, inst) is called in cli._one on the in-memory instance, but writer.write_instance_sqlite drops rows that fail FK checks (rows_skipped: advisor 194, prereq 156, takes 15, department 21, classroom 2, teaches 1). The spec's fk_validation and group_size_realization rules require verification on the FINAL written rows (post-dedup, post-filter, post-NULL-planting, post-group-size-realization). The reported group_sizes_ok therefore does not reflect the written database.",
+     "requested_revision": "Compute group sizes from the written SQLite file (or from the exact row set the writer inserts) and report that. Also reconcile the large rows_skipped counts: advisor 194/202 and prereq 156/174 dropped indicates FK re-validation is discarding most generated rows, which undermines the intended value variation."
+    },
+    {
+     "agent": "engineer",
+     "title": "Large FK-driven row drops undermine intended variation",
+     "evidence": "rows_skipped: advisor 194 of 202 generated, prereq 156 of 174, department 21 of 60, takes 15, classroom 2, teaches 1. The spec requires FK validation against final parents with re-pointing, and that generated rows exercise boundary/near-variant/group-size targets. Dropping ~96% of advisor and ~90% of prereq rows means those tables' generated variation is largely absent from the written instances.",
+     "requested_revision": "Investigate why advisor.i_ID and prereq rows fail FK validation after _revalidate_fks (e.g. advisor.i_ID re-pointed to instructor IDs that are themselves dropped, or prereq_id values not in the final course set). Ensure re-pointing uses only parent values that survive to the final written set, and that dropped-row counts are small."
+    },
+    {
+     "agent": "designer",
+     "title": "department.dept_name group-size target may be unsatisfiable given compact data",
+     "evidence": "The spec requires (per_column_exceptions) that on the final written set at least one dept has exactly 1 child, one exactly 2, one >=3, using only dept values present in department, realized via child tables. But the compact database already has many children per dept (course/instructor/student), and appended rows can only increase counts. If every dept already has >=3 children in the compact data, no appended rows can produce a size-1 or size-2 group. The execution feedback (group_sizes_fail department.dept_name 14/20) is consistent with this.",
+     "requested_revision": "Clarify whether the group-size target is over the union of child tables or per child table, and whether it must hold on compact+generated or only on generated rows. If compact data makes 1/2/>=3 impossible, the spec should state the achievable target (e.g. 'at least one dept with the minimum child count, one with the next, one with >=3') or restrict the target to a designated child table. As written the target is not realizable by construction."
+    },
+    {
+     "agent": "designer",
+     "title": "prereq.course_id group-size target conflicts with compact counts",
+     "evidence": "The spec requires some course_id to appear once, some twice, some >=3 times in prereq (compact+generated), realized by varying prereq_id. But if every compact course_id already appears >=2 times in prereq, appending rows cannot create a size-1 group. The execution feedback shows prereq.course_id failing in 19/20 instances.",
+     "requested_revision": "State how the target interacts with compact counts: either the target is over generated rows only, or the spec must allow the generator to choose course_ids absent from compact prereq (count 0) and add exactly 1/2/>=3 rows for them. The current wording ('across the final written set (compact + appended)') is not achievable when compact counts already exceed the target for all course_ids."
+    },
+    {
+     "agent": "engineer",
+     "title": "Nullable columns with NULL 0 / n noted (non-blocking)",
+     "evidence": "nullable_columns shows classroom.capacity, course.credits, course.title, department.budget, department.building, instructor.salary, student.tot_cred with 'NULL 0 / n'. Per the review instructions this is noted for the engineer and does not block a pass, but the spec's null_rule says the NULL rule applies only to null_targets, so these are consistent with the spec (they are not in null_targets).",
+     "requested_revision": "No change required; noted for awareness. If the intent is that all nullable columns get NULLs, the spec's null_targets list should be extended."
+    },
+    {
+     "agent": "engineer",
+     "title": "construction_pairs_by_group is empty in execution feedback",
+     "evidence": "The execution feedback shows \"construction_pairs_by_group\": [] while the spec's uncertainty section requires construction_pairs_by_group to be populated with per-group eligible/separated counts. The CLI's _group_breakdown is defined but the reported summary has an empty list (the summary JSON in the feedback shows construction_pairs_by_group: []), and construction_pairs shows eligible 165 / separated 40.",
+     "requested_revision": "Ensure construction_pairs_by_group is actually populated in the emitted summary (the _group_breakdown output appears to be dropped or the summary shown is from a different path). The reviewer needs per-group eligible/separated counts to confirm boundary/near-variant/group-size targets are exercised."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the department.dept_name and prereq.course_id group-size targets are achievable at all given compact data (designer clarification needed).",
+    "Whether the large advisor/prereq row drops are due to a re-pointing bug or an inherent FK conflict; not resolved from the feedback alone.",
+    "Whether construction_pairs_by_group emptiness is a reporting bug or a real absence of separated groups."
+   ]
+  }
+ ]
 }

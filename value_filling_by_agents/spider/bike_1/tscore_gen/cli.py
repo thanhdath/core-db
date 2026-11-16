@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -10,32 +10,44 @@ import time
 from .instance import build_random_instance
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
+from .spec import load_specification, spec_from_columns
 from .writer import unit_path, write_instance_sqlite
 
 _G: dict = {}
 
 
-def _init(orig: str, pool: dict, args: dict) -> None:
+def _init(orig: str, pool: dict, args: dict, spec: dict) -> None:
     """Worker initializer: read the original ONCE per process."""
     _G['schema'] = read_schema(orig)
     _G['pool'] = pool
     _G['args'] = args
+    _G['spec'] = spec
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int) -> tuple:
+    """Build and write unit i; returns ('', added, skipped) or (exception type name, {}, {})."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return '', {}, {}
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        inst = build_random_instance(_G['schema'], _G['pool'], None, rng, spec=_G['spec'])
+        rep = write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])
+        return '', rep.get('rows_ok', {}), rep.get('rows_failed', {})
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return type(e).__name__, {}, {}
+
+
+def _load_spec(path: str, schema) -> dict:
+    """Specification from tscore_gen/specification.json if present, else from the compact columns."""
+    if path and os.path.exists(path):
+        try:
+            return load_specification(path, schema)
+        except Exception as e:  # pragma: no cover - defensive
+            print('specification load failed: %r' % (e,), file=sys.stderr)
+    return spec_from_columns(schema)
 
 
 def main(argv=None) -> None:
@@ -50,6 +62,7 @@ def main(argv=None) -> None:
     g.add_argument('--seed-base', type=int, default=42)
     g.add_argument('--procs', type=int, default=6)
     g.add_argument('--tag', default='gen')
+    g.add_argument('--spec', default=None)
     a = ap.parse_args(argv)
     t0 = time.time()
     with open(a.pool_sqls) as f:
@@ -63,21 +76,32 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    spec_path = a.spec or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'specification.json')
+    spec = _load_spec(spec_path, schema)
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base,
+            'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
+        _G.update(schema=schema, pool=pool, args=args, spec=spec)
         res = [_one(i) for i in idx]
     else:
-        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
+        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args, spec)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
-    for r in res:
+    added: dict = {}
+    failed: dict = {}
+    for r, ok, bad in res:
         if r:
             errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        for t, n in ok.items():
+            added[t] = added.get(t, 0) + n
+        for t, n in bad.items():
+            failed[t] = failed.get(t, 0) + n
+    n_ok = sum(1 for r, _, _ in res if not r)
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': failed}))
 
 
 if __name__ == '__main__':

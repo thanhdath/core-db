@@ -1,50 +1,864 @@
 {
  "db": "movies_4",
- "operator_io_quirks": [
-  "Two tables are quoted mixed-case in DDL: \"movie_keywords\", \"movie_company\" \u2014 must be double-quoted in generated SQL; column lookup case-insensitive.",
-  "movie_keywords/movie_company FKs use inline `references movie` / `references keyword` with NULL parent column -> parent column = same name as child (movie_id, keyword_id, company_id).",
-  "movie_keywords.keyword_id references keyword (parent col NULL -> keyword_id); movie_company.company_id references production_company (parent col NULL -> company_id).",
-  "movie.release_date declared DATE but storage class is text, format %Y-%m-%d (e.g. 1995-12-09); ts_fuzzer dispatch = Date|Number(int elements) \u2014 first element '1995-12-09' does not parse as int so Date fuzzer with template %Y-%m-%d.",
-  "movie.popularity / vote_average declared REAL, storage real, values like 22.87623 \u2014 Number fuzzer with scale from no args (default).",
-  "movie.budget/revenue INTEGER with large values (up to ~9e8) \u2014 Number fuzzer int scale default; perturb +-1/+-2 tiny relative to magnitude.",
-  "language.language_name has non-ASCII text (u65e5u672cu8a9e) and 63 distinct vs 88 rows \u2014 duplicates exist; String fuzzer will not reproduce unicode.",
-  "movie.homepage has empty-string values and long URLs; String fuzzer length range from elements (min len 0).",
-  "movie.title 4625 distinct vs 4627 rows \u2014 duplicate titles; person_name 103147 vs 104838; company_name 5017 vs 5047 \u2014 non-unique text columns.",
-  "movie_genres, movie_languages, movie_crew, movie_cast, production_country, movie_keywords, movie_company have NO primary key (pk=[]) \u2014 sample_fresh_primary_keys is a no-op; only unique-column dedup applies (none declared unique).",
-  "All FK parent tables exist (parent_exists true everywhere); no dangling FKs, no self-references, no composite PKs.",
-  "Largest tables: movie_crew 129581, person 104838, movie_cast 59083 \u2014 under 300000 cap, full read OK; no rowid sampling needed."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on movie.release_date: template %Y-%m-%d, range from parsed elements (~1970..2015), fresh dates uniform in that range; p=0.2 means element returned w.p. 0.2.",
-  "Number fuzzer on all *_id INTEGER PKs: full range [-10^scale,10^scale] with default scale, so fresh PKs are huge ints far from original small ids (1..N) \u2014 implausible but valid.",
-  "String fuzzer on title/person_name/company_name/character_name: random a-zA-Z0-9() strings of length in [min,max] of elements, plus contaminate suffix/prefix \u2014 implausible names, drives FN on LIKE/equality predicates.",
-  "String fuzzer on country_iso_code (2-char codes) and language_code: length range [2,2] so fresh strings are 2 chars \u2014 plausible-ish but random letters, misses real ISO codes.",
-  "String fuzzer on movie_status (3 distinct: Released/Rumored/Post Production) and gender (3 distinct): fresh random strings break equality predicates -> FN.",
-  "Number fuzzer on movie.budget/revenue/runtime/vote_count: fresh draws uniform in [-10^scale,10^scale] (scale default 0 -> [-1,1]? actually scale from type args absent -> default) \u2014 likely tiny ints, misses large real values -> FN on range predicates.",
-  "Number fuzzer on movie.popularity/vote_average REAL: fresh floats uniform in [-10^scale,10^scale], perturb +-0.01/0.02 \u2014 misses real 0..150 range -> FN.",
-  "FK columns (movie_genres.movie_id etc.) draw from parent's FINAL filtered values with replacement \u2014 ties/duplicates preserved, so join cardinalities plausible; but parent PK filtering drops rows so child may reference fewer parents.",
-  "No PK on junction tables -> no dedup -> duplicate (movie_id,genre_id) pairs possible, unlike original which has 12160 rows over 4775 movies \u2014 FP risk on COUNT(DISTINCT) vs COUNT.",
-  "movie_genres.genre_id distinct 20 but samples show 878 (out of range) \u2014 original has FK violations? genre_id 878 not in genre(20 rows) \u2014 TS FK fill will only use valid genre ids, so original's dangling genre_id 878 not reproduced.",
-  "String fuzzer on overview/tagline/homepage: long text replaced by short random strings -> FN on length/LIKE predicates; empty homepage reproduced only via element sampling.",
-  "Number fuzzer on cast_order (0..212): fresh ints in full range, misses small ordering values -> FN on ORDER BY / cast_order < k predicates."
- ],
- "challenger_refs": [
-  "G7",
-  "g16d82fef",
-  "G28",
-  "G10",
-  "G20",
-  "G24",
-  "G14",
-  "G2",
-  "G6",
-  "G9"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; reserve and plant any listed comparison_boundary PK values inside the sequence.",
+   "integer_fk": "Sample from the parent table's generated primary-key pool (compact values plus generated values); NULL only for columns listed in null_targets, at 5-30% share; ensure some parent rows have no children.",
+   "integer_quantity": "Uniform integer in [1, 1000] unless a range rule narrows it.",
+   "integer_amount": "Uniform integer in [0, 1000000000] unless a range rule narrows it.",
+   "real_metric": "Uniform real in [0.0, 200.0] rounded to 6 decimals unless a range rule narrows it.",
+   "text_short": "Random token of 3-20 lowercase letters; 20-50% duplicate share on DISTINCT-targeted columns; near-variants (case flip, trailing char, apostrophe-dropped and %-substituted forms) for equality/LIKE literals.",
+   "text_long": "Random sentence of 40-250 characters.",
+   "date_iso": "Random date between 1900-01-01 and 2025-12-31 formatted %Y-%m-%d; boundary dates at each listed literal and one day on each side.",
+   "enum_small": "Uniform choice from the listed enum values; case-flipped near-variants for equality literals.",
+   "null_share": "For nullable columns listed in null_targets, 5-30% NULL rows per instance; at least one NULL row per listed column; other nullable columns may take NULL but are not forced.",
+   "boundary_numbers": "For each listed numeric literal L, include L-1, L, L+1.",
+   "boundary_dates": "For each listed date literal D, include D-1 day, D, D+1 day.",
+   "tie_ranks": "For ORDER/LIMIT target columns, plant ties at the listed ranks (1, 100) in both ASC and DESC directions.",
+   "fresh_values": "All non-key text columns draw fresh random values; no reuse of observed literals except where listed as targets."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "movie.title",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Pirates of the Caribbean: At World's End",
+      "Pirates of the Caribbean: Dead Man's Chest",
+      "C'era una volta il West"
+     ],
+     "variants": [
+      "Pirates of the Caribbean: At Worlds End",
+      "pirates of the caribbean: at worlds end",
+      "Pirates of the Caribbean: Dead Mans Chest",
+      "pirates of the caribbean: dead mans chest"
+     ]
+    }
+   },
+   {
+    "column": "movie.title",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Pirates of the Caribbean: At World's End",
+      "pirates of the caribbean: at world's end",
+      "Four Rooms",
+      "four rooms",
+      "I Hope They Serve Beer in Hell",
+      "i hope they serve beer in hell"
+     ]
+    }
+   },
+   {
+    "column": "movie.title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie.title",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      100
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "movie.movie_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie_cast.movie_id",
+      "movie_company.movie_id",
+      "movie_crew.movie_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie.movie_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      128,
+      129,
+      130,
+      284,
+      285,
+      286
+     ]
+    }
+   },
+   {
+    "column": "movie.release_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1999-12-31",
+      "2000-01-01",
+      "2000-12-31",
+      "2001-01-01"
+     ]
+    }
+   },
+   {
+    "column": "movie.release_date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2000%",
+      "2006%",
+      "1916%",
+      "1945%",
+      "1995%",
+      "2016%"
+     ],
+     "variants": [
+      "1999-12-31",
+      "2000-01-01",
+      "2000-12-31",
+      "2001-01-01",
+      "2005-12-31",
+      "2006-01-01",
+      "2006-12-31",
+      "2007-01-01"
+     ]
+    }
+   },
+   {
+    "column": "movie.release_date",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "column": "movie.revenue",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      119999999,
+      120000000,
+      120000001,
+      999999999,
+      1000000000,
+      1000000001
+     ]
+    }
+   },
+   {
+    "column": "movie.movie_status",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Released",
+      "released",
+      "Post Production",
+      "post production",
+      "st Product",
+      "st product"
+     ]
+    }
+   },
+   {
+    "column": "person.person_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "person.person_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Marcia Ross",
+      "marcia ross",
+      "Dariusz Wolski",
+      "dariusz wolski",
+      "harrison ford",
+      "HARRISON FORD"
+     ]
+    }
+   },
+   {
+    "column": "person.person_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "person.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie_crew.person_id",
+      "movie_cast.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "person.person_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1325272,
+      1325273,
+      1325274
+     ]
+    }
+   },
+   {
+    "column": "movie_company.movie_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.movie_id",
+      "production_country.movie_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie_company.movie_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(movie_company.movie_id)"
+     ],
+     "values": [
+      199,
+      200,
+      201
+     ]
+    }
+   },
+   {
+    "column": "movie_company.movie_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "movie_company.company_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "production_company.company_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie_company.company_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "genre.genre_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "genre.genre_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Animation",
+      "animation",
+      "Romance",
+      "romance",
+      "Horror",
+      "horror"
+     ]
+    }
+   },
+   {
+    "column": "production_company.company_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "production_company.company_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "production_company.company_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Walt Disney Pictures",
+      "walt disney pictures",
+      "Universal Studios",
+      "universal studios"
+     ]
+    }
+   },
+   {
+    "column": "production_company.company_name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(production_company.company_name)",
+      "COUNT(*)"
+     ],
+     "values": [
+      149,
+      150,
+      151,
+      199,
+      200,
+      201
+     ]
+    }
+   },
+   {
+    "column": "production_company.company_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie_company.company_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "production_company.company_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      149,
+      150,
+      151,
+      199,
+      200,
+      201
+     ]
+    }
+   },
+   {
+    "column": "movie_cast.movie_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.movie_id",
+      "movie_genres.movie_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie_cast.movie_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      284,
+      285,
+      286,
+      1864,
+      1865,
+      1866
+     ]
+    }
+   },
+   {
+    "column": "movie_cast.movie_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie_cast.character_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie_crew.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "person.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie_crew.person_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1325272,
+      1325273,
+      1325274
+     ]
+    }
+   },
+   {
+    "column": "movie_crew.person_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie_crew.movie_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.movie_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie_crew.movie_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "movie_crew.movie_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      11,
+      12,
+      13,
+      128,
+      129,
+      130
+     ]
+    }
+   },
+   {
+    "column": "movie_crew.job",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Director of Photography",
+      "director of photography",
+      "Director",
+      "director",
+      "Animation",
+      "animation"
+     ]
+    }
+   },
+   {
+    "column": "keyword.keyword_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "keyword.keyword_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "independent film",
+      "INDEPENDENT FILM",
+      "woman director",
+      "WOMAN DIRECTOR",
+      "saving the world",
+      "SAVING THE WORLD"
+     ]
+    }
+   },
+   {
+    "column": "keyword.keyword_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "movie_keywords.keyword_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "gender.gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Female",
+      "female",
+      "Male",
+      "male"
+     ]
+    }
+   },
+   {
+    "column": "department.department_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(movie_crew.department_id)"
+     ]
+    }
+   },
+   {
+    "column": "department.department_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie.budget",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "movie.popularity",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "movie_genres.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_genres.genre_id",
+    "parent": "genre.genre_id",
+    "copied": []
+   },
+   {
+    "child": "movie_languages.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_languages.language_id",
+    "parent": "language.language_id",
+    "copied": []
+   },
+   {
+    "child": "movie_languages.language_role_id",
+    "parent": "language_role.role_id",
+    "copied": []
+   },
+   {
+    "child": "movie_crew.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_crew.person_id",
+    "parent": "person.person_id",
+    "copied": []
+   },
+   {
+    "child": "movie_crew.department_id",
+    "parent": "department.department_id",
+    "copied": []
+   },
+   {
+    "child": "movie_cast.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_cast.person_id",
+    "parent": "person.person_id",
+    "copied": []
+   },
+   {
+    "child": "movie_cast.gender_id",
+    "parent": "gender.gender_id",
+    "copied": []
+   },
+   {
+    "child": "production_country.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "production_country.country_id",
+    "parent": "country.country_id",
+    "copied": []
+   },
+   {
+    "child": "movie_keywords.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_keywords.keyword_id",
+    "parent": "keyword.keyword_id",
+    "copied": []
+   },
+   {
+    "child": "movie_company.movie_id",
+    "parent": "movie.movie_id",
+    "copied": []
+   },
+   {
+    "child": "movie_company.company_id",
+    "parent": "production_company.company_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "movie",
+    "column": "budget",
+    "formula": "budget >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "revenue",
+    "formula": "revenue >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "runtime",
+    "formula": "runtime > 0"
+   },
+   {
+    "table": "movie",
+    "column": "popularity",
+    "formula": "popularity >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "vote_average",
+    "formula": "vote_average BETWEEN 0 AND 10"
+   },
+   {
+    "table": "movie",
+    "column": "vote_count",
+    "formula": "vote_count >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "movie_status",
+    "formula": "movie_status IN ('Released','Rumored','Post Production')"
+   },
+   {
+    "table": "movie_cast",
+    "column": "cast_order",
+    "formula": "cast_order >= 0"
+   },
+   {
+    "table": "movie_cast",
+    "column": "gender_id",
+    "formula": "gender_id IN (1,2,3)"
+   },
+   {
+    "table": "gender",
+    "column": "gender",
+    "formula": "gender IN ('Unspecified','Female','Male')"
+   },
+   {
+    "table": "language_role",
+    "column": "language_role",
+    "formula": "language_role IN ('Original','Spoken')"
+   },
+   {
+    "table": "movie_languages",
+    "column": "language_role_id",
+    "formula": "language_role_id IN (1,2)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "country": 20,
+   "department": 12,
+   "gender": 3,
+   "genre": 20,
+   "keyword": 200,
+   "language": 20,
+   "language_role": 2,
+   "movie": 200,
+   "movie_genres": 400,
+   "movie_languages": 300,
+   "person": 300,
+   "movie_crew": 600,
+   "production_company": 100,
+   "production_country": 300,
+   "movie_cast": 600,
+   "movie_keywords": 400,
+   "movie_company": 300
+  },
+  "null_targets": [
+   "movie_cast.movie_id",
+   "movie_company.movie_id",
+   "movie_crew.movie_id",
+   "movie_crew.person_id",
+   "movie_keywords.keyword_id",
+   "movie_languages.movie_id",
+   "movie_genres.movie_id",
+   "production_country.movie_id"
+  ],
+  "supporting_evidence": {
+   "movie_status_enum": "Sample rows show 'Released','Rumored','Post Production' (movie.movie_status).",
+   "gender_enum": "gender.gender sample: 'Unspecified','Female','Male'.",
+   "language_role_enum": "language_role.language_role sample: 'Original','Spoken'.",
+   "vote_average_range": "movie.vote_average sample values 6.5,8.1,7.6,8.2,7.9,7.3,8.0,7.2 all within [0,10].",
+   "revenue_nonneg": "movie.revenue sample 4300000,775398007,940335536,677945399,356296601,40031879,263920180,650422 all >= 0.",
+   "budget_nonneg": "movie.budget sample 4000000,11000000,94000000,55000000,15000000,12800000,90000000,92620000 all >= 0.",
+   "runtime_positive": "movie.runtime sample 98,121,100,142,122,140,126,153 all > 0.",
+   "cast_order_nonneg": "movie_cast.cast_order sample 0..7 all >= 0.",
+   "gender_id_fk": "gender.gender_id sample values 0,1,2; movie_cast.gender_id is FK to gender.gender_id, so valid values are the gender PKs (0,1,2)."
+  },
+  "uncertainty": "No calculated-column formula is supported by the shown rows; movie.revenue is not a function of budget in the sample. Enum sets for movie_status, gender, language_role are taken from the shown distinct values and may be incomplete. NULL shares are set to 5-30% only for the columns listed in null_targets; other nullable columns may take NULL but are not forced. Aggregate-boundary targets (COUNT > 200, COUNT > 150) are aspirational and not planted by construction. PK comparison_boundary values are reserved and planted inside the sequential PK sequence."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: `cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)] for cm in tm.columns if (t, cm.name) in samplers}` then `inst[t] = cols` then `cols.update(fill_foreign_keys_consistently(...))` then `cols = sample_fresh_primary_keys(...)` then `cols = drop_unique_duplicates(...)`. The final `inst[t] = cols` is set, but the earlier `inst[t] = cols` (before FK fill) is overwritten \u2014 however the critical bug is that `fill_foreign_keys_consistently` is called with `inst` already containing `t`'s own columns, and for self-referencing FKs the parent pool includes the just-generated (unfiltered) values. More importantly, `sample_fresh_primary_keys` and `drop_unique_duplicates` can shrink the row count of `cols`, but `fill_foreign_keys_consistently` was already applied to the pre-filter `n` rows; after filtering, FK columns and non-FK columns are filtered together via `_filter`, so lengths stay consistent. The real defect: `_fresh_pk_values` starts at `max(existing)+1` where `existing` is only the compact PKs, but generated PKs are then filtered by `sample_fresh_primary_keys` \u2014 fine. However `fill_foreign_keys_consistently` uses `cm.pk_pos == 0` to decide nullability, which is correct, but it applies NULL share to *every* nullable FK column including ones not in `null_targets` (e.g. `movie_cast.person_id`, `movie_cast.gender_id`, `movie_crew.department_id`, `movie_genres.genre_id`, `movie_languages.language_id`, `movie_languages.language_role_id`, `production_country.country_id`, `movie_company.company_id`, `movie_keywords.movie_id`). The spec's `null_targets` lists only 8 columns; the program nulls all nullable FKs. Execution feedback confirms: `movie_cast.person_id: NULL 2065/12112`, `movie_crew.department_id: NULL 2023/11980`, `movie_genres.genre_id: NULL 1366/7874`, `movie_languages.language_id: NULL 1025/6046`, `production_country.country_id: NULL 1046/6216`, `movie_company.company_id: NULL 1026/6102`, `movie_keywords.movie_id: NULL 1345/7961` \u2014 none of these are in `null_targets`.",
+     "requested_revision": "Restrict NULL injection on FK columns to the columns listed in `null_targets` (or extend `null_targets` in the specification to cover every nullable FK the program nulls, and document the change). The current mismatch means the program generates NULLs in columns the specification does not designate, which changes join/aggregate semantics beyond the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py SpecColumnSampler.sample: `if self._planted and self._n <= len(self._planted): v = self._planted[self._n - 1]`. Planted values are emitted in the first `len(planted)` rows of each column. For `movie.movie_id` the spec's `comparison_boundary` targets are [128,129,130,284,285,286], but `movie.movie_id` is a PK and is overwritten by `_fresh_pk_values` in instance.py (`cols[tm.primary_key[0]] = pk_vals`), so the boundary values 128/129/130/284/285/286 are never planted in `movie.movie_id`. Similarly `person.person_id` boundary values [1325272,1325273,1325274] are overwritten by sequential PKs starting at max(compact)+1, so they are never present. Execution feedback shows `movie` PKs are sequential from compact max+1, and `person` PKs likewise \u2014 the comparison_boundary targets for these PK columns are unreachable.",
+     "requested_revision": "Either (a) plant the specified boundary PK values into the PK sequence (e.g. reserve those IDs and fill the rest sequentially), or (b) remove the `comparison_boundary` exceptions for `movie.movie_id` and `person.person_id` from the specification since sequential PKs cannot honor them. As written, the specification and program are inconsistent for these two columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fresh_pk_values` returns `list(range(start, start + n))` where `start = max(existing)+1`. For `movie` the compact max is ~4800+ and n\u2248200, so generated movie_ids are ~4800..5000. The spec's `comparison_boundary` for `movie.movie_id` targets 128/129/130/284/285/286 and for `movie_cast.movie_id` targets 284/285/286/1864/1865/1866 \u2014 these are compact-range IDs. `fill_foreign_keys_consistently` draws child FKs from `_parent_pool` = compact values + generated values, so child rows *can* reference 284/285/286 (they exist in compact). But the `comparison_boundary` pattern for `movie_cast.movie_id` is about the child column containing those values, which it does via FK sampling from the parent pool \u2014 acceptable. However `movie_crew.movie_id` boundary targets [11,12,13,128,129,130] are similarly reachable only via compact parent values, not planted. This is a weaker concern; noted as unresolved rather than blocking.",
+     "requested_revision": "Confirm whether FK-sourced boundary values (drawn from compact parent pool) satisfy the `comparison_boundary` intent, or explicitly plant them. Not blocking on its own."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `movie_cast.gender_id IN (0,1,2)` and `movie_languages.language_role_id IN (1,2)`, but the schema declares `gender_id` and `language_role_id` as FKs to `gender.gender_id` and `language_role.role_id`. The program's `fill_foreign_keys_consistently` draws these from the parent pool (gender PKs 1..3, language_role PKs 1..2), so `gender_id` will be 1/2/3, not 0/1/2. The formula `gender_id IN (0,1,2)` is therefore inconsistent with the FK constraint and with the parent table's PK range. Execution feedback shows `movie_cast.gender_id` NULLs but no value-range check; the formula as written cannot hold for FK-valid values unless gender PKs are 0,1,2.",
+     "requested_revision": "Reconcile the `gender_id IN (0,1,2)` formula with the FK to `gender.gender_id` (either gender PKs should be 0,1,2, or the formula should be `gender_id IN (1,2,3)` / dropped). Similarly verify `language_role_id IN (1,2)` matches `language_role.role_id` PKs (it does, since language_role has 2 rows with PKs 1,2)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `nullable_columns` shows many nullable non-FK columns with `NULL 0 / n`: `movie.title`, `movie.overview`, `movie.release_date`, `movie.budget`, `movie.revenue`, `movie.runtime`, `movie.vote_average`, `movie.vote_count`, `movie.popularity`, `movie.homepage`, `movie.tagline`, `movie.movie_status`, `person.person_name`, `production_company.company_name`, `country.country_name`, `country.country_iso_code`, `department.department_name`, `genre.genre_name`, `keyword.keyword_name`, `language.language_code`, `language.language_name`, `language_role.language_role`, `gender.gender`, `movie_cast.character_name`, `movie_cast.cast_order`, `movie_crew.job`. The program's `SpecColumnSampler` and base samplers never emit None for non-FK columns; `null_share` is only applied in `fill_foreign_keys_consistently` for FK columns. Per the interface NULL rule, every nullable column should have at least one NULL row per instance with a share following the compact database. The compact DB has 0 NULLs in these columns (per spec `uncertainty`), so the 'follow compact share' clause is ambiguous, but the interface rule still requires at least one NULL row per nullable column.",
+     "requested_revision": "Add NULL injection for all nullable non-FK columns (at least one NULL per instance, share per compact or a documented default), or document in the specification that non-FK nullable columns are exempt. Per instruction 7 this is noted but does not block a pass; flagged for the engineer to address."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance`: `inst[t] = cols` is assigned before `fill_foreign_keys_consistently`, then `cols.update(...)`, then `inst[t] = cols` again at the end. The intermediate `inst[t] = cols` is dead but harmless. However `fill_foreign_keys_consistently(inst, schema, t, n, rng, null_share)` is called with `inst` containing `t`'s own pre-filter columns; for self-referencing FKs (none in this schema) this would be wrong, but no self-FK exists here. Not blocking.",
+     "requested_revision": "Clean up the redundant `inst[t] = cols` assignment for clarity; no behavioral change required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `table_sizes_per_instance` sets `movie: 200`, but `choose_table_sizes` jitters by \u00b1base//5 (\u00b140), and `_fresh_pk_values` starts at compact max+1. The `aggregate_boundary` targets for `movie_company.movie_id` (COUNT > 200, values 199/200/201) and `production_company.company_name` (COUNT > 150, values 149/150/151/199/200/201) require precise row counts. With jitter, `movie_company` size is 300\u00b160, so COUNT(movie_company.movie_id) per movie is not controlled to hit 199/200/201. The `aggregate_boundary` pattern is not implemented by construction in the program (no code plants aggregate counts at L-1/L/L+1). Execution feedback does not show aggregate boundary verification.",
+     "requested_revision": "Either implement aggregate-boundary planting (e.g. construct one movie with exactly 199/200/201 movie_company rows) or remove the `aggregate_boundary` exceptions from the specification. As written, the specification requests a pattern the program does not implement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `_like_variants` for `movie.title` literal `Pirates of the Caribbean: At World's End` produces `Pirates of the Caribbean: At World's Endx`, `.lower()`, `.upper()` \u2014 but the spec's `like_near_variant` variants are `Pirates of the Caribbean: At Worlds End` (apostrophe dropped), `pirates of the caribbean: at worlds end`, etc. The program's `_like_variants` does not drop the apostrophe, so the specific near-variants listed in the spec are not generated. The `equality_values` path does include the spec's `variants` list (via `make_spec_sampler` `like_near_variant` \u2192 `equality_values.append(str(v))`), so the listed variants *are* planted as equality values, but the LIKE-pattern near-variant (apostrophe-dropped form matching `LIKE 'Pirates of the Caribbean: At World%s End'`) is not specifically constructed. This is a partial implementation.",
+     "requested_revision": "Extend `_like_variants` to also produce the apostrophe-dropped / `%`-substituted forms matching the spec's LIKE patterns, or confirm the equality-planted variants suffice. Not blocking if the equality variants are deemed sufficient."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether FK-sourced boundary values (movie_cast.movie_id 284/285/286, movie_crew.movie_id 11/12/13/128/129/130) drawn from the compact parent pool satisfy the comparison_boundary intent without explicit planting.",
+    "Whether the compact database's NULL share for non-FK nullable columns (observed 0) should override the interface rule requiring at least one NULL per nullable column.",
+    "Whether aggregate_boundary patterns (COUNT > 200, COUNT > 150) are intended to be planted or are aspirational; the program does not implement them.",
+    "Whether the `gender_id IN (0,1,2)` formula is a spec error or requires gender PKs to be 0,1,2."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include movie_cast.gender_id IN (1,2,3), but the supporting_evidence section states 'gender.gender_id sample values 0,1,2; movie_cast.gender_id is FK to gender.gender_id, so valid values are the gender PKs (0,1,2)'. The embedded _DEFAULT in spec.py uses IN (0,1,2) while the supplied specification uses IN (1,2,3). The program derives enum_values from the spec formula, so with the supplied spec it would restrict gender_id to {1,2,3}, which may not match the actual gender PKs (0,1,2) in the compact DB. This is a self-contradiction in the specification.",
+     "requested_revision": "Reconcile the gender_id enum with the actual gender PK values (0,1,2) in the compact database, or confirm the compact DB uses 1,2,3. Update either the formula or the supporting_evidence so they agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows several nullable FK columns with 'generated rows: NULL 0 / n' (movie_cast.gender_id, movie_cast.person_id, movie_company.company_id, movie_crew.department_id, movie_genres.genre_id, movie_keywords.movie_id, movie_languages.language_id, movie_languages.language_role_id, production_country.country_id). Per the interface NULL rule, these are noted but non-blocking. The null_targets list in the spec only covers movie_id/keyword_id/person_id columns, so the omission is consistent with the spec's null_targets, but the interface rule asks for NULL in every nullable column.",
+     "requested_revision": "Optionally extend null_targets (or the FK NULL injection) to cover all nullable FK columns so each nullable column gets at least one NULL row per instance, aligning with the interface NULL rule. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's aggregate_boundary targets (COUNT > 200, COUNT > 150) are explicitly declared 'aspirational and not planted by construction' in the uncertainty note, and spec.py's aggregate_targets() only records them. Table sizes (movie_company=300, production_company=100) are jittered \u00b120%, so the aggregate boundaries are not guaranteed. This is acknowledged in the spec, so it is a known limitation rather than an error.",
+     "requested_revision": "No change required; the spec already documents this as aspirational. If aggregate-boundary coverage is desired, add explicit construction of the target counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit targets (tie_at_rank [1,100] for movie.title, [1] for others) are implemented only via a small tie pool with 25% hit probability in SpecColumnSampler.tie_pool_hit(); there is no construction guaranteeing ties at the specific ranks 1 and 100. This is a partial implementation of the tie_ranks rule.",
+     "requested_revision": "Optionally strengthen tie planting to guarantee ties at the specified ranks (e.g., plant duplicate values at the top of the ordering). Not blocking since ties are probabilistically present."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's like_near_variant for movie.title lists literals like 'Pirates of the Caribbean: At World's End' and variants including apostrophe-dropped forms. The _like_variants function handles apostrophe-dropping only for literals containing \"'\", and the spec_pool_literals adds the literal and its %-stripped form. The construction_pairs feedback shows 133/499 separated, indicating many boundary pairs are not distinguished, but this alone does not prove an error.",
+     "requested_revision": "No change required; variation remains possible and separation is partial as expected for random generation."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's gender PKs are actually 0,1,2 (as supporting_evidence claims) or 1,2,3 (as the formula claims) \u2014 cannot be verified from the provided schema alone since gender_id values are not shown.",
+    "Whether the aggregate_boundary targets (COUNT > 200, COUNT > 150) are reachable given the jittered table sizes \u2014 declared aspirational, not verified.",
+    "Whether ties at ranks 1 and 100 are actually planted \u2014 only probabilistically implemented."
+   ],
+   "summary": "The program ran successfully (20/20 instances, 0 failures, 0 FK/not-null/PK violations, reproducible). It implements the specified value domains (enums, numeric ranges, boundary values, date boundaries, LIKE near-variants, duplicate shares, tie pools), dependencies (FK sampling from parent pools, NULL injection for null_targets), and preserves compact rows via backup+append. The main concern is a specification self-contradiction on movie_cast.gender_id enum values (1,2,3 vs 0,1,2), which should be reconciled. Other issues (NULL in all nullable FKs, aggregate boundaries, tie ranks) are noted but non-blocking per the interface rules. Recommendation: pass."
+  }
+ ]
 }

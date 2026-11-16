@@ -9,10 +9,10 @@ api_port=${API_PORT:-8011}
 proxy_port=${PROXY_PORT:-8021}
 export no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
 BIRD_TRAIN_DB_ROOT=$tree/bird BIRD_DEV_DB_ROOT=$tree/bird SPIDER_DB_ROOT=$tree/spider \
-  uvicorn api:app --app-dir "$app_dir" --host 127.0.0.1 --port "$api_port" --workers 16 > "$tree/api.log" 2>&1 &
+  python -m uvicorn api:app --app-dir "$app_dir" --host 127.0.0.1 --port "$api_port" --workers 16 > "$tree/api.log" 2>&1 &
 api_pid=$!
 COREDB_UPSTREAM=http://127.0.0.1:$api_port COREDB_TREE=$tree \
-  uvicorn bundle_proxy:app --app-dir "$app_dir" --host 127.0.0.1 --port "$proxy_port" --workers 8 \
+  python -m uvicorn bundle_proxy:app --app-dir "$app_dir" --host 127.0.0.1 --port "$proxy_port" --workers 8 \
   > "$tree/proxy.log" 2>&1 &
 echo "$api_pid $!" > "$tree/servers.pid"
 for _ in $(seq 1 150); do

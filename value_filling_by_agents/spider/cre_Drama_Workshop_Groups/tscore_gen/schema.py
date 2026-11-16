@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (read-only); remembers FK child columns, unique groups and compact values."""
 import math
 import sqlite3
 import warnings
@@ -34,15 +34,14 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_groups: list = field(default_factory=list)
 
 
 def q(name: str) -> str:
-    """Double-quote an SQL identifier."""
     return '"' + str(name).replace('"', '""') + '"'
 
 
 def _levels(items: list, deps: dict) -> list:
-    """Topological levels; deterministic cycle breaking by smallest remaining item."""
     remaining = sorted(set(items))
     known = set(items)
     placed: set = set()
@@ -58,7 +57,6 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -70,38 +68,27 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
     return _levels(list(all_columns), cdeps), _levels(tables, tdeps)
 
 
-def _first_token(line: str) -> str:
-    toks = line.strip().split()
-    return toks[0].strip('"`[](),') if toks else ''
-
-
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
         ddl = [s for ty, n, s in master if not str(n).startswith('sqlite_')]
         tnames = [n for ty, n, s in master if ty == 'table' and not str(n).startswith('sqlite_')]
-        create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        ugroups: list = []
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
-            low = {r[1].lower(): r[1] for r in info}
             uniq, chk = set(), set()
-            for line in create[t].split('\n'):
-                ll = line.lower()
-                tok = _first_token(line).lower()
-                if 'unique' in ll and tok in low:
-                    uniq.add(tok)
-                if ('check (' in ll or 'check(' in ll) and tok in low:
-                    chk.add(tok)
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
-                if idx[2]:
-                    cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
+                if len(idx) < 3 or not idx[2]:
+                    continue
+                cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                names = [c[2] for c in sorted(cols, key=lambda c: c[0]) if c[2]]
+                ugroups.append((t, names))
+                if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
+                    uniq.add(cols[0][2].lower())
+                    from_index.append((t, cols[0][2]))
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
@@ -139,4 +126,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, ugroups)

@@ -1,16 +1,17 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
 import os
 import random
+import shutil
 import sys
 import time
 
 from .instance import build_random_instance
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
-from .writer import unit_path, write_instance_sqlite
+from .writer import unit_path, copy_compact_db, write_generated_rows
 
 _G: dict = {}
 
@@ -30,11 +31,22 @@ def _one(i: int) -> str:
         return ''
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
+        part = p + '.part'
+        if os.path.exists(part):
+            os.remove(part)
+        copy_compact_db(a['orig'], part)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
+        write_generated_rows(part, _G['schema'], inst)
+        os.chmod(part, 0o644)
+        os.replace(part, p)
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
+        try:
+            if os.path.exists(p + '.part'):
+                os.remove(p + '.part')
+        except OSError:
+            pass
         return type(e).__name__
 
 
@@ -63,7 +75,8 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base,
+            'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)

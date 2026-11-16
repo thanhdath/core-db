@@ -82,6 +82,7 @@ class StringSampler(ColumnSampler):
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
+        self.length = length
 
     def _rand(self, k):
         return ''.join(self.rng.choice(CHARSET) for _ in range(k))
@@ -131,20 +132,23 @@ class DateSampler(ColumnSampler):
             if d is not None:
                 self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.template = self.template or '%Y-%m-%d %H:%M:%S'
+        self.full = (dt.datetime(2016, 1, 1), dt.datetime(2018, 3, 31, 23, 59, 59))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
-        self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
+        self.strip0 = False
 
     def _draw(self):
         r = self.rng
         lo, hi = self.full if (r.random() < self.p or self.n_parsed <= 1) else self.rng_dates
         d = lo + dt.timedelta(seconds=r.randint(0, int((hi - lo).total_seconds())))
         s = d.strftime(self.template)
-        if self.strip0:
-            s = re.sub(r'(^|[-/ :])0(\d)', r'\1\2', s)
         return int(s) if self.as_int and s.isdigit() else s
+
+    def draw_between(self, lo, hi):
+        r = self.rng
+        d = lo + dt.timedelta(seconds=r.randint(0, max(0, int((hi - lo).total_seconds()))))
+        return d.strftime(self.template)
 
     def sample(self):
         if self.elements and self.rng.random() < self.p:
@@ -180,6 +184,29 @@ class BoolSampler(ColumnSampler):
         if not self.elements or self.rng.random() < self.p:
             return self.vals[0] if self.rng.random() < 0.5 else self.vals[1]
         return self.rng.choice(self.elements)
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform choice from an enum domain (specification enum rule)."""
+
+    def __init__(self, values, rng, max_l0=float('inf')):
+        super().__init__(list(values), 1.0, max_l0, rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class BankSampler(ColumnSampler):
+    """Cycles a fixed value bank (near-variant / boundary rules): exact literal + one-step variants."""
+
+    def __init__(self, bank: list, rng):
+        super().__init__(list(bank), 0.0, float('inf'), rng)
+        self._i = 0
+
+    def sample(self):
+        v = self.elements[self._i % len(self.elements)]
+        self._i += 1
+        return v
 
 
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:

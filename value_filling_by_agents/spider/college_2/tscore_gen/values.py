@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -82,6 +84,7 @@ class StringSampler(ColumnSampler):
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
+        self.length = length
 
     def _rand(self, k):
         return ''.join(self.rng.choice(CHARSET) for _ in range(k))
@@ -104,7 +107,7 @@ class StringSampler(ColumnSampler):
                 v = v[:-1]
             else:
                 v = v[1:]
-        return v
+        return v[:self.length] if self.length else v
 
 
 def _parse_date(s: str):
@@ -182,6 +185,121 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Draw from a fixed enumeration (semester, grade, day, time_slot_id, credits)."""
+
+    def __init__(self, values, rng, near_variants=()):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.near = list(near_variants)
+
+    def sample(self):
+        r = self.rng
+        if self.near and r.random() < 0.05:
+            return r.choice(self.near)
+        return r.choice(self.elements)
+
+
+class RangeSampler(ColumnSampler):
+    """Uniform value in a CHECK range; CHECK-boundary probes are included."""
+
+    def __init__(self, lo, hi, decimals, rng, pool=(), boundaries=()):
+        super().__init__(list(pool), 0.0, float('inf'), rng)
+        self.lo, self.hi, self.dec = lo, hi, decimals
+        self.boundary = list(boundaries)
+
+    def _cast(self, v):
+        return round(v, self.dec) if self.dec else int(round(v))
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < 0.3:
+            return r.choice(self.elements)
+        if self.boundary and r.random() < 0.15:
+            return self._cast(r.choice(self.boundary))
+        if self.dec:
+            return self._cast(r.uniform(self.lo, self.hi))
+        return self._cast(r.randint(int(self.lo), int(self.hi)))
+
+
+class BoundarySampler(ColumnSampler):
+    """Base sampler plus a pool of comparison-boundary / LIKE-near-variant literals."""
+
+    def __init__(self, base: ColumnSampler, boundary: list, p: float, rng):
+        self.base = base
+        self.boundary = list(boundary)
+        self.p = p
+        self.rng = rng
+
+    def sample(self):
+        if self.boundary and self.rng.random() < self.p:
+            return self.rng.choice(self.boundary)
+        return self.base.sample()
+
+
+class IdSampler(ColumnSampler):
+    """Digit-string ids of a fixed length, unique within the table's key."""
+
+    def __init__(self, length, rng, taken: set, prefix=''):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.length, self.taken, self.prefix = length, taken, prefix
+
+    def sample(self):
+        r = self.rng
+        for _ in range(1000):
+            body = ''.join(r.choice(string.digits) for _ in range(self.length - len(self.prefix)))
+            v = self.prefix + body
+            if v not in self.taken:
+                self.taken.add(v)
+                return v
+        n = len(self.taken)
+        v = self.prefix + str(n).zfill(self.length - len(self.prefix))
+        while v in self.taken:
+            n += 1
+            v = self.prefix + str(n).zfill(self.length - len(self.prefix))
+        self.taken.add(v)
+        return v
+
+
+class NameSampler(ColumnSampler):
+    """Surnames with a 20% duplicate share and 5% near-variants."""
+
+    def __init__(self, pool, rng):
+        super().__init__(list(pool), 0.0, float('inf'), rng)
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < 0.20:
+            v = r.choice(self.seen)
+        else:
+            v = r.choice(self.elements) if self.elements else 'Name'
+            self.seen.append(v)
+        if r.random() < 0.05:
+            u = r.random()
+            if u < 0.4:
+                v = v.lower()
+            elif u < 0.7:
+                v = v.upper()
+            elif len(v) > 1:
+                i = r.randrange(len(v))
+                v = v[:i] + r.choice(string.ascii_lowercase) + v[i + 1:]
+        return v[:20]
+
+
+class CreditsSampler(ColumnSampler):
+    """course.credits: bulk {3,4}; 10% CHECK-boundary probes {1,2} (both > 0)."""
+
+    def __init__(self, rng):
+        super().__init__(list(spec.CREDITS), 0.0, float('inf'), rng)
+        self.boundary = list(spec.CHECK_BOUNDARIES.get(('course', 'credits'), ()))
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.10:
+            return r.choice(self.boundary)
+        return r.choice(self.elements)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +351,40 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column: str, column_meta, literal_pool: list, original_values,
+                 rng, taken_ids: set) -> ColumnSampler:
+    """Return a sampler that implements the specification for (table, column)."""
+    key = (table, column)
+    base = _init_sampler(column_meta, literal_pool, original_values, 0.2, rng,
+                         1 if column_meta.pk_pos else 0)
+
+    if key == ('section', 'semester'):
+        base = EnumSampler(spec.SEMESTERS, rng)
+    elif key == ('takes', 'grade'):
+        base = EnumSampler(spec.GRADES, rng)
+    elif key == ('time_slot', 'day'):
+        base = EnumSampler(spec.DAYS, rng)
+    elif key == ('time_slot', 'time_slot_id'):
+        base = EnumSampler(spec.TIME_SLOT_IDS, rng)
+    elif key == ('course', 'credits'):
+        base = CreditsSampler(rng)
+    elif key == ('time_slot', 'start_min') or key == ('time_slot', 'end_min'):
+        base = EnumSampler(spec.MINUTES, rng)
+    elif key in spec.RANGES:
+        lo, hi, dec = spec.RANGES[key]
+        base = RangeSampler(lo, hi, dec, rng, boundaries=spec.CHECK_BOUNDARIES.get(key, ()))
+    elif column_meta.pk_pos > 0 and column.lower() == 'id':
+        base = IdSampler(5, rng, taken_ids)
+    elif key == ('course', 'course_id'):
+        base = IdSampler(8, rng, taken_ids)
+    elif key == ('instructor', 'name') or key == ('student', 'name'):
+        pool = [str(v) for v in original_values if v is not None] or ['Smith', 'Jones', 'Lee']
+        base = NameSampler(pool, rng)
+
+    if key in spec.BOUNDARY_VALUES:
+        base = BoundarySampler(base, spec.BOUNDARY_VALUES[key], spec.BOUNDARY_P, rng)
+    if key in spec.LIKE_VARIANTS:
+        base = BoundarySampler(base, spec.LIKE_VARIANTS[key], spec.LIKE_P, rng)
+    return base

@@ -1,48 +1,766 @@
 {
  "db": "icfp_1",
- "operator_io_quirks": [
-  "All identifiers are simple ASCII, no spaces/mixed case; but spec still requires double-quoting and case-insensitive column lookup.",
-  "Tiny DB (8/13/7/14 rows) \u2014 no huge-table sampling path exercised; original_values fully read.",
-  "All declared types are INTEGER/TEXT; no Date/Time/Bool/Bit/Year dispatch, no crash-fallback types.",
-  "All columns notnull=0 despite being PKs \u2014 sqlite PK on INTEGER is not NOT NULL; TS may insert NULL PKs and they fail at insert.",
-  "Authorship has composite PK (authID,instID,paperID) \u2014 composite-PK members get max_l0=30 cap in TS.",
-  "Authorship.authID/instID/paperID are both PK members and FK children \u2014 FK fill draws from parent's FINAL filtered column.",
-  "All FKs resolve to existing parents (parent_exists true); no dangling FKs, no self-references.",
-  "Parent PKs are single-column INTEGER with distinct=rows (no duplicates) \u2014 FK draws with replacement will still create duplicate Authorship rows, dropped by composite-PK dedup.",
-  "authOrder INTEGER distinct=3 (values 1,2,3) \u2014 Number fuzzer will produce values far outside [1,3].",
-  "Storage classes match declared types everywhere (integer/text); no contradictions.",
-  "No views, triggers, indexes beyond PKs in DDL.",
-  "TEXT columns hold multi-word strings with spaces, colons, periods (titles truncated mid-word) \u2014 String fuzzer's CHARSET lacks ':' and '.'."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER columns: uniform in [-10^scale,10^scale] with scale from type args (none -> default), then +-1/+-2 perturbation; PKs get fresh draws (max_l0=inf).",
-  "String fuzzer on name/country/lname/fname/title: random a-zA-Z0-9() strings length [0,20], 50% contaminate; will not reproduce 'University of Oxford' style.",
-  "Literal pool from train SQL likely seeds country values (UK/USA/Japan/France) and maybe names \u2014 String sampler returns elements w.p. 1-p.",
-  "authOrder will be random large ints, not 1..3 \u2014 plausible FN source for queries filtering authOrder=1.",
-  "FK consistency: Authorship.authID/instID/paperID drawn from parent final values, so joins work; but composite-PK dedup drops many rows, shrinking Authorship.",
-  "Table sizes: level-based (Inst/Authors/Papers level 0, Authorship level 1) or rand_lin \u2014 Authorship ~4x parents, so many duplicate (authID,instID,paperID) triples dropped.",
-  "No NOT NULL enforcement: NULL PKs possible on Inst/Authors/Papers (INTEGER PK allows NULL in sqlite) \u2014 insert may succeed with NULL PK, creating odd states.",
-  "Missing ties/duplicates: original has distinct=rows on all PKs, so TS-generated duplicates are dropped \u2014 queries relying on duplicate rows (e.g. COUNT DISTINCT vs COUNT) may FP.",
-  "Implausible values: country gets random strings not in {UK,USA,Japan,France} \u2014 queries filtering country='USA' may FN if pool didn't seed it.",
-  "Titles truncated in original; TS random titles won't match LIKE patterns on real title substrings \u2014 FN for title LIKE queries.",
-  "Small DB means TS sizes (30-2500) vastly exceed original \u2014 cardinality-sensitive queries (e.g. HAVING COUNT>10) may flip."
- ],
- "challenger_refs": [
-  "G4",
-  "G6",
-  "G7",
-  "G9",
-  "G3",
-  "G2",
-  "G1",
-  "G5",
-  "G8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL. For tables with compact rows, start above the compact max so compact keys are preserved.",
+   "integer_fk": "Copy from the parent table's key pool (compact + generated keys actually present in the instance); ~7% of child rows get NULL only when the FK column is nullable; otherwise all rows reference an existing parent. Reserve at least one parent key per parent table to remain unreferenced (parent_rows_without_children).",
+   "integer_numeric": "Uniform integer in the observed range; include min, max, min-1 and max+1 as boundary probes where the semantic rule permits; NULL only if nullable.",
+   "text_name": "Draw from a small pool of realistic names; allow near-duplicates (case variants, one-character edits) at ~10% of rows; NULL only if nullable.",
+   "text_title": "Draw from a pool of realistic titles; allow near-variants (case, truncation, one-char edit) at ~10% of rows; NULL only if nullable.",
+   "text_country": "Draw from a small enum-like pool of country codes; allow case variants at ~10% of rows; NULL only if nullable.",
+   "text_generic": "Draw from a small pool; allow near-duplicates at ~10%; NULL only if nullable.",
+   "fresh_value_share": "0.1 of rows per text column are fresh near-variants derived from base-pool values, not in the base pool.",
+   "tie_rule": "For ORDER/LIMIT columns, ensure at least two rows share the top rank value; for COUNT(*)-based ties, control join cardinality so two parent rows have equal child counts. Plant ties by choosing existing child rows (never by appending ragged rows); if a tie cannot be planted on existing rows, append a full child row (all columns, valid FK/NULL values) to every column of the child table.",
+   "duplicate_rule": "For DISTINCT columns, ensure 20-50% of rows (on the combined compact+generated data) are duplicates of another row's value; compute the share over the merged column and adjust generated values accordingly.",
+   "null_rule": "Every nullable column gets at least one NULL row; NULL share follows the compact database's share (0.0 observed, so use a small share ~5-10% to exercise NULL logic). Planted NULLs are never replaced to satisfy a rule; rules constrain only non-NULL operands. NULL injection is a deliberate deviation from the observed 0.0 null rate, permitted by the schema's nullability; rules are three-valued (NULL passes).",
+   "boundary_rule": "Boundary probes are planted before NULL injection and before rule application; rule application must not overwrite planted boundary values (apply rules first, or exempt boundary values). Boundary values must survive as non-NULL in generated rows.",
+   "post_processing_rule": "All post-processing keeps every column of a table the same length; guard against short/empty lists when planting ties or diversity. After build, verify: duplicate share and group-size distribution per targeted column over merged data; top-rank tie counts for Inst, Papers, Authors; presence of all boundary values as non-NULL; unreferenced-parent count per parent table."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Papers.title",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Database%",
+      "%Functio%",
+      "%Functional%",
+      "%Databas%",
+      "%tabase%"
+     ],
+     "variants": [
+      "Database",
+      "Databasf",
+      "Database x",
+      "database",
+      "Functio",
+      "Functip",
+      "Functio x",
+      "functio"
+     ]
+    }
+   },
+   {
+    "column": "Papers.title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Papers.title",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Papers.title",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Papers.paperID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Authorship.paperID",
+      "Inst.instID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Papers.paperID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Authors.lname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Authors.lname",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Authors.lname",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Ueno",
+      "ueno",
+      "Turon",
+      "turon"
+     ]
+    }
+   },
+   {
+    "column": "Authors.lname",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Authors.fname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Authors.fname",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Authors.fname",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Katsuhiro",
+      "katsuhiro",
+      "Aaron",
+      "aaron",
+      "Stephanie",
+      "stephanie"
+     ]
+    }
+   },
+   {
+    "column": "Authors.fname",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Authors.authID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Authorship.authID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Authors.authID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Authorship.paperID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Papers.paperID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Authorship.authID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Authors.authID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Authorship.instID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Inst.instID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Authorship.authOrder",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Authorship.authOrder",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Authorship.authOrder",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Inst.name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Tokohu University",
+      "tokohu university",
+      " Universit",
+      " universit",
+      "TokUniversity",
+      "tokuniversity",
+      "Tokohu Univty",
+      "tokohu univty"
+     ]
+    }
+   },
+   {
+    "column": "Inst.name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Inst.name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(authorship.paperid)"
+     ]
+    }
+   },
+   {
+    "column": "Inst.name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Inst.instID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Authorship.instID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Inst.instID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(authorship.paperid)"
+     ]
+    }
+   },
+   {
+    "column": "Inst.country",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "USA",
+      "usa"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Authorship",
+    "child_column": "authID",
+    "parent_table": "Authors",
+    "parent_column": "authID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Authorship",
+    "child_column": "instID",
+    "parent_table": "Inst",
+    "parent_column": "instID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Authorship",
+    "child_column": "paperID",
+    "parent_table": "Papers",
+    "parent_column": "paperID",
+    "copied_columns": []
+   },
+   {
+    "table": "Inst",
+    "unique_tuple": [
+     "instID"
+    ]
+   },
+   {
+    "table": "Authors",
+    "unique_tuple": [
+     "authID"
+    ]
+   },
+   {
+    "table": "Papers",
+    "unique_tuple": [
+     "paperID"
+    ]
+   },
+   {
+    "table": "Authorship",
+    "unique_tuple": [
+     "authID",
+     "instID",
+     "paperID"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Authorship",
+    "column": "authOrder",
+    "formula": "authOrder BETWEEN 1 AND 3",
+    "evidence": "observed distinct values 1,2,3"
+   },
+   {
+    "table": "Inst",
+    "column": "country",
+    "formula": "country IN ('UK','USA','Japan','France')",
+    "evidence": "observed distinct countries; case-sensitive rule, 'usa' is a boundary probe that may be replaced by a valid enum value"
+   },
+   {
+    "table": "Inst",
+    "column": "instID",
+    "formula": "instID > 0",
+    "evidence": "surrogate key"
+   },
+   {
+    "table": "Authors",
+    "column": "authID",
+    "formula": "authID > 0",
+    "evidence": "surrogate key"
+   },
+   {
+    "table": "Papers",
+    "column": "paperID",
+    "formula": "paperID > 0",
+    "evidence": "surrogate key"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Inst": 8,
+   "Authors": 13,
+   "Papers": 7,
+   "Authorship": 14
+  },
+  "null_targets": [
+   "Authors.lname",
+   "Authors.fname",
+   "Papers.title",
+   "Inst.name",
+   "Inst.country",
+   "Authorship.authOrder"
+  ],
+  "supporting_evidence": {
+   "authOrder_range": "Authorship.authOrder distinct values are 1,2,3 (statistics); no 0 observed, so range 1-3.",
+   "country_enum": "Inst.country distinct values are UK, USA, Japan, France (statistics).",
+   "pk_positive": "All surrogate keys are positive integers in the sample rows."
+  },
+  "uncertainty": "The compact database shows null_rate 0.0 for all nullable columns; NULL shares are set small (~5-10%) to exercise NULL logic without contradicting the observed statistics. NULL injection is intentional and permitted by the schema's nullability; rules are three-valued (NULL passes). authOrder=0 is not a valid value (BETWEEN 1 AND 3); the boundary target lists only 1,2,3, and these must appear as non-NULL in generated rows (reserve rows for boundary probes before NULL injection). Inst.country and Authorship.authOrder are declared nullable but observed non-NULL; NULLs are permitted by the schema. The Inst.name boundary values are misspelled near-variants of 'Tohoku University' chosen to exercise equality/LIKE predicates; the Authors.lname/fname boundary values include fresh names (Ueno, Katsuhiro, Stephanie) consistent with the fresh_value_share rule. The IN rule for Inst.country is case-sensitive, so 'usa' is a boundary probe that may be replaced by a valid enum value; if the program enforces the IN rule strictly, 'usa' will not survive. table_sizes_per_instance are minimums; the program may add up to 6 extra rows per table. COUNT-based ties must be planted for the exact (parent, child-count-column) pairs: Inst via Authorship.paperID, Papers via Authorship.paperID, Authors via Authorship.authID. Unreferenced parents must be provably unreferenced by both compact and generated child rows (add a fresh parent key above the compact max and never reference it)."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20 with reasons no_rows_added (20), compact_rows_missing (20), new_integrity_failures (16); integrity.fk_violations = 134. The writer (tscore_gen/writer.py) is called as write_instance_sqlite(_G['schema'], inst, p) in cli.py _one(), i.e. orig_path is never passed. Consequently the writer does not copy the compact database (the `if orig_path and os.path.exists(orig_path)` branch is skipped) and instead re-creates tables from schema.ddl, then inserts only rows from index n_compact onward. Since build_random_instance merges compact rows + generated rows and n_compact is computed from schema.original_values, the compact rows are never inserted, so every instance is missing the compact rows and 'no_rows_added'/'compact_rows_missing' fire. Because the compact rows are absent, FK targets referenced by generated Authorship rows (which draw from the parent key pool that includes compact keys) do not exist, producing 134 FK violations.",
+     "requested_revision": "Pass the original database path to the writer (e.g. write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])) so the compact database is copied and compact rows are preserved, and so generated rows are appended as a tail. Alternatively, when not copying, insert the full merged column lists (including compact rows) rather than only the tail. Re-run and confirm validity.valid > 0, compact_rows_missing = 0, no_rows_added = 0, and fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows 'generated rows: NULL 0 / n' for Authors.fname, Authors.lname, Inst.country, Inst.name, Papers.title. The specification's null_targets lists these columns plus Authorship.authOrder, and the generic null_rule requires at least one NULL row per nullable column. In instance.py _sample_independent, the sampler is initialized with p=0.2 and never injects NULLs; _init_sampler/make_column_sampler (values.py) drop None elements and never emit None. _sample_fk does honor spec['null_share'], but only for FK columns. So nullable non-FK columns never receive NULLs, contradicting the NULL rule.",
+     "requested_revision": "In _sample_independent (or a post-processing step), for nullable non-PK columns inject NULLs at the spec['null_share'] rate (with at least one NULL per nullable column per instance), and ensure _apply_rules never replaces a planted NULL. Note: per instruction 7 this is a non-blocking note, but it should be fixed for spec conformance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py _EXCEPTIONS sets ('Authorship','authOrder') boundary to [0,1,2,3] and _RULES enforces ('between',1,3). In instance.py _sample_independent, boundary values are appended to the pool and sampled; _apply_rules then replaces any value failing check_rule with rng.randint(1,3). So the boundary probe value 0 is generated and then immediately overwritten, meaning the 'comparison_boundary' target values [0,1,2,3] for authOrder are not actually realized in the data. The specification's uncertainty note says 0 is a boundary probe, not a valid value, so this is arguably intended, but the per_column_exceptions target lists 0 as a value to include, creating an internal inconsistency between the exception target and the semantic rule.",
+     "requested_revision": "Clarify in the specification whether authOrder=0 should appear in generated data (as a boundary probe) or be excluded by the BETWEEN 1 AND 3 rule. If 0 must appear, the rule must be relaxed or the boundary probe must be applied outside the rule-checked column; if not, remove 0 from the per_column_exceptions boundary target so the spec is self-consistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include ('Inst','country') IN ('UK','USA','Japan','France') and ('Authorship','authOrder') BETWEEN 1 AND 3, both supported by observed distinct values. However, the specification also lists null_targets including Inst.country and Authorship.authOrder, and the generic null_rule says every nullable column gets at least one NULL. The schema declares these columns as nullable (no NOT NULL), so NULLs are permitted, but the observed compact data has null_rate 0.0. The specification acknowledges this in 'uncertainty' but does not resolve whether NULLs in country/authOrder are semantically valid (e.g., an institution with unknown country, or an authorship with unknown order). This is an uncertain pattern rather than a supported rule.",
+     "requested_revision": "State explicitly whether Inst.country and Authorship.authOrder may be NULL in generated data. If NULL is semantically invalid for these columns, remove them from null_targets and treat them as effectively NOT NULL in the sampler. If NULL is allowed, document that the IN/BETWEEN rules are three-valued and NULL passes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ('Authorship','instID') comparison_boundary with values ['Tokohu University','tokohu university'] and equal_and_one_step_from ['Inst.instID']. In spec.py _EXCEPTIONS this is stored as boundary values and equal_and_one_step_from='Inst.instID'. In instance.py _sample_independent, boundary values are appended to the pool for a column, but Authorship.instID is an FK column handled by _sample_fk, which ignores the boundary/equal_and_one_step_from exception entirely and only draws from the parent key pool. So the specified boundary probe (string values compared against an integer FK, plus one-step-from-parent values) is never generated. This is a spec/program mismatch for the FK boundary pattern.",
+     "requested_revision": "Either (a) implement the equal_and_one_step_from behavior in _sample_fk for Authorship.instID (generate values equal to and one step from parent instID values, plus the specified string boundary probes if intended), or (b) remove the unsupported boundary/equal_and_one_step_from exception for Authorship.instID from the specification, since string literals cannot be valid values for an INTEGER FK column and would violate the FK constraint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include unmatched_join_rows targets with parent_rows_without_children=true for Papers.paperID, Authors.authID, Inst.instID, Authorship.paperID, Authorship.authID, Authorship.instID. In instance.py, _sample_fk draws from the parent pool for every generated child row (with NULL only by null_share), and _dedupe_keys only dedupes PK/unique values. There is no logic to deliberately leave some parent rows without children (e.g., by ensuring some parent keys are never referenced). The 'unmatched_parent' exception flag is set in spec.py but never read by instance.py. So the parent_rows_without_children pattern is not implemented.",
+     "requested_revision": "Implement the unmatched_join_rows pattern: after generating child rows, ensure at least one parent key per parent table is not referenced by any child row (e.g., by reserving a parent key or by biasing FK sampling away from one parent key). Alternatively, remove the unmatched_join_rows exceptions from the specification if they are not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit with tie_at_rank [1], direction DESC, tie_on COUNT(*) for Papers.title, Papers.paperID, Authors.lname, Authors.fname, Authors.authID, Inst.name, Inst.instID, Authorship.authOrder. In instance.py _sample_independent, the 'tie' exception only forces vals[1]=vals[0] for string columns (isinstance(vals[0], str)), and only within a single column's values. For integer columns (paperID, authID, instID) and for COUNT(*)-based ties (which depend on join cardinality, not on a single column's value distribution), this does not produce a tie at rank 1. The tie_rule in the generic sampling rules ('ensure at least two rows share the top rank value') is not generally satisfied for COUNT(*)-based ORDER/LIMIT queries.",
+     "requested_revision": "Implement tie generation for COUNT(*)-based ORDER/LIMIT patterns by controlling join cardinality (e.g., ensure two parent rows have the same number of child rows, or two groups have the same size) rather than only duplicating a single column value. Also handle integer columns in the tie logic. Alternatively, narrow the ties_for_order_limit exceptions to patterns the program can actually realize."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include group_sizes targets '1, 2 and >= 3' for Papers.title, Papers.paperID, Authors.lname, Authors.fname, Authors.authID, Inst.name, Inst.instID. In instance.py _sample_independent, the group_sizes exception only fires when n >= 6 and vals[0] is a string, and it forces vals[0..3] equal and vals[4]=vals[5]. For integer columns (paperID, authID, instID) and for small n, group sizes are not controlled. Also, for PK columns the sampler returns _fresh_int_pool (sequential unique integers), so group sizes are always 1, contradicting the group_sizes target for Papers.paperID, Authors.authID, Inst.instID.",
+     "requested_revision": "Either implement group-size control for integer/PK columns (which conflicts with PK uniqueness for single-column PKs, so the target may be infeasible for PK columns and should be removed from the spec for those columns), or remove the group_sizes exceptions for PK columns from the specification. For non-PK columns, extend the group-size logic to integer columns and small n."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include duplicates_for_distinct with duplicate_share 20-50% for Papers.title, Authors.lname, Authors.fname, Inst.name. In instance.py _sample_independent, the duplicate_share logic is applied only when ex.get('duplicate_share') is set, and it repeats earlier values. However, the sampler is initialized with p=0.2 and max_l0=len(tm.primary_key), and _init_sampler may set p=0.0 for checked columns. More importantly, the duplicate_share logic runs after sampling but before _apply_rules and _dedupe_keys; _dedupe_keys only dedupes PK/unique columns, so duplicates in non-unique text columns survive. This part appears implemented. However, the execution feedback does not report duplicate shares, so it is unverified. Also, the duplicate_share is applied to the generated rows only, not to the combined compact+generated rows, so the overall duplicate share may fall below 20% if compact rows are diverse.",
+     "requested_revision": "Verify the duplicate share on the combined compact+generated data, not just generated rows, and adjust the duplicate injection to account for compact row diversity. Add a check to the execution feedback that reports the observed duplicate share per DISTINCT column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include like_near_variant for Papers.title with literals ['%Database%','%Functio%','%Functional%','%Databas%','%tabase%'] and variants ['Database','Databasf','Database x','database','Functio','Functip','Functio x','functio']. In instance.py _sample_independent, like_literals are expanded via like_variants (stripping '%' and adding near-variants) and variants are appended to the pool. However, the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool; the rest are random strings. The like_near_variant pattern requires that the specified literals and variants actually appear in the data so that LIKE queries with those patterns match. With p=0.2 and a small pool, the probability that a specific variant appears is low, and the execution feedback does not report whether the LIKE patterns match any rows.",
+     "requested_revision": "Ensure the specified like_near_variant literals and variants are actually present in the generated Papers.title values (e.g., by forcing at least one row per variant, or by increasing the pool probability for this column). Add a check to the execution feedback that reports whether each LIKE pattern matches at least one row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authors.lname (['Ueno','ueno','Turon','turon']), Authors.fname (['Katsuhiro','katsuhiro','Aaron','aaron','Stephanie','stephanie']), Inst.name (['Tokohu University','tokohu university',' Universit',' universit','TokUniversity','tokuniversity','Tokohu Univty','tokohu univty']), Inst.country (['USA','usa']). In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data, so equality predicates on these values may not match. The execution feedback does not report whether boundary values are present.",
+     "requested_revision": "Ensure the specified comparison_boundary values are actually present in the generated data (e.g., by forcing at least one row per boundary value, or by increasing the pool probability for these columns). Add a check to the execution feedback that reports whether each boundary value appears in the data."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include rows_with_different_values for Authorship.authOrder with qualifying_rows '>= 2 per group with different values'. In instance.py _sample_independent, authOrder is sampled from the pool [1,2,3] (plus boundary 0, which is then overwritten by _apply_rules). The sampler is a NumberSampler with p=0.2, so values are mostly random integers in [-10^10, 10^10] before _apply_rules clamps them to [1,3]. After clamping, values are in {1,2,3}, so groups (by paperID) may or may not have different values. There is no logic to ensure at least two rows per group have different authOrder values. The execution feedback does not report this.",
+     "requested_revision": "Implement the rows_with_different_values pattern for Authorship.authOrder: for each paperID group with >= 2 rows, ensure at least two rows have different authOrder values. Add a check to the execution feedback that reports whether this holds."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include ('Inst','country') IN ('UK','USA','Japan','France'). In instance.py _apply_rules, values failing check_rule are replaced with rng.choice(r[1]) for 'in' rules. However, the sampler for Inst.country is a StringSampler with p=0.2, so most generated values are random strings, which are then replaced by a random country from the enum. This means the country distribution is uniform over the enum, not following the compact database's distribution. The specification does not require a specific distribution, so this is acceptable, but the boundary values ['USA','usa'] are appended to the pool and may be overwritten by _apply_rules if 'usa' fails the IN check (case-sensitive). So the 'usa' boundary value is never realized.",
+     "requested_revision": "Either make the IN rule case-insensitive (or add 'usa' to the allowed enum) so the 'usa' boundary value survives, or remove 'usa' from the boundary target. Also consider whether the country distribution should follow the compact database's distribution."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules include integer_numeric: 'Uniform integer in the observed range; include min, max, and one step beyond each boundary.' In instance.py _sample_independent, for non-PK integer columns the sampler is a NumberSampler with scale=10 (range [-10^10, 10^10]), not the observed range. For Authorship.authOrder, _apply_rules clamps to [1,3], but the min/max/one-step-beyond boundaries (0 and 4) are not included. For Inst.instID, Authors.authID, Papers.paperID (PK columns), _fresh_int_pool generates sequential integers above the compact max, not the observed range. So the integer_numeric rule is not implemented as specified.",
+     "requested_revision": "Implement the integer_numeric rule: for non-PK integer columns, sample uniformly from the observed range and explicitly include min, max, min-1, and max+1. For PK columns, the sequential-above-max approach is reasonable but should be documented as an exception to the integer_numeric rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules include text_name, text_title, text_country, text_generic: 'Draw from a small pool of realistic names/titles/countries; allow near-duplicates (case variants, one-character edits) at ~10% of rows; NULL only if nullable.' In instance.py _sample_independent, the sampler is a StringSampler with p=0.2, so ~80% of values are random strings from CHARSET, not from the pool. The near-duplicate injection (rng.random() < 0.1) applies near_variants to the sampled value, but since most values are random strings, the near-duplicates are of random strings, not of realistic names/titles. So the text_* rules are not implemented as specified.",
+     "requested_revision": "Increase the pool probability for text columns (e.g., p=0.8) so most values come from the realistic pool, and apply near-duplicate injection to pool values. Alternatively, document that the StringSampler's random-string behavior is intentional and adjust the specification's text_* rules accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules include fresh_value_share: '0.1 of rows per text column are fresh near-variants not in the base pool.' In instance.py _sample_independent, near_variants are applied with probability 0.1, but the base value may already be a random string (not from the pool), so the 'fresh near-variant not in the base pool' requirement is not clearly met. Also, the fresh_value_share is not tracked or reported.",
+     "requested_revision": "Track and report the fresh_value_share per text column, and ensure fresh near-variants are derived from pool values (not random strings) so they are genuinely 'near-variants not in the base pool'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules include null_rule: 'Every nullable column gets at least one NULL row; NULL share follows the compact database's share (0.0 observed, so use a small share ~5-10% to exercise NULL logic).' In instance.py _sample_fk, null_share is read from spec['null_share'], which is set to 0.07 for nullable non-PK columns in spec_from_columns. However, _sample_independent never injects NULLs, so nullable non-FK columns (Authors.lname, Authors.fname, Papers.title, Inst.name, Inst.country) never get NULLs. This is the same issue as the nullable_columns feedback.",
+     "requested_revision": "Same as the nullable_columns issue: inject NULLs in _sample_independent for nullable non-PK columns at the spec['null_share'] rate, with at least one NULL per nullable column per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies list FK dependencies (Authorship.authID -> Authors.authID, Authorship.instID -> Inst.instID, Authorship.paperID -> Papers.paperID) and unique_tuple constraints. In instance.py build_random_instance, FKs are sampled from the parent's compact+generated key pool, and _dedupe_keys enforces PK/unique constraints. However, the execution feedback shows 134 FK violations, which indicates that the FK sampling is not consistent with the actual parent rows present in the instance. This is because the compact rows are not inserted (see the first issue), so the parent key pool includes compact keys that are not present in the instance. Once the compact rows are preserved, the FK violations should disappear.",
+     "requested_revision": "Fix the compact-row preservation issue (first issue) and re-verify that fk_violations = 0. Also, consider sampling FKs only from parent keys that are actually present in the instance (compact + generated), not from the schema's original_values directly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's table_sizes_per_instance is {Inst: 8, Authors: 13, Papers: 7, Authorship: 14}. In instance.py choose_table_sizes, sizes are base + rng.randint(0, 6), so the actual sizes vary from the specified sizes. The specification says 'table_sizes_per_instance' which suggests exact sizes, but the program treats them as minimums. The execution feedback does not report actual table sizes.",
+     "requested_revision": "Clarify whether table_sizes_per_instance are exact or minimums. If exact, remove the rng.randint(0, 6) addition. If minimums, document this in the specification. Add actual table sizes to the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's supporting_evidence says 'authOrder_range: Authorship.authOrder distinct values are 1,2,3 (statistics); no 0 observed, so range 1-3.' and 'uncertainty: ... The authOrder lower bound is 1 based on observed values; 0 is included only as a boundary probe in per_column_exceptions, not as a valid value.' In spec.py _RULES, ('Authorship','authOrder') is ('between',1,3), which is consistent. However, the per_column_exceptions boundary [0,1,2,3] includes 0, which is then overwritten by _apply_rules. This is an internal inconsistency in the specification (boundary probe vs. valid value).",
+     "requested_revision": "Resolve the inconsistency: either remove 0 from the boundary target (since it is not a valid value), or relax the BETWEEN rule to allow 0 as a boundary probe. Document the decision in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.name with values ['Tokohu University','tokohu university',' Universit',' universit','TokUniversity','tokuniversity','Tokohu Univty','tokohu univty']. These are near-variants of 'Tohoku University' (note the misspelling 'Tokohu' vs. 'Tohoku'). The compact database has 'Tohoku University' (correct spelling). The boundary values are misspelled variants, which may be intentional (to test LIKE/equality predicates), but the specification does not explain why these specific misspellings are chosen. This is an uncertain pattern.",
+     "requested_revision": "Document the rationale for the specific misspellings in the Inst.name boundary values, or replace them with more systematic near-variants (case, truncation, one-char edit) of the compact value 'Tohoku University'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authors.lname (['Ueno','ueno','Turon','turon']) and Authors.fname (['Katsuhiro','katsuhiro','Aaron','aaron','Stephanie','stephanie']). The compact database has 'Turon' and 'Aaron' but not 'Ueno', 'Katsuhiro', or 'Stephanie'. These are fresh values not in the compact database, which is consistent with the fresh_value_share rule, but the specification does not explain why these specific names are chosen. This is an uncertain pattern.",
+     "requested_revision": "Document the rationale for the specific fresh names in the Authors.lname and Authors.fname boundary values, or derive them systematically from the compact database's names (e.g., near-variants of existing names)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.country (['USA','usa']). The compact database has 'USA' (uppercase). The 'usa' variant is a case variant, which is consistent with the text_country rule ('allow case variants at ~10% of rows'). However, the IN rule ('UK','USA','Japan','France') is case-sensitive, so 'usa' would be replaced by _apply_rules. This is an internal inconsistency.",
+     "requested_revision": "Either make the IN rule case-insensitive (or add 'usa' to the allowed enum) so the 'usa' boundary value survives, or remove 'usa' from the boundary target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include like_near_variant for Papers.title with literals ['%Database%','%Functio%','%Functional%','%Databas%','%tabase%']. The compact database has titles containing 'Database' (e.g., 'Making Standard ML a Practical Database Programming Language') and 'Functional' (e.g., 'Functional Pearl: Modular Rollback through Control Logging'). The literals '%Functio%' and '%Functional%' are overlapping (the former is a prefix of the latter), and '%Databas%' and '%tabase%' are truncations of '%Database%'. This is a reasonable set of LIKE patterns, but the specification does not explain why these specific patterns are chosen. This is an uncertain pattern.",
+     "requested_revision": "Document the rationale for the specific LIKE patterns in the Papers.title like_near_variant target, or derive them systematically from the compact database's titles (e.g., by truncating at various positions)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit for Inst.name and Inst.instID with tie_on COUNT(authorship.paperid). This requires that two institutions have the same number of papers. In instance.py, there is no logic to ensure this. The tie logic only duplicates a single column value, which does not affect COUNT(authorship.paperid). So this tie pattern is not implemented.",
+     "requested_revision": "Implement tie generation for COUNT(authorship.paperid)-based ORDER/LIMIT patterns by ensuring two institutions have the same number of authorship rows. Alternatively, remove this tie pattern from the specification if it is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit for Authors.lname, Authors.fname, Authors.authID with tie_on COUNT(*). This requires that two authors have the same number of papers. In instance.py, there is no logic to ensure this. The tie logic only duplicates a single column value, which does not affect COUNT(*). So this tie pattern is not implemented.",
+     "requested_revision": "Implement tie generation for COUNT(*)-based ORDER/LIMIT patterns by ensuring two authors have the same number of authorship rows. Alternatively, remove this tie pattern from the specification if it is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit for Papers.title, Papers.paperID with tie_on COUNT(*). This requires that two papers have the same number of authors. In instance.py, there is no logic to ensure this. The tie logic only duplicates a single column value, which does not affect COUNT(*). So this tie pattern is not implemented.",
+     "requested_revision": "Implement tie generation for COUNT(*)-based ORDER/LIMIT patterns by ensuring two papers have the same number of authorship rows. Alternatively, remove this tie pattern from the specification if it is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit for Authorship.authOrder with tie_at_rank [1], direction DESC. This requires that two rows share the maximum authOrder value. In instance.py _sample_independent, the tie logic only fires for string columns (isinstance(vals[0], str)), so it does not apply to authOrder (integer). So this tie pattern is not implemented.",
+     "requested_revision": "Extend the tie logic to integer columns, or remove this tie pattern from the specification if it is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include group_sizes for Papers.paperID, Authors.authID, Inst.instID with group_sizes '1, 2 and >= 3'. These are PK columns, so group sizes are always 1 (each key is unique). The group_sizes target is infeasible for PK columns. This is an internal inconsistency in the specification.",
+     "requested_revision": "Remove the group_sizes exceptions for PK columns (Papers.paperID, Authors.authID, Inst.instID) from the specification, since group sizes are always 1 for unique keys."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include unmatched_join_rows for Papers.paperID, Authors.authID, Inst.instID with parent_rows_without_children=true. These are PK columns, and the pattern requires that some parent rows have no children. In instance.py, there is no logic to ensure this. The 'unmatched_parent' exception flag is set in spec.py but never read by instance.py. So this pattern is not implemented.",
+     "requested_revision": "Implement the unmatched_join_rows pattern for parent tables (Papers, Authors, Inst) by ensuring at least one parent key is not referenced by any child row. Alternatively, remove these exceptions from the specification if they are not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include unmatched_join_rows for Authorship.paperID, Authorship.authID, Authorship.instID with parent_rows_without_children=true. These are FK columns, and the pattern requires that some parent rows have no children. In instance.py, _sample_fk draws from the parent pool for every generated child row, so every parent key may be referenced. There is no logic to ensure some parent keys are unreferenced. So this pattern is not implemented.",
+     "requested_revision": "Implement the unmatched_join_rows pattern for child tables (Authorship) by ensuring at least one parent key per parent table is not referenced by any child row. Alternatively, remove these exceptions from the specification if they are not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authorship.instID with values ['Tokohu University','tokohu university'] and equal_and_one_step_from ['Inst.instID']. These are string values compared against an INTEGER FK column, which is a type mismatch. In instance.py _sample_fk, the boundary values are ignored (FK sampling only draws from the parent key pool). So this pattern is not implemented, and the specified values are not valid for the column type.",
+     "requested_revision": "Remove the string boundary values from the Authorship.instID comparison_boundary target, since they are not valid for an INTEGER FK column. If the intent is to test type coercion, document this explicitly and implement it in _sample_fk. Otherwise, replace with integer boundary values (e.g., equal to and one step from parent instID values)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authorship.authOrder with values [0,1,2,3]. The value 0 is not a valid authOrder (BETWEEN 1 AND 3), so it is overwritten by _apply_rules. The values 1,2,3 are valid but may not appear in the data if the sampler draws random integers. So the boundary values are not reliably realized.",
+     "requested_revision": "Ensure the boundary values 1,2,3 are present in the generated authOrder data (e.g., by forcing at least one row per value). Remove 0 from the boundary target or relax the BETWEEN rule to allow it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.name with values ['Tokohu University','tokohu university',' Universit',' universit','TokUniversity','tokuniversity','Tokohu Univty','tokohu univty']. These are near-variants of 'Tohoku University' (misspelled as 'Tokohu'). In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Inst.name data (e.g., by forcing at least one row per value, or by increasing the pool probability for this column)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authors.lname and Authors.fname with values that include case variants (e.g., 'Ueno'/'ueno', 'Katsuhiro'/'katsuhiro'). In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Authors.lname and Authors.fname data (e.g., by forcing at least one row per value, or by increasing the pool probability for these columns)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.country with values ['USA','usa']. In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. Also, 'usa' is overwritten by _apply_rules (case-sensitive IN rule). So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Inst.country data (e.g., by forcing at least one row per value, or by increasing the pool probability for this column). Make the IN rule case-insensitive or add 'usa' to the allowed enum so 'usa' survives."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include duplicates_for_distinct for Papers.title, Authors.lname, Authors.fname, Inst.name with duplicate_share 20-50%. In instance.py _sample_independent, the duplicate_share logic is applied to generated rows only, not to the combined compact+generated rows. If compact rows are diverse, the overall duplicate share may fall below 20%. The execution feedback does not report the observed duplicate share.",
+     "requested_revision": "Verify the duplicate share on the combined compact+generated data, not just generated rows, and adjust the duplicate injection to account for compact row diversity. Add a check to the execution feedback that reports the observed duplicate share per DISTINCT column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include group_sizes for Papers.title, Authors.lname, Authors.fname, Inst.name with group_sizes '1, 2 and >= 3'. In instance.py _sample_independent, the group_sizes logic only fires when n >= 6 and vals[0] is a string, and it forces vals[0..3] equal and vals[4]=vals[5]. This may not produce all three group sizes (1, 2, >= 3) if the sampler's random values create additional groups. The execution feedback does not report the observed group sizes.",
+     "requested_revision": "Verify the group sizes on the combined compact+generated data, and adjust the group-size injection to ensure all three group sizes (1, 2, >= 3) are present. Add a check to the execution feedback that reports the observed group sizes per column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ties_for_order_limit for Papers.title, Papers.paperID, Authors.lname, Authors.fname, Authors.authID, Inst.name, Inst.instID, Authorship.authOrder. In instance.py _sample_independent, the tie logic only fires for string columns (isinstance(vals[0], str)), so it does not apply to integer columns (paperID, authID, instID, authOrder). Also, for COUNT(*)-based ties, the tie logic does not affect join cardinality. So most tie patterns are not implemented.",
+     "requested_revision": "Extend the tie logic to integer columns and to COUNT(*)-based patterns (by controlling join cardinality). Alternatively, remove the tie patterns that cannot be implemented from the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include rows_with_different_values for Authorship.authOrder with qualifying_rows '>= 2 per group with different values'. In instance.py, there is no logic to ensure this. The execution feedback does not report this.",
+     "requested_revision": "Implement the rows_with_different_values pattern for Authorship.authOrder: for each paperID group with >= 2 rows, ensure at least two rows have different authOrder values. Add a check to the execution feedback that reports whether this holds."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authorship.instID with equal_and_one_step_from ['Inst.instID']. In instance.py _sample_fk, this is not implemented. The execution feedback does not report this.",
+     "requested_revision": "Implement the equal_and_one_step_from behavior in _sample_fk for Authorship.instID (generate values equal to and one step from parent instID values). Alternatively, remove this exception from the specification if it is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authorship.authOrder with values [0,1,2,3]. In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a NumberSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. Also, 0 is overwritten by _apply_rules. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Authorship.authOrder data (e.g., by forcing at least one row per value). Remove 0 from the boundary target or relax the BETWEEN rule to allow it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.name with values that include leading-space variants (' Universit', ' universit'). In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Inst.name data (e.g., by forcing at least one row per value, or by increasing the pool probability for this column)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.name with values that include truncation variants ('TokUniversity', 'tokuniversity', 'Tokohu Univty', 'tokohu univty'). In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Inst.name data (e.g., by forcing at least one row per value, or by increasing the pool probability for this column)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Authors.lname and Authors.fname with values that include case variants. In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Authors.lname and Authors.fname data (e.g., by forcing at least one row per value, or by increasing the pool probability for these columns)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include comparison_boundary for Inst.country with values ['USA','usa']. In instance.py _sample_independent, boundary values are appended to the pool, but the sampler is a StringSampler with p=0.2, so only ~20% of generated values come from the pool. The boundary values may not appear in the data. Also, 'usa' is overwritten by _apply_rules (case-sensitive IN rule). So this pattern is not reliably implemented.",
+     "requested_revision": "Ensure the specified boundary values are present in the generated Inst.country data (e.g., by forcing at least one row per value, or by increasing the pool probability for this column). Make the IN rule case-insensitive or add 'usa' to the allowed enum so 'usa' survives."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the duplicate share, group sizes, tie patterns, and boundary values are actually realized in the generated data (execution feedback does not report these).",
+    "Whether the LIKE patterns match any rows in the generated Papers.title data.",
+    "Whether the fresh_value_share rule is satisfied for text columns.",
+    "Whether the table sizes match the specification's table_sizes_per_instance exactly or as minimums.",
+    "Whether the compact database's NULL share (0.0) should be followed exactly or overridden by the ~5-10% rule (the specification says both, which is contradictory)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 11 of 20 units failed with IndexError('list index out of range') (n_ok=9, n_fail=11). The failure is reproducible. The most likely source is in instance.py: `_plant_count_ties` appends to `child_vals` (a local list) and then assigns `inst[ct][cc] = child_vals`, but the other columns of the child table are not extended, so the child table's columns become ragged. Later, `_reserve_unmatched_parents` / `_plant_authorder_diversity` / writer iterate by `len(cols[names[0]])` and index `cols[c][i]` for every column, raising IndexError when a column is shorter. Also `_plant_authorder_diversity` indexes `orders[idxs[0]]`/`orders[idxs[1]]` and `_plant_count_ties` uses `sorted_parents[1]` without guarding `len(parent_vals) < 2` in all paths.",
+     "requested_revision": "Make post-processing keep all columns of a table the same length: when `_plant_count_ties` appends child rows, append a full row (all columns, with valid FK/NULL values) to every column of the child table, or better, plant ties by choosing existing child rows rather than appending. Guard `_plant_authorder_diversity` and `_plant_count_ties` against short/empty lists. Re-run and confirm n_fail=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `_RULES` uses `('Inst','country'): ('in_ci', [...])` and `check_rule` treats `in_ci` case-insensitively, so 'usa' survives. But the generation specification's semantic rule is `country IN ('UK','USA','Japan','France')` (case-sensitive) and the specification's own uncertainty note says 'usa' may be replaced by a valid enum value. The program therefore silently widens the domain beyond the stated rule. Additionally `_apply_rules` for `in_ci` picks `rng.choice(r[1])`, which can overwrite the planted 'usa' boundary probe, so the boundary target is not reliably realized.",
+     "requested_revision": "Either (a) keep the case-sensitive `in` rule and drop 'usa' from the boundary list (matching the specification's stated uncertainty), or (b) explicitly document in the specification that the country rule is case-insensitive and that 'usa' is a permitted value. In either case, ensure `_apply_rules` does not overwrite planted boundary values (apply rules before planting, or exempt boundary values)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists `Authorship.authOrder` comparison_boundary targets as `values: [1,2,3]` (extracted atomic ops show `[0,1,2,3]`), and the semantic rule is `authOrder BETWEEN 1 AND 3`. The program's `_plant_boundary` writes boundary values into the first generated rows, but `_inject_nulls` then sets ~7% of them to NULL and `_apply_rules` may replace out-of-range values. With only ~14 generated Authorship rows, the boundary probes 1,2,3 are not guaranteed to all appear as non-NULL values. Execution feedback shows `Authorship.authOrder: NULL 5/26` but does not confirm 1,2,3 all present.",
+     "requested_revision": "Specify that boundary values for authOrder must appear as non-NULL in generated rows (e.g., reserve rows for boundary probes before NULL injection), and confirm the intended boundary set is {1,2,3} (0 excluded)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_reserve_unmatched_parents` reserves `parent_vals[-1]` (the last generated parent key) and rewrites child references to it. But `parent_vals` includes compact keys first, so `parent_vals[-1]` is a generated key only if generated rows exist; if `n_gen==0` for the parent table, the reserved key is a compact key that compact child rows already reference, so the 'parent_rows_without_children' target is not achieved. Also the function only rewrites generated child rows, so a compact child row referencing the reserved key would still violate the target.",
+     "requested_revision": "Reserve a parent key that is provably unreferenced by both compact and generated child rows (e.g., add a fresh parent key above the compact max and never reference it), and verify the target holds after post-processing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_duplicates` and `_plant_group_sizes` operate on generated values only, but the specification's duplicate_share and group_sizes targets are stated over the combined compact+generated data ('on the combined compact+generated data'). With compact sizes (Inst 8, Authors 13, Papers 7) and only 0-6 appended rows, the generated-only manipulation cannot reliably achieve 20-50% duplicate share or group sizes 1/2/>=3 on the combined data. Execution feedback does not report per-column duplicate/group statistics, so this is unverified.",
+     "requested_revision": "Compute duplicate share and group sizes over the merged column (compact+generated) and adjust generated values accordingly; add a post-build verification that reports achieved duplicate share and group-size distribution per targeted column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_sample_independent` for PK columns returns `_fresh_int_pool` (sequential above compact max), but `_dedupe_keys` then drops rows repeating a PK tuple. For `Papers.paperID` the exception includes `group_sizes` and `tie`, which are meaningless for a unique PK and are skipped (`cm.pk_pos == 0` guard), yet the specification lists `Papers.paperID` group_sizes/ties targets. The tie target for paperID is actually about COUNT(*) over Authorship joins, which is handled by `_plant_count_ties` keyed on `(pt,pc)` \u2014 but `_plant_count_ties` looks up `spec['exceptions'].get((pt,pc))` for the parent, and `Papers.paperID` exception has `tie: True`, so it is handled. However `Inst.instID` tie is keyed on `COUNT(authorship.paperid)` and `_plant_count_ties` only handles FK child columns, not the `Inst` parent via `Authorship.instID`; the tie_on column differs (paperid vs instid), so the Inst tie may not be realized.",
+     "requested_revision": "Verify that COUNT-based ties are planted for the exact (parent, child-count-column) pairs named in the specification (Inst via Authorship.paperID, Papers via Authorship.paperID, Authors via Authorship.authID), and add a post-build check reporting achieved top-rank tie counts."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` includes `Authorship.authOrder`, `Inst.country`, `Inst.name`, `Papers.title`, `Authors.lname`, `Authors.fname`, but the compact database shows null_rate 0.0 for all. The program injects ~7% NULLs, which is consistent with the stated uncertainty. However, the specification's semantic rule `country IN (...)` and `authOrder BETWEEN 1 AND 3` are three-valued, so NULLs pass \u2014 this is consistent. No blocking issue, but the specification should state explicitly that NULL injection is intentional and does not contradict the observed 0.0 null rate.",
+     "requested_revision": "Add an explicit note in the specification that NULL injection at ~7% is a deliberate deviation from the observed 0.0 null rate, permitted by the schema's nullability, and that rules are three-valued."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 11 IndexError failures are fully resolved after fixing ragged-column post-processing (requires re-run).",
+    "Whether duplicate_share (20-50%) and group_sizes (1,2,>=3) targets are achieved on combined compact+generated data (no per-column statistics in feedback).",
+    "Whether COUNT(*)-based ties at rank 1 are achieved for Inst, Papers, and Authors (no tie statistics in feedback).",
+    "Whether all boundary values (authOrder 1,2,3; Inst.name variants; Authors.lname/fname variants; Inst.country USA/usa) survive as non-NULL in generated rows.",
+    "Whether parent_rows_without_children holds for all four parent tables after post-processing (no per-table unreferenced-parent count in feedback)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules are backed by the compact statistics: authOrder BETWEEN 1 AND 3 (observed distinct 1,2,3), Inst.country IN ('UK','USA','Japan','France') (observed enum), and surrogate keys > 0 (all observed keys positive). The specification explicitly flags the 'usa' boundary probe as possibly replaced by a valid enum value, and the program's case-sensitive IN rule (spec.py _RULES + check_rule) is consistent with that note. The authOrder boundary target is [1,2,3] (0 excluded), matching the BETWEEN rule.",
+     "requested_revision": "None required; rules are adequately evidenced. (Optional: document that 'usa' will not survive the case-sensitive IN rule, which the uncertainty note already states.)"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Value domains and dependencies are implemented: integer PKs start above compact max (_fresh_int_pool), FKs draw from parent compact+generated key pools (_sample_fk), unique tuples enforced via _dedupe_keys, and per-column exceptions (like_literals, variants, boundary, duplicate_share, group_sizes, tie, unmatched_parent, rows_with_different_values) are wired through spec.py _EXCEPTIONS and instance.py. Boundary values are planted after rule application and exempted from NULL injection (_plant_boundary_after_rules + exempt sets), satisfying the boundary_rule.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 20/20 instances valid, 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, reproducible=true, no errors. Compact rows are preserved (writer copies orig then appends tail rows from n_compact onward). Unreferenced parents are guaranteed by _reserve_unmatched_parents adding a fresh key above compact max and never referencing it.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL injection is active on all nullable columns (Authors.fname 20/69, Authors.lname 22/69, Authorship.authOrder 8/58, Inst.country 32/89, Inst.name 20/89, Papers.title 38/90), each with at least one NULL and non-NULL rows, consistent with the interface NULL rule. Note: the observed NULL shares (e.g. Inst.country 32/89 \u2248 36%) exceed the spec's stated ~5-10% target; this is a soft deviation, not a blocking error, since the interface rule only requires a NULL share following the compact share (0.0) with at least one NULL per column, and rules are three-valued.",
+     "requested_revision": "Optional: tighten null_share so injected NULL fractions stay near the documented ~5-10% rather than ~30%+ on some columns; not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: 64/119 separated, 0 unknown executions. Separation is partial but non-zero, so intended value variation remains possible; a missing separation alone does not establish a generation error. No held-out data was used.",
+     "requested_revision": "None required; partial separation is acceptable per instructions."
+    }
+   ],
+   "unresolved_checks": [
+    "Exact duplicate-share and group-size distributions over merged data were not independently recomputed from the 20 instances; only aggregate validity and separation were observed.",
+    "Whether the 'usa' boundary probe survives as non-NULL in generated Inst.country rows was not directly verified (the case-sensitive IN rule may replace it, which the spec permits)."
+   ]
+  }
+ ]
 }

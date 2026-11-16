@@ -1,13 +1,4 @@
-"""Step 5: database instance selection by greedy set cover.
-
-C_i = construction pairs separated by instance i, U = union of all C_i.  Starting from J = {} and R = U,
-repeatedly add the instance that separates the most uncovered pairs (ties: lowest index) until R is empty.
-The compact database (instance 0) is always kept; set cover adds the fewest generated instances that
-separate the pairs it does not separate.  Variants restrict the pairs to one neighbor source.
-
-Output: <out>/selection.json and, with ``--coredb-root``, the members of variant ``full`` in the release layout
-<coredb>/dbs/<ds>/<db>/compact/<db>.sqlite and .../units/<unit>.sqlite.
-"""
+"""Step 5: database instance selection by greedy set cover."""
 import argparse
 import shutil
 from pathlib import Path

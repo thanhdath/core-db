@@ -1,18 +1,4 @@
-"""Score CoRE-DB against the original databases on the RQ3 / RQ6 evaluation sets (``evaluation_sets/``).
-
-Every case is a (gold SQL, predicted SQL) pair of a training question with a reference label:
-  spurious  original match AND semantically wrong (3-LLM majority);
-  correct   original match AND semantically correct;
-  wrong     original mismatch, prediction error or gold error.
-Verdicts: ``original`` on the official training database alone, ``coredb`` aggregated over the CoRE-DB members
-(any refusal refuses, otherwise any unknown is unknown).  Positive = accepted as correct:
-FPR = accepted (spurious + wrong) / (spurious + wrong), FNR = refused correct / correct; unknown verdicts stay in
-the denominators.
-
-Usage:
-    python scripts/score_evaluation_sets.py --set rq3_3b --coredb data/core-db \
-        --bird-train-root data/bird/train/train_databases --spider-root data/spider
-"""
+"""Score CoRE-DB against the original databases on the RQ3 / RQ6 evaluation sets (``evaluation_sets/``)."""
 import argparse
 import json
 import sys
@@ -26,7 +12,6 @@ from agentic_coding.common import (coredb_verdict, execute_all, has_top_level_or
 from scripts.coredb_members import coredb_members, original_database  # noqa: E402
 
 SETS = {
-    'rq3_05b': REPO / 'evaluation_sets' / 'rq3_spurious_train200_05b.jsonl',
     'rq3_3b': REPO / 'evaluation_sets' / 'rq3_spurious_train200_3b.jsonl',
     'rq6_sample300': REPO / 'evaluation_sets' / 'rq6_rollout_sample300.jsonl',
 }
@@ -76,7 +61,7 @@ def table_row(cases, verdicts, setting):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--set', required=True, choices=sorted(SETS))
-    parser.add_argument('--coredb', required=True, help='local copy of thanhdath/core-db')
+    parser.add_argument('--coredb', required=True, help='local copy of the CoRE-DB dataset')
     parser.add_argument('--bird-train-root', default='data/bird/train/train_databases')
     parser.add_argument('--spider-root', default='data/spider')
     parser.add_argument('--out', default=None, help='optional JSON output (table + per-case verdicts)')

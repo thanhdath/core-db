@@ -6,16 +6,16 @@ from itertools import product
 import requests
 
 
-def _unorder_row(row: tuple) -> tuple:
+def _unorder_row(row):
     return tuple(sorted(row, key=lambda x: str(x) + str(type(x))))
 
 
-def _quick_rej(r1: list, r2: list, order_matters: bool) -> bool:
+def _quick_rej(r1, r2, order_matters):
     s1, s2 = [_unorder_row(r) for r in r1], [_unorder_row(r) for r in r2]
     return s1 == s2 if order_matters else set(s1) == set(s2)
 
 
-def _perms(sets1: list, r2: list):
+def _perms(sets1, r2):
     n = len(r2[0])
     cons = [set(range(n)) for _ in range(n)]
     if n <= 3:
@@ -30,7 +30,7 @@ def _perms(sets1: list, r2: list):
     return product(*[sorted(c) for c in cons])
 
 
-def result_eq(rows_a: list, rows_b: list, order_matters: bool) -> bool:
+def result_eq(rows_a, rows_b, order_matters):
     """Bag equality up to column permutation (exec_eval.py:20-119)."""
     a, b = [tuple(r) for r in rows_a], [tuple(r) for r in rows_b]
     if not a and not b:
@@ -55,8 +55,7 @@ def result_eq(rows_a: list, rows_b: list, order_matters: bool) -> bool:
     return False
 
 
-def execute_batch(api_base: str, ds: str, db_id: str, sqls: list, timeout_ms: int = 30000) -> list:
-    """POST <base>/execute_batch of the db_execution API (replaces upstream subprocess execution)."""
+def execute_batch(api_base, ds, db_id, sqls, timeout_ms=30000):
     r = requests.post(api_base.rstrip('/') + '/execute_batch',
                       json={'dataset_name': ds, 'db_id': db_id, 'sqls': list(sqls), 'mode': 'read_only',
                             'timeout_ms': timeout_ms, 'max_rows': 10000},
@@ -65,11 +64,10 @@ def execute_batch(api_base: str, ds: str, db_id: str, sqls: list, timeout_ms: in
     return r.json()
 
 
-def execute_and_compare(sql_a: str, sql_b: str, instance_id: str, ds: str, api_base: str, order_matters=None):
-    """True same denotation, False differ or sql_b fails, None if sql_a unusable (exec_eval.py:171-232)."""
+def execute_and_compare(sql_a, sql_b, instance_id, ds, api_base, order_matters=None):
     if order_matters is None:
         order_matters = 'order by' in sql_a.lower()
-    ra, rb = execute_batch(api_base, ds, instance_id, [sql_a, sql_b])
+    ra, rb = execute_batch(api_base, instance_id, ds, [sql_a, sql_b])
     if not ra.get('ok') or ra.get('timed_out'):
         return None
     if not rb.get('ok') or rb.get('timed_out'):

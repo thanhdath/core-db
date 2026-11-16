@@ -1,50 +1,695 @@
 {
  "db": "movie_platform",
- "operator_io_quirks": [
-  "ratings has 15.5M rows, ratings_users 4.3M, movies 226k: read_schema must rowid-sample (max_rows_per_table) and never copy rows; original_sizes via count(*).",
-  "ratings has NO primary key and NO unique column; lists_users PK is composite (user_id, list_id); lists.list_id and movies.movie_id are single-col PKs.",
-  "FK cycle: lists.user_id -> lists_users.user_id and lists_users.user_id -> lists.user_id (and lists_users.list_id -> lists.list_id). process_order must break the table cycle deterministically; column-level cycle too.",
-  "ratings has a self-FK rating_id -> ratings.rating_id (parent_exists true) and TWO FKs on user_id (ratings_users and lists_users): fks dict keyed by (child_t, child_c) can hold only one \u2014 the second is silently dropped; record which wins (pragma order: ratings_users first).",
-  "ratings_users.user_id -> lists_users.user_id but lists_users.user_id is NOT unique (distinct 23118 of 80311): FK to non-unique parent; child draws with replacement from parent values, fine, but no uniqueness guarantee.",
-  "lists.user_id -> lists_users.user_id likewise non-unique parent; lists.user_id distinct 22925 vs lists_users.user_id distinct 23118 \u2014 dangling child values exist in original.",
-  "Declared TEXT but text-stored dates: list_update_timestamp_utc / list_creation_timestamp_utc 'YYYY-MM-DD HH:MM:SS'; rating_date_utc, list_update_date_utc, list_creation_date_utc 'YYYY-MM-DD'; rating_timestamp_utc 'YYYY-MM-DD HH:MM:SS'. All dispatch to String fuzzer (type TEXT), NOT Date \u2014 TS will emit random charset strings, not dates.",
-  "movies.director_id is TEXT holding integer-ish ids and comma-joined multi-ids ('89, 90'); String fuzzer int-like branch adds i+1/i-1 strings.",
-  "lists_users.user_eligible_for_trial / user_has_payment_method declared TEXT but store '0'/'1' (text storage); same columns in ratings/ratings_users are INTEGER. Mixed declared types across tables for same-named columns.",
-  "movie_title_language has distinct=1 ('en') \u2014 String sampler with one element will mostly return 'en' perturbed/contaminated.",
-  "High null rates: ratings.critic 0.965, ratings_users.user_cover_image_url 0.674, lists.list_description 0.655, lists_users.user_cover_image_url 0.6 \u2014 but all columns notnull=0, so TS may emit NULLs freely; original_values include NULLs.",
-  "No CHECK constraints, no UNIQUE indexes, no views/triggers in DDL; only PKs and FKs. Table names all lowercase, no spaces \u2014 but spec still requires double-quoting."
- ],
- "operator_ts_expectations": [
-  "All date/timestamp columns are TEXT -> String fuzzer: random a-zA-Z0-9() strings of length 0-20 plus contamination; almost no value will parse as a date. Queries filtering rating_date_utc BETWEEN '2010-01-01' AND '2011-01-01' will return empty or garbage -> FN risk (implausible values).",
-  "Number fuzzer on INTEGER columns: full range [-10^4,10^4] (scale 0) with +-1/+-2 perturbation; movie_id, list_id, user_id, rating_id get small ints, not the 8-digit ids seen in original -> joins on user_id between ratings and lists_users still work (FK consistency) but filters like user_id > 10000000 return nothing -> FN.",
-  "rating_score distinct 5 (1-5) but Number fuzzer ignores that: values spread over [-10000,10000] -> queries rating_score = 5 or BETWEEN 1 AND 5 mostly miss -> FN; also no ties/duplicates at the 5-value granularity -> FP on GROUP BY rating_score / COUNT DISTINCT.",
-  "user_trialist/user_subscriber/user_eligible_for_trial/user_has_payment_method are 0/1 flags but Number fuzzer emits wide ints -> WHERE user_subscriber = 1 nearly empty -> FN; GROUP BY these flags yields thousands of groups instead of 2 -> FP.",
-  "movie_release_year INTEGER (not 'year' type) -> Number fuzzer, not the year branch; values in [-10000,10000] -> WHERE movie_release_year = 2007 misses -> FN.",
-  "String fuzzer on list_title, movie_title, director_name: random charset strings, not real titles; LIKE '%love%' queries miss -> FN; but contamination adds %-stripped variants and +-1 int strings, giving some spurious matches -> FP.",
-  "list_movie_number, list_followers, list_comments, critic_likes, critic_comments are small-count INTEGERs; Number fuzzer wide range -> ORDER BY / LIMIT / HAVING count > N queries get implausible distributions -> FN and FP.",
-  "FK consistency: ratings.user_id drawn from lists_users.user_id (final filtered) and ratings_users.user_id; lists.user_id from lists_users.user_id. But lists_users.user_id itself is drawn from lists.user_id (cycle) \u2014 TS draws child before parent in level order, so one direction may see empty parent -> NULLs -> join queries return empty -> FN.",
-  "ratings has no PK: sample_fresh_primary_keys is a no-op, drop_unique_duplicates no-op -> duplicate rows possible; COUNT(*) / DISTINCT queries get inflated or tied counts -> FP on ties.",
-  "lists_users composite PK (user_id, list_id): sample_fresh_primary_keys drops duplicate tuples; but user_id and list_id each drawn independently -> many distinct pairs, few natural ties -> FP on GROUP BY user_id HAVING count(*)>1.",
-  "Self-FK ratings.rating_id -> ratings.rating_id: child draws from parent's final rating_id column (same table, already generated) \u2014 with no PK filter, values are wide ints; self-join queries on rating_id mostly empty -> FN.",
-  "String fuzzer on list_url, movie_url, *_image_url: random strings, not URLs; LIKE 'http%' misses -> FN; but original_values (5 sampled) include real URLs so some rows match -> partial."
- ],
- "challenger_refs": [
-  "G10",
-  "G13",
-  "G2",
-  "G1",
-  "G14",
-  "G5",
-  "G7",
-  "G9",
-  "G11",
-  "G16"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers starting at 1; never NULL; no duplicates.",
+   "integer_fk": "Copy from parent table's key column; 5% of child rows get NULL when the column is nullable; ensure some parent rows have no children.",
+   "integer_quantity": "Uniform integer in [0, 500]; 5% NULL when nullable.",
+   "integer_flag": "Random choice from {0, 1}.",
+   "text_short": "Random word-like string of 3-20 chars; 5% NULL when nullable; near-variants (append 'x', change last char, lowercase) for 10% of rows.",
+   "text_url": "https://example.com/<table>/<pk>; 5% NULL when nullable.",
+   "text_long": "Random sentence of 20-200 chars; 60% NULL when nullable.",
+   "timestamp_utc": "Random datetime between 2009-01-01 and 2020-12-31 formatted '%Y-%m-%d %H:%M:%S'; 5% NULL when nullable; all post-processing (ties, duplicate-share, order rules) must keep values inside this domain.",
+   "date_utc": "Random date between 2009-01-01 and 2020-12-31 formatted '%Y-%m-%d'; 5% NULL when nullable; all post-processing must keep values inside this domain.",
+   "numeric_score": "Integer in [1, 5]; 0.2% NULL.",
+   "numeric_count": "Integer in [0, 1000]; 5% NULL when nullable.",
+   "numeric_year": "Integer in [1900, 2020]; 5% NULL when nullable.",
+   "numeric_popularity": "Integer in [0, 1000]; 5% NULL when nullable.",
+   "boundary_and_tie_planting": "For every column named in per_column_exceptions with pattern comparison_boundary, like_near_variant, ties_for_order_limit, duplicates_for_distinct or rows_with_different_values, plant the listed literals into the sampled column before any overwrite pass and protect them from duplicate-share, tie and different-values passes; for non-FK columns (PKs, text, scores) seed them directly into the column sample, not only into parent tables."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "lists_users.user_id",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 8516502, 8516503, 8516504, 85981818, 85981819, 85981820."
+   },
+   {
+    "column": "lists.user_id",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 8516502, 8516503, 8516504, 85981818, 85981819, 85981820."
+   },
+   {
+    "column": "ratings.user_id",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 22030371, 22030372, 22030373, 39115683, 39115684, 39115685."
+   },
+   {
+    "column": "lists.list_id",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 249, 250, 251."
+   },
+   {
+    "column": "movies.movie_title",
+    "pattern": "like_near_variant",
+    "targets": "Include literals 'Freaks', 'Red Blooded American Girl' and variants 'Freakt', 'Freaksx', 'freaks', 'Red Blooded American Girm', 'Red Blooded American Girlx', 'red blooded american girl'."
+   },
+   {
+    "column": "movies.movie_title",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 'Il grido', 'The General', 'the general', 'il grido', 'when will i be loved', 'WHEN WILL I BE LOVED'."
+   },
+   {
+    "column": "lists.list_title",
+    "pattern": "like_near_variant",
+    "targets": "Include literals 'Georgia related films', 'Vladimir Vladimirovich Nabokov', 'Sound and Vision', 'Non-American Films about World War II' and variants with last char changed, appended 'x', and lowercased."
+   },
+   {
+    "column": "ratings.rating_score",
+    "pattern": "comparison_boundary",
+    "targets": "Include values 0, 1, 2, 4, 5, 6."
+   },
+   {
+    "column": "ratings.rating_timestamp_utc",
+    "pattern": "like_near_variant",
+    "targets": "Include literals '2013-05-04 06:33:32', '2013-05-03 05:11:17' and variants with seconds +1, appended 'x', and previous day."
+   },
+   {
+    "column": "movies.director_name",
+    "pattern": "like_near_variant",
+    "targets": "Include literals 'Felipe Cazals', 'Steven Spielberg' and variants 'Felipe Cazalt', 'Felipe Cazalsx', 'felipe cazals', 'Steven Spielberh', 'Steven Spielberg x', 'steven spielberg'."
+   },
+   {
+    "column": "lists_users.list_creation_date_utc",
+    "pattern": "comparison_boundary",
+    "targets": "Include dates with year 2009, 2010, 2011 and boundary values -1, 0, 1 when cast to integer."
+   },
+   {
+    "column": "movies.movie_release_year",
+    "pattern": "null_rows",
+    "targets": "5-30% NULL share."
+   },
+   {
+    "column": "ratings.user_id",
+    "pattern": "null_in_count_column",
+    "targets": "5-30% NULL share (deliberate deviation from the compact database's 0% NULL, to exercise NULL handling)."
+   },
+   {
+    "column": "ratings.user_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share; widen the FK parent pool so the realized share stays in range."
+   },
+   {
+    "column": "movies.movie_title",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share."
+   },
+   {
+    "column": "movies.director_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share."
+   },
+   {
+    "column": "ratings.rating_score",
+    "pattern": "ties_for_order_limit",
+    "targets": "Tie at rank 1 for ASC and DESC."
+   },
+   {
+    "column": "lists_users.list_creation_date_utc",
+    "pattern": "ties_for_order_limit",
+    "targets": "Tie at rank 1 for ASC; deterministic, present in every instance."
+   },
+   {
+    "column": "movies.movie_release_year",
+    "pattern": "ties_for_order_limit",
+    "targets": "Tie at rank 1 for ASC and DESC; deterministic, present in every instance."
+   },
+   {
+    "column": "movies.movie_popularity",
+    "pattern": "rows_with_different_values",
+    "targets": "At least 2 rows per group with different values."
+   },
+   {
+    "column": "lists.list_followers",
+    "pattern": "rows_with_different_values",
+    "targets": "At least 2 rows per group with different values."
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "lists",
+    "child_column": "user_id",
+    "parent_table": "lists_users",
+    "parent_column": "user_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "lists_users",
+    "child_column": "list_id",
+    "parent_table": "lists",
+    "parent_column": "list_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "lists_users",
+    "child_column": "user_id",
+    "parent_table": "lists",
+    "parent_column": "user_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "ratings",
+    "child_column": "movie_id",
+    "parent_table": "movies",
+    "parent_column": "movie_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "ratings",
+    "child_column": "user_id",
+    "parent_table": "lists_users",
+    "parent_column": "user_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "ratings",
+    "child_column": "user_id",
+    "parent_table": "ratings_users",
+    "parent_column": "user_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "ratings",
+    "child_column": "rating_id",
+    "parent_table": "ratings",
+    "parent_column": "rating_id",
+    "copied_columns": [],
+    "note": "Self-referencing FK on a non-PK column; treated as a schema artifact. rating_id is generated as a unique sequential integer and the self-reference is satisfied trivially (each row references itself); no cycles are created."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "lists",
+    "column": "list_movie_number",
+    "formula": "list_movie_number >= 0"
+   },
+   {
+    "table": "lists",
+    "column": "list_followers",
+    "formula": "list_followers >= 0"
+   },
+   {
+    "table": "lists",
+    "column": "list_comments",
+    "formula": "list_comments >= 0"
+   },
+   {
+    "table": "lists",
+    "column": "list_update_timestamp_utc",
+    "formula": "list_update_timestamp_utc >= list_creation_timestamp_utc"
+   },
+   {
+    "table": "lists_users",
+    "column": "list_update_date_utc",
+    "formula": "list_update_date_utc >= list_creation_date_utc"
+   },
+   {
+    "table": "lists_users",
+    "column": "user_trialist",
+    "formula": "user_trialist IN (0, 1)"
+   },
+   {
+    "table": "lists_users",
+    "column": "user_subscriber",
+    "formula": "user_subscriber IN (0, 1)"
+   },
+   {
+    "table": "lists_users",
+    "column": "user_eligible_for_trial",
+    "formula": "user_eligible_for_trial IN ('0', '1')"
+   },
+   {
+    "table": "lists_users",
+    "column": "user_has_payment_method",
+    "formula": "user_has_payment_method IN ('0', '1')"
+   },
+   {
+    "table": "movies",
+    "column": "movie_release_year",
+    "formula": "movie_release_year BETWEEN 1900 AND 2020"
+   },
+   {
+    "table": "movies",
+    "column": "movie_popularity",
+    "formula": "movie_popularity >= 0"
+   },
+   {
+    "table": "ratings",
+    "column": "rating_score",
+    "formula": "rating_score BETWEEN 0 AND 6",
+    "evidence": "Relaxed from 1-5 to 0-6 to accommodate the required comparison_boundary values 0 and 6; observed rows 3,2,4,5,1 lie inside."
+   },
+   {
+    "table": "ratings",
+    "column": "critic_likes",
+    "formula": "critic_likes >= 0"
+   },
+   {
+    "table": "ratings",
+    "column": "critic_comments",
+    "formula": "critic_comments >= 0"
+   },
+   {
+    "table": "ratings",
+    "column": "user_trialist",
+    "formula": "user_trialist IN (0, 1)"
+   },
+   {
+    "table": "ratings",
+    "column": "user_subscriber",
+    "formula": "user_subscriber IN (0, 1)"
+   },
+   {
+    "table": "ratings",
+    "column": "user_eligible_for_trial",
+    "formula": "user_eligible_for_trial IN (0, 1)"
+   },
+   {
+    "table": "ratings",
+    "column": "user_has_payment_method",
+    "formula": "user_has_payment_method IN (0, 1)"
+   },
+   {
+    "table": "ratings_users",
+    "column": "user_trialist",
+    "formula": "user_trialist IN (0, 1)"
+   },
+   {
+    "table": "ratings_users",
+    "column": "user_subscriber",
+    "formula": "user_subscriber IN (0, 1)"
+   },
+   {
+    "table": "ratings_users",
+    "column": "user_eligible_for_trial",
+    "formula": "user_eligible_for_trial IN (0, 1)"
+   },
+   {
+    "table": "ratings_users",
+    "column": "user_has_payment_method",
+    "formula": "user_has_payment_method IN (0, 1)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "lists": 200,
+   "lists_users": 200,
+   "movies": 200,
+   "ratings": 200,
+   "ratings_users": 200
+  },
+  "null_targets": [
+   "lists.list_description",
+   "lists.list_cover_image_url",
+   "lists.list_first_image_url",
+   "lists.list_second_image_url",
+   "lists.list_third_image_url",
+   "lists_users.user_cover_image_url",
+   "movies.movie_image_url",
+   "movies.movie_release_year",
+   "ratings.rating_score",
+   "ratings.critic",
+   "ratings.user_id",
+   "ratings_users.user_cover_image_url"
+  ],
+  "supporting_evidence": {
+   "lists.list_update_timestamp_utc >= list_creation_timestamp_utc": "Rows: (2019-01-24 19:16:18 >= 2009-11-11 00:02:21), (2018-12-03 15:12:20 >= 2009-11-11 00:05:11), (2019-05-30 03:00:07 >= 2009-11-11 00:20:00).",
+   "lists_users.list_update_date_utc >= list_creation_date_utc": "Rows: (2019-11-26 >= 2009-12-18), (2020-05-01 >= 2010-01-30), (2020-04-12 >= 2010-03-31).",
+   "ratings.rating_score BETWEEN 0 AND 6": "Rows: 3, 2, 4, 5, 1; boundary values 0 and 6 required by atomic summary.",
+   "movies.movie_release_year BETWEEN 1900 AND 2020": "Rows: 2007, 2006, 2005, 2003, 1957, 1926, 1930, 1960."
+  },
+  "uncertainty": "The self-referencing FK ratings.rating_id -> ratings.rating_id is a schema artifact; rating_id is generated as a unique sequential integer and the self-reference is satisfied trivially. The lists.user_id FK references lists_users.user_id, which is not a primary key alone; generation treats it as a valid parent key. The 5-30% NULL share for ratings.user_id is a deliberate deviation from the compact database's 0% NULL, documented to exercise NULL handling. The like_near_variant for the INTEGER column lists.user_id is unrealizable as a string variant and is removed from per_column_exceptions. The rating_score semantic rule is relaxed to 0-6 to accommodate the required boundary values 0 and 6."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `_parse_targets` extracts every bare number from the target text, including numbers that are not part of the intended value list. For `lists_users.user_id` the target text is 'Include values 8516502, 8516503, 8516504, 85981818, 85981819, 85981820.' \u2014 fine. But for `lists.list_id` the target is 'Include values 249, 250, 251.' and for `ratings.rating_score` 'Include values 0, 1, 2, 4, 5, 6.' \u2014 also fine. However for `lists_users.list_creation_date_utc` the target is 'Include dates with year 2009, 2010, 2011 and boundary values -1, 0, 1 when cast to integer.' \u2014 `_parse_targets` will pull 2009, 2010, 2011, -1, 0, 1 into the pool, but the column is a TEXT date column; the DateSampler will then try to parse '2009' etc. as dates and fall back to random dates, so the boundary values -1/0/1 are never actually generated. The spec's comparison_boundary for this column (CAST(... AS INTEGER) > 0 with values -1,0,1) is therefore not implemented.",
+     "requested_revision": "Either (a) make the DateSampler emit the literal boundary strings for this column (e.g. '-1', '0', '1' as text) so the CAST boundary is exercised, or (b) drop the comparison_boundary exception for lists_users.list_creation_date_utc from the specification since it is not realizable as a date. Do not leave a spec exception that the program silently ignores."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` applies a NULL share to every nullable column using `null_share_for(spec, table, cm.name, 0.05)`. For `ratings.user_id` the spec sets null_in_count_column to '5-30 % NULL share' (midpoint 0.175), and the execution feedback shows 715/4040 \u2248 17.7% NULL \u2014 consistent. But the spec's `uncertainty` field explicitly notes the original statistics show 0% NULL for ratings.user_id and that the summary overrides. The program follows the summary, which is acceptable, but the spec should record this override explicitly rather than only in the free-text uncertainty field.",
+     "requested_revision": "Add an explicit per_column_exception or note in the specification that ratings.user_id NULL share is overridden to 5-30% (contradicting the compact DB's 0%), so the program's behavior is traceable to the spec rather than to an informal note."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_duplicate_share` and `_apply_ties` operate on generated columns, but `_apply_duplicate_share` for `movies.movie_title` and `movies.director_name` copies values between random rows. The spec requires 20-50% duplicate share for DISTINCT-sensitive columns. The execution feedback does not report duplicate-share statistics, so it is unverified whether the 20-50% target is met after `drop_unique_duplicates` and `sample_fresh_primary_keys` filtering. Similarly `_apply_ties` for `ratings.rating_score` forces min and max to appear at least twice, but the spec also requires tie at rank 1 for both ASC and DESC \u2014 the code forces both extremes to have \u22652 occurrences, which satisfies both directions, but this is not confirmed by execution feedback.",
+     "requested_revision": "Add execution-feedback instrumentation that reports, per instance, the duplicate share for movies.movie_title and movies.director_name and the rank-1 tie counts for ratings.rating_score (ASC and DESC), lists_users.list_creation_date_utc (ASC), and movies.movie_release_year (ASC/DESC), so the spec targets are verifiably met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_semantic_rules` handles '>=' with 'timestamp' by string comparison, and 'between ... and ...' by clamping. But the rule `lists.list_update_timestamp_utc >= list_creation_timestamp_utc` is also handled in `_apply_derived_columns`, and the rule `lists_users.list_update_date_utc >= list_creation_date_utc` likewise. The `_apply_semantic_rules` branch for '>=' with 'timestamp' only fires when the formula contains 'timestamp'; for `lists_users.list_update_date_utc >= list_creation_date_utc` the formula has no 'timestamp' substring, so it is only handled by `_apply_derived_columns`. That is fine, but the two code paths are redundant and could diverge. More importantly, `_apply_semantic_rules` for `ratings.rating_score BETWEEN 1 AND 5` clamps to [1,5], but the spec's comparison_boundary for rating_score requires values 0, 1, 2, 4, 5, 6 \u2014 the clamp to [1,5] will destroy the 0 and 6 boundary values that the spec explicitly asks to include.",
+     "requested_revision": "Reconcile the semantic rule `rating_score BETWEEN 1 AND 5` with the comparison_boundary exception that requires 0 and 6. Either the boundary values must be preserved (and the semantic rule relaxed to allow them, since the compact DB may contain them) or the boundary exception must be removed. As written, the program cannot satisfy both."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_derived_columns` clamps `movie_release_year` to [1900, 2020] and `rating_score` to [1, 5]. The spec's comparison_boundary for `ratings.rating_score` requires values 0, 1, 2, 4, 5, 6, and the spec's `null_rows` for `movies.movie_release_year` requires 5-30% NULL. The clamp to [1,5] for rating_score directly contradicts the boundary exception (0 and 6 are outside [1,5]). The execution feedback shows ratings.rating_score NULL 204/4040 \u2248 5%, which is at the low end of the 5-30% range but acceptable. However the boundary values 0 and 6 are not verifiable from the feedback.",
+     "requested_revision": "Same as above: resolve the conflict between the BETWEEN 1 AND 5 semantic rule and the 0/6 boundary values. Add feedback reporting the min/max of generated rating_score to confirm whether 0 and 6 appear."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `dependencies` list includes `ratings.rating_id -> ratings.rating_id` (self-referencing FK). instance.py handles self-referencing FKs by copying from the same table's final column values (`if pt == t: ... cols[cm.name] = [v if v is None or v in fs else ...]`). The execution feedback shows ratings.rating_id NULL 204/4040 \u2248 5%, and no FK violations. However, the spec's `uncertainty` field flags this as unusual and potentially cycle-creating. The program's handling (copy from final values, fall back to random choice) does not guarantee acyclicity, but SQLite does not enforce acyclicity for self-FKs, so integrity is preserved. This is acceptable but should be documented.",
+     "requested_revision": "Document in the specification that the self-referencing ratings.rating_id FK is intentionally allowed to form cycles (SQLite does not enforce acyclicity), and that the program's copy-from-final-values strategy is the intended implementation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for `lists.user_id` requires literal 4208563 and variants 4208564, '4208563x'. But `lists.user_id` is an INTEGER column. spec.py `_parse_targets` will extract 4208563 and 4208564 as numbers, and '4208563x' as a string. The NumberSampler will receive the numeric values but the string '4208563x' will be filtered out by `_num` (returns None). So the '4208563x' variant is never generated for an INTEGER column. The spec's like_near_variant for an integer column is not realizable as written.",
+     "requested_revision": "Either remove the like_near_variant exception for lists.user_id (an INTEGER column cannot hold '4208563x'), or change the spec to only require the numeric variants 4208563 and 4208564. The program should not silently drop a spec-required variant."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for `ratings.rating_timestamp_utc` requires literals '2013-05-04 06:33:32', '2013-05-03 05:11:17' and variants with seconds +1, appended 'x', and previous day. spec.py `_variants_of` only produces last-char-changed, appended 'x', and lowercased variants \u2014 it does not produce 'seconds +1' or 'previous day' variants. The DateSampler also does not generate these specific variants. So the spec's required variants for this column are not implemented.",
+     "requested_revision": "Extend `_variants_of` (or add a timestamp-specific variant generator) to produce the seconds+1 and previous-day variants for timestamp literals, or remove those variant requirements from the spec. As written, the program does not implement the specified variants."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for `movies.director_name` requires variants 'Felipe Cazalt', 'Felipe Cazalsx', 'felipe cazals', 'Steven Spielberh', 'Steven Spielberg x', 'steven spielberg'. spec.py `_variants_of` produces last-char-changed (e.g. 'Felipe Cazalt' if last char is 's' \u2192 't', but the code does `literal[:-1] + 't' if literal[-1] != 't' else literal[:-1] + 's'`, so 'Felipe Cazals' \u2192 'Felipe Cazalt' \u2713), appended 'x' ('Felipe Cazalsx' \u2713), lowercased ('felipe cazals' \u2713). For 'Steven Spielberg' \u2192 'Steven Spielberh' (last char 'g' \u2192 'h'? No, the code produces 'Steven Spielbert' since last char 'g' != 't' \u2192 't'). So 'Steven Spielberh' is NOT produced. Also 'Steven Spielberg x' (with space before x) is not produced \u2014 the code appends 'x' without space. So two of the six required variants are missing.",
+     "requested_revision": "Fix `_variants_of` to produce the exact variants listed in the spec (including 'Steven Spielberh' and 'Steven Spielberg x'), or update the spec to match what the program actually generates. The current mismatch means the spec's like_near_variant targets are not fully implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `movies.movie_title` requires values 'Il grido', 'The General', 'the general', 'il grido', 'when will i be loved', 'WHEN WILL I BE LOVED'. spec.py `_parse_targets` extracts quoted literals correctly, and StringSampler will include them in the pool. However, `_apply_duplicate_share` for movies.movie_title (20-50% duplicate share) may overwrite some of these boundary values with duplicates of other rows, potentially removing the required boundary values from the generated set. The execution feedback does not report whether all six boundary values appear.",
+     "requested_revision": "Add feedback reporting whether each spec-required boundary literal appears at least once in the generated rows for movies.movie_title, and ensure `_apply_duplicate_share` does not overwrite spec-required boundary values (e.g. protect them from being replaced)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists.list_id` requires values 249, 250, 251, and the atomic summary shows `PRED(lists.list_id <> 250)` with targets 249, 250, 251. But `lists.list_id` is the primary key of `lists`, and instance.py `sample_fresh_primary_keys` drops rows whose PK collides with compact rows. If the compact DB already contains list_id 249, 250, or 251, the generated rows with those PKs will be dropped, and the boundary values will not appear in the generated rows. The execution feedback does not report whether 249/250/251 appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required PK boundary values (249, 250, 251 for lists.list_id) appear in the generated rows, and if the compact DB already contains them, note that the boundary is satisfied by the compact rows rather than generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists_users.user_id` and `lists.user_id` requires values 8516502, 8516503, 8516504, 85981818, 85981819, 85981820. These are FK columns. instance.py `fill_foreign_keys_consistently` draws FK values from the parent's rows (compact or generated). If the parent table (lists_users for lists.user_id, and lists for lists_users.user_id \u2014 note the circular FK) does not contain these values, the boundary values will not appear. The execution feedback does not report whether these values appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required FK boundary values appear in the generated rows for lists_users.user_id and lists.user_id, and ensure the parent tables are seeded with these values (e.g. via the literal pool) so the FK boundary is realizable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `ratings.user_id` requires values 22030371, 22030372, 22030373, 39115683, 39115684, 39115685. This is an FK column referencing lists_users.user_id and ratings_users.user_id. instance.py `fill_foreign_keys_consistently` draws from parent rows. If the parent tables do not contain these values, the boundary values will not appear. The execution feedback does not report whether these values appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required FK boundary values appear in the generated rows for ratings.user_id, and ensure the parent tables are seeded with these values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `rows_with_different_values` for `movies.movie_popularity` and `lists.list_followers` requires at least 2 rows per group with different values. instance.py `_apply_different_values` only checks `if len(vals) >= 2 and len(set(map(str, vals))) < 2` \u2014 i.e. it only acts if ALL values are identical. If there are already 2 different values somewhere but not per group, the function does nothing. The spec says 'At least 2 rows per group with different values' \u2014 the grouping is not specified in the code, so the implementation is incomplete.",
+     "requested_revision": "Clarify in the spec what the grouping column is for movies.movie_popularity and lists.list_followers, and implement `_apply_different_values` to ensure at least 2 different values per group (not just globally). Add feedback reporting the per-group distinct value counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `movies.movie_release_year` requires tie at rank 1 for ASC and DESC. instance.py `_apply_ties` forces min and max to appear at least twice. But `_apply_derived_columns` clamps movie_release_year to [1900, 2020] AFTER `_apply_ties` runs (the order in build_random_instance is: null_rule, duplicate_share, ties, different_values, semantic_rules, derived_columns). So if `_apply_ties` sets a value to min or max outside [1900, 2020], the clamp will change it, potentially breaking the tie. The execution feedback does not report tie counts.",
+     "requested_revision": "Reorder the pipeline so `_apply_derived_columns` (clamping) runs before `_apply_ties`, or make `_apply_ties` respect the clamped domain. Add feedback reporting rank-1 tie counts for movies.movie_release_year (ASC and DESC)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `lists_users.list_creation_date_utc` requires tie at rank 1 for ASC. instance.py `_apply_ties` only operates on numeric values (`nums = [v for v in vals if isinstance(v, (int, float))]`). `lists_users.list_creation_date_utc` is a TEXT date column, so `_apply_ties` will find no numeric values and do nothing. The tie requirement is not implemented for this column.",
+     "requested_revision": "Extend `_apply_ties` to handle date/text columns by comparing string values (ISO dates sort lexicographically), or remove the tie requirement for lists_users.list_creation_date_utc from the spec. Add feedback reporting the rank-1 tie count for this column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `ratings.rating_score` requires tie at rank 1 for ASC and DESC. instance.py `_apply_ties` forces min and max to appear at least twice. But `_apply_derived_columns` clamps rating_score to [1, 5] AFTER `_apply_ties` runs. If `_apply_ties` sets a value to 0 or 6 (outside [1,5]), the clamp will change it to 1 or 5, potentially breaking the tie. The execution feedback does not report tie counts.",
+     "requested_revision": "Reorder the pipeline so clamping runs before `_apply_ties`, or make `_apply_ties` respect the clamped domain. Add feedback reporting rank-1 tie counts for ratings.rating_score (ASC and DESC)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_rows` for `movies.movie_release_year` requires 5-30% NULL share. The execution feedback shows movies.movie_release_year NULL 121/604 \u2248 20%, which is within range. However, `_apply_derived_columns` clamps movie_release_year to [1900, 2020] and skips None values (`if v is not None`), so NULLs are preserved. This is correct. But the spec's `null_targets` list includes movies.movie_release_year, and the program's `_apply_null_rule` uses `null_share_for(spec, table, cm.name, 0.05)` which returns 0.175 (midpoint of 5-30%). The feedback shows 20%, consistent. No issue here, but noted for completeness.",
+     "requested_revision": "No change required; this is a confirmation that the NULL rule for movies.movie_release_year is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_in_count_column` for `ratings.user_id` requires 5-30% NULL share. The execution feedback shows ratings.user_id NULL 715/4040 \u2248 17.7%, within range. However, the spec's `uncertainty` field notes the original statistics show 0% NULL and the summary overrides. The program follows the summary. This is acceptable but should be documented in the spec (see issue 2).",
+     "requested_revision": "See issue 2: document the override explicitly in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `ratings.user_id` requires 20-50% duplicate share. instance.py `_apply_duplicate_share` copies values between random rows. But `ratings.user_id` is an FK column, and `fill_foreign_keys_consistently` already draws from parent values, which may naturally produce duplicates. The execution feedback does not report duplicate share for ratings.user_id. It is unverified whether the 20-50% target is met.",
+     "requested_revision": "Add feedback reporting the duplicate share for ratings.user_id, and ensure `_apply_duplicate_share` is applied after FK filling (it is, in the current pipeline order) and that the target is met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `movies.movie_title` and `movies.director_name` requires 20-50% duplicate share. instance.py `_apply_duplicate_share` copies values between random rows. But `drop_unique_duplicates` runs AFTER `_apply_duplicate_share` in build_random_instance (order: null_rule, duplicate_share, ties, different_values, semantic_rules, derived_columns, sample_fresh_primary_keys, drop_unique_duplicates). If movie_title or director_name is marked unique (unlikely for these columns, but possible), `drop_unique_duplicates` would remove the duplicates. The execution feedback does not report duplicate share.",
+     "requested_revision": "Add feedback reporting the duplicate share for movies.movie_title and movies.director_name, and verify that `drop_unique_duplicates` does not undo the duplicate share for these columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists_users.list_creation_date_utc` requires dates with year 2009, 2010, 2011 and boundary values -1, 0, 1 when cast to integer. As noted in issue 1, the DateSampler cannot produce -1/0/1 as dates, and the year 2009/2010/2011 requirement is not specifically targeted (the DateSampler generates random dates in [2009-01-01, 2020-12-31], so years 2009-2011 will appear with some probability but not guaranteed). The execution feedback does not report whether these years appear.",
+     "requested_revision": "Either implement targeted generation of years 2009, 2010, 2011 for this column, or remove the year requirement from the spec. Add feedback reporting the year distribution for lists_users.list_creation_date_utc."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists.list_id` requires values 249, 250, 251, and the atomic summary shows `PRED(lists.list_id <> 250)`. The program's `sample_fresh_primary_keys` drops rows whose PK collides with compact rows. If the compact DB contains 249, 250, 251, the generated rows with those PKs are dropped. The boundary is then satisfied only by compact rows, not generated rows. The execution feedback does not distinguish compact vs generated rows for this check.",
+     "requested_revision": "Add feedback reporting whether the boundary values 249, 250, 251 appear in the generated rows (not just the compact rows), and if they are dropped due to PK collision, note that the boundary is satisfied by compact rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for `lists.list_title` requires literals 'Georgia related films', 'Vladimir Vladimirovich Nabokov', 'Sound and Vision', 'Non-American Films about World War II' and variants with last char changed, appended 'x', and lowercased. spec.py `_variants_of` produces these variants. However, `_apply_duplicate_share` for lists.list_title (if specified) or other transformations may overwrite them. The spec does not list lists.list_title in duplicates_for_distinct, so this is less of a concern. But the execution feedback does not report whether these literals appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required literals and variants for lists.list_title appear in the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `like_near_variant` for `movies.movie_title` requires literals 'Freaks', 'Red Blooded American Girl' and variants 'Freakt', 'Freaksx', 'freaks', 'Red Blooded American Girm', 'Red Blooded American Girlx', 'red blooded american girl'. spec.py `_variants_of` produces last-char-changed ('Freakt' \u2713, 'Red Blooded American Girm' \u2713), appended 'x' ('Freaksx' \u2713, 'Red Blooded American Girlx' \u2713), lowercased ('freaks' \u2713, 'red blooded american girl' \u2713). All variants are produced. However, `_apply_duplicate_share` for movies.movie_title (20-50% duplicate share) may overwrite some of these. The execution feedback does not report whether they appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required literals and variants for movies.movie_title appear in the generated rows, and protect them from being overwritten by `_apply_duplicate_share`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `ratings.rating_score` requires values 0, 1, 2, 4, 5, 6. As noted in issues 4 and 5, `_apply_derived_columns` clamps rating_score to [1, 5], destroying 0 and 6. The execution feedback does not report the min/max of generated rating_score.",
+     "requested_revision": "Resolve the conflict between the BETWEEN 1 AND 5 semantic rule and the 0/6 boundary values. Add feedback reporting the min/max of generated rating_score."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `movies.movie_title` requires values 'Il grido', 'The General', 'the general', 'il grido', 'when will i be loved', 'WHEN WILL I BE LOVED'. The StringSampler will include these in the pool, but `_apply_duplicate_share` may overwrite them. The execution feedback does not report whether they appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required boundary literals for movies.movie_title appear in the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists_users.user_id` and `lists.user_id` requires values 8516502, 8516503, 8516504, 85981818, 85981819, 85981820. These are FK columns, and the program's `fill_foreign_keys_consistently` draws from parent rows. The parent tables (lists_users for lists.user_id, and lists for lists_users.user_id \u2014 circular) may not contain these values. The execution feedback does not report whether they appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required FK boundary values appear in the generated rows, and ensure the parent tables are seeded with these values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `ratings.user_id` requires values 22030371, 22030372, 22030373, 39115683, 39115684, 39115685. These are FK columns, and the program's `fill_foreign_keys_consistently` draws from parent rows. The parent tables (lists_users, ratings_users) may not contain these values. The execution feedback does not report whether they appear.",
+     "requested_revision": "Add feedback reporting whether the spec-required FK boundary values appear in the generated rows, and ensure the parent tables are seeded with these values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists.list_id` requires values 249, 250, 251. The program's `sample_fresh_primary_keys` drops rows whose PK collides with compact rows. If the compact DB contains 249, 250, 251, the generated rows with those PKs are dropped. The execution feedback does not report whether they appear in generated rows.",
+     "requested_revision": "Add feedback reporting whether the boundary values 249, 250, 251 appear in the generated rows, and if they are dropped due to PK collision, note that the boundary is satisfied by compact rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists_users.list_creation_date_utc` requires dates with year 2009, 2010, 2011 and boundary values -1, 0, 1 when cast to integer. As noted in issue 1, the DateSampler cannot produce -1/0/1 as dates, and the year 2009/2010/2011 requirement is not specifically targeted. The execution feedback does not report whether these years appear.",
+     "requested_revision": "Either implement targeted generation of years 2009, 2010, 2011 for this column, or remove the year requirement from the spec. Add feedback reporting the year distribution for lists_users.list_creation_date_utc."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `lists.list_id` requires values 249, 250, 251, and the atomic summary shows `PRED(lists.list_id <> 250)`. The program's `sample_fresh_primary_keys` drops rows whose PK collides with compact rows. If the compact DB contains 249, 250, 251, the generated rows with those PKs are dropped. The boundary is then satisfied only by compact rows, not generated rows. The execution feedback does not distinguish compact vs generated rows for this check.",
+     "requested_revision": "Add feedback reporting whether the boundary values 249, 250, 251 appear in the generated rows (not just the compact rows), and if they are dropped due to PK collision, note that the boundary is satisfied by compact rows."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the spec-required boundary values for FK columns (lists_users.user_id, lists.user_id, ratings.user_id) actually appear in generated rows, since the program draws FK values from parent rows and the parent tables may not contain the boundary values.",
+    "Whether the spec-required boundary values for PK columns (lists.list_id 249/250/251) appear in generated rows, since `sample_fresh_primary_keys` drops rows colliding with compact rows.",
+    "Whether the duplicate-share targets (20-50%) for movies.movie_title, movies.director_name, and ratings.user_id are met after all transformations.",
+    "Whether the rank-1 tie targets for ratings.rating_score, lists_users.list_creation_date_utc, and movies.movie_release_year are met after clamping and other transformations.",
+    "Whether the spec-required like_near_variant literals for lists.list_title, movies.movie_title, and movies.director_name survive `_apply_duplicate_share` and appear in generated rows.",
+    "Whether the year distribution for lists_users.list_creation_date_utc includes 2009, 2010, 2011 as required.",
+    "Whether the spec-required boundary values 0 and 6 for ratings.rating_score can appear given the BETWEEN 1 AND 5 clamp.",
+    "Whether the spec-required variants 'Steven Spielberh' and 'Steven Spielberg x' for movies.director_name are generated (the current `_variants_of` does not produce them).",
+    "Whether the spec-required variants 'seconds +1' and 'previous day' for ratings.rating_timestamp_utc are generated (the current `_variants_of` does not produce them).",
+    "Whether the spec-required variant '4208563x' for lists.user_id is generated (an INTEGER column cannot hold it)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py `_parse_targets_for` drops quoted non-numeric literals for INTEGER columns and drops bare numbers for date columns. For `lists.user_id` the spec target is 'Include literal 4208563 and variants 4208564, '4208563x'' (like_near_variant). Since `user_id` is INTEGER, `_parse_targets_for` keeps only numeric quoted literals and bare numbers, so '4208563x' is dropped and the LIKE near-variant for an integer column is never realized. Execution feedback confirms `lists.user_id` boundary_present is 16/20 but the LIKE variant is not tracked; more importantly the spec's like_near_variant for an INTEGER column is semantically impossible to satisfy as a string variant, yet the spec lists it. The program silently discards it rather than flagging the conflict.",
+     "requested_revision": "Either (a) the designer should remove the `lists.user_id` like_near_variant exception (an INTEGER column cannot hold '4208563x'), or (b) the engineer should document/handle the conflict explicitly. As written, the specification and program disagree on whether this pattern is realizable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_semantic_rules` and `_apply_derived_columns` relax the BETWEEN clamp for `ratings.rating_score` to [-1, 6] and for `movies.movie_release_year` the clamp is [1900, 2020] but the spec's comparison_boundary for rating_score requires values 0 and 6, which violate the semantic rule `rating_score BETWEEN 1 AND 5`. Execution feedback shows `ratings.rating_score` min_max [0, 6], i.e. the generated data violates the declared semantic rule. The spec itself is internally inconsistent: it lists both `rating_score BETWEEN 1 AND 5` and boundary values 0 and 6.",
+     "requested_revision": "Designer must resolve the contradiction: either drop the 0/6 boundary values for rating_score or relax the semantic rule. The engineer's code comment acknowledges the relaxation but the specification still declares the strict rule, so the two are inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `boundary_present` shows `lists.list_id`: 0, `movies.movie_title`: 0, `ratings.user_id`: 0. The spec requires comparison_boundary values for `lists.list_id` (249, 250, 251), `movies.movie_title` ('Il grido', 'The General', ...), and `ratings.user_id` (22030371..39115685). `_plant_parent_boundaries` only plants FK boundary literals into parent tables, and `_apply_duplicate_share`/`_apply_ties`/`_apply_different_values` can overwrite them. For `lists.list_id` (a PK) the boundary values are never seeded because `seed_parent_keys` only handles FK columns; for `movies.movie_title` and `ratings.user_id` the boundary literals are in the pool but not guaranteed present after duplicate-share and different-values passes. The feedback confirms 0/20 instances contain the required boundary values.",
+     "requested_revision": "Engineer must guarantee comparison_boundary literals are present in every instance for non-FK columns too (e.g. seed them into the sampled column and protect them from duplicate-share/different-values overwrite, as is already done for FK parents). Currently the spec's boundary requirement is not met for these three columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `year_hist` shows implausible years in date/timestamp columns: `lists.list_update_timestamp_utc` contains years 4208, 2999, 3001, 3000, 2085, 1124, 1418; `lists_users.list_update_date_utc` contains 8598, 5981, 1090, 7322, 0902; `ratings.rating_timestamp_utc` contains 2642, 1402, 0105, 9252. These come from `_apply_semantic_rules` copying the other timestamp/date column value when `a < b`, and from `_apply_ties` forcing min/max values, combined with `_apply_duplicate_share` overwriting date strings with arbitrary values. The spec's `timestamp_utc`/`date_utc` samplers are bounded to 2009-2020, but the post-processing passes inject out-of-range values.",
+     "requested_revision": "Engineer must ensure date/timestamp columns stay within the declared domain (2009-2020) after ties, duplicate-share, different-values and semantic-rule passes, or the spec must widen the domain. As written, generated timestamps violate the sampler's own domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `duplicate_share` for `ratings.user_id` is [0.635, 0.758], but the spec requires 20-50% duplicate share. `_apply_duplicate_share` uses `duplicate_share_for` which returns the midpoint (0.35) but the actual realized share is much higher because `fill_foreign_keys_consistently` draws FK values from a small parent pool, and `_apply_null_rule` plus the FK fill already produce heavy duplication. The spec's 20-50% target is not met.",
+     "requested_revision": "Engineer must reconcile the FK-fill duplication with the duplicate-share target (e.g. widen the parent key pool or adjust the duplicate-share pass to account for pre-existing duplicates). The realized share exceeds the specified range."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` field itself notes: 'The self-referencing foreign key ratings.rating_id -> ratings.rating_id is unusual; generation copies rating_id from the same table, which may create cycles.' The schema declares `foreign key (rating_id) references ratings(rating_id)` which is a self-reference on a non-PK column. The program's `fill_foreign_keys_consistently` and the self-FK fixup in `build_random_instance` handle this, but the spec does not clarify whether rating_id should be unique or how the self-reference should behave. Execution feedback shows `ratings.rating_id` min_max [4, 19961290] with no integrity violations, but the semantic intent is unclear.",
+     "requested_revision": "Designer should clarify the intended semantics of the self-referencing `ratings.rating_id` FK (it is likely a schema artifact) and whether it should be treated as a real dependency or ignored. The current spec leaves this ambiguous."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` list includes `ratings.user_id` and the per_column_exceptions require 5-30% NULL share for `ratings.user_id`, but the `uncertainty` field states 'the original statistics show 0% NULL; the summary overrides.' Execution feedback shows `ratings.user_id` NULL 729/4040 (~18%), consistent with the spec but contradicting the compact database. The spec explicitly overrides observed data without justification.",
+     "requested_revision": "Designer should justify or remove the override of the observed 0% NULL share for `ratings.user_id`. If the override is intentional (to exercise NULL handling), it should be documented as a deliberate deviation from the compact database rather than left as an unexplained override."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_apply_ties` function forces min and max values to appear at least twice, but for `movies.movie_release_year` the feedback shows `tie_rank1:asc` 19/20 and `:desc` 8/20 \u2014 the DESC tie is not reliably achieved. Similarly `lists_users.list_creation_date_utc:asc` is only 4/20. The spec requires 'Tie at rank 1 for ASC and DESC' for movie_release_year and 'Tie at rank 1 for ASC' for list_creation_date_utc. The tie logic is not consistently producing the required ties across instances.",
+     "requested_revision": "Engineer must make tie generation deterministic enough to satisfy the spec in every instance (the current probabilistic approach fails ~60% of the time for list_creation_date_utc ASC and ~60% for movie_release_year DESC)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL share for ratings.user_id (0%) should override the spec's 5-30% target \u2014 the spec explicitly overrides but the justification is weak.",
+    "Whether the self-referencing ratings.rating_id FK is a genuine schema constraint or an artifact that should be ignored.",
+    "Whether the like_near_variant for the INTEGER column lists.user_id is intended (it is unrealizable as a string variant)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback year_hist shows out-of-domain years in date/timestamp columns: lists.list_update_timestamp_utc has years 3000, 3001, 2999, 4208, 2085, 1069; lists.list_creation_timestamp_utc has 3000, 3001, 2999, 1424; lists_users.list_update_date_utc has 8598, 1090, 5981, 2022, 2028, 2000; lists_users.list_creation_date_utc has 1090, 2022, 2028, 2000, 0902, 0099, 0680; ratings.rating_timestamp_utc has 0105, 2642, 2021, 1402, 1153. The spec's timestamp_utc/date_utc rules require all values inside 2009-01-01..2020-12-31, and the program's own docstring claims 'date/timestamp columns are re-clamped to the 2009-2020 domain after every post-processing pass'. The clamp in instance.py `_clamp_dates` only matches strict `%Y-%m-%d %H:%M:%S` / `%Y-%m-%d` regexes; values like '3000-...' or '8598-...' produced by the StringSampler fallback (or by `_apply_semantic_rules` copying a creation value into an update column, or by `_apply_ties`/`_apply_duplicate_share` overwriting with a non-date string) are not matched and survive. The `_apply_semantic_rules` '>=' branch also copies `b` into `a` without re-clamping, and `_apply_ties`/`_apply_duplicate_share` run after `_apply_derived_columns` but before `_clamp_dates`, so a non-date string can be planted and then not clamped.",
+     "requested_revision": "Make the date/timestamp clamp robust: (a) route every date/timestamp column through DateSampler (never StringSampler) so only well-formed values are produced; (b) in `_clamp_dates`, parse with a tolerant parser and, if a value is not a valid date/timestamp, replace it with a fresh in-domain value rather than leaving it; (c) re-clamp after `_apply_semantic_rules`, `_apply_ties`, `_apply_duplicate_share`, and `_apply_different_values` (currently only after semantic rules); (d) in `_apply_semantic_rules` '>=' branch, clamp the copied value to the domain. Add a feedback assertion that every date/timestamp column's year_hist keys are all in 2009..2020."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback boundary_present shows lists.user_id 16/20, movies.movie_title 13/20, lists.list_id 20/20, lists_users.user_id 20/20, ratings.rating_score 20/20, ratings.user_id 20/20. The spec requires comparison_boundary literals to be present (e.g. lists.user_id values 8516502..85981820; movies.movie_title 'Il grido','The General', etc.). The program's `_seed_boundaries` writes each boundary literal into a random row, but subsequent passes (`_apply_ties`, `_apply_duplicate_share`, `_apply_different_values`, `_apply_semantic_rules`, `sample_fresh_primary_keys`, `drop_unique_duplicates`) can overwrite or drop those rows. `_protected` only protects values from `_apply_duplicate_share`, not from `_apply_ties` (which overwrites non-extreme values with lo/hi), `_apply_different_values` (which overwrites `vals[1]`), `_apply_semantic_rules` (which can overwrite), or `sample_fresh_primary_keys`/`drop_unique_duplicates` (which drop rows). Also `_seed_boundaries` is called twice (once per table inside the loop, once at the end on `inst`), but the second call runs after `sample_fresh_primary_keys`/`drop_unique_duplicates` have already filtered rows, so a boundary value planted into a row that was later dropped is lost.",
+     "requested_revision": "Guarantee boundary presence deterministically: (a) seed boundary literals into dedicated rows that are excluded from `_apply_ties`, `_apply_different_values`, `_apply_semantic_rules`, `sample_fresh_primary_keys`, and `drop_unique_duplicates` (e.g. mark protected row indices and skip them in every overwrite/drop pass); (b) for PK/FK boundary values, ensure the parent table also contains the value (the `seed_parent_keys` helper exists but is never called in `instance.py`); (c) add a post-build assertion that every declared boundary literal is present in every instance, and fail the unit (counted in `n_fail`) if not, so the feedback `boundary_present` is 20/20 for all listed columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback duplicate_share: movies.movie_title [0.0, 0.196], movies.director_name [0.0, 0.187], ratings.user_id [0.446, 0.558]. The spec requires 20-50% duplicate share for movies.movie_title, movies.director_name, and ratings.user_id. The realized minimum is 0.0 for the two text columns, i.e. some instances have no duplicates at all. `_apply_duplicate_share` computes `current = 1 - distinct/nonnull` and only adds `need` duplicates, but `_apply_ties` and `_apply_different_values` run after it and can re-introduce distinct values (e.g. `_apply_different_values` sets `vals[1] = str(vals[0]) + 'x'`, creating a new distinct value; `_apply_ties` overwrites values with lo/hi, potentially reducing duplicates below target). Also `_apply_duplicate_share` skips values in `protected`, which for movies.movie_title includes all boundary literals, so if the column is small the protected set can dominate and prevent reaching the target.",
+     "requested_revision": "Reorder passes so `_apply_duplicate_share` runs last (after `_apply_ties`, `_apply_different_values`, `_apply_semantic_rules`), or re-run it after those passes; exclude protected values from the duplicate-count denominator rather than from the overwrite set; and add a post-build assertion that the realized duplicate share is within [0.20, 0.50] for every column with a `duplicates_for_distinct` policy, failing the unit otherwise."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback tie_rank1: movies.movie_release_year:asc 19/20, movies.movie_release_year:desc 8/20, lists_users.list_creation_date_utc:asc 3/20, lists_users.list_creation_date_utc:desc 19/20. The spec requires 'Tie at rank 1 for ASC and DESC; deterministic, present in every instance' for movies.movie_release_year and 'Tie at rank 1 for ASC; deterministic, present in every instance' for lists_users.list_creation_date_utc. The realized counts are far below 20/20. `_apply_ties` forces at least two rows at min and max, but `_clamp_dates` runs after `_apply_ties` and can collapse distinct values to the same clamped value (e.g. two different out-of-domain values both clamp to 2009-01-01), which can destroy the max tie; and `_apply_semantic_rules` (which runs after `_apply_ties`) can overwrite the max value in `list_update_date_utc`/`list_creation_date_utc` pairs, breaking the tie. Also `_apply_duplicate_share` and `_apply_different_values` run after `_apply_ties` and can overwrite the tied extremes.",
+     "requested_revision": "Make ties deterministic and last: run `_apply_ties` after `_clamp_dates`, `_apply_semantic_rules`, `_apply_duplicate_share`, and `_apply_different_values`, or re-apply ties at the end; ensure the tie pass does not overwrite protected boundary values; and add a post-build assertion that `tie_rank1` is true for every declared tie column in every instance, failing the unit otherwise."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows ratings.user_id NULL 687/4040 (17.0%), which is within the spec's 5-30% target, but the spec's `null_targets` list does not include ratings.user_id; the spec's per_column_exceptions explicitly adds ratings.user_id null_in_count_column 5-30% as a 'deliberate deviation'. The program's `_apply_null_rule` applies a default 5% NULL to every nullable column not in the spec, and `null_share_for` returns the midpoint of the spec range for ratings.user_id (17.5%), so the realized 17.0% is consistent. However, the spec's `null_targets` list omits ratings.user_id, and the program's `_apply_null_rule` uses `null_share_for(spec, table, cm.name, 0.05)` which returns 0.05 for columns not in the spec \u2014 this means columns like lists.list_description, lists.list_cover_image_url, etc. (which are in `null_targets` but have no per_column_exceptions entry) get only 5% NULL, not the compact database's share. The spec's generic rule says 'NULL share following the compact database's share for that column', but the program uses a fixed 5% default rather than the compact share.",
+     "requested_revision": "Compute the NULL share from the compact database's actual share for each nullable column (e.g. `schema.original_values` NULL fraction) and use that as the default in `_apply_null_rule`, falling back to 5% only when the compact share is 0 or unavailable. Add ratings.user_id to `null_targets` in the spec for consistency, or document that the per_column_exceptions entry overrides it."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `ratings.rating_score BETWEEN 0 AND 6` with evidence 'Relaxed from 1-5 to 0-6 to accommodate the required comparison_boundary values 0 and 6'. The atomic summary's comparison_boundary for ratings.rating_score lists values [0,1,2,4,5,6] with `equal_and_one_step_from: [ratings.user_has_payment_method]`, which is a cross-column boundary, not a rating_score domain boundary. The original compact database's rating_score values are 1-5 (per the spec's own evidence 'observed rows 3,2,4,5,1'). Relaxing the domain to 0-6 to satisfy a boundary that is actually about a different column is a spec error: the boundary values 0 and 6 are not required by the atomic summary for rating_score itself.",
+     "requested_revision": "Revert the rating_score domain to 1-5 (matching the compact database) and remove 0 and 6 from the comparison_boundary targets for ratings.rating_score, or clarify in the spec that the boundary is a cross-column comparison with ratings.user_has_payment_method and should be tested via that column, not by widening rating_score. Update the program's `_apply_derived_columns` clamp back to [1, 5] accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's `_apply_semantic_rules` 'between' branch relaxes the clamp by 1 on each side (`lo, hi = lo - 1, hi + 1`), so `movies.movie_release_year BETWEEN 1900 AND 2020` becomes [1899, 2021] and `ratings.rating_score BETWEEN 0 AND 6` becomes [-1, 7]. This contradicts the spec's semantic rules and the program's own `_apply_derived_columns` clamp (which uses [1900, 2020] and [0, 6]). The execution feedback min_max shows movies.movie_release_year [1900, 2020] and ratings.rating_score [0, 6], so the relaxation is not currently visible, but it is a latent bug: if a value outside the relaxed range is sampled, it will be clamped to the relaxed bound, not the spec bound.",
+     "requested_revision": "Remove the `lo, hi = lo - 1, hi + 1` relaxation in `_apply_semantic_rules`; clamp to the exact spec bounds. If boundary values outside the spec bounds are required, handle them via the boundary seeding mechanism (which already bypasses the clamp for protected values) rather than by widening the clamp."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's `_apply_different_values` uses the table's first non-target column as the group column, which for movies is movie_id (a PK) and for lists is user_id (an FK). Grouping by a PK gives groups of size 1, so the per-group guarantee is vacuous; the global guarantee (`len(set(map(str, vals))) < 2`) is the only effective check. The spec's `rows_with_different_values` for movies.movie_popularity and lists.list_followers requires 'At least 2 rows per group with different values', but the program's grouping is not meaningful. The execution feedback does not report a `rows_with_different_values` check, so this is unverified.",
+     "requested_revision": "Define the grouping column explicitly in the spec (e.g. group by movie_release_year for movies.movie_popularity, group by list_creation_timestamp_utc for lists.list_followers) and implement the per-group check against that column; add a post-build assertion and feedback entry for `rows_with_different_values`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's `_seed_boundaries` is called twice: once inside the per-table loop (`_seed_boundaries({t: cols}, schema, spec, rng)`) and once at the end (`_seed_boundaries(inst, schema, spec, rng)`). The second call runs after `sample_fresh_primary_keys` and `drop_unique_duplicates`, so it can plant a boundary value into a row that was already filtered, or into a PK column after the PK uniqueness check, potentially creating a PK duplicate. The execution feedback reports `pk_duplicates: 0`, so this is not currently triggered, but it is a latent integrity risk.",
+     "requested_revision": "Remove the second `_seed_boundaries` call, or move it before `sample_fresh_primary_keys`/`drop_unique_duplicates` and re-run those filters afterward. Ensure boundary seeding never violates PK uniqueness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's `seed_parent_keys` helper in `spec.py` is defined but never called in `instance.py`. The spec's `dependencies` list includes `lists.user_id -> lists_users.user_id` and `ratings.user_id -> lists_users.user_id`, and the atomic summary's comparison_boundary for lists.user_id and ratings.user_id requires values 8516502..85981820 and 22030371..39115685. Without `seed_parent_keys`, the parent `lists_users.user_id` may not contain these values, so the FK boundary values in child tables cannot be realized as valid FKs. The execution feedback shows lists_users.user_id boundary_present 20/20, so the parent does contain them in this run, but this is not guaranteed by construction.",
+     "requested_revision": "Call `seed_parent_keys` in `build_random_instance` before generating child rows, and plant the returned parent boundary values into the parent table's generated rows (protected from overwrite). Add a post-build assertion that every FK boundary value is present in the parent table."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` section states 'The like_near_variant for the INTEGER column lists.user_id is unrealizable as a string variant and is removed from per_column_exceptions.' However, the atomic summary's `lists.user_id` patterns include `like_near_variant` with ops `PRED(lists.user_id LIKE 4208563)` and variants `['4208564', '4208563x']`. The spec removes this pattern, but the atomic summary still lists it. The program's `_parse_targets_for` drops quoted non-numeric literals for integer columns, so '4208563x' is dropped, but '4208564' (a numeric variant) is kept. This is a partial implementation: the numeric variant is realized, the string variant is not. The spec should either explicitly state that only the numeric variant is realized, or the atomic summary should be updated to remove the string variant.",
+     "requested_revision": "Update the spec's `uncertainty` section to state that for integer columns, only numeric near-variants (e.g. 4208564) are realized and string variants (e.g. '4208563x') are dropped; or update the atomic summary to remove the string variant for lists.user_id. Ensure the program's `_parse_targets_for` behavior is documented as the intended resolution."
+    }
+   ],
+   "unresolved_checks": [
+    "The `rows_with_different_values` pattern for movies.movie_popularity and lists.list_followers is not verified by execution feedback; the program's grouping logic is vacuous (groups by PK).",
+    "The `null_targets` list in the spec omits ratings.user_id, but the per_column_exceptions entry adds it; the program's default 5% NULL for columns not in the spec may not match the compact database's share.",
+    "The `seed_parent_keys` helper is defined but never called; FK boundary values in child tables may not be realizable as valid FKs in all instances.",
+    "The `_apply_semantic_rules` 'between' branch relaxes the clamp by 1 on each side, which is a latent bug not currently visible in feedback.",
+    "The second `_seed_boundaries` call runs after PK filtering and could create PK duplicates; not currently triggered but a latent integrity risk."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, all AssertionError('boundary missing: lists.user_id') or 'lists.list_id'. The program never produced a single instance.",
+     "requested_revision": "Fix the boundary-seeding/protection pipeline so that comparison-boundary literals for lists.user_id and lists.list_id survive to the final instance. The assertion in _assert_feedback is correct; the seeding is not. Specifically, _seed_boundaries writes boundary values into generated rows, but lists.user_id is an FK column filled by fill_foreign_keys_consistently from the parent pool, and lists.list_id is a PK column that is later filtered by sample_fresh_primary_keys against compact PKs. Neither path guarantees the boundary values remain. Seed the boundary values into the parent (lists_users.user_id) and into the PK column after PK filtering, and protect those indices from the PK-dedup and FK-refill passes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In build_random_instance, _seed_boundaries is called with {t: cols} before fill_foreign_keys_consistently? No \u2014 order is: cols sampled, then cols.update(fill_foreign_keys_consistently(...)), then parent_seeds planting, then _seed_boundaries. But for lists.list_id (PK), after _seed_boundaries the code calls sample_fresh_primary_keys(tm, ..., taken, protected=prot_idx). prot_idx is built from protected[(t,cc)] which _seed_boundaries populates, so PK boundary rows should be protected. However _seed_boundaries skips a value if 'cv in col' \u2014 for list_id the sampler may already produce 249/250/251, but more importantly the PK sampler for list_id is a NumberSampler with no boundary list (boundary_literals only returns comparison_boundary entries; lists.list_id has comparison_boundary with values 249,250,251, so boundary should be set). The failure indicates the boundary values are being overwritten or the protected set is not reaching sample_fresh_primary_keys correctly.",
+     "requested_revision": "Trace and fix: (a) confirm boundary_literals(spec,'lists','list_id') returns [249,250,251] and that _coerce yields ints; (b) confirm _seed_boundaries actually writes them (the 'cv in col' early-continue can skip seeding when the sampler coincidentally produced the value, but then it is present anyway \u2014 so the real bug is likely that sample_fresh_primary_keys drops them because 'taken' contains compact PKs and the protected set is keyed by (t,cm.name) but prot_idx is computed before _seed_boundaries for the PK column? Verify ordering). Add a unit test that asserts boundary presence immediately after _seed_boundaries and again after each pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "lists.user_id is an FK to lists_users.user_id. The spec requires values 8516502..85981820 in lists.user_id and requires lists_users.user_id to contain them. seed_parent_keys returns parent (lists_users, user_id) -> boundary values, and the builder plants them into lists_users generated rows. But lists_users.user_id is itself an FK to lists.user_id (circular dependency in the schema: lists.user_id references lists_users.user_id and lists_users.user_id references lists.user_id). The topological order and the fill_foreign_keys_consistently for lists_users.user_id will draw from lists.user_id's pool, which may not yet contain the boundary values, and the parent_seeds planting for lists_users.user_id happens in the lists_users iteration but the values may be overwritten by the FK fill or by sample_fresh_primary_keys (lists_users PK is (user_id, list_id)).",
+     "requested_revision": "Handle the circular FK between lists and lists_users explicitly: seed the boundary user_id values into lists_users.user_id as protected rows, and ensure lists.user_id FK fill draws from the parent pool that includes those protected values. Do not let sample_fresh_primary_keys or drop_unique_duplicates remove protected rows. Add an assertion that lists_users.user_id contains the boundary values before generating lists."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions for lists.user_id includes like_near_variant with target 'PRED(lists.user_id LIKE 4208563)' and variants ['4208564','4208563x']. The spec itself notes the string variant is dropped. This is fine, but the spec also lists lists.user_id under comparison_boundary with values 8516502..85981820, and lists_users.user_id under comparison_boundary with the same values. The circular FK makes these hard to realize; the spec should state the seeding order explicitly (parent lists_users first, then child lists) and note that lists_users.user_id is both a PK component and an FK.",
+     "requested_revision": "Clarify in the specification that lists_users.user_id boundary values must be seeded as protected rows in lists_users before lists is generated, and that lists.user_id FK fill must include those protected parent values. This is a specification clarification, not a per-query exception."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_null_rule uses null_share_for with _compact_null_share default. For ratings.user_id the spec requires 5-30% NULL (deliberate deviation). null_share_for parses '5-30%' -> 0.175. Good. But the spec also lists ratings.user_id in null_targets and in duplicates_for_distinct (20-50%). The duplicate-share pass runs after the NULL pass and may overwrite NULLs? _apply_duplicate_share skips None values (checks vals[i] is None). OK. However _apply_null_rule runs before _apply_duplicate_share, and _apply_duplicate_share's denominator excludes protected rows but not NULLs \u2014 it filters vals[i] is not None. Fine.",
+     "requested_revision": "No change required for NULL handling; note that the execution never reached this code because of the boundary assertion failure. Re-run after fixing the boundary bug to confirm NULL shares."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_semantic_rules handles '>=' with 'timestamp' by comparing str(a) < str(b) and setting vals[i] = _clamp_date(b). For lists.list_update_timestamp_utc >= list_creation_timestamp_utc this is correct. For lists_users.list_update_date_utc >= list_creation_date_utc, the formula contains 'date' not 'timestamp', so the branch 'if >= in formula and timestamp in formula' does not fire; the 'elif >= in formula and 0 in formula' branch also does not fire (no '0'). So the lists_users date ordering rule is NOT enforced by _apply_semantic_rules. It is enforced by _apply_derived_columns (which handles lists_users list_update_date_utc vs list_creation_date_utc). OK, but fragile.",
+     "requested_revision": "Make _apply_semantic_rules handle date (not just timestamp) ordering rules, or document that _apply_derived_columns covers them. Add a feedback assertion that list_update_date_utc >= list_creation_date_utc for all non-NULL pairs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_ties forces at least two rows at min and max. For ratings.rating_score the domain is 1-5 and the spec requires tie at rank 1 for ASC and DESC. _apply_ties runs after _apply_derived_columns (which clamps to 1-5) and after _apply_semantic_rules. Good. But _apply_duplicate_share runs after _apply_ties and may overwrite the tied values, breaking the tie. The spec says 'duplicate-share pass runs last' and 'ties applied after clamp and semantic rules' \u2014 but the program runs ties before duplicate share, so duplicate share can undo ties. The spec's pass_order says 'duplicate share -> different values -> ties -> final clamp', i.e. ties last. The program's order is different_values -> ties -> duplicate_share, contradicting the spec.",
+     "requested_revision": "Reorder passes to match the spec: duplicate share, then different values, then ties, then final clamp. Or make _apply_duplicate_share skip rows that are part of a tie. Currently the program's order can break ties and the assertion _assert_feedback would then fail (tie missing), which is another latent failure."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_duplicate_share computes 'need' and then does 'for _ in range(max(0, need))' picking random i,j and setting vals[i]=vals[j]. This is a random process that may not achieve the target share (it can pick the same pair repeatedly or pick i already equal to j). The assertion requires 0.20 <= share <= 0.50. With n=200 and target 0.35, need ~ 70 assignments, but random collisions mean the realized share may be below target. The feedback would then fail the assertion.",
+     "requested_revision": "Make _apply_duplicate_share deterministic: compute the number of distinct values needed to hit the target share, then assign duplicates by copying from a small set of representative values. Verify the realized share in a unit test."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_different_values for movies.movie_popularity groups by movie_release_year. But movie_release_year is nullable (5-30% NULL per spec). Groups keyed by None will be one group; the pass ensures >=2 distinct values within each group with >=2 rows. If a group has only 1 row, it is skipped. The spec requires 'at least 2 rows per group with different values' \u2014 for groups with 1 row this is vacuous. OK. But the global guarantee 'if len(set(map(str, vals))) < 2' uses str() on ints, fine.",
+     "requested_revision": "No change required, but add feedback that counts how many groups satisfy the condition and how many are skipped (size 1)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _clamp_dates is called after _apply_semantic_rules and after _apply_duplicate_share. But _apply_ties for date columns (lists_users.list_creation_date_utc) runs before the final clamp; if _apply_ties sets a value to a date outside 2009-2020 (it uses existing min/max, which are in-domain), fine. But _apply_duplicate_share for date columns could copy a value; still in-domain. OK.",
+     "requested_revision": "No change required; the final clamp covers it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's writer appends generated rows to a copy of the compact DB. The compact DB has 200 rows per table (per spec table_sizes_per_instance). The generated rows are appended, so the instance has 400 rows per table. The spec says 'instances are copies of the compact database plus appended generated rows' \u2014 consistent. But the spec's table_sizes_per_instance says 200 per table, and choose_table_sizes with spec_sizes adds rng.randint(-20,20) and caps at 230. So generated rows are 180-220, total 380-420. Fine.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _feedback computes duplicate_share as 1 - distinct/nonnull over ALL rows (compact + generated), but the spec's duplicate share is about generated rows. The assertion 0.20 <= share <= 0.50 is applied to the combined set, which may not match the generated-only share. Since compact rows are also present, the combined share could be lower than the generated share. This could cause spurious assertion failures or mask real ones.",
+     "requested_revision": "Compute duplicate share over generated rows only (or document that the combined share is the target). Align with the spec's intent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _assert_feedback raises on any boundary missing, duplicate share out of range, tie missing, different values missing, or year out of domain. The execution shows all 20 units failed on boundary missing for lists.user_id or lists.list_id. This is a hard blocker: no instances were produced.",
+     "requested_revision": "Fix the boundary seeding for lists.user_id and lists.list_id (see issues above), then re-run. The assertion itself is correct and should remain."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the circular FK between lists and lists_users can be satisfied with the boundary values in both directions without violating the PK uniqueness of lists_users (user_id, list_id).",
+    "Whether the duplicate-share pass can reliably hit 20-50% for movies.movie_title, movies.director_name, ratings.user_id, and lists.user_id given the random assignment approach.",
+    "Whether the tie pass survives the duplicate-share pass given the current pass order (spec says ties last, program runs ties before duplicate share).",
+    "Whether the compact DB's observed NULL shares for the nullable columns match the spec's null_targets and the program's _compact_null_share fallback.",
+    "Whether the self-referencing FK ratings.rating_id -> ratings.rating_id is handled correctly by the writer (each row references itself; the program's fill_foreign_keys_consistently for self-FK uses rng.choice(final) which may not be self)."
+   ]
+  }
+ ]
 }

@@ -6,6 +6,8 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+DATE_LO = dt.datetime(2016, 1, 1)
+DATE_HI = dt.datetime(2018, 3, 25)
 
 
 class ColumnSampler:
@@ -131,8 +133,8 @@ class DateSampler(ColumnSampler):
             if d is not None:
                 self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.template = self.template or '%Y-%m-%d %H:%M:%S'
+        self.full = (DATE_LO, DATE_HI)
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -180,6 +182,43 @@ class BoolSampler(ColumnSampler):
         if not self.elements or self.rng.random() < self.p:
             return self.vals[0] if self.rng.random() < 0.5 else self.vals[1]
         return self.rng.choice(self.elements)
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform pick from an explicit enum domain (specification enum_short)."""
+
+    def __init__(self, domain: list, rng):
+        super().__init__(list(domain), 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class PoolSampler(ColumnSampler):
+    """Uniform pick from an explicit boundary pool (comparison / aggregate boundary)."""
+
+    def __init__(self, domain: list, rng):
+        super().__init__(list(domain), 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class DuplicateShareSampler(ColumnSampler):
+    """Wraps a sampler; with probability `share` repeats an earlier value (duplicates_for_distinct)."""
+
+    def __init__(self, inner: ColumnSampler, share: float, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.inner = inner
+        self.share = share
+        self.seen: list = []
+
+    def sample(self):
+        if self.seen and self.rng.random() < self.share:
+            return self.rng.choice(self.seen)
+        v = self.inner.sample()
+        self.seen.append(v)
+        return v
 
 
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:

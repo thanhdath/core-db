@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -105,6 +107,44 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Explicit enum pool: canonical values plus near-variants (case/whitespace)."""
+
+    def __init__(self, values: list, near: list, p: float, max_l0: float, rng):
+        super().__init__(list(values), p, max_l0, rng)
+        self.near = list(near)
+
+    def sample(self):
+        r = self.rng
+        if self.near and r.random() < 0.25:
+            return r.choice(self.near)
+        return r.choice(self.elements)
+
+
+class PlanSampler(ColumnSampler):
+    """Group-size plan: emits each planned value with its multiplicity (1, 2, >=3)."""
+
+    def __init__(self, values: list, plan: list, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.plan = list(plan)
+        self.queue: list = []
+
+    def _refill(self):
+        r = self.rng
+        vals = list(self.elements)
+        r.shuffle(vals)
+        q = []
+        for k, mult in enumerate(self.plan):
+            v = vals[k % len(vals)]
+            q.extend([v] * int(mult))
+        self.queue = q
+
+    def sample(self):
+        if not self.queue:
+            self._refill()
+        return self.queue.pop(0)
 
 
 def _parse_date(s: str):
@@ -231,5 +271,48 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng,
+                      1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column: str, column_meta, literal_pool: list, original_values: list,
+                 n: int, rng) -> list:
+    """Draw n values for one column, honouring the specification by construction."""
+    key = (table, column)
+    if column_meta.pk_pos > 0:
+        return random_values_for_a_column(column_meta, literal_pool, n, rng, original_values=original_values)
+    if spec.is_enum_column(table, column):
+        vals = spec.enum_values(table, column)
+        near = []
+        for v in vals:
+            near.extend(spec.near_variants(v))
+        s = EnumSampler(vals, near, 0.0, float('inf'), rng)
+        return [s.sample() for _ in range(n)]
+    if key in spec.GROUP_PLANS:
+        if spec.is_enum_column(table, column):
+            vals = list(spec.enum_values(table, column))
+        else:
+            vals = list(dict.fromkeys([str(v) for v in original_values if v is not None]))
+        if not vals:
+            vals = [str(v) for v in literal_pool] or ['v%d' % k for k in range(1, 4)]
+        s = PlanSampler(vals, spec.GROUP_PLANS[key], rng)
+        out = [s.sample() for _ in range(n)]
+        if spec.is_enum_column(table, column):
+            near = []
+            for v in spec.enum_values(table, column):
+                near.extend(spec.near_variants(v))
+            for i in range(len(out)):
+                if near and rng.random() < 0.2:
+                    out[i] = rng.choice(near)
+        return out
+    if key == ('festival_detail', 'Year'):
+        pool = spec.year_pool()
+        return [rng.choice(pool) for _ in range(n)]
+    if key == ('festival_detail', 'Num_of_Audience'):
+        pool = spec.audience_pool()
+        return [rng.choice(pool) for _ in range(n)]
+    if key == ('festival_detail', 'Location'):
+        pool = list(spec.LOCATION_VALUES)
+        return [rng.choice(pool) for _ in range(n)]
+    return random_values_for_a_column(column_meta, literal_pool, n, rng, original_values=original_values)

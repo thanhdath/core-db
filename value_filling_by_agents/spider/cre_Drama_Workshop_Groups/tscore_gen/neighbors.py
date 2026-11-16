@@ -1,4 +1,4 @@
-"""Neighbour queries (fuzz/neighbor.py:1-177)."""
+"""Neighbour queries (unchanged from the shared library)."""
 import re
 import sqlite3
 
@@ -15,7 +15,6 @@ def _join(toks: list) -> str:
 
 
 def _droppable(span: list) -> bool:
-    """neighbor.py:110-129."""
     s = ''.join(span).strip().lower()
     if not s or s in ('asc', '*', 'as', ';', 'as result'):
         return False
@@ -63,8 +62,7 @@ def _norm(s: str) -> str:
 
 
 def neighbor_queries(sql: str, schema, rng, max_neighbors: int = 50000) -> list:
-    """Span drops + token replacements kept if executable on an empty schema clone (neighbor.py:1-177).
-    Neighbours that lose the FROM clause of a query that has one are excluded (new, recorded)."""
+    """Span drops + token replacements kept if executable on an empty schema clone."""
     try:
         toks = [t for st in sqlparse.parse(sql) for t in st.flatten()]
     except Exception:

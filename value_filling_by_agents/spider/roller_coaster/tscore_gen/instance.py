@@ -1,4 +1,5 @@
-"""Random instance construction (fuzz/fuzz.py:83-196)."""
+"""Random instance construction (fuzz/fuzz.py:83-196) adapted to the specification."""
+from . import spec
 from .values import _init_sampler
 
 
@@ -47,7 +48,7 @@ def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, r
 
 
 def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+    """Uniform rand_lin sizes w.p."""
     sizes = {}
     if rng.random() < 0.5:
         for lvl in schema.table_order:
@@ -63,8 +64,50 @@ def choose_table_sizes(schema, rng) -> dict:
     return sizes
 
 
+def _compact_max(schema, table: str, column: str):
+    """Max integer value of a compact column (for fresh PK offsets)."""
+    vals = [v for v in schema.original_values.get((table, column), []) if isinstance(v, int)]
+    return max(vals) if vals else 0
+
+
+def _spec_column_values(schema, table: str, column: str, n: int, rng, parent_ids):
+    """Per-column values from the specification (by construction)."""
+    key = (table, column)
+    if table == 'country':
+        if column == 'Country_ID':
+            return spec.country_id_values(rng, n, parent_ids)
+        if column == 'Name':
+            return spec.country_name_values(rng, n)
+        if column == 'Population':
+            return [spec.rand_int_area_population(rng) for _ in range(n)]
+        if column == 'Area':
+            return [spec.rand_int_area_population(rng) for _ in range(n)]
+        if column == 'Languages':
+            return spec.languages_values(rng, n)
+    if table == 'roller_coaster':
+        if column == 'Roller_Coaster_ID':
+            return list(range(1, n + 1))
+        if column == 'Name':
+            return spec.coaster_name_values(rng, n)
+        if column == 'Park':
+            return spec.park_values(rng, n)
+        if column == 'Country_ID':
+            return spec.coaster_country_id_values(rng, n, parent_ids)
+        if column == 'Length':
+            return spec.length_values(rng, n)
+        if column == 'Height':
+            return spec.height_values(rng, n)
+        if column == 'Speed':
+            return spec.speed_values(rng, n)
+        if column == 'Opened':
+            return spec.opened_values(rng, n)
+        if column == 'Status':
+            return spec.status_values_for_groups(rng, n)
+    return None
+
+
 def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
+    """Build one random instance (fuzz.py:111-196) with the specification applied."""
     p = 0.0 if rng.random() < 0.3 else 0.2
     order = [t for lvl in schema.table_order for t in lvl]
     samplers = {}
@@ -81,11 +124,46 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
     for t in order:
         tm = schema.tables[t]
         n = int(size.get(t, 0))
-        cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)]
-                for cm in tm.columns if (t, cm.name) in samplers}
-        inst[t] = cols
-        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
-        cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
+        parent_ids = {}
+        for cm in tm.columns:
+            key = (t, cm.name)
+            if key in schema.fks:
+                pt, pc = schema.fks[key]
+                compact = [v for v in schema.original_values.get((pt, pc), []) if v is not None]
+                gen = inst.get(pt, {}).get(pc, [])
+                parent_ids[cm.name] = compact + list(gen)
+        cols = {}
+        for cm in tm.columns:
+            if (t, cm.name) in schema.fks:
+                continue
+            spec_vals = _spec_column_values(schema, t, cm.name, n, rng, parent_ids.get(cm.name, []))
+            if spec_vals is not None:
+                cols[cm.name] = spec_vals
+            else:
+                cols[cm.name] = [samplers[(t, cm.name)].sample() for _ in range(n)]
+        for cm in tm.columns:
+            key = (t, cm.name)
+            if key not in schema.fks:
+                continue
+            pt, pc = schema.fks[key]
+            pv = parent_ids.get(cm.name, [])
+            if cm.name == 'Country_ID' and t == 'roller_coaster':
+                vals = spec.coaster_country_id_values(rng, n, pv)
+            else:
+                vals = [rng.choice(pv) for _ in range(n)] if pv else [None] * n
+            cols[cm.name] = vals
+        for cm in tm.columns:
+            if cm.pk_pos > 0 and cm.name in cols:
+                off = _compact_max(schema, t, cm.name)
+                if all(isinstance(v, int) for v in cols[cm.name]):
+                    cols[cm.name] = [v + off for v in cols[cm.name]]
+        for cm in tm.columns:
+            if cm.name not in cols:
+                continue
+            share = spec.null_share_for(cm, schema)
+            if share > 0.0:
+                cols[cm.name] = spec.plant_nulls(cols[cm.name], share, rng)
+        cols = sample_fresh_primary_keys(tm, cols)
         cols = drop_unique_duplicates(tm, cols)
         for cm in tm.columns:
             pt, pc = schema.fks.get((t, cm.name), (None, None))

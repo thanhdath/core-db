@@ -1,42 +1,508 @@
 {
  "db": "trains",
- "operator_io_quirks": [
-  "Backtick-quoted identifiers in DDL; column `len` is a SQL keyword-ish name (also `position`, `shape`) \u2014 must be double-quoted in generated SQL.",
-  "Column named `len` (TEXT) \u2014 name collides with SQL length function; quoting required.",
-  "DDL has `len`TEXT` (no space between backtick and type) \u2014 line-based unique/check scan and type parse must tolerate.",
-  "FK cars.train_id -> trains.id, parent exists, parent PK unique; ON DELETE/UPDATE CASCADE declared.",
-  "Table order: trains (level 0) before cars (level 1); cars depends on trains.",
-  "Tiny tables (63 and 20 rows) \u2014 original_values fully read, no sampling needed.",
-  "All columns null_rate 0.0 in original, but all non-PK columns are DEFAULT NULL / notnull=0 \u2014 TS may still emit NULLs via FK-empty-parent path.",
-  "No unique/check constraints beyond PKs; no composite keys; no self-FK.",
-  "Storage classes match declared types everywhere (integer/text) \u2014 no contradictions.",
-  "distinct counts tiny (2-5) for most cars columns \u2014 literal pool will be small; String sampler length range narrow.",
-  "trains.id distinct=20 = row count; cars.train_id distinct=20 = parent size (all parents referenced).",
-  "cars.id distinct=63 = row count; position distinct=4, load_num distinct=4 (small domains)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer for all INTEGER columns (id, train_id, position, wheels, load_num): uniform in [-10^scale,10^scale] with scale from type args (none -> default), then +-1/+-2 perturbation; produces implausible ids/positions.",
-  "String fuzzer for TEXT columns (shape, len, sides, roof, load_shape, direction): random strings over a-zA-Z 0-9() length 0..20, plus 50% contaminate; will not reproduce enum-like values (rectangle, east, short) unless in literal pool.",
-  "PK columns (cars.id, trains.id) get max_l0=inf -> always fresh Number draws; PK dedup keeps first occurrence, so many rows dropped for small target sizes.",
-  "FK cars.train_id drawn from trains.id final values with replacement -> duplicates in child, fine; if trains empty -> NULLs.",
-  "Expected FN drivers: Number fuzzer emits ids/positions outside the tiny real domains (position 1-4, wheels 2-3, load_num 0-3) so predicates like position=2 or wheels=3 rarely match; String fuzzer rarely hits 'east'/'west'/'short'/'long' enums.",
-  "Expected FP drivers: no ties/duplicates in original (all distinct counts = row counts for ids), but TS injects duplicate train_id/position/load_num values -> queries with DISTINCT/COUNT/GROUP BY may agree spuriously; also empty-parent NULL train_id can make joins drop rows consistently.",
-  "String contaminate (prefix/suffix/drop char) makes shape/roof values near-misses of real enums -> LIKE '%east%' style predicates may flip.",
-  "Small tables: choose_table_sizes may produce sizes far from 63/20 (up to 2500 or 30+200u) -> cardinality-sensitive queries (COUNT) diverge from original but that is expected TS behaviour.",
-  "No Date/Time/Bool columns -> those fuzzers unused here.",
-  "Literal pool from train SQL will seed shape/roof/direction enums if present in gold/candidate SQL; otherwise String fuzzer dominates."
- ],
- "challenger_refs": [
-  "G1",
-  "g9c5ec6d2",
-  "G2",
-  "gbbfeb968"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential 1..N per table; no NULL; no duplicates.",
+   "integer_foreign_key": "Sample from the parent's id pool (1..N_parent); 0% NULL; guarantee at least one parent row with no children and at least one child row per parent; never emit 0 or values outside the parent pool.",
+   "text_enum": "Sample uniformly from the enumerated value pool for that column; no other values; near-variants and upper-case literals are query literals only and are never generated.",
+   "text_short": "Sample values from the column's pool; no near-variants unless the column is listed in per_column_exceptions.",
+   "integer_small": "Sample from the column's enumerated pool; no other values.",
+   "fresh_values": "0% fresh values; every column draws from its enumerated pool.",
+   "null_rule": "Each nullable column gets at least one NULL row per instance; NULL share follows the compact database's share (0.0 observed, so plant exactly one NULL per nullable column per instance); NOT NULL and primary-key columns never get NULL; planted NULLs are never replaced to satisfy a rule; rules constrain only non-NULL operands; do not plant a NULL in a column with fewer than 2 generated rows and assert each nullable column keeps at least one non-NULL value.",
+   "boundary_values": "For each numeric column listed in per_column_exceptions, include the listed literals and one step on each side within the column's domain; literals outside the column's semantic range (e.g. 0 for a positive id, 5 for position) are query literals only and are never generated.",
+   "tie_rule": "For ORDER columns listed in per_column_exceptions, assign values so the listed rank ties (equal counts) across the generated rows; the tie is enforced after sampling and before NULL planting, and the planted NULL is placed so the tie on non-NULL counts is preserved.",
+   "duplicate_rule": "For DISTINCT columns listed in per_column_exceptions, ensure a 20-50% duplicate share among generated non-NULL values.",
+   "group_size_rule": "For GROUP columns listed in per_column_exceptions, assign foreign-key values so the listed group sizes occur exactly; the assignment must cover every generated child row (sum of sizes equals the child row count) and must not drop a required size; if the required sizes cannot fit the child row count, raise a clear error rather than truncating."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "trains",
+    "column": "id",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "1",
+     "2"
+    ],
+    "note": "0 is a query literal only; never generated because it is not a valid primary key."
+   },
+   {
+    "table": "trains",
+    "column": "id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "primary key, no duplicates"
+    ],
+    "note": "DISTINCT target not applicable; primary key is unique."
+   },
+   {
+    "table": "trains",
+    "column": "direction",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "east",
+     "EAST",
+     "west",
+     "WEST"
+    ],
+    "note": "Upper-case literals are query literals only; generated values stay in the enum pool."
+   },
+   {
+    "table": "trains",
+    "column": "direction",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1 on COUNT(*), COUNT(trains.id)"
+    ],
+    "note": "Force an equal east/west split across generated trains before planting NULLs; place the planted NULL so the non-NULL counts still tie."
+   },
+   {
+    "table": "trains",
+    "column": "direction",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "id",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "4"
+    ],
+    "note": "4 is a query literal only; generated ids are sequential and never overwritten to 4."
+   },
+   {
+    "table": "cars",
+    "column": "id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "primary key, no duplicates"
+    ],
+    "note": "DISTINCT target not applicable; primary key is unique."
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "1",
+     "2"
+    ],
+    "note": "0 is a query literal only; never generated because it is not a valid trains.id."
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "group sizes 1, 2 and >= 3"
+    ],
+    "note": "Required sizes 1,2,3,4 must sum to the generated car count; with 12 cars and 6 trains use 1+2+3+4+1+1=12."
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "HAVING(COUNT(*) < 4)",
+     "HAVING(COUNT(*) >= 4)",
+     "HAVING(COUNT(*) >= 3)",
+     "values 2,3,4"
+    ],
+    "note": "Value 5 is not achievable with 12 cars and 6 trains together with sizes 1,2,3,4; it is a query literal only."
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "at least one parent row with no children",
+     "at least one child row with a parent"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "position",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "1",
+     "2",
+     "3",
+     "4"
+    ],
+    "note": "0 and 5 are query literals only; generated values stay in [1,4]."
+   },
+   {
+    "table": "cars",
+    "column": "position",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     "at least 2 rows per group with different values"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "shape",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "rectangle",
+     "bucket",
+     "ellipse",
+     "BUCKET",
+     "ELIPSE",
+     "RECTANGLE",
+     "ele",
+     "ELE",
+     "eli",
+     "ELI"
+    ],
+    "note": "Upper-case and near-variants are query literals only; generated values stay in the enum pool (ellipse, not elipse)."
+   },
+   {
+    "table": "cars",
+    "column": "shape",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%bucket%",
+     "%ellipse%"
+    ],
+    "note": "LIKE patterns are query literals only; generated values stay in the enum pool."
+   },
+   {
+    "table": "cars",
+    "column": "shape",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "shape",
+    "pattern": "group_sizes",
+    "targets": [
+     "group sizes 1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "len",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "short",
+     "SHORT"
+    ],
+    "note": "SHORT is a query literal only."
+   },
+   {
+    "table": "cars",
+    "column": "sides",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "double"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "roof",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "flat",
+     "FLAT",
+     "none",
+     "NONE"
+    ],
+    "note": "Upper-case literals are query literals only."
+   },
+   {
+    "table": "cars",
+    "column": "wheels",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "2",
+     "3"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "load_shape",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "circle",
+     "CIRCLE"
+    ],
+    "note": "CIRCLE is a query literal only."
+   },
+   {
+    "table": "cars",
+    "column": "load_shape",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "cars",
+    "column": "load_num",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "3"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "cars.train_id",
+    "parent": "trains.id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "trains",
+    "column": "id",
+    "formula": "id > 0",
+    "evidence": "Primary key; all values 1..N."
+   },
+   {
+    "table": "trains",
+    "column": "direction",
+    "formula": "direction IN ('east', 'west')",
+    "evidence": "direction values observed: east, west."
+   },
+   {
+    "table": "cars",
+    "column": "id",
+    "formula": "id > 0",
+    "evidence": "Primary key; all values 1..N."
+   },
+   {
+    "table": "cars",
+    "column": "train_id",
+    "formula": "train_id IN (SELECT id FROM trains)",
+    "evidence": "Foreign key to trains.id."
+   },
+   {
+    "table": "cars",
+    "column": "position",
+    "formula": "position BETWEEN 1 AND 4",
+    "evidence": "position values observed: 1,2,3,4."
+   },
+   {
+    "table": "cars",
+    "column": "shape",
+    "formula": "shape IN ('rectangle', 'bucket', 'u_shaped', 'hexagon', 'ellipse')",
+    "evidence": "shape values observed: rectangle, bucket, u_shaped, hexagon, ellipse."
+   },
+   {
+    "table": "cars",
+    "column": "len",
+    "formula": "len IN ('short', 'long')",
+    "evidence": "len values observed: short, long."
+   },
+   {
+    "table": "cars",
+    "column": "sides",
+    "formula": "sides IN ('not_double', 'double')",
+    "evidence": "sides values observed: not_double, double."
+   },
+   {
+    "table": "cars",
+    "column": "roof",
+    "formula": "roof IN ('none', 'peaked', 'flat', 'arc', 'jagged')",
+    "evidence": "roof values observed: none, peaked, flat, arc, jagged."
+   },
+   {
+    "table": "cars",
+    "column": "wheels",
+    "formula": "wheels IN (2, 3)",
+    "evidence": "wheels values observed: 2, 3."
+   },
+   {
+    "table": "cars",
+    "column": "load_shape",
+    "formula": "load_shape IN ('circle', 'hexagon', 'triangle', 'rectangle', 'diamond')",
+    "evidence": "load_shape values observed: circle, hexagon, triangle, rectangle, diamond."
+   },
+   {
+    "table": "cars",
+    "column": "load_num",
+    "formula": "load_num IN (0, 1, 2, 3)",
+    "evidence": "load_num values observed: 0, 1, 2, 3."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "trains": 6,
+   "cars": 12
+  },
+  "null_targets": [
+   "cars.train_id",
+   "cars.position",
+   "cars.shape",
+   "cars.len",
+   "cars.sides",
+   "cars.roof",
+   "cars.wheels",
+   "cars.load_shape",
+   "cars.load_num",
+   "trains.direction"
+  ],
+  "supporting_evidence": [
+   "No calculated columns were found; all rows are independent draws from the enumerated pools.",
+   "All nullable columns are 0% NULL in the observed data; the interface NULL rule still requires at least one NULL row per nullable column per instance.",
+   "trains: 6 generated rows allow equal east/west counts (3/3) to satisfy the rank-1 tie target; the planted NULL is placed so non-NULL counts still tie.",
+   "cars: 12 generated rows allow group sizes 1,2,3,4 plus two extra groups of 1 (1+2+3+4+1+1=12) to satisfy group_sizes and aggregate_boundary targets; value 5 is not achievable and is a query literal only.",
+   "cars.train_id=0 and cars.id=4 are query literals only; generated values are restricted to valid trains.id values and sequential primary keys.",
+   "cars.position boundary literals 0 and 5 are query literals only; generated values stay in [1,4]."
+  ],
+  "uncertainty": [
+   "No calculated columns were found; the schema is a simple parent-child pair with no derived fields.",
+   "The atomic-operation summary mentions DISTINCT on primary keys, but no duplicate values are possible; those targets are recorded as not applicable.",
+   "Whether table_sizes_per_instance refers to total rows or generated rows; this specification treats it as generated rows appended to compact rows.",
+   "Whether the compact database's actual null shares for nullable columns are zero; if so, the NULL rule's share is 0 but the interface still requires at least one NULL row per nullable column.",
+   "Whether the aggregate_boundary value 5 for cars.train_id is required; with 12 cars and 6 trains it is not achievable together with sizes 1,2,3,4."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 15 of 20 units failed with IndexError('list index out of range'); only 5 instances produced. Integrity: fk_violations=20, validity invalid=5 with reasons no_rows_added, compact_rows_missing, new_integrity_failures. The CLI calls build_random_instance(...) then write_instance_sqlite(schema, inst, p) with orig_path=None (cli.py `_one`), so the writer creates a fresh DB from DDL instead of copying the compact database; the docstring claims 'every instance is a copy of the compact database plus appended generated rows' but orig_path is never passed.",
+     "requested_revision": "Pass the original database path to write_instance_sqlite (orig_path=a['orig']) so compact rows are preserved, and fix the IndexError in instance construction (see next issue). Re-run until n_fail=0 and validity reports valid instances with compact rows present and no new integrity failures."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: for each table it builds `cols` from samplers, then calls `cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))`, then `sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})`. fill_foreign_keys_consistently returns only FK columns, so after update `cols` lacks non-FK columns that were not sampled (e.g. columns whose sampler was skipped) \u2014 but more importantly, `_assign_group_sizes`/FK assignment can produce a list of length n while `sample_fresh_primary_keys`/`drop_unique_duplicates` filter rows by index over `next(iter(columns.values()))`, and the subsequent `inst[t] = cols` may have columns of differing lengths. The IndexError in writer.py (`cols[c][i]` for i in range(n) where n=len(cols[names[0]])`) is the direct symptom: column lists have inconsistent lengths after filtering.",
+     "requested_revision": "Ensure all column lists for a table have identical length after PK dedup / unique dedup / FK reassignment (filter all columns with the same keep-index list, and re-derive n from a single canonical column). Add a length-consistency assertion before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py TABLE_SIZES = {'trains': 4, 'cars': 4} and choose_table_sizes returns these fixed sizes; build_random_instance uses them as the number of *generated* rows. But the specification's table_sizes_per_instance {'trains': 4, 'cars': 4} describes total instance size, and the program appends these on top of compact rows (when orig_path is fixed). Also GROUP_SIZE_TARGETS requires sizes 1,2,>=3 and min_large=4 across parents, but with only 4 cars and 4 trains the aggregate-boundary target (>=4 children for one parent) cannot coexist with group sizes 1 and 2 within 4 rows \u2014 _assign_group_sizes will silently drop targets when n is too small.",
+     "requested_revision": "Reconcile table sizes with the group-size/aggregate-boundary targets: either increase generated cars so that sizes {1,2,>=4} fit, or document that targets are best-effort. Make _assign_group_sizes fail loudly (or log) when it cannot satisfy the required targets rather than silently trimming."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions add near-variants and upper-case literals (e.g. 'EAST','WEST','BUCKET','ELIPSE','ele','eli','SHORT','FLAT','NONE','CIRCLE') to the enumerated pools, and spec.py COLUMN_EXCEPTIONS does the same. But semantic_rules_and_formulas state direction IN ('east','west'), shape IN ('rectangle','bucket','u_shaped','hexagon','ellipse'), etc. These two parts of the specification contradict each other: the enum rule forbids the exception literals that the comparison_boundary/like_near_variant patterns require. The program resolves this by adding exceptions to the pool (spec.enum_pool), which violates the stated enum formula.",
+     "requested_revision": "Clarify the specification: either the enum formulas are the authoritative domain and near-variants are only used as query literals (not generated values), or the domain explicitly includes the exception literals. State which is intended so the program and spec agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification generic_sampling_rules.integer_foreign_key says 'Sample 0..N parent values from parent's id pool; 0% NULL ... include at least one parent row with no children and at least one child row with a parent.' But the program's fill_foreign_keys_consistently assigns every car to a parent (no orphan parent guaranteed) and _assign_group_sizes distributes all n children across parents starting at index 0, so a parent with zero children is not guaranteed. Also INT_BOUNDARY for cars.train_id includes 0, but 0 is not a valid trains.id (PK starts at 1), so a generated train_id=0 would violate the FK.",
+     "requested_revision": "Specify whether orphan parents are required and whether train_id=0 is a valid generated value; if 0 is only a query literal (comparison boundary), remove it from the generated FK pool. Ensure the FK sampler guarantees at least one parent with no children if that is a requirement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows 'generated rows: NULL 0 / 20' for every nullable column (cars.train_id, cars.shape, etc.). Per the interface NULL rule, each instance should contain at least one NULL row per nullable column with a share following the compact database. The program's NULL_RULE='none' and samplers never emit NULL, and fill_foreign_keys_consistently only emits NULL when the parent pool is empty.",
+     "requested_revision": "Implement the interface NULL rule: for each nullable column, plant at least one NULL per instance with a share matching the compact database's null share, without replacing planted NULLs to satisfy rules. (Noted as non-blocking per instructions, but should be fixed for correctness.)"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "trains.direction tie target: spec.DIRECTION_TIE=True and the specification requires counts per direction to tie at rank 1. The program samples direction uniformly from EnumSampler over ['east','west',...] with no mechanism to guarantee equal counts across the 4 generated trains; with random draws a tie is not guaranteed. Similarly cars.shape group_sizes target (1,2,>=3) is not enforced by any sampler.",
+     "requested_revision": "Add explicit assignment logic (like _assign_group_sizes) for trains.direction to guarantee equal counts, and for cars.shape to guarantee group sizes 1,2,>=3, or document these as probabilistic and adjust the specification accordingly."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual null shares for nullable columns are zero (spec claims 0.0) \u2014 if so, the NULL rule's 'share following compact database' would be 0, but the interface still requires at least one NULL row per nullable column.",
+    "Whether table_sizes_per_instance refers to total rows or generated rows; the program treats it as generated rows appended to compact rows.",
+    "Whether the 5 successfully generated instances (n_ok=5) actually satisfy the group-size and tie targets, since construction_pairs separated=24/108 and no per-group breakdown was provided."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 13 of 20 units failed with IndexError('list index out of range') (n_ok=7, n_fail=13). The failure is reproducible. The traceback is not shown, but the only place in the generation path that indexes a list by a computed position without a guard is `_assign_group_sizes` in instance.py: it builds `pairs` with `k % n_parents` and then `fill_foreign_keys_consistently` does `vals.extend([pv[k]] * s)`; more importantly, `_assign_group_sizes` can return fewer than `n` children (it pops sizes when `sum(sizes) > n`), so `out[cm.name] = vals[:n]` can be shorter than `n`, and later `cols[cm.name][i]` in writer.py / `_plant_nulls` / the length-consistency check indexes past the end. The same shortfall also arises when `n_parents` is small relative to the required sizes (1,2,3,4) \u2014 with 6 trains and 12 cars the sizes 1+2+3+4=10 fit, but the remainder loop `rng.randint(1,3)` can overshoot and the `while sum(sizes) > n: sizes.pop()` can drop a required size, leaving `len(sizes) < 3` or `max(sizes) < 4` after the earlier guard, and the returned `pairs` then do not cover `n` rows.",
+     "requested_revision": "Make `_assign_group_sizes` deterministic in length: after building the required sizes (1,2,3,4) and distributing the remainder, assert `sum(sizes) == n` and `len(sizes) >= 3` and `max(sizes) >= 4`; if the remainder distribution would violate these, redistribute (e.g. add remainder to the largest group) instead of popping. In `fill_foreign_keys_consistently`, pad/truncate to exactly `n` and raise a clear error if the target cannot be met. Add a unit test that builds an instance for the given schema (trains=6, cars=12) and asserts every column has length 12 and the group-size targets hold. Re-run the generator and confirm n_fail=0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` lists `cars.shape` comparison_boundary targets including `'elipse'`, `'ELIPSE'`, `'ele'`, `'ELE'`, `'eli'`, `'ELI'`, and `like_near_variant` targets `%bucket%`, `%elipse%`. But `semantic_rules_and_formulas` for `cars.shape` says the observed pool is `('rectangle','bucket','u_shaped','hexagon','ellipse')` \u2014 note `ellipse`, not `elipse`. The spec's own note says near-variants are query literals only and generated values stay in the enum pool, yet `spec.py` `COLUMN_EXCEPTIONS[('cars','shape')]` adds `'elipse'`, `'ele'`, `'eli'` etc. to the generated pool via `enum_pool()`, and `EnumSampler` draws from that merged pool. This contradicts the stated rule ('near-variants ... are never generated') and injects values (`elipse`, `ele`, `eli`, upper-case) that are not in the observed domain.",
+     "requested_revision": "Either (a) keep `COLUMN_EXCEPTIONS` out of the generated pool and only use them as query literals (i.e. `enum_pool` should return only `ENUM_POOLS`), or (b) if the intent is to generate near-variants, state that explicitly in the specification and remove the 'never generated' note. Also reconcile `ellipse` vs `elipse`: the semantic rule uses `ellipse`; the exception list uses `elipse`. Pick one and make the LIKE pattern consistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `trains.direction` `ties_for_order_limit` says 'Assign equal counts of east and west across generated trains', and `supporting_evidence` says 'trains: 6 generated rows allow equal east/west counts (3/3)'. But `instance.py` does not implement this: `trains.direction` is sampled by `EnumSampler` uniformly at random, and `_plant_nulls` then replaces one value with NULL, so the counts are not guaranteed to tie. The spec's `DIRECTION_TIE = True` in spec.py is declared but never used.",
+     "requested_revision": "Implement the tie in the generator: after sampling `trains.direction`, force an equal split (e.g. 3 east / 3 west for 6 rows) before planting NULLs, and ensure the planted NULL does not break the tie (or account for it). Alternatively, drop the tie target from the specification if it is not required. Add a test asserting equal counts."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `cars.train_id` `aggregate_boundary` targets `HAVING(COUNT(*) < 4)`, `HAVING(COUNT(*) >= 4)`, `HAVING(COUNT(*) >= 3)`, values 2,3,4,5, and `group_sizes` targets 'group sizes 1, 2 and >= 3'. `spec.GROUP_SIZE_TARGETS = {'sizes': [1, 2, 3], 'min_large': 4}`. The `_assign_group_sizes` logic only guarantees sizes 1,2,3,4 appear; it does not guarantee a group of size >= 5, and the `aggregate_boundary` target mentions value 5. Also, `_plant_nulls` can set a `cars.train_id` to NULL, which removes that child from the group count and can break the group-size targets (the spec says 'a planted NULL is never replaced to satisfy a rule', but the group-size target is then not guaranteed).",
+     "requested_revision": "Clarify whether value 5 is required; if so, extend `GROUP_SIZE_TARGETS` to include 5 and ensure `n` is large enough (12 cars, 6 trains: 1+2+3+4+5=15 > 12, so 5 is not achievable with the stated table sizes \u2014 either raise `cars` size or drop 5 from the target). Also decide whether the group-size target must hold on non-NULL `train_id` values only; if so, plant the NULL in a row whose removal does not break the target (e.g. in a group of size >= 4), and document this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` plants exactly one NULL per nullable column, but the interface NULL rule says the NULL share should follow the compact database's share for that column. The spec's `null_rule` says 'NULL share follows the compact database's share (0.0 observed, so plant exactly one NULL per nullable column per instance)'. The execution feedback shows 7 NULLs per nullable column across 7 instances (1 per instance), consistent with the spec. However, `_plant_nulls` skips a column if it already contains a NULL (`if any(v is None for v in cols[cm.name]): continue`), which is fine, but it does not check that the column also has non-NULL values \u2014 for a column with n=1 this would leave only NULL. With the stated sizes (n>=6) this is not triggered, but it is a latent bug.",
+     "requested_revision": "Add a guard: if `n < 2`, do not plant a NULL (or raise), and assert after planting that each nullable column has at least one non-NULL value. This is a robustness fix, not a blocker for the current sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`build_random_instance` computes `p = 0.0 if rng.random() < 0.3 else 0.2` and passes it to `_init_sampler`, but for columns in `spec.ENUM_POOLS` / `spec.INT_POOLS` the sampler ignores `p` (EnumSampler/IntPoolSampler hardcode 0.0). For other columns (e.g. `cars.wheels`, `cars.load_num` are in INT_POOLS so fine; but `cars.sides` is in ENUM_POOLS) the `p` is used. This is consistent with the spec's '0% fresh values' for enumerated columns, but the spec's `generic_sampling_rules.integer_small` says 'Sample from the column's enumerated pool; no other values' \u2014 `IntPoolSampler` does this. OK. However, `spec.INT_BOUNDARY[('cars','position')] = [0,1,2,3,4,5]` and `int_pool` returns `sorted(set([1,2,3,4] + [0,1,2,3,4,5])) = [0,1,2,3,4,5]`, so `cars.position` can be generated as 0 or 5, which violates the semantic rule `position BETWEEN 1 AND 4`. The spec's `per_column_exceptions` for `cars.position` lists targets `1,2,3,4` (not 0,5), but `INT_BOUNDARY` adds 0 and 5.",
+     "requested_revision": "Remove 0 and 5 from `INT_BOUNDARY[('cars','position')]` (they are query literals only, per the spec's note pattern used for `cars.train_id=0`), or change `int_pool` to intersect with `INT_RANGES`. Add a test asserting generated `cars.position` values are in [1,4]."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `cars.id` `comparison_boundary` targets `['4']`, and `INT_BOUNDARY[('cars','id')] = [4]`. But `cars.id` is a primary key and `build_random_instance` overwrites it with sequential values `range(start, start+n)` where `start = max(original)+1`. So the literal 4 is never generated as a `cars.id` value (unless the compact DB has id 4, which is a query literal, not a generated value). The spec's `per_column_exceptions` for `cars.id` `duplicates_for_distinct` correctly notes 'primary key, no duplicates', but the `comparison_boundary` target is not achievable by generation.",
+     "requested_revision": "Clarify that `cars.id=4` is a query literal only (like `cars.train_id=0`), and remove it from `INT_BOUNDARY` or mark it as not generated. The same applies to `trains.id` targets `[0,1,2]` \u2014 0 is not a valid PK, and 1,2 are only generated if the compact DB's max id is < 2."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact traceback for the IndexError is not provided; the diagnosis above is inferred from the code. The engineer should confirm the failing line.",
+    "Whether the compact database's actual NULL shares are 0.0 for all nullable columns (the spec asserts this but the execution feedback only shows generated-row NULL counts, not compact-row shares).",
+    "Whether `table_sizes_per_instance` means total rows or generated rows; the spec treats it as generated rows appended to compact rows, which is consistent with the writer but should be confirmed.",
+    "Whether the `aggregate_boundary` target value 5 for `cars.train_id` is required; with 12 cars and 6 trains it is not achievable together with sizes 1,2,3,4."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "low",
+     "evidence": "Specification `table_sizes_per_instance` fixes trains=6 and cars=12 and group_sizes target 1,2,3,4 (sum 12). The atomic ops for `cars.train_id` aggregate_boundary list achievable values [2,3,4,5]; value 5 is unreachable for any `cars.train_id` with these sizes, so the HAVING(COUNT(*) >= 5)-style pairs can only be separated by query-literal/query-shape changes, not by data. The spec explicitly notes this (targets list 2,3,4 with 5 as query literal only), so it is documented, not a bug.",
+     "requested_revision": "None required to pass. Optionally raise the chosen car/train counts or allow one group of 5 children so the aggregate-boundary ceiling of 5 is exercised, tightening the construction rate on that family."
+    },
+    {
+     "agent": "designer",
+     "severity": "low",
+     "evidence": "The atomic ops for `cars.id` and `cars.train_id` comparison_boundary mention values 0 and 4 (e.g. PRED(trains.id = 1) replaced by PRED(cars.id = 4)). The spec records cars.id=4 and FK value 0 as 'query literals only'. Primary keys are sequential fresh above the compact max, so whether 4 is generated is incidental, not guaranteed. This under-couples the id boundary pairs to the generated data.",
+     "requested_revision": "Optional: state explicitly that boundary literals on primary keys are exercised only by query variants and cannot be forced by data generation; no program change needed."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "evidence": "In `_assign_group_sizes`, sizes are [1,2,3,min_large=4] with the remainder added to the largest group, then shuffled and assigned via `k % n_parents`. With n=12, n_parents=6, sum=12 remainder=0, so sizes are exactly {4,3,2,1,1,1} across 6 distinct parents \u2014 one parent gets no children, which satisfies 'at least one parent with no children' as a side effect. However, `choose_table_sizes` uses fixed TABLE_SIZES regardless of rng, and `_assign_group_sizes` ignores which parent is null-bearing; the 'unmatched_join_rows' guarantee relies on n_parents (6) >= len(sizes) (6). If sizes grew beyond parent count, round-robin would not leave an empty parent. This is not triggered with the current spec.",
+     "requested_revision": "Optional hardening: assert `len(sizes) < n_parents` in `_assign_group_sizes` (or drop the shuffle-and-round-robin in favour of explicit 'pick one parent to leave childless first') so the unmatched-join invariant is enforced by construction rather than incidentally."
+    },
+    {
+     "agent": "engineer",
+     "severity": "low",
+     "evidence": "`_balance_direction` splits `n//2` and `n - n//2` over `pool[0]`/`pool[1]`, giving a 3/3 split for trains=6, then `_plant_nulls` sets one entry to NULL. With an odd count the non-NULL east/west counts would differ by one and the rank-1 tie would break. With trains=6 the tie holds, as confirmed by the 20/120 NULL ratio (one NULL of 6 per instance) and reproducible construction. No error today.",
+     "requested_revision": "Optional: make `_plant_nulls` for `trains.direction` choose a row such that non-NULL east and west counts remain equal (works only for even n in pool[0]*+pool[1]); document the even-count requirement, or split as ceil/floor of the two counts before planting."
+    },
+    {
+     "agent": "engineer",
+     "severity": "information",
+     "evidence": "Execution feedback: 20/20 instances valid, 0 FK/not-null/PK violations, reproducible=true, 28/108 construction pairs separated. Nullable columns all show 'NULL 20 / 240' or '20 / 120' \u2014 exactly one NULL per generated block per column, matching the spec NULL rule. Enumerated pools (e.g. car shapes include 'ellipse', not 'elipse') are wired through `spec.ENUM_POOLS`; `int_pool` intersects ranges so `cars.position` stays in [1,4]. Integer PKs are sequential above compact max and FK children draw from the union of compact and generated parent ids.",
+     "requested_revision": "None. The low separation rate (28/108) is not evidence of a generation error; the distinct-value/share patterns and query-literal specialization in the pairs explain the rest."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the aggregate-boundary value 5 for cars.train_id could be exercised without changing table sizes; the spec documents it as unreachable under current counts, so the associated pairs (H1) remain separated only by query-shape changes.",
+    "Whether `cars.id=4` and `cars.train_id=0` boundary pairs (C1) were intended to be data-sensitive; the spec classifies them as query literals only, so they are not expected to be separated by generated values."
+   ]
+  }
+ ]
 }

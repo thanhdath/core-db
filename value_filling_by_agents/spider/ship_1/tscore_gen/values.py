@@ -39,16 +39,32 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 dom_min=None, dom_max=None, soft=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if dom_min is not None:
+            self.min = dom_min
+        if dom_max is not None:
+            self.max = dom_max
+        if soft and dom_min is not None and dom_max is not None:
+            span = max(1.0, float(dom_max) - float(dom_min))
+            self.min = float(dom_min) - span
+            self.max = float(dom_max) + span
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
+
+    def _clamp(self, v):
+        if v < self.min:
+            return self.min
+        if v > self.max:
+            return self.max
+        return v
 
     def sample(self):
         r = self.rng
@@ -67,7 +83,7 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._cast(self._clamp(v))
 
 
 class StringSampler(ColumnSampler):
@@ -105,6 +121,37 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Enumerated text domain: uniform over the listed values, with case near-variants."""
+
+    def __init__(self, values: list, variants: list, p: float, max_l0: float, rng,
+                 extra_values: list = None):
+        els = [str(v) for v in values if v is not None]
+        for v in extra_values or []:
+            if v not in els:
+                els.append(str(v))
+        for v in variants or []:
+            if v not in els:
+                els.append(str(v))
+        super().__init__(els, p, max_l0, rng)
+        self.p = 0.0
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class NumericTextSampler(ColumnSampler):
+    """Text column holding integer-like values in a range (e.g. captain.age)."""
+
+    def __init__(self, lo: int, hi: int, p: float, max_l0: float, rng):
+        super().__init__([], p, max_l0, rng)
+        self.lo, self.hi = int(lo), int(hi)
+        self.p = 0.0
+
+    def sample(self):
+        return str(self.rng.randint(self.lo, self.hi))
 
 
 def _parse_date(s: str):
@@ -182,8 +229,20 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, domain: dict = None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    domain = domain or {}
+    kind = domain.get('kind')
+    if kind == 'text_enum' or (domain.get('values') and not domain.get('min')):
+        return EnumSampler(domain.get('values') or [], domain.get('variants') or [], p, max_l0, rng,
+                           extra_values=domain.get('extra_values') if domain.get('soft') else None)
+    if kind == 'text_free' and domain.get('numeric_text'):
+        return NumericTextSampler(domain.get('min', 0), domain.get('max', 100), p, max_l0, rng)
+    if kind == 'real_numeric' or (domain.get('min') is not None and domain.get('max') is not None):
+        is_int = bool(domain.get('integer_like'))
+        return NumberSampler(elements, p, max_l0, rng, scale=10, is_int=is_int, precision=0 if is_int else 4,
+                             dom_min=domain.get('min'), dom_max=domain.get('max'),
+                             soft=bool(domain.get('soft')))
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
@@ -215,8 +274,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), domain: dict = None) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (domain-aware)."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,11 +284,12 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, domain)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), domain: dict = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, domain)
     return [s.sample() for _ in range(n)]

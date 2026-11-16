@@ -1,53 +1,530 @@
 {
  "db": "inn_1",
- "operator_io_quirks": [
-  "Mixed-case table/column names (Rooms, RoomId, roomName, maxOccupancy, CheckIn) \u2014 must be double-quoted in generated SQL; case-insensitive lookup.",
-  "TEXT PK RoomId holds short uppercase codes (AOB, CAS, FNA) \u2014 String fuzzer will emit random charset strings, not code-shaped.",
-  "CheckIn/CheckOut are TEXT-stored dates in format 'DD-MON-YY' (e.g. '23-OCT-10', '02-FEB-10') \u2014 declared TEXT so TS dispatches to String, not Date; leading-zero day present.",
-  "Reservations.Room FK -> Rooms.RoomId, parent exists and is unique (PK); 600 child rows over 10 parents, so heavy duplication expected.",
-  "Rooms has only 10 rows; Reservations 600 \u2014 child table much larger than parent, FK draw with replacement will repeat parents.",
-  "No NOT NULL, no CHECK, no UNIQUE beyond PKs; all columns nullable in DDL.",
-  "Rate is REAL with 2-decimal values (218.75, 287.5) \u2014 Number fuzzer with scale from 'real' (no args) will produce wide-range floats.",
-  "beds/maxOccupancy/Adults/Kids are small-cardinality INTEGERs (2-4 distinct) \u2014 Number fuzzer ignores this and draws from [-10^scale,10^scale].",
-  "basePrice INTEGER with 6 distinct values (75..175) \u2014 Number fuzzer range far exceeds observed.",
-  "No views, triggers, or indexes beyond PKs in DDL.",
-  "Table order: Rooms (level 0) before Reservations (level 1) \u2014 FK fill works with upstream ordering.",
-  "All storage classes match declared types (text/integer/real); no affinity contradictions."
- ],
- "operator_ts_expectations": [
-  "CheckIn/CheckOut: String fuzzer (declared TEXT) \u2014 random charset strings + contamination, NOT date-shaped; any query comparing to 'DD-MON-YY' literals will mostly miss.",
-  "RoomId/Room: String fuzzer emits random a-zA-Z0-9() strings, not 3-letter codes; joins still work (FK consistency) but value predicates on codes fail.",
-  "roomName/decor/bedType/LastName/FirstName: random strings with contamination \u2014 implausible names, likely FN on LIKE/equality predicates.",
-  "beds/maxOccupancy/Adults/Kids: Number fuzzer draws from [-10^scale,10^scale] (scale from type args, default 0 -> [-1,1] for bare INTEGER? actually scale=0 -> [-1,1]) \u2014 implausible occupancy values, FN on range predicates.",
-  "basePrice/Rate: Number fuzzer wide range; Rate scale from 'real' (no args) -> default scale, likely [-10^4,10^4] \u2014 implausible prices, FN on price-range predicates.",
-  "Code (INTEGER PK): Number fuzzer with PK -> max_l0=inf, fresh draws; values near 0 or perturbed, not 5-digit codes \u2014 FN on Code predicates.",
-  "FK Room draws from Rooms.RoomId final values with replacement \u2014 ties/duplicates abundant (600 rows, 10 parents), good for COUNT/GROUP BY but may FP on DISTINCT-count queries.",
-  "Small parent (10 rows) means FK child values cluster; queries expecting uniform distribution may see skew.",
-  "String contamination (suffix/prefix/drop-char) creates near-miss values \u2014 may cause FP on LIKE '%X%' predicates.",
-  "No NOT NULL enforcement in Python; NULLs only from empty parent or dropout \u2014 with 10 parents, few NULLs expected.",
-  "Date-shaped TEXT columns never get Date fuzzer \u2014 a known TS miss for this schema shape (text-stored dates)."
- ],
- "challenger_refs": [
-  "G3",
-  "G2",
-  "g272274e9",
-  "g272274e9",
-  "g272274e9",
-  "g272274e9",
-  "g272274e9",
-  "G6",
-  "G5",
-  "G7",
-  "G8",
-  "G9",
-  "G4",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a pool of 8-20 distinct short strings; 5% of rows get a near-variant (case change, trailing space, or one-character edit) of a pool value; nullable columns get NULL in 5-15% of rows.",
+   "text_name": "Sample from a pool of 40-80 distinct surname-like and 40-80 given-name-like strings; 10% near-variants (case change or one-character edit); nullable columns get NULL in 5-15% of rows.",
+   "text_code": "Sample from a pool of 8-12 distinct 3-letter uppercase codes; 10% near-variants (case change or one-character edit); nullable columns get NULL in 5-15% of rows, except primary-key codes which are drawn from a fresh, non-colliding pool (see dependencies and uncertainty).",
+   "integer_small": "Sample uniformly from the observed distinct values; include the minimum and maximum; nullable columns get NULL in 5-15% of rows.",
+   "integer_price": "Sample integers from the observed range with step 25; include the minimum and maximum; nullable columns get NULL in 5-15% of rows.",
+   "real_rate": "Sample from the observed distinct values with step 6.25; include the minimum and maximum; nullable columns get NULL in 5-15% of rows.",
+   "date_text": "Sample a date in DD-MON-YY format between 01-JAN-10 and 31-DEC-11; nullable columns get NULL in 5-15% of rows.",
+   "primary_key_integer": "Assign sequential integers starting at max(compact Reservations.Code) + 1 (a per-instance margin of +1 is sufficient because each instance is a separate copy of the compact DB); never NULL and never colliding with compact rows.",
+   "primary_key_text": "Assign values drawn from a fresh pool of 3-letter uppercase codes disjoint from the compact Rooms.RoomId values; number of generated Rooms rows is 10 and the values are 10 distinct fresh codes; never NULL and never colliding with compact rows."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Reservations.Room",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Rooms.RoomId"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "null_share": "5%"
+    }
+   },
+   {
+    "column": "Reservations.Room",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "measured over distinct parent values referenced (not over child rows): with 10 parent rows and 600 child rows, distinct/n is at most 10/600 = 1.7%; the target is interpreted as distinct referenced parent values / child rows, i.e. all 10 parent values are referenced and at least 9 of them are referenced by the generated child rows"
+    }
+   },
+   {
+    "column": "Reservations.Room",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Rooms.RoomId",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Reservations.Room"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Rooms.RoomId",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "equal_and_one_step_from": [
+      "a derived column"
+     ]
+    }
+   },
+   {
+    "column": "Rooms.RoomId",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Rooms.roomName",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Rooms.roomName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Rooms.roomName",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "unordered"
+    }
+   },
+   {
+    "column": "Rooms.basePrice",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      140,
+      141,
+      142,
+      159,
+      160,
+      161
+     ],
+     "expression_values": [
+      {
+       "expression": "Reservations.Rate - Rooms.basePrice",
+       "values": [
+        -1,
+        0,
+        1
+       ]
+      }
+     ],
+     "equal_and_one_step_from": [
+      "Reservations.Rate",
+      "a derived column"
+     ]
+    }
+   },
+   {
+    "column": "Rooms.basePrice",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Reservations.FirstName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "ROY",
+      "roy"
+     ]
+    }
+   },
+   {
+    "column": "Reservations.Rate",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "expression_values": [
+      {
+       "expression": "Reservations.Rate - Rooms.basePrice",
+       "values": [
+        -1,
+        0,
+        1
+       ]
+      }
+     ],
+     "equal_and_one_step_from": [
+      "Rooms.basePrice"
+     ]
+    }
+   },
+   {
+    "column": "Rooms.decor",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC",
+     "tie_on": [
+      "COUNT(Rooms.decor)",
+      "COUNT(Rooms.roomName)"
+     ]
+    }
+   },
+   {
+    "column": "Reservations.LastName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "SWEAZY",
+      "sweazy"
+     ]
+    }
+   },
+   {
+    "column": "Rooms.bedType",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30% of generated rows"
+    }
+   },
+   {
+    "column": "Rooms.maxOccupancy",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3,
+      4
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Reservations",
+    "child_column": "Room",
+    "parent_table": "Rooms",
+    "parent_column": "RoomId",
+    "copied_columns": []
+   },
+   {
+    "table": "Rooms",
+    "column": "RoomId",
+    "kind": "fresh_text_primary_key",
+    "rule": "10 distinct 3-letter uppercase codes disjoint from compact Rooms.RoomId values; never NULL"
+   },
+   {
+    "table": "Reservations",
+    "column": "Code",
+    "kind": "fresh_integer_primary_key",
+    "rule": "sequential integers starting at max(compact Reservations.Code) + 1; never NULL and never overlapping compact Codes"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Rooms",
+    "column": "RoomId",
+    "formula": "RoomId IS NOT NULL",
+    "evidence": "primary key"
+   },
+   {
+    "table": "Rooms",
+    "column": "beds",
+    "formula": "beds IN (1, 2)",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "Rooms",
+    "column": "bedType",
+    "formula": "bedType IN ('King', 'Queen', 'Double')",
+    "evidence": "observed distinct values; NULL allowed (nullable, null_targets)"
+   },
+   {
+    "table": "Rooms",
+    "column": "maxOccupancy",
+    "formula": "maxOccupancy IN (2, 4)",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "Rooms",
+    "column": "basePrice",
+    "formula": "basePrice IS NULL OR basePrice >= 0",
+    "evidence": "price is non-negative; basePrice is NOT NULL in compact rows and not in null_targets"
+   },
+   {
+    "table": "Rooms",
+    "column": "decor",
+    "formula": "decor IN ('modern', 'traditional', 'rustic')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "Reservations",
+    "column": "Code",
+    "formula": "Code IS NOT NULL",
+    "evidence": "primary key"
+   },
+   {
+    "table": "Reservations",
+    "column": "CheckIn",
+    "formula": "CheckIn IS NOT NULL",
+    "evidence": "NOT NULL per schema and not in null_targets"
+   },
+   {
+    "table": "Reservations",
+    "column": "CheckOut",
+    "formula": "CheckOut IS NOT NULL",
+    "evidence": "NOT NULL per schema and not in null_targets"
+   },
+   {
+    "table": "Reservations",
+    "column": "CheckOut",
+    "formula": "CheckOut >= CheckIn",
+    "evidence": "10105: 23-OCT-10 -> 25-OCT-10; 10183: 19-SEP-10 -> 20-SEP-10; 10449: 30-SEP-10 -> 01-OCT-10; 10984: 28-DEC-10 -> 01-JAN-11"
+   },
+   {
+    "table": "Reservations",
+    "column": "Rate",
+    "formula": "Rate IS NOT NULL AND Rate >= 0",
+    "evidence": "NOT NULL per schema; all shown Rate values positive"
+   },
+   {
+    "table": "Reservations",
+    "column": "Adults",
+    "formula": "Adults IN (1, 2, 3, 4)",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "Reservations",
+    "column": "Kids",
+    "formula": "Kids IN (0, 1, 2, 3)",
+    "evidence": "observed distinct values"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Rooms": 10,
+   "Reservations": 600
+  },
+  "null_targets": [
+   "Reservations.Room",
+   "Rooms.bedType"
+  ],
+  "supporting_evidence": {
+   "Reservations.CheckOut >= CheckIn": [
+    "10105: 23-OCT-10 -> 25-OCT-10",
+    "10183: 19-SEP-10 -> 20-SEP-10",
+    "10449: 30-SEP-10 -> 01-OCT-10",
+    "10489: 02-FEB-10 -> 05-FEB-10",
+    "10500: 11-AUG-10 -> 12-AUG-10",
+    "10574: 26-NOV-10 -> 03-DEC-10",
+    "10984: 28-DEC-10 -> 01-JAN-11",
+    "10990: 21-SEP-10 -> 27-SEP-10"
+   ],
+   "Rooms.beds IN (1, 2)": [
+    "observed distinct values 1, 2"
+   ],
+   "Rooms.bedType IN ('King', 'Queen', 'Double')": [
+    "observed distinct values King, Queen, Double"
+   ],
+   "Rooms.maxOccupancy IN (2, 4)": [
+    "observed distinct values 2, 4"
+   ],
+   "Rooms.decor IN ('modern', 'traditional', 'rustic')": [
+    "observed distinct values modern, traditional, rustic"
+   ],
+   "Reservations.Adults IN (1, 2, 3, 4)": [
+    "observed distinct values 1, 2, 3, 4"
+   ],
+   "Reservations.Kids IN (0, 1, 2, 3)": [
+    "observed distinct values 0, 1, 2, 3"
+   ],
+   "Reservations.FirstName equality literal 'ROY'": [
+    "row 10574: FirstName = ROY"
+   ],
+   "Reservations.LastName equality literal 'SWEAZY'": [
+    "row 10574: LastName = SWEAZY"
+   ]
+  },
+  "uncertainty": {
+   "Primary-key collisions with compact rows": "The compact DB already contains Rooms.RoomId values from the shared 3-letter code pool and Reservations.Code values 10105, 10183, 10449, 10489, 10500, 10574, 10984, 10990. Generated primary keys must be disjoint: Rooms.RoomId from a fresh 10-code pool disjoint from compact RoomIds; Reservations.Code sequential starting at max(compact Code)+1 per instance. This guarantees table_sizes_per_instance (Rooms 10, Reservations 600) are actually added.",
+   "NOT NULL vs planted NULLs": "Compact null_rate is 0.0 for every column, but null_targets contains Reservations.Room (nullable FK, 5% NULL) and Rooms.bedType (5-30% NULL) because the atomic-operation summary requires NULL rows for those columns. All other columns (Rooms.basePrice, Reservations.Rate, FirstName, LastName, CheckIn, CheckOut, etc.) are NOT NULL and never receive NULL. The instruction-7 'at least one NULL row per nullable column' clause is satisfied only for the columns in null_targets; all other nullable columns are generated with no NULLs because the compact share of 0 overrides the 'at least one NULL' clause for them. Planted NULLs are never replaced.",
+   "Reservations.Rate vs Rooms.basePrice": "No universal formula is stated: sample most Rate values from the real_rate domain (step 6.25 including min/max). On a controlled subset of rows (at least 3 per instance, deterministically cycling through offsets -1, 0, +1) plant Rate such that Rate - basePrice of the reservation's Room equals -1, 0, or 1, so the join-level expression takes the boundary values while the general Rate domain is preserved. Rate must be looked up relative to the actual referenced Room.",
+   "Reservations.Room group sizes and duplicates": "Construct Reservations.Room explicitly: draw wins over the 10 fresh RoomIds with a controlled multiplicity distribution so at least one group has size 1, at least one has size 2, at least one has size >= 3, and the number of distinct referenced parent values is at least 9 (the 10th parent room is referenced by no child rows, so the parent-without-children target holds). The duplicate_share target is measured over distinct parent values referenced, not over child rows, because with 10 parent rows and 600 child rows the maximum distinct/n is 10/600 = 1.7%. Plant ~5% NULL FKs. The count vector must be initialized to length k before filling the distribution so that the loop never indexes out of range.",
+   "Tie targets for Rooms.decor and Rooms.roomName": "Force exact count distributions: Rooms.decor counts (4, 3, 3) across 10 rows and Rooms.roomName counts (4, 3, 3), so the minimum count is tied at rank 1 for COUNT(decor) ASC and guaranteed ties at rank 1 for ORDER BY COUNT(roomName) ASC. Rooms.roomName is restricted to 3 distinct values to satisfy group_sizes (1, 2, >= 3 partition, e.g. 4/3/3) and duplicates_for_distinct (20-50%), overriding generic text_short; no NULL for roomName.",
+   "Writer preserves compact rows": "The generation program must pass the original database path to write_instance_sqlite (orig_path=orig); generated rows are appended and compact rows are never deleted or altered.",
+   "Rooms.RoomId duplicates/group_sizes for Rooms.RoomId": "RoomId is a primary key and cannot contain duplicates; the duplicates_for_distinct and group_sizes entries in the atomic summary for Rooms.RoomId describe join-visible multiplicities through Reservations.Room, not duplicate PK values.",
+   "Rooms.basePrice observed range": "The observed range is derived from the compact data (schema.original_values[('Rooms','basePrice')]) rather than hardcoded; the integer_price domain samples with step 25 over that range and includes the minimum and maximum. The planted boundary values 140/141/142/159/160/161 fall inside the observed range and are on top of the general domain."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances are invalid with reason 'compact_rows_missing' (dc_rows_missing_or_changed: Reservations 1660 rows, Rooms 200 rows across 20 instances; 93 rows missing/changed per instance). The CLI calls build_random_instance(...) then write_instance_sqlite(_G['schema'], inst, p) with no orig_path argument. In writer.py, write_instance_sqlite(schema, instance, path, orig_path=None) only copies the compact database when orig_path is given; otherwise it creates a fresh DB from schema.ddl and inserts only generated rows. So the original D_c rows are never preserved.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the worker args and call write_instance_sqlite(schema, inst, p, orig_path=orig)) so each unit is a copy of the compact DB with generated rows appended, keeping all D_c rows unchanged. Re-run and confirm 'valid' instances > 0 and dc_rows_missing_or_changed == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms plants basePrice boundary values [140,141,142,159,160,161] into the first 6 of 10 Rooms rows, and _build_reservations sets Rate[i] = basePrice[i] + {-1,0,1} for the first min(n, len(prices)) rows. But Reservations.Room is assigned independently (random choice from child_pool, with 5% NULL), so the planted Rate/basePrice boundary pairs are attached to unrelated rooms. The comparison_boundary target for Rooms.basePrice / Reservations.Rate ('Reservations.Rate - Rooms.basePrice in {-1,0,1}') is therefore not realized on the joined rows that queries actually evaluate. Construction feedback shows only 17 of 70 eligible pairs separated.",
+     "requested_revision": "When planting Rate boundary values, set Rate relative to the basePrice of the room actually referenced by that reservation (look up rooms['basePrice'] by the chosen Room id), so the join-level expression Rate - basePrice actually takes values in {-1,0,1}. Keep the NULL rule (planted NULLs not replaced)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms: roomName is built so that only 3 distinct values exist and rows 3-9 reuse them (group sizes 1,2,>=3 and duplicate share 20-50% are satisfied), but the ShortTextSampler is constructed with nullable=True and its sample() may return None; the code then reuses name_vals[i % 3] which could be None, and no explicit NULL-share control is applied. More importantly, the specification's generic text_short rule (8-20 distinct strings, 5% near-variants) is overridden by the hard-coded 3-value reuse, so the 'duplicates_for_distinct 20-50%' target is met but the 'group_sizes 1,2,>=3' target is met only by construction, not by the sampler. This is a design/implementation mismatch worth flagging, though not blocking.",
+     "requested_revision": "Either document in the specification that Rooms.roomName is intentionally restricted to 3 distinct values to satisfy group_sizes/duplicates_for_distinct, or adjust the sampler so the generic text_short rule and the group-size target are both honored explicitly (e.g. draw from the short pool, then force the required group-size distribution)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty notes: 'Reservations.Room nullability: observed null_rate is 0.0; the specification plants 5% NULL foreign keys' and 'Rooms.bedType nullability: observed null_rate is 0.0; the specification plants 5-30% NULL values'. The interface NULL rule says the NULL share should follow the compact database's share for that column. Planting 5% / 5-30% NULLs where the compact DB has 0% NULLs contradicts that rule.",
+     "requested_revision": "Reconcile the specification with the interface NULL rule: either state that these columns are treated as nullable with a planted share (and justify why the compact share of 0 is overridden), or set the planted NULL share to match the compact share (0) and drop the unmatched_join_rows / null_rows targets that depend on planted NULLs. Do not leave the contradiction implicit."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions include 'Rooms.RoomId duplicates_for_distinct 20-50%' and 'Rooms.RoomId group_sizes 1,2,>=3', but Rooms.RoomId is a PRIMARY KEY (TEXT PRIMARY KEY) and cannot contain duplicates. The uncertainty note acknowledges this ('interpreted as a sampling-domain exception for the join column, not as a violation of the primary key'), but the exception is still listed against Rooms.RoomId rather than only against Reservations.Room.",
+     "requested_revision": "Remove the duplicates_for_distinct and group_sizes exceptions from Rooms.RoomId (they belong to Reservations.Room, the join column), and keep only the NOT NULL / primary-key rule for Rooms.RoomId. This avoids an internally inconsistent specification."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the planted Rate/basePrice boundary pairs are actually reachable through the join after the fix (needs re-run of construction_pairs).",
+    "Whether the compact DB's actual NULL shares for Reservations.Room and Rooms.bedType are 0 (as the uncertainty note claims) \u2014 not independently verified from the supplied schema dump.",
+    "Whether the 5% NULL FK share plus the 'parent_rows_without_children' target is satisfied after the writer fix (currently masked by the compact_rows_missing failure)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added Rooms 45, rows_skipped Rooms 155 across 20 instances (i.e. ~2.25 Rooms rows added per instance, ~7.75 skipped). The spec requires Rooms=10 and Reservations=600 per instance. The writer appends generated rows to a copy of the compact DB, but Rooms.RoomId is a TEXT PRIMARY KEY drawn from a 12-value code pool (_CODE_POOL in values.py, PKTextSampler). The compact DB already contains Rooms rows with RoomId values from that same pool, so most generated Rooms rows collide on the primary key and are skipped. Reservations.Code is sequential from 10000, which also collides with existing compact Codes (e.g. 10105, 10183, 10449, 10489, 10500, 10574, 10984, 10990 appear in supporting_evidence), causing ~111 skipped Reservations rows per instance (2220/20).",
+     "requested_revision": "Make generated primary keys disjoint from the compact rows: e.g. start Reservations.Code above max(compact Code)+1, and generate Rooms.RoomId values that do not already exist in the compact Rooms table (or otherwise guarantee no PK collision). The spec's table_sizes_per_instance (Rooms 10, Reservations 600) must actually be added per instance; the current ~2 Rooms / ~489 Reservations per instance does not satisfy it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms: `bp = ObservedIntSampler([75,100,125,150,175,250], ..., nullable=True)` then `prices = [bp.sample() ...]`. ObservedIntSampler returns None with probability null_share (5-15%). The boundary planting loop `for k,v in enumerate(boundary): if k<n: prices[k]=v` overwrites the first 6 slots, but the remaining 4 slots can be None. Execution feedback confirms: 'Rooms.basePrice: generated rows: NULL 3 / 48'. basePrice is not in null_targets and the spec's semantic rule is `basePrice >= 0` with no NULL allowance; the compact share is 0. Similarly `_build_reservations` uses `ObservedRealSampler(..., nullable=True)` for Rate and `NameSampler(..., nullable=True)` for FirstName/LastName, and `DateTextSampler(..., nullable=True)` for CheckIn/CheckOut, all of which are NOT NULL columns per the schema and not in null_targets.",
+     "requested_revision": "Pass nullable=False for Rooms.basePrice, Reservations.Rate, Reservations.FirstName, Reservations.LastName, Reservations.CheckIn, Reservations.CheckOut (and any other NOT NULL column not listed in null_targets). Only Reservations.Room and Rooms.bedType should receive NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_reservations: `rates[i] = float(price_by_room[rid]) + rng.choice([-1.0, 0.0, 1.0])` is applied to every non-NULL Room, so Rate - basePrice is always in {-1,0,1} on the joined row. The spec's comparison_boundary target for Reservations.Rate / Rooms.basePrice requires the expression to *take* values in {-1,0,1} (i.e. those boundary values must be present), not that every row be a boundary value. The spec's generic real_rate rule ('Sample from the observed distinct values with step 6.25; include the minimum and maximum') is thereby violated: no Rate value is drawn from the 6.25-step pool, and the min/max of the observed Rate range are never produced. This also removes the intended value variation for the Rate column.",
+     "requested_revision": "Draw most Rate values from the real_rate sampler (step 6.25, min/max included) and plant the {-1,0,1} offsets only on a subset of rows (e.g. a handful per instance) so the boundary expression values are present while the general domain is preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms: `dec = ['modern','traditional','rustic']; cols['decor'] = [dec[i % 3] for i in range(n)]`. With n=10 this yields counts 4/3/3, which is fine, but the spec's ties_for_order_limit target for Rooms.decor requires a tie at rank 1 for `ORDER(COUNT(Rooms.decor), ASC)` and `ORDER(COUNT(Rooms.roomName), ASC)`. roomName is forced to 3 distinct values with counts 3/3/4 (i<3 -> pool[i], i<6 -> name_vals[i%3], else random) \u2014 the rank-1 tie is not guaranteed (the random tail can break it). The decor counts 4/3/3 also do not guarantee a rank-1 tie. The construction_pairs feedback shows only 16 of 70 eligible pairs separated, consistent with these ties not being reliably produced.",
+     "requested_revision": "Force explicit count distributions for Rooms.decor and Rooms.roomName that guarantee a tie at rank 1 under ASC ordering (e.g. equal minimum counts for at least two values), and document the exact distribution in the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec uncertainty section states Reservations.Room nullability: 'observed null_rate is 0.0 ... the specification plants 5% NULL foreign keys; this overrides the compact share of 0'. The interface NULL rule (instruction 7) says the NULL share should follow the compact database's share for that column. The spec's own uncertainty note acknowledges the conflict but resolves it by overriding the compact share. Similarly Rooms.bedType: compact share 0, spec plants 5-30%.",
+     "requested_revision": "Reconcile the spec with the interface NULL rule: either state explicitly that the compact share is 0 and therefore the NULL share target is 0 (and drop the planted NULLs), or justify the override in a way consistent with the interface rule. As written the spec and the interface rule disagree, and the program follows the spec (planting NULLs), which is the correct behavior given the spec but the spec itself is inconsistent with the interface."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_reservations: `child_pool = room_ids[:-1] if len(room_ids) > 1 else room_ids` then `room_vals.append(rng.choice(child_pool))` for most rows. With 10 Rooms and 600 Reservations, the last RoomId is excluded from the child pool, guaranteeing at least one parent without children (good), but the group_sizes target ('1, 2 and >= 3') and duplicates_for_distinct ('20-50%') for Reservations.Room are only satisfied by chance: the first 6 rows are forced to specific patterns, but the remaining ~570 rows are uniform random over 9 values, giving group sizes far above 3 and a duplicate share near 100% (not 20-50%). The spec's per_column_exceptions require these targets explicitly.",
+     "requested_revision": "Construct Reservations.Room explicitly to satisfy the group_sizes (1, 2, >=3) and duplicate_share (20-50%) targets, e.g. by assigning a controlled number of distinct Room values with the required multiplicities rather than uniform random choice."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's existing Rooms.RoomId values overlap the 12-value _CODE_POOL (strongly implied by the skipped-row counts, but not directly verified from the compact data).",
+    "Whether the 16/70 separated construction pairs are due to the tie/group-size issues above or to other causes; the per-group breakdown was empty in the feedback."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with IndexError('list index out of range') at tscore_gen/instance.py:216 (`counts[i] += extra`) inside `_build_room_fk`. The loop `for i in range(k): counts[i] += extra` iterates over k, but `counts` was initialized as `[1, 2, max(3, n_nonnull // 2)]` and only truncated when `len(counts) > k`; when k > 3 (which is the normal case since k = round(n_nonnull * U(0.5,0.8)) \u2248 300-480 for n=600), `counts` has length 3 while the loop indexes up to k-1. Result: n_ok=0, n_fail=20, no instance directories written.",
+     "requested_revision": "Fix `_build_room_fk` so the count vector has length k before the distribution loop, e.g. build `counts = [1, 2, max(3, n_nonnull // 2)] + [0] * (k - 3)` (or pad/truncate to k) before adding `extra` and the remainder. Re-run the construction check and confirm n_ok == n_instances with rows_added for both Rooms and Reservations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after the IndexError is fixed, `_build_room_fk` cannot satisfy the specified duplicate share. The spec requires `duplicate_share` in 20-50% for Reservations.Room, i.e. distinct/n in [0.5, 0.8]. The code sets `k = max(2, min(k, int(round(n_nonnull * rng.uniform(0.5, 0.8)))))` and then `chosen = child_pool[:k]`, but `child_pool = room_ids[:-1]` has only 9 elements (10 fresh RoomIds minus the childless one). For n=600, n_nonnull\u2248570, so k is capped at 9, giving distinct/n \u2248 9/600 \u2248 1.5% \u2014 far below the 20-50% target. The spec's own uncertainty note says 'draw wins independently over the 10 fresh RoomIds with a controlled multiplicity distribution so ... the distinct value count yields a duplicate share in 20-50%', which is impossible with only 10 parent rows and 600 children unless the target is interpreted as distinct/n over the *non-null* rows and even then 9/570 \u2248 1.6%.",
+     "requested_revision": "Designer: reconcile the duplicate_share target with the fixed table sizes (Rooms=10, Reservations=600). With 10 parent rows the maximum achievable distinct/n is 10/600 \u2248 1.7%, so a 20-50% duplicate share is unattainable. Either (a) relax the duplicate_share target for Reservations.Room to a value consistent with 10 parents and 600 children, or (b) increase Rooms size / decrease Reservations size, or (c) clarify that duplicate_share is measured over distinct parent values referenced (not over child rows). Engineer: implement whichever is chosen and verify the resulting share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_rooms` sets `cols['roomName']` from `_SHORT_POOL[:3]` with forced counts 4/3/3, satisfying the tie/group-size targets. However `_SHORT_POOL` values are long phrases ('Recluse and defiance', etc.), not 'short strings' as the generic text_short rule requires (8-20 distinct short strings). This is a minor deviation but the spec explicitly overrides generic text_short for roomName ('overriding generic text_short'), so it is acceptable. No change required here; noted for completeness.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_reservations` plants boundary offsets on `boundary_rows = [i for i in range(n) if room_vals[i] is not None and room_vals[i] in price_by_room][:6]`. Because `_build_room_fk` shuffles `out`, the first 6 non-null rows are effectively random, so the planted offsets {-1,0,1} are present but the spec's `expression_values` target for `Reservations.Rate - Rooms.basePrice` requires all three of -1, 0, 1 to appear. With only 6 rows and `rng.choice([-1.0, 0.0, 1.0])` per row, there is a non-trivial probability (\u2248 (2/3)^6 \u2248 8.8% per instance) that one of the three values is missing. This is a probabilistic gap, not a hard failure, but it weakens the boundary coverage the spec asks for.",
+     "requested_revision": "Engineer: deterministically assign the three offsets across the planted rows (e.g. cycle through [-1.0, 0.0, 1.0] for the first three boundary rows) so all three expression values are guaranteed present in every instance. Also ensure the planted rows are chosen from non-null FK rows referencing a room whose basePrice is known."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_rooms` plants basePrice boundary values 140/141/142/159/160/161 into the first 6 rows, but `ObservedIntSampler` with step=25 over [75,100,125,150,175,250] produces values {75,100,125,150,175,200,225,250} \u2014 none of which are 140/141/142/159/160/161. The spec's comparison_boundary target for Rooms.basePrice lists values [140,141,142,159,160,161] and expression_values for Rate-basePrice in {-1,0,1}. The planted boundary values are present, but the general basePrice domain (step 25) does not include them, so the two are disjoint. This is acceptable per the spec (boundary values are planted on top of the general domain), but the spec's `integer_price` rule says 'Sample integers from the observed range with step 25; include the minimum and maximum' \u2014 the observed range is [75,250], and 140/141/142/159/160/161 fall inside it, so they are consistent. No change required.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` lists only Reservations.Room and Rooms.bedType, and the uncertainty note says 'All other columns ... are NOT NULL and never receive NULL.' However the schema declares Rooms.roomName, Rooms.beds, Rooms.bedType, Rooms.maxOccupancy, Rooms.basePrice, Rooms.decor, Reservations.Room, Reservations.Rate, Reservations.LastName, Reservations.FirstName, Reservations.Adults, Reservations.Kids as nullable (no NOT NULL constraint). The program interface rule (instruction 7) says 'for every nullable column (including nullable foreign keys), each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column.' The compact DB has null_rate 0.0 for every column, so the 'compact share' is 0, which conflicts with 'at least one NULL row per nullable column.' The spec resolves this by restricting NULLs to null_targets, which is a reasonable interpretation, but it should be stated explicitly that the compact share of 0 overrides the 'at least one NULL' clause for non-target nullable columns.",
+     "requested_revision": "Designer: add an explicit note to the spec that because the compact DB has null_rate 0.0 for all columns, the 'at least one NULL row per nullable column' clause is satisfied only for the columns in null_targets (Reservations.Room, Rooms.bedType), and all other nullable columns are generated with no NULLs. This removes the apparent contradiction with instruction 7."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_reservations` sets `cols['Code'] = list(range(start, start + n))` where `start = _compact_max_code(schema) + 1`. The spec's primary_key_integer rule says 'sequential integers starting strictly above the maximum Code present in the compact Reservations table (offset by a per-instance margin)'. The code uses +1, not a margin. Since each instance is a separate copy of the compact DB, +1 is sufficient to avoid collisions within an instance, but the spec explicitly mentions a 'per-instance margin'. This is a minor deviation.",
+     "requested_revision": "Engineer: either add a small per-instance margin (e.g. +1000) to match the spec wording, or update the spec to say +1 is sufficient. Low priority."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_rooms` uses `ObservedIntSampler([75, 100, 125, 150, 175, 250], ...)` for basePrice, but the spec's `integer_price` rule says 'Sample integers from the observed range with step 25; include the minimum and maximum.' The observed range from the compact DB is not given in the fast-mode input, but the spec's comparison_boundary target lists values [140,141,142,159,160,161] and the supporting evidence does not list basePrice observed values. The hardcoded [75,100,125,150,175,250] may not match the actual observed range. This is a potential mismatch between spec and program.",
+     "requested_revision": "Engineer: derive the basePrice observed range from `schema.original_values[('Rooms','basePrice')]` rather than hardcoding, so the step-25 domain matches the compact data. If the compact range is unknown, document the assumption in the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the duplicate_share target for Reservations.Room (20-50%) is achievable with Rooms=10 and Reservations=600 \u2014 appears impossible; requires designer clarification.",
+    "Whether the compact basePrice observed range matches the hardcoded [75,100,125,150,175,250] \u2014 compact values not provided in fast mode.",
+    "Whether the planted Rate-basePrice offsets {-1,0,1} are guaranteed present in every instance \u2014 currently probabilistic.",
+    "Whether the 'at least one NULL row per nullable column' interface rule is satisfied for non-target nullable columns \u2014 spec restricts NULLs to null_targets, which should be made explicit."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions for Reservations.Room duplicates_for_distinct reinterprets the atomic target 'duplicate_share 20-50%' as 'distinct referenced parent values / child rows' (max 10/600 = 1.7%), which is not the natural reading of the atomic operation (duplicate share among child rows). The atomic summary lists 'duplicates_for_distinct' with targets duplicate_share 20-50% for Reservations.Room, and the spec explicitly overrides this. This is a documented interpretation, not a silent deviation, and the spec explains why the literal reading is impossible with 10 parents / 600 children.",
+     "requested_revision": "None blocking. Optionally note in the spec that the atomic 'duplicate_share' target for Reservations.Room is intentionally reinterpreted because the literal reading is unsatisfiable at the specified table sizes; the current text already does this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'Reservations.Room: generated rows: NULL 600 / 12000' (5%) and 'Rooms.bedType: generated rows: NULL 32 / 200' (16%) \u2014 both within the spec's 5% and 5-30% targets. All other nullable columns show NULL 0 / n, which the spec's uncertainty section explicitly justifies (compact null_rate 0.0 overrides the 'at least one NULL' clause for non-null_targets columns). Per instruction 7 this is noted, not blocking.",
+     "requested_revision": "None blocking. If the interface NULL rule is to be applied strictly to every nullable column, the spec's uncertainty section would need to be revised; as written the program follows the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms plants boundary basePrice values [140,141,142,159,160,161] into the first 6 rows, but _build_room_fk excludes the last room id from child_pool (childless parent). The boundary rows are at indices 0-5, so they are all in child_pool and can be referenced; the Rate-basePrice offsets {-1,0,1} are planted on the first 6 non-null-FK rows referencing rooms in price_by_room, cycling deterministically. This satisfies the spec's 'at least 3 per instance, deterministically cycling through offsets -1, 0, +1'.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_rooms uses _SHORT_POOL[:3] for roomName with forced counts 4/3/3, satisfying group_sizes (1,2,>=3) and duplicates_for_distinct 20-50% (3 distinct / 10 rows = 30%). decor uses forced counts 4/3/3 for ties at rank 1. Both match the spec's uncertainty section.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution: 20/20 valid instances, 0 FK violations, 0 PK duplicates, 0 NOT NULL violations, 0 compact rows changed, 610 rows added per instance (10 Rooms + 600 Reservations), reproducible (returncode 0, deterministic seed). Rooms.RoomId drawn from fresh pool disjoint from compact (PKTextSampler with reserved set); Reservations.Code sequential from max(compact Code)+1. Writer copies orig DB and appends, never deletes.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: beds IN (1,2), bedType IN (King,Queen,Double), maxOccupancy IN (2,4), decor IN (modern,traditional,rustic), Adults IN (1,2,3,4), Kids IN (0,1,2,3) are all backed by 'observed distinct values' in supporting_evidence. CheckOut >= CheckIn is backed by 8 concrete row examples. FirstName='ROY' and LastName='SWEAZY' backed by row 10574. basePrice >= 0 is stated as 'price is non-negative' \u2014 this is a reasonable domain assumption but not directly evidenced by compact rows (all compact basePrice values are positive, so the rule is consistent but the '>= 0' lower bound is inferred).",
+     "requested_revision": "None blocking; the basePrice >= 0 rule is a standard price-domain assumption and is consistent with observed data."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction pairs: 12 of 70 eligible separated, 0 unknown executions. This is a low separation rate but per instruction 4 a missing separation alone does not establish a generation error. The spec's boundary planting (basePrice 140-161, Rate-basePrice offsets, ROY/SWEAZY, maxOccupancy 1-4) is implemented; the low separation likely reflects query pairs whose denotations coincide on the generated data rather than a generation defect.",
+     "requested_revision": "None blocking. If higher separation is desired, the designer could add more boundary values or widen the planted subsets, but this is not required for a pass."
+    }
+   ],
+   "unresolved_checks": [
+    "The atomic 'duplicate_share 20-50%' for Reservations.Room is reinterpreted by the spec; the literal reading is unsatisfiable at 10 parents / 600 children, so the reinterpretation is accepted but is a spec-level judgment rather than a program defect.",
+    "basePrice >= 0 lower bound is inferred (all compact values positive) rather than directly evidenced; consistent with data.",
+    "Construction separation is 12/70; not investigated per-pair (held-out labels not used), but no evidence of a generation error."
+   ]
+  }
+ ]
 }

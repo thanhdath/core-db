@@ -1,49 +1,846 @@
 {
  "db": "driving_school",
- "operator_io_quirks": [
-  "All table/column names are backtick-quoted in DDL; generated SQL must double-quote them (no spaces/mixed case here, but keep the rule).",
-  "Tiny DB: every table has 15 rows except Vehicles=3; read_schema sampling is trivial, no huge-table path exercised.",
-  "DATETIME columns store TEXT like 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no timezone); ts_fuzzer dispatch is 'Date|Number(int elements)' because the first element does not parse as int -> Date fuzzer.",
-  "lesson_time is VARCHAR(10) holding bare integers '5','6','3' (hour-of-day), NOT a time string; String fuzzer will emit random letters there.",
-  "customer_status_code / payment_method_code / lesson_status_code are VARCHAR holding multi-word enum labels ('Bad Customer','Direct Debit','Cancelled') with distinct=2.",
-  "country has distinct=1 ('USA'); state_province_county distinct=11 of 15.",
-  "Customer_Payments has composite PK (customer_id, datetime_payment); customer_id is also an FK to Customers -> composite-PK member gets max_l0=30.",
-  "Lessons.staff_id is nullable FK (notnull=0) to Staff; Lessons.vehicle_id NOT NULL FK to Vehicles (only 3 parent rows -> heavy FK reuse).",
-  "All FKs resolve to existing parents; no dangling FKs, no self-references, no non-unique parents.",
-  "amount_outstanding / amount_payment / price are DOUBLE stored as REAL; samples are whole numbers (255.0) but Number fuzzer will emit floats.",
-  "phone_number / cell_mobile_phone_number / email_address are free-form text with punctuation and '+', '(', ')', 'x' extensions; String fuzzer charset a-zA-Z 0-9() will not reproduce them.",
-  "zip_postcode is text with leading zeros ('00005','08938'); String fuzzer may drop leading zeros."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer picks template from first parsable element -> '%Y-%m-%d %H:%M:%S' (space form); fresh dates uniform in [min,max] of the 5 sampled originals, so date ranges stay near 2016-2018 for Customers/Lessons and 1991-2015 for date_of_birth.",
-  "Number fuzzer on INTEGER PKs: full range [-10^0,10^0]=[-1,1] then +-1/+-2 perturbation -> tiny PKs, collisions likely; sample_fresh_primary_keys drops duplicates so tables shrink.",
-  "Number fuzzer on DOUBLE (amount_outstanding, price, amount_payment): scale=0 -> range [-1,1] plus +-0.01/+-0.02 -> values ~0, wildly implausible vs original 199-9443 -> FN risk on range predicates (price > 200, amount_payment > 1000).",
-  "String fuzzer on VARCHAR(80) names: random a-zA-Z 0-9() strings of length 0-80, plus contaminate suffix/prefix -> no realistic names; LIKE '%Smith%' style predicates will miss (FN).",
-  "String fuzzer on customer_status_code / payment_method_code / lesson_status_code: literal pool from train SQL likely contains 'Good Customer','Bad Customer','Credit Card','Direct Debit','Cancelled','Completed' -> those survive via element path; fresh draws produce garbage -> equality predicates on these codes may FP/FN.",
-  "String fuzzer on lesson_time (VARCHAR holding '5'..'9'): int-like elements get str(i+1),str(i-1) added, so '4','6','10' appear; predicates like lesson_time = '5' may still hit but lesson_time > '5' semantics shift.",
-  "FK fill: Lessons.vehicle_id drawn from Vehicles.vehicle_id (3 values) with replacement -> many duplicate vehicle_ids; Lessons.staff_id nullable but fill_foreign_keys_consistently draws from Staff (no NULLs unless parent empty) -> NULL-rate 0 preserved by accident.",
-  "Customer_Payments composite PK: after Number fuzzer on customer_id (tiny ints) and Date fuzzer on datetime_payment, PK duplicates likely -> sample_fresh_primary_keys drops rows, table may shrink below 15.",
-  "Addresses has no FK and is level 0; Staff/Customers depend on it; Lessons depends on Customers, Staff, Vehicles -> table_order levels: [Addresses,Vehicles], [Staff,Customers], [Customer_Payments,Lessons].",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs -> drop_unique_duplicates is a no-op; NOT NULL on staff_address_id, customer_address_id, customer_status_code, datetime_payment, payment_method_code, lesson_status_code, vehicle_id, customer_id(Customer_Payments) enforced only at insert -> rows with NULL from empty parent would be skipped.",
-  "Known TS misses on this DB: FN from implausible numeric ranges (price/amount) and garbage strings (names, phone, email); FP from missing ties (distinct=15 everywhere means GROUP BY / DISTINCT queries return all rows in original but fewer after PK dedup)."
- ],
- "challenger_refs": [
-  "G11",
-  "G20",
-  "G19",
-  "G7",
-  "G13",
-  "G1",
-  "G9",
-  "G16",
-  "G21",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1; never NULL; unique per table; never targeted by duplicate planting or group-size planting.",
+   "integer_fk": "Sample from the final parent PK pool (after all parent dedupe and NULL planting); 5-30% NULL only where the column is nullable; otherwise always a valid parent key. Re-validate FK after all planting.",
+   "varchar_short": "Random word-like token 3-20 chars; 5% near-variant (case flip, trailing space, doubled char) of a pool literal.",
+   "varchar_name": "Random capitalized given/surname from a 40-name pool; 5% near-variant (lowercase, typo) of a pool literal.",
+   "varchar_address": "Number + street word + suffix; city/state/country from small pools.",
+   "varchar_zip": "5-digit zero-padded string.",
+   "varchar_phone": "Random digits with optional +, -, (), x separators, 10-15 chars.",
+   "varchar_email": "first.last@example.org or example.com.",
+   "datetime": "Random timestamp in 2015-01-01..2018-03-31, format %Y-%m-%d %H:%M:%S.",
+   "double_amount": "Uniform 0..10000 with 2 decimals; 5-30% NULL where nullable.",
+   "enum_short": "Pick uniformly from the column's enum list.",
+   "boundary_numeric": "For each listed literal L, include L, L-step, L+step where step is 1 for integers and 0.01 for doubles.",
+   "boundary_text": "For each listed literal L, include L and a case-variant (lower/upper) and a one-char typo.",
+   "boundary_date": "For each listed literal L, include L, L-1 day, L+1 day in the column format.",
+   "duplicates_for_distinct": "Ensure 20-50% of non-NULL values repeat an earlier value in the same column; never applied to primary-key columns.",
+   "ties_for_order_limit": "Ensure at least 3 rows share the same value at the listed ORDER rank.",
+   "null_share": "For nullable columns, 5-30% of rows NULL; at least one NULL per nullable column per instance; never applied to PK columns; applied exactly once per column (FK NULL path or generic path, not both).",
+   "group_sizes": "Ensure groups of size 1, 2 and >=3 exist on the grouped column; applied to the final column values after all planting; never applied to a primary-key column.",
+   "unmatched_join_rows": "For each join column, ensure at least one parent row has no child and at least one child FK points to a valid parent (no orphan unless nullable). For NOT NULL child FKs, achieve parent-childlessness by redirecting/removing child rows, never by setting the FK to NULL.",
+   "aggregate_boundary": "For each listed aggregate target, plant child-row counts so that COUNT(*) and COUNT(col) take the values 1, 2 and >=3 across parent groups; NULLs in the counted column reduce COUNT(col) but not COUNT(*); use the instance rng for parent selection; preserve planted NULLs in the counted column."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Addresses.city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Lockmanfurt",
+     "lockmanfurt",
+     "Damianfort",
+     "damianfort"
+    ]
+   },
+   {
+    "column": "Addresses.country",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Addresses.state_province_county",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Addresses.zip_postcode",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Addresses.address_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) > 2",
+     "1,2,>=3"
+    ]
+   },
+   {
+    "column": "Customers.customer_address_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "Customers.customer_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Good Customer",
+     "Bad Customer"
+    ]
+   },
+   {
+    "column": "Customers.first_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Carole",
+     "carole"
+    ]
+   },
+   {
+    "column": "Customers.last_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Bernhard",
+     "bernhard"
+    ]
+   },
+   {
+    "column": "Customers.amount_outstanding",
+    "pattern": "null_rows",
+    "targets": [
+     "5-30%"
+    ]
+   },
+   {
+    "column": "Customers.date_of_birth",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Customers.date_became_customer",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">=2 per group"
+    ]
+   },
+   {
+    "column": "Customer_Payments.customer_id",
+    "pattern": "group_sizes",
+    "targets": [
+     "1,2,>=3"
+    ]
+   },
+   {
+    "column": "Customer_Payments.customer_id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) > 2",
+     "1,2,>=3"
+    ]
+   },
+   {
+    "column": "Customer_Payments.payment_method_code",
+    "pattern": "enum",
+    "targets": [
+     "Direct Debit",
+     "Credit Card"
+    ]
+   },
+   {
+    "column": "Customer_Payments.amount_payment",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(amount_payment) > 2",
+     "1,2,>=3"
+    ]
+   },
+   {
+    "column": "Staff.staff_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "Staff.first_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Ludie",
+     "ludie",
+     "Janessa",
+     "janessa"
+    ]
+   },
+   {
+    "column": "Staff.last_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Sawayn",
+     "sawayn"
+    ]
+   },
+   {
+    "column": "Staff.nickname",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Lessons.vehicle_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Lessons.staff_id",
+    "pattern": "null_rows",
+    "targets": [
+     "5-30%"
+    ]
+   },
+   {
+    "column": "Lessons.lesson_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Completed",
+     "Cancelled"
+    ]
+   },
+   {
+    "column": "Lessons.lesson_time",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "",
+     "x"
+    ]
+   },
+   {
+    "column": "Lessons.lesson_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Vehicles.vehicle_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "column": "Vehicles.vehicle_details",
+    "pattern": "group_sizes",
+    "targets": [
+     "1,2,>=3"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Staff.staff_address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   },
+   {
+    "child": "Customers.customer_address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Payments.customer_id",
+    "parent": "Customers.customer_id",
+    "copied": []
+   },
+   {
+    "child": "Lessons.customer_id",
+    "parent": "Customers.customer_id",
+    "copied": []
+   },
+   {
+    "child": "Lessons.staff_id",
+    "parent": "Staff.staff_id",
+    "copied": []
+   },
+   {
+    "child": "Lessons.vehicle_id",
+    "parent": "Vehicles.vehicle_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Payments",
+    "parent": "Customers",
+    "copied": [],
+    "note": "composite PK (customer_id, datetime_payment); datetime_payment sampled distinct per customer_id; composite PK dedupe must not drop rows needed for aggregate-boundary planting"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customers",
+    "column": "customer_status_code",
+    "formula": "customer_status_code IN ('Good Customer','Bad Customer')"
+   },
+   {
+    "table": "Customers",
+    "column": "amount_outstanding",
+    "formula": "amount_outstanding IS NULL OR amount_outstanding >= 0"
+   },
+   {
+    "table": "Customers",
+    "column": "date_became_customer",
+    "formula": "date_became_customer IS NULL OR date_of_birth IS NULL OR date_became_customer >= date_of_birth"
+   },
+   {
+    "table": "Customer_Payments",
+    "column": "payment_method_code",
+    "formula": "payment_method_code IN ('Direct Debit','Credit Card')"
+   },
+   {
+    "table": "Customer_Payments",
+    "column": "amount_payment",
+    "formula": "amount_payment IS NULL OR amount_payment >= 0"
+   },
+   {
+    "table": "Lessons",
+    "column": "lesson_status_code",
+    "formula": "lesson_status_code IN ('Completed','Cancelled')"
+   },
+   {
+    "table": "Lessons",
+    "column": "price",
+    "formula": "price IS NULL OR price >= 0"
+   },
+   {
+    "table": "Staff",
+    "column": "date_left_staff",
+    "formula": "date_left_staff IS NULL OR date_joined_staff IS NULL OR date_left_staff >= date_joined_staff"
+   },
+   {
+    "table": "Staff",
+    "column": "date_joined_staff",
+    "formula": "date_joined_staff IS NULL OR date_of_birth IS NULL OR date_joined_staff >= date_of_birth"
+   },
+   {
+    "table": "Vehicles",
+    "column": "vehicle_details",
+    "formula": "vehicle_details IN ('Van','Truck','Car')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 15,
+   "Staff": 15,
+   "Vehicles": 6,
+   "Customers": 15,
+   "Customer_Payments": 15,
+   "Lessons": 15
+  },
+  "null_targets": [
+   "Customers.amount_outstanding",
+   "Lessons.staff_id",
+   "Lessons.lesson_time",
+   "Lessons.lesson_date",
+   "Lessons.price",
+   "Staff.date_left_staff",
+   "Staff.date_of_birth",
+   "Staff.date_joined_staff",
+   "Customers.date_of_birth",
+   "Customers.date_became_customer",
+   "Customers.first_name",
+   "Customers.last_name",
+   "Customers.email_address",
+   "Customers.phone_number",
+   "Customers.cell_mobile_phone_number",
+   "Addresses.line_1_number_building",
+   "Addresses.city",
+   "Addresses.zip_postcode",
+   "Addresses.state_province_county",
+   "Addresses.country",
+   "Staff.nickname",
+   "Staff.first_name",
+   "Staff.middle_name",
+   "Staff.last_name",
+   "Vehicles.vehicle_details",
+   "Customer_Payments.amount_payment"
+  ],
+  "supporting_evidence": [
+   {
+    "rule": "Customers.customer_status_code enum",
+    "rows": [
+     "Customers row 1: Bad Customer",
+     "Customers row 2: Good Customer"
+    ]
+   },
+   {
+    "rule": "Customer_Payments.payment_method_code enum",
+    "rows": [
+     "Customer_Payments row 1: Direct Debit",
+     "Customer_Payments row 2: Credit Card"
+    ]
+   },
+   {
+    "rule": "Lessons.lesson_status_code enum",
+    "rows": [
+     "Lessons row 1: Cancelled",
+     "Lessons row 2: Completed"
+    ]
+   },
+   {
+    "rule": "Vehicles.vehicle_details enum",
+    "rows": [
+     "Vehicles row 1: Van",
+     "Vehicles row 2: Truck",
+     "Vehicles row 3: Car"
+    ]
+   },
+   {
+    "rule": "Staff.date_left_staff >= date_joined_staff",
+    "rows": [
+     "Staff row 1: joined 2017-04-27, left 2018-03-23",
+     "Staff row 2: joined 2016-06-06, left 2018-03-10",
+     "Staff row 3: joined 2018-01-02, left 2018-03-24"
+    ]
+   },
+   {
+    "rule": "Staff.date_joined_staff >= date_of_birth",
+    "rows": [
+     "Staff row 1: dob 2010-12-08, joined 2017-04-27",
+     "Staff row 3: dob 1994-05-17, joined 2018-01-02",
+     "Staff row 6: dob 1998-04-27, joined 2017-08-27"
+    ]
+   },
+   {
+    "rule": "Customers.date_became_customer >= date_of_birth",
+    "rows": [
+     "Customers row 1: dob 1998-12-15, became 2016-05-11",
+     "Customers row 2: dob 1995-07-17, became 2015-11-16",
+     "Customers row 3: dob 1994-06-21, became 2016-04-08"
+    ]
+   },
+   {
+    "rule": "amounts >= 0",
+    "rows": [
+     "Customers row 1: 255.0",
+     "Customer_Payments row 1: 9570.93",
+     "Lessons row 1: 199.0"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "table_sizes_per_instance counts GENERATED rows appended to the compact database, not total rows. The compact DB already has 3 Vehicles rows, so the final Vehicles table has 3 compact + 6 generated = 9 rows; the 6 generated rows are needed to make group_sizes (1,2,>=3) on vehicle_details achievable.",
+   "No formula relates amount_outstanding to payments or lesson price; none is stated.",
+   "lesson_time is a free-form VARCHAR(10); boundary values '' and 'x' are targeted and the column is also nullable, so boundary literals appear among non-NULL rows and NULLs are planted separately.",
+   "Customer_Payments composite PK (customer_id, datetime_payment) is enforced by generation order and unique datetime per customer; datetime_payment is sampled per customer with uniqueness; composite PK dedupe must not drop rows needed for aggregate-boundary planting.",
+   "Staff.date_of_birth values in the sample include minors (2010-2015); no age constraint is asserted, and no minimum-age is intended.",
+   "No FK enforcement is enabled in the writer; FK targets are sampled from the final parent PK pool after all dedupe and NULL planting, and a post-generation FK validation is required.",
+   "Duplicate planting is applied to primary-key columns only where the final PK is not required to be unique; the program should dedupe PKs after planting and re-validate FK references.",
+   "The instance file is the compact database plus appended generated rows; the original DB path must be passed through to the writer so compact rows are copied.",
+   "Aggregate-boundary targets (COUNT(*) > 2 with counts 1,2,>=3) must be planted explicitly for Customers.customer_id and Customer_Payments.customer_id/amount_payment; the parent-side group sizes (Customers.customer_id) must take 1, 2 and >=3 across the full parent set, not just 3 parents with 1/2/3 and the rest 0.",
+   "Customers.customer_id group_sizes is achieved via the child-side (Customer_Payments.customer_id) distribution, not by planting duplicates on the PK column; _plant_group_sizes must never be applied to a primary-key column.",
+   "Nullable FK NULL share must be computed once from _null_share(rng) and applied as a single target count; the previous double mechanism (0.15 pre-threshold plus _plant_nulls) could exceed the 5-30% cap. Lessons.staff_id is handled solely by the FK NULL path and must be removed from NULL_SHARE_COLUMNS.",
+   "Each nullable column must receive at least one NULL per instance; a post-generation assertion should verify this across all instances.",
+   "The lesson_date >= '2015-01-01' rule is removed from semantic_rules_and_formulas; the DateSampler range (2015-01-01..2018-03-31) already satisfies it by construction.",
+   "The writer should enable foreign_keys=ON before any transaction (or run PRAGMA foreign_key_check after commit) and raise on violations; generated parent PKs must be a superset of the original PKs so compact child rows still resolve.",
+   "The writer should open the compact DB read-only and use the sqlite3 backup API or VACUUM INTO to create a consistent copy, or ensure the original is not in WAL mode.",
+   "max_l0 in the sampler must be at least 3 for columns in GROUP_SIZE_COLUMNS and large enough for 20-50% duplicates on DUPLICATE_COLUMNS, so that group_sizes and duplicates_for_distinct targets remain achievable.",
+   "After fixing aggregate-boundary and group-size planting, re-run the construction check and verify that construction_pairs_by_group is populated and separated count increases; add a post-generation assertion that for each AGGREGATE_BOUNDARY triple, the child-row counts per parent include 1, 2 and >=3, and that COUNT(counted_col) also includes 1, 2 and >=3."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 749 across 20 instances, and validity.reasons.new_integrity_failures = 20 (every instance). The writer (writer.py) sets `pragma foreign_keys = OFF` and inserts generated rows without validating FK targets; instance.py draws FKs from `key_pool[pt]`, but the pool is extended with generated keys only *after* the child table is built in `order`, and `_compact_keys`/`_next_int_key` can produce keys that are later dropped by `sample_fresh_primary_keys`/`drop_unique_duplicates` (e.g. composite PK Customer_Payments, or dedupe of Vehicles.vehicle_id), leaving child FKs pointing at keys that never get inserted. The spec's `unmatched_join_rows` rule explicitly requires 'no orphan unless nullable', which is violated.",
+     "requested_revision": "Make FK generation reference only keys that actually survive into the parent table: build parent tables fully (including PK dedupe) before sampling child FKs, or re-validate/repair child FKs against the final parent key set. Enable `pragma foreign_keys = ON` (or run a post-insert FK check) so violations are caught, and ensure the `unmatched_join_rows` rule (parent without children + no orphan) holds. Re-run and confirm fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.compact_rows_missing = 20 (all instances). writer.py's `write_instance_sqlite` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` with no `orig_path`, so the `if orig_path and os.path.exists(orig_path)` branch is skipped and the file is created fresh from `schema.ddl` \u2014 the compact rows are never copied. The module docstring and spec both state instances are 'copies of the compact database plus appended generated rows'.",
+     "requested_revision": "Pass the original DB path through to `write_instance_sqlite` (e.g. store `orig` in `_G['args']` and forward it), so the instance file is a copy of the compact DB before appending. Verify compact_rows_missing = 0 after the fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows 'generated rows: NULL 0 / n' for many nullable columns that the spec lists in `null_targets` (e.g. Addresses.city/country/zip/state/line_1, Customers.first_name/last_name/email/phone/cell/date_of_birth/date_became_customer, Staff.first_name/last_name/middle_name/nickname/date_of_birth/date_joined/date_left, Lessons.lesson_date/lesson_time/price, Vehicles.vehicle_details, Customer_Payments.amount_payment). spec.NULL_SHARE_COLUMNS only contains two entries (Customers.amount_outstanding, Lessons.staff_id), so the program does not plant NULLs for the other nullable columns despite the interface rule requiring at least one NULL per nullable column per instance.",
+     "requested_revision": "Extend NULL_SHARE_COLUMNS (or derive it from the schema's nullable columns) to cover every nullable column in `null_targets`, and plant NULLs per the compact share (5-30%, at least one). Note: per instruction 7 this is a non-blocking observation, but it should be fixed for spec fidelity."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` lists `Customers.customer_status_code` enum targets including 'good customer' (lowercase), and `ENUMS` in spec.py includes it, but the semantic formula `_f_customer_status` only accepts ('Good Customer','Bad Customer'). `_apply_formula` repairs any 'good customer' value to one of the two canonical values, so the lowercase enum variant can never survive \u2014 the enum target and the formula are mutually inconsistent.",
+     "requested_revision": "Reconcile the enum list with the formula: either drop 'good customer' from the enum targets, or relax the formula to accept the case-variant (and document the intended semantics)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` includes `Lessons.lesson_time` comparison_boundary targets ['', 'x'], and `BOUNDARY_TEXT` encodes them, but `Lessons.lesson_time` is also in `null_targets` and the interface rule requires NULLs there; the boundary sampler (BoundaryTextSampler) never emits NULL, and `_plant_nulls` is only applied for columns in NULL_SHARE_COLUMNS (lesson_time is not). The two rules are not jointly satisfiable as written.",
+     "requested_revision": "Clarify precedence: either add lesson_time to NULL_SHARE_COLUMNS and ensure boundary literals still appear among non-NULL rows, or remove it from null_targets. Document the intended interaction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` and `_plant_duplicates` operate on the *generated* column values only, but `GROUP_SIZE_COLUMNS` includes ('Customer_Payments','customer_id') and ('Vehicles','vehicle_details'), and `DUPLICATE_COLUMNS` includes ('Vehicles','vehicle_id') and ('Lessons','lesson_id') which are primary keys. For PK columns, `_next_int_key` assigns fresh sequential keys, then `_plant_duplicates` overwrites some with earlier values, and `sample_fresh_primary_keys` then drops the duplicates \u2014 so the duplicate share is not actually achieved on PK columns, and the group-size rule on customer_id (a FK) is applied before FK re-sampling may overwrite it. The construction_pairs feedback (separated 27/155) is consistent with these rules not being reliably realized.",
+     "requested_revision": "Apply duplicate/group-size planting to the final column values (after PK dedupe and FK assignment), and do not target primary-key columns for duplicates_for_distinct (or handle the dedupe interaction explicitly). Verify group sizes 1/2/>=3 and 20-50% duplicate share on the final data."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_formula` repairs values using only the single column's value (`row = {col: v}`), so cross-column formulas like `_f_date_became` (needs date_of_birth), `_f_date_left`/`_f_date_joined` (need the other date) always see the other operand as None and pass trivially; the actual enforcement relies on `_fix_date_order`, which only runs for Staff and Customers and only fixes `later < earlier` by pushing `later` forward \u2014 it does not handle the case where `date_of_birth` is NULL but `date_became_customer` is set, nor does it re-check after `_plant_duplicates`/`_plant_different_values` may have altered dates. The `date_became_customer` rows_with_different_values planting (`_plant_different_values`) can set a value that violates `>= date_of_birth`.",
+     "requested_revision": "Enforce cross-column date formulas on the final row values (after all planting), and re-run `_fix_date_order` last. Ensure `_plant_different_values` respects the date_became_customer >= date_of_birth constraint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` is applied to `Lessons.staff_id` (nullable FK) and `Customers.amount_outstanding`, but the FK sampling for `Lessons.staff_id` happens before `_plant_nulls` and the NULL planting uses `_null_share` from the compact DB; however `_plant_nulls` can also NULL out a value that was the only non-NULL in a group, and the `unmatched_join_rows` rule for `Lessons.vehicle_id` (in UNMATCHED_JOIN) is not actually enforced anywhere \u2014 there is no code that guarantees a parent row without children or a child pointing to a parent. The `UNMATCHED_JOIN` list is declared but never consulted in instance.py.",
+     "requested_revision": "Implement the unmatched_join_rows rule: after building all tables, ensure at least one parent row (Addresses, Customers, Staff) has no referencing child, and at least one child FK points to a valid parent. Remove or wire up the unused UNMATCHED_JOIN list."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `uncertainty` notes 'Staff.date_of_birth values in the sample include minors (2010-2015); no age constraint is asserted', and the supporting_evidence shows Staff row 1 dob 2010-12-08 joined 2017-04-27. The formula `date_joined_staff >= date_of_birth` is satisfied but semantically implausible (a 7-year-old employee). This is a data-quality concern, not a hard constraint, but the spec should state whether it is intentional.",
+     "requested_revision": "Document explicitly that no minimum-age constraint is intended, or add one to the semantic rules if the original data implies it."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 27/155 separated construction pairs reflect genuine value variation or are an artifact of the FK/PK dedupe bugs above; re-evaluate after fixes.",
+    "Whether `Customer_Payments` composite PK (customer_id, datetime_payment) uniqueness is actually enforced \u2014 instance.py leaves composite PKs to `sample_fresh_primary_keys`, but `datetime_payment` is not sampled with uniqueness per customer, so duplicate (customer_id, datetime_payment) pairs may be dropped silently, reducing row counts below the spec's 15.",
+    "Whether `Vehicles.vehicle_id` duplicate planting (a PK) combined with `_next_int_key` and dedupe yields the intended 20-50% duplicate share on the final data.",
+    "Whether the `Addresses.city` boundary literals ('Lockmanfurt','Damianfort') actually appear in generated rows given the AddressSampler draws from CITIES pool and only 5% near-variants \u2014 the boundary literals are in CITIES so they can appear, but the share is not guaranteed."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Spec table_sizes_per_instance fixes Addresses=15, Staff=15, Vehicles=3, Customers=15, Customer_Payments=15, Lessons=15. instance.py _table_size varies each table by +/-40% (rng.randint(lo,hi)). Execution feedback reflects this: 'Addresses.city: generated rows: NULL 8 / 40' implies ~40 Addresses rows across 20 instances (avg 2/instance??) while Vehicles shows 4 rows total across 20 instances, i.e. all sizes shrink/vary, not the specified 15/15/3/15/15/15. The Vehicles group_sizes planting (_plant_group_sizes requires n>=6) can therefore never fire either.",
+     "requested_revision": "Either (a) make _table_size honor TABLE_SIZES exactly (deterministic per-table sizes), or (b) explicitly relax the specification to allow per-instance size variation and lower Vehicles below group-size target. Also re-check that all group_sizes targets (1,2,>=3) can actually be produced for Vehicles, since spec demands them but a 3-row Vehicles table can never yield a >=3 group without header extension. Fix specification and/or program so group_sizes is achievable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZE_COLUMNS only contains ('Customer_Payments','customer_id') and ('Vehicles','vehicle_details'), but atomic-operation extraction lists group_sizes also for Customers.customer_id (pairs:4, targets 1/2/>=3) and aggregate_boundary for Customers.customer_id and Customer_Payments.customer_id and Customer_Payments.amount_payment. Aggregate-boundary targets (COUNT(*) > 2 with counts 1,2,3) are not planted anywhere in code (no HAVING-with-counts planting). Only its side-effect from user_id duplication partly covers it.",
+     "requested_revision": "Add Customers.customer_id to GROUP_SIZE_COLUMNS (or explain why the patterned target on customers.customer_id is treated as the same single-column group behavior) and add explicit aggregate-boundary planting so that COUNT(*)/COUNT(customer_id) take values {1,2,>=3} across customers. Add explicit planting for Customer_Payments.customer_id / amount_payment aggregate boundary too (e.g., customers with 1, 2, 3, and >=4 payments, ensuring amount_payment is non-NULL in at least two, plus NULLs on one-customer with NULL amount so COUNT(amount_payment) hits 1/2/3 boundary)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_table FK assignment uses float threshold rng.random() > 0.15 to introduce NULLs on nullable FKs, and then calls _plant_nulls(vals, rng, share) on the SAME list. _plant_nulls unconditionally overwrites a random sample of positions with NULL (k = round(n*share)), so for non-nullable FK columns whose FK is set to a valid parent, no NULL is planted (correct), but for nullable FK, two independent NULL mechanisms combine. The 0.15 pre-threshold already lets roughly 15% NULL, and _plant_nulls on top yields ~5-30% more, which can violate the spec's '5-30% NULL' share cap. The secondary validation is not enforced.",
+     "requested_revision": "Compute a single target NULL count from _null_share(rng), then sample that many distinct FK rows to be NULL, otherwise always set the FK to a valid parent key. Validate final NULL share against [0.05, 0.30] after all planting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls silently skips planting for empty values. Instance sizes are large enough (>=9) that this is fine, but if a column values list has length n=1 (possible on small tables like Vehicles size 3 with duplicates already restricting) at least one NULL is required per nullable column per instance per the NULL rule. The spec requires 'at least one NULL per nullable column per instance', while the current piping cannot enforce that Vehicles.vehicle_details also receives NULL and non-NULL rows in every instance. Execution feedback only reports NULLs for Vehicles.vehicle_details 1/4 across 20 instances - far below one NULL per nullable column per instance. Many of the 20 instances likely have zero NULLs in Vehicles.vehicle_details.",
+     "requested_revision": "Guarantee exactly one NULL per nullable column per instance: after all planting, if a nullable column has zero NULLs, force-replace one row's value with NULL (unless doing so would break a semantic formula or PK). Conversely ensure at least one non-NULL value remains. Add a post-generation assertion that verifies this across all 20 instances."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Supported semantic rules from supporting_evidence: customer_status_code enum (rows 1-2), payment_method_code enum (rows 1-2), lesson_status_code enum (rows 1-2), vehicle_details enum (rows 1-3), date_left_staff >= date_joined_staff (3 example rows), date_joined_staff >= date_of_birth (3 example rows, but Staff row 1 dob is 2010-12-08, i.e., a 7-year-old employee - weak evidence, but the spec note 'no age constraint is intended' is acknowledged), date_became_customer >= date_of_birth (3 example rows), amounts >= 0. Other rules (`lesson_date >= '2015-01-01'`, `date_became_customer IS NULL OR date_of_birth IS NULL OR date_became_customer >= date_of_birth`) only have weak support; the lesson_time boundary spec is stated as 'VARCHAR(10)' free-form with values {'', 'x'}, but the atomic operations only show SUM(CASE...) with values ['', 'x'], which is a target literal, not a semantic rule. The evidence for `lesson_date >= 2015-01-01` is missing - the supporting_evidence does not list any lesson_date rows, and the value domain _DT_MIN = 2015-01-01 derives from generic sampling rules, not from the compact DB. The reviewer should flag that the rule is unsupported.",
+     "requested_revision": "The lesson_date >= '2015-01-01' rule is currently justified only by generic sampling rules, not by extraction. Either drop it, or state it as 'warm-up bound consistent with DateSampler range'. The date-of-birth / date_joined-staff relationship is technically supported but produces minors (rows 1 and 6); either confirm this is intentionally unconstrained or add a do I need an age >= 14 rule. The boundary 'x'/' ' for lesson_time should be treated as a comparison-boundary (already noted, and used by BoundaryTextSampler)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the original DB (orig_path) into the part file before inserting ALL generated rows (sizes vary 9-21 per table). Rows are concatenated, not preserved-discriminated. Compact rows are never modified (good), but the FK check is only done in SQLite at write time (foreign_keys=OFF during insert, so no check). The automated integrity report says fk_violations=0 for 20 instances, but the SQLite check is disabled during write and the validator runs later. There is also no post-generation FK validation code path in the provided program (only re-validate FK per instance is mentioned in spec uncertainty, but no code enforces it).",
+     "requested_revision": "Enable foreign_keys=ON before commit (or run PRAGMA foreign_key_check after commit) and raise if violations are found. Also assert that generated parent PKs (Vehicles.vehicle_id, Staff.staff_id, Customers.customer_id, Addresses.address_id) correspond to a superset of the original PKs, so existing compact child rows still resolve. Add a reproducibility assertion: same seed_base yields byte-identical DBs for the same i."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction feedback: construction_pairs separated=5 of 155 eligible. The reviewer notes that separation is a weak signal (per instructions 4), but the categories with zero separation include many aggregate_boundary/group_sizes on Customer_Payments.customer_id and Customers.customer_id. Given _plant_group_sizes fires only if n >= 6 (so Vehicles and any shrunken table is excluded-even if Vehicle group target existed, it cannot fire), and aggregate boundaries are never planted, these targets are likely never separated in this run. This is a superset of Issue #2.",
+     "requested_revision": "Implement explicit planting for all documented group-size/aggregate-boundary targets, then re-run and confirm at least one construction pair separates for each. Values '1,2,3' from the target counts must appear after planting."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the installer's integrity block 'nullable_columns' reports only columns that had >=1 generated NULL (aggregated over instances), not per-instance - the spec requires at least one per instance. Cannot fully verify from the summary; individual DBs were not inspected.",
+    "Whether Customers.customer_id duplicated_by planting on the FK-equivalent column still yields \u22651 parent row without children for Addresses.address_id and Staff.staff_id when the only child is Lessons (single child table). _ensure_unmatched runs per parent/child but can be undone if the very next child loop resets values.",
+    "Whether rows_with_different_values for Customers.date_became_customer truly produces groups with two different values under any GROUP BY grouping - the current implementation just staggers adjacent rows, which satisfies the raw pattern only when the grouping column is aligned with row order; not verified by construction.",
+    "Whether the unknown '1,2,3' values in aggregate_boundary are reachable for Customer_Payments.customer_id when NULL customer_id is allowed on customer_payments (it is not nullable per schema - customer_id INTEGER NOT NULL), and the program does not plant NULL there."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py AGGREGATE_BOUNDARY lists ('Customers','customer_id','Customer_Payments','customer_id','customer_id') and ('Customers','customer_id','Customer_Payments','customer_id','amount_payment'). instance.py _plant_aggregate_boundary assigns child rows to only 3 parents (1,2,3 rows) and leaves the remaining 12 Customers with 0 payments. But the spec's aggregate_boundary target for Customers.customer_id is COUNT(*) > 2 with values 1,2,3 across parent groups, and the extraction also lists Customers.customer_id group_sizes 1,2,>=3. The construction feedback shows construction_pairs separated=7 of 155 eligible, and no construction_pairs_by_group entries, indicating the aggregate/group-size planting is not producing the intended boundary distribution across the parent side. Additionally, _plant_aggregate_boundary uses random.Random(0) instead of the instance rng, so the choice of parents is identical across all instances (not reproducible per-instance variation).",
+     "requested_revision": "Make _plant_aggregate_boundary use the instance rng, and ensure the parent-side group sizes (Customers.customer_id) actually take 1, 2 and >=3 across the full parent set (not just 3 parents with 1/2/3 and the rest 0). Also verify that COUNT(*) and COUNT(amount_payment) both hit 1, 2, >=3 across Customer_Payments groups, and that the NULL in amount_payment for the size-2 group is preserved (it currently may be overwritten by later NULL planting or _ensure_one_null)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _ensure_unmatched sets a child FK to None when all parents are used, but for NOT NULL FK columns (e.g. Customers.customer_address_id, Lessons.vehicle_id, Lessons.customer_id, Customer_Payments.customer_id) this would violate NOT NULL. The writer's foreign_key_check would then raise. The construction feedback shows 0 FK violations for the 20 instances, but the logic is fragile: _ensure_unmatched is called for every (parent, child) pair in spec.UNMATCHED_JOIN, and for Customers.customer_id it iterates all child tables including Customer_Payments and Lessons; if all Customers are used, it nulls a Customer_Payments.customer_id (NOT NULL) or Lessons.customer_id (NOT NULL).",
+     "requested_revision": "In _ensure_unmatched, only null out a child FK if the column is nullable; otherwise, instead of nulling, remove/redirect a child row so a parent becomes childless without violating NOT NULL. Re-validate FK and NOT NULL after this step."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_table: for composite PK Customer_Payments, pk_cols = ['customer_id','datetime_payment']. The code fills data['customer_id'] from FK assignment (nullable? customer_id is NOT NULL per schema), then 'if all(v is None for v in data[pc])' fills with range(1,n+1) \u2014 but customer_id is already populated from FK, so this branch is skipped. datetime_payment is sampled by random_values_for_a_column (DateSampler) and is not guaranteed unique per customer. The spec's dependency note says 'datetime_payment unique per customer'. The writer's PK dedupe drops duplicate (customer_id, datetime_payment) tuples, which can silently reduce Customer_Payments row count below 15 and break the aggregate-boundary planting (which assumes 6 child rows assigned to 3 parents).",
+     "requested_revision": "Explicitly generate datetime_payment unique per customer_id (e.g., sample distinct timestamps per customer group), and ensure the composite PK dedupe does not drop rows needed for aggregate-boundary planting. Add a post-generation assertion that Customer_Payments has the expected row count and that (customer_id, datetime_payment) is unique."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARE_COLUMNS includes ('Lessons','staff_id') and ('Lessons','lesson_time'), and instance.py _build_table plants NULLs for nullable FK staff_id via the single _null_share mechanism, then later _plant_nulls is applied again for columns in NULL_SHARE_COLUMNS (including staff_id). This double-plants NULLs on Lessons.staff_id, potentially exceeding the 5-30% cap. The revision note claims 'single NULL mechanism' but the code still applies _plant_nulls after FK assignment for staff_id.",
+     "requested_revision": "Skip _plant_nulls for nullable FK columns already handled by the FK NULL mechanism (Lessons.staff_id), or remove staff_id from NULL_SHARE_COLUMNS and rely solely on the FK NULL path. Verify the final NULL share for Lessons.staff_id is within 5-30%."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes requires n >= 6 and picks distinct[0], distinct[1], distinct[2]. For Vehicles.vehicle_details with TABLE_SIZES Vehicles=6 and enum ['Van','Truck','Car'], this works. But for Customers.customer_id (PK, sequential 1..15), _plant_group_sizes is applied to the PK column, overwriting PK values with duplicates of distinct[0..2]. This corrupts the PK uniqueness and the FK references from Customer_Payments/Lessons (which were sampled from the pre-planting parent_keys). The writer's PK dedupe then drops rows, and FK references may point to removed PKs.",
+     "requested_revision": "Do not apply _plant_group_sizes to primary-key columns. For Customers.customer_id group_sizes, achieve 1,2,>=3 via the child-side (Customer_Payments.customer_id) distribution instead, or plant group sizes on a non-PK column. Re-validate FK after any PK-affecting planting."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py TABLE_SIZES sets Vehicles=6, but the extraction's table_sizes_per_instance in the generation specification says Vehicles=6 while the original compact DB has 3 Vehicles rows. The uncertainty note acknowledges this. However, the spec's group_sizes target for Vehicles.vehicle_details (1,2,>=3) is achievable with 6 rows, but the compact DB has only 3 Vehicles rows; the writer copies compact rows and appends generated rows, so the final Vehicles table has 3 + 6 = 9 rows, not 6. The spec's table_sizes_per_instance is ambiguous about whether it means generated rows or total rows.",
+     "requested_revision": "Clarify in the specification whether table_sizes_per_instance refers to generated rows (appended) or total rows (compact + generated). If total, adjust TABLE_SIZES to account for compact rows (e.g., Vehicles generated = 3 to reach 6 total). Update instance.py _table_size accordingly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification's semantic_rules_and_formulas includes 'lesson_date >= 2015-01-01' with evidence 'warm-up bound consistent with DateSampler range; not directly evidenced by compact rows'. This is an unsupported rule (the uncertainty section admits it). The extraction does not list lesson_date comparison_boundary or any date rule for Lessons.lesson_date.",
+     "requested_revision": "Remove the lesson_date >= '2015-01-01' formula from semantic_rules_and_formulas, or mark it explicitly as a non-evidenced warm-up bound that is not enforced. The DateSampler range (2015-01-01..2018-03-31) already satisfies it by construction, so the formula is redundant and misleading."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py _init_sampler: 'if max_l0 == float('inf') and rng.random() < 0.5: max_l0 = rng.random() * 30'. This randomly caps the number of distinct values per column, which can conflict with duplicates_for_distinct (20-50% repeat) and group_sizes (1,2,>=3) planting. For example, if max_l0 is small, the sampler reuses values, and _plant_duplicates then further reduces distinctness, potentially making group_sizes unachievable (e.g., Vehicles.vehicle_details with max_l0 < 3).",
+     "requested_revision": "Ensure max_l0 is at least the number of distinct values needed for group_sizes (3) and duplicates_for_distinct targets. For columns in GROUP_SIZE_COLUMNS or DUPLICATE_COLUMNS, set max_l0 to a value that permits the required distinctness (e.g., >= 3 for group_sizes, and enough for 20-50% duplicates)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py: 'con.execute('begin')' is called after 'pragma foreign_keys = ON' and after _compact_pks. If the compact DB already has an open transaction or if the pragma is inside a transaction, foreign_keys may not take effect. Also, the writer copies the compact DB file (shutil.copyfile) which may include WAL/journal state; the copy may not be consistent if the original is in WAL mode.",
+     "requested_revision": "Open the compact DB read-only and use sqlite3 backup API or VACUUM INTO to create a consistent copy, or ensure the original is in a consistent state (no WAL). Set foreign_keys=ON before any transaction and verify with PRAGMA foreign_keys. Add a post-commit PRAGMA foreign_key_check (already present) and assert it returns empty."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The construction feedback shows construction_pairs separated=7 of 155 eligible, with construction_pairs_by_group empty. This suggests the aggregate-boundary and group-size planting is not producing the intended boundary distributions that would separate the query pairs. While a missing separation alone does not prove an error, the combination with the _plant_aggregate_boundary issues (only 3 parents, random.Random(0), overwritten NULLs) indicates the boundary planting is not effective.",
+     "requested_revision": "After fixing the aggregate-boundary and group-size planting, re-run the construction check and verify that construction_pairs_by_group is populated and separated count increases. Add a post-generation assertion that for each AGGREGATE_BOUNDARY triple, the child-row counts per parent include 1, 2 and >=3, and that COUNT(counted_col) also includes 1, 2 and >=3."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's Vehicles table has 3 rows and the generated instance has 9 rows (3 compact + 6 generated), and whether the spec intends 6 total or 6 generated.",
+    "Whether the writer's shutil.copyfile of the compact DB produces a consistent copy if the original is in WAL mode.",
+    "Whether _ensure_unmatched's nulling of NOT NULL FK columns actually occurs in the 20 test instances (feedback shows 0 FK violations, but the logic is fragile).",
+    "Whether the composite PK dedupe in _build_table drops Customer_Payments rows needed for aggregate-boundary planting.",
+    "Whether the NULL share for Lessons.staff_id exceeds 5-30% due to double planting."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARE_COLUMNS omits several nullable columns that the specification's null_targets list requires to receive NULLs: Customers.customer_address_id is NOT NULL (fine), but the spec's null_targets includes Addresses.city, Addresses.country, Addresses.zip_postcode, Addresses.state_province_county, Addresses.line_1_number_building, Staff.nickname, Staff.first_name, Staff.middle_name, Staff.last_name, Vehicles.vehicle_details, Customers.first_name/last_name/email_address/phone_number/cell_mobile_phone_number, Customers.date_of_birth/date_became_customer, Staff.date_of_birth/date_joined_staff/date_left_staff, Lessons.lesson_time/lesson_date/price, Customer_Payments.amount_payment, Customers.amount_outstanding. The execution feedback 'nullable_columns' only reports NULLs for Addresses.city/country/line_1/state/zip, Customer_Payments.amount_payment, and Vehicles.vehicle_details. Columns like Staff.nickname, Staff.first_name, Staff.middle_name, Staff.last_name, Customers.first_name, Customers.last_name, Customers.email_address, Customers.phone_number, Customers.cell_mobile_phone_number, Customers.date_of_birth, Customers.date_became_customer, Staff.date_of_birth, Staff.date_joined_staff, Staff.date_left_staff, Lessons.lesson_time, Lessons.lesson_date, Lessons.price are absent from the feedback, indicating they received no NULLs. This violates the interface NULL rule ('for every nullable column ... each instance contains generated rows with NULL').",
+     "requested_revision": "Add all nullable columns from the specification's null_targets to spec.NULL_SHARE_COLUMNS (except nullable FK columns handled by the FK NULL path, i.e. Lessons.staff_id), and ensure _plant_nulls is applied to each. Re-run and confirm the nullable_columns feedback lists a NULL count > 0 for every nullable column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets includes Lessons.lesson_time and Lessons.lesson_date and Lessons.price, but the execution feedback's nullable_columns list does not include Lessons.lesson_time, Lessons.lesson_date, or Lessons.price at all. spec.NULL_SHARE_COLUMNS does include ('Lessons','lesson_time'), ('Lessons','lesson_date'), ('Lessons','price'), so the omission in feedback suggests either the feedback only reports a subset or the NULL planting is not reaching these columns. Either way, the interface NULL rule requires at least one NULL per nullable column per instance, and the feedback does not demonstrate this for Lessons columns.",
+     "requested_revision": "Verify that Lessons.lesson_time, Lessons.lesson_date, and Lessons.price receive NULLs in every instance; if the feedback is incomplete, extend it to report all nullable columns. If NULLs are not planted, fix the NULL planting path."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Customers.customer_id aggregate_boundary with targets ['COUNT(*) > 2', '1,2,>=3'] and Customers.customer_id group_sizes via child side. spec.AGGREGATE_BOUNDARY includes ('Customers','customer_id','Customer_Payments','customer_id','customer_id') and ('Customers','customer_id','Customer_Payments','customer_id','amount_payment'). However, _plant_aggregate_boundary assigns child rows to only three parents (p1, p2, p3) with counts 1, 2, 3 and leaves the remaining parents with 0. The specification's uncertainty note explicitly states: 'the parent-side group sizes (Customers.customer_id) must take 1, 2 and >=3 across the full parent set, not just 3 parents with 1/2/3 and the rest 0.' The current implementation does exactly what the note warns against. Additionally, the construction_pairs_by_group is empty and separated=7 out of 155 eligible, which is consistent with the aggregate-boundary targets not being properly planted.",
+     "requested_revision": "Revise _plant_aggregate_boundary to distribute child rows so that across the full parent set, group sizes take 1, 2, and >=3 (not just three parents with 1/2/3 and the rest 0). Ensure COUNT(*) and COUNT(counted_col) both take values 1, 2, and >=3 across parent groups, with NULLs in the counted column reducing COUNT(col) but not COUNT(*). Re-run and confirm construction_pairs_by_group is populated and separated count increases."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Customers.customer_id group_sizes with targets ['1,2,>=3'] and the uncertainty note states 'Customers.customer_id group_sizes is achieved via the child-side (Customer_Payments.customer_id) distribution, not by planting duplicates on the PK column; _plant_group_sizes must never be applied to a primary-key column.' spec.GROUP_SIZE_COLUMNS includes ('Customer_Payments','customer_id') and ('Vehicles','vehicle_details'), which is correct. However, _plant_group_sizes in instance.py is applied to Customer_Payments.customer_id, which is a FK column, not a PK column \u2014 that is fine. But the group_sizes target for Customer_Payments.customer_id requires groups of size 1, 2, and >=3, and _plant_group_sizes only sets 6 positions (order[0..5]) to a, b, b, c, c, c. With n=15 rows, this creates groups of size 1 (a), 2 (b), and 3 (c), but the remaining 9 rows keep their original values, which may create additional groups. This is acceptable for the target, but the aggregate_boundary planting in _plant_aggregate_boundary then overwrites child_fk values for the first 6 rows, potentially destroying the group_sizes planting. The order of operations in build_random_instance: _build_table (which includes _plant_group_sizes) runs first, then _plant_aggregate_boundary overwrites child_fk for the first 6 rows. This means the group_sizes planting on Customer_Payments.customer_id is overwritten by aggregate_boundary planting, so the group_sizes target may not be satisfied.",
+     "requested_revision": "Ensure that _plant_aggregate_boundary and _plant_group_sizes on Customer_Payments.customer_id are coordinated so both targets are satisfied. Either apply group_sizes after aggregate_boundary, or make aggregate_boundary planting itself produce group sizes 1, 2, and >=3 across the full parent set (which would satisfy both). Re-run and verify both targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Lessons.lesson_id duplicates_for_distinct with targets ['20-50%'] and Vehicles.vehicle_id duplicates_for_distinct with targets ['20-50%']. However, spec.DUPLICATE_COLUMNS does not include ('Lessons','lesson_id') or ('Vehicles','vehicle_id'). The specification's generic_sampling_rules state 'duplicates_for_distinct: Ensure 20-50% of non-NULL values repeat an earlier value in the same column; never applied to primary-key columns.' Since lesson_id and vehicle_id are primary keys, the generic rule says never apply duplicates to PK columns. But the per_column_exceptions explicitly list them as duplicates_for_distinct targets. This is a contradiction in the specification itself: the per_column_exceptions request duplicates on PK columns, while the generic rule forbids it. The program follows the generic rule (does not plant duplicates on PKs), which is the safer choice for integrity, but it does not implement the per_column_exceptions as written.",
+     "requested_revision": "Designer: resolve the contradiction between the generic rule ('never applied to primary-key columns') and the per_column_exceptions listing Lessons.lesson_id and Vehicles.vehicle_id as duplicates_for_distinct targets. Either remove these from per_column_exceptions or clarify that the generic rule takes precedence. Engineer: if the designer confirms PK duplicates are not intended, no code change is needed; otherwise, implement a mechanism that does not violate PK uniqueness (e.g., the duplicates_for_distinct pattern on a PK is likely a mis-extraction and should be dropped)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Customers.customer_address_id unmatched_join_rows with targets ['parent_rows_without_children'] and Addresses.address_id unmatched_join_rows with targets ['parent_rows_without_children']. spec.UNMATCHED_JOIN includes 'Addresses': 'address_id', 'Customers': 'customer_id', 'Staff': 'staff_id'. The _ensure_unmatched function is called for each (ptable, pcol) in spec.UNMATCHED_JOIN, iterating over all child tables with FKs to ptable. For Addresses, this covers Staff.staff_address_id and Customers.customer_address_id. For Customers, this covers Customer_Payments.customer_id and Lessons.customer_id. For Staff, this covers Lessons.staff_id. However, the specification also lists Customers.customer_id unmatched_join_rows with joins_with ['Staff.staff_id','Customers.customer_id','Customer_Payments.customer_id'] \u2014 the join with Staff.staff_id is a cross-table join not a FK, which is unusual. The program only enforces unmatched joins for actual FK relationships, which is reasonable. But the specification's unmatched_join_rows for Customers.customer_id mentions 'parent_rows_without_children': true and 'child_rows_with_null_fk': false \u2014 the program's _ensure_unmatched for Customers.customer_id with Customer_Payments.customer_id (NOT NULL FK) redirects children to another parent, which is correct. However, the execution feedback does not report on unmatched_join_rows targets specifically, so it is unclear whether they are satisfied.",
+     "requested_revision": "Add post-generation assertions or feedback that verifies for each UNMATCHED_JOIN target: at least one parent row has no child, and at least one child FK points to a valid parent. Re-run and confirm."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Customers.date_became_customer rows_with_different_values with targets ['>=2 per group']. spec.DIFFERENT_VALUE_COLUMNS includes ('Customers','date_became_customer'). The _plant_different_values function varies adjacent pairs (i, i+1) if they are equal, but it does not ensure '>=2 per group with different values' in the sense of grouping by some key. The specification's pattern description says 'rows_with_different_values: pairs:1, targets: qualifying_rows: >= 2 per group with different values'. The program's implementation only ensures adjacent pairs differ, which may not satisfy the 'per group' requirement if groups are defined by some other column. Without knowing the group definition, this is uncertain.",
+     "requested_revision": "Clarify the group definition for Customers.date_became_customer rows_with_different_values. If groups are defined by customer_id (each customer is its own group), then adjacent-pair variation is insufficient. Revise _plant_different_values to ensure at least 2 rows per group have different values, or document that the group is the whole table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Lessons.lesson_time comparison_boundary with targets ['', 'x']. spec.BOUNDARY_TEXT includes ('Lessons','lesson_time'): ['', 'x']. The BoundaryTextSampler draws from the boundary list, so '' and 'x' are included. However, the specification's generic_sampling_rules for boundary_text say 'For each listed literal L, include L and a case-variant (lower/upper) and a one-char typo.' For '' (empty string), a case-variant and one-char typo are not meaningful. The program's BoundaryTextSampler just picks from the boundary list, which includes '' and 'x', but does not add case-variants or typos. This is a minor deviation but may be acceptable given the literals are already boundary values.",
+     "requested_revision": "Confirm that for Lessons.lesson_time, the boundary literals '' and 'x' are sufficient and that case-variants/typos are not required for empty string. If required, extend BoundaryTextSampler to handle empty string specially."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Addresses.city comparison_boundary with targets ['Lockmanfurt','lockmanfurt','Damianfort','damianfort']. spec.BOUNDARY_TEXT includes ('Addresses','city'): ['Lockmanfurt','lockmanfurt','Damianfort','damianfort']. The BoundaryTextSampler draws from this list, so all four values are included. However, the specification's generic_sampling_rules for boundary_text say 'For each listed literal L, include L and a case-variant (lower/upper) and a one-char typo.' The program's BoundaryTextSampler only picks from the boundary list, which already includes case-variants (Lockmanfurt/lockmanfurt, Damianfort/damianfort), but does not add one-char typos. This is a minor deviation.",
+     "requested_revision": "Confirm whether one-char typos are required for Addresses.city boundary literals. If so, extend BoundaryTextSampler to add typos. If the case-variants already in the list are sufficient, document this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include Customers.first_name comparison_boundary with targets ['Carole','carole'], Customers.last_name with ['Bernhard','bernhard'], Staff.first_name with ['Ludie','ludie','Janessa','janessa'], Staff.last_name with ['Sawayn','sawayn']. spec.BOUNDARY_TEXT includes these. However, the NameSampler is used for first_name and last_name columns (see make_column_sampler: key in (('Customers','first_name'),('Staff','first_name'),('Staff','middle_name')) returns NameSampler, and key in (('Customers','last_name'),('Staff','last_name')) returns NameSampler). The NameSampler draws from spec.GIVEN_NAMES and spec.SURNAMES, which include 'Carole', 'Janessa', 'Ludie' (given) and 'Bernhard', 'Sawayn' (surnames), but not the lowercase variants 'carole', 'ludie', 'janessa', 'bernhard', 'sawayn'. The BOUNDARY_TEXT check in make_column_sampler comes before the NameSampler check, so for these columns, BoundaryTextSampler is used (since key in spec.BOUNDARY_TEXT is checked first). Let me re-check: make_column_sampler checks `if key in spec.ENUMS` first, then `if key in spec.BOUNDARY_TEXT` \u2014 so for ('Customers','first_name'), which is in BOUNDARY_TEXT, BoundaryTextSampler is returned. Good, so the boundary literals are used. But the NameSampler is never used for these columns, meaning the 40-name pool is not used for first_name/last_name. This is a deviation from the generic_sampling_rules 'varchar_name: Random capitalized given/surname from a 40-name pool; 5% near-variant (lowercase, typo) of a pool literal.' The program uses BoundaryTextSampler instead, which only draws from the boundary list, not the 40-name pool.",
+     "requested_revision": "Revise make_column_sampler so that for first_name/last_name columns, the sampler draws from the 40-name pool (NameSampler) AND includes the boundary literals. Either combine the two (e.g., NameSampler with boundary literals added to the pool) or use a hybrid sampler. Ensure the 5% near-variant rule is applied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules for varchar_short say 'Random word-like token 3-20 chars; 5% near-variant (case flip, trailing space, doubled char) of a pool literal.' The StringSampler._draw returns _word(rng, 3, max(3, min(self.length, 20))), which generates random lowercase words. The 5% near-variant is applied in ColumnSampler.sample when drawing from elements (pool literals), but StringSampler._draw does not apply near-variants to its own generated words. This is consistent with the rule (near-variant of a pool literal, not of generated words). However, the StringSampler is used for Staff.nickname and other varchar columns, and the near-variant is only applied when sampling from elements. This seems correct.",
+     "requested_revision": "No change needed; this is consistent with the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules for datetime say 'Random timestamp in 2015-01-01..2018-03-31, format %Y-%m-%d %H:%M:%S.' The DateSampler._draw uses _rand_dt which samples in _DT_MIN.._DT_MAX = 2015-01-01..2018-03-31 23:59:59. This is correct. However, the specification's uncertainty note says 'The lesson_date >= '2015-01-01' rule is removed from semantic_rules_and_formulas; the DateSampler range (2015-01-01..2018-03-31) already satisfies it by construction.' The program's DateSampler satisfies this. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules for double_amount say 'Uniform 0..10000 with 2 decimals; 5-30% NULL where nullable.' The AmountSampler._draw returns round(self.rng.uniform(0, 10000), 2). This is correct. NULL planting is handled separately via _plant_nulls for columns in NULL_SHARE_COLUMNS. Customers.amount_outstanding and Customer_Payments.amount_payment are in NULL_SHARE_COLUMNS. Lessons.price is in NULL_SHARE_COLUMNS. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules for integer_fk say 'Sample from the final parent PK pool (after all parent dedupe and NULL planting); 5-30% NULL only where the column is nullable; otherwise always a valid parent key. Re-validate FK after all planting.' The program's _build_table samples FK values from parent_keys (which is set after each parent table is built, so after dedupe). For nullable FK columns (Lessons.staff_id), it applies the FK NULL path with _null_share. For NOT NULL FK columns, it always picks a valid parent key. The writer runs PRAGMA foreign_key_check after commit and raises on violations. This is correct.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules for integer_pk say 'Sequential from 1; never NULL; unique per table; never targeted by duplicate planting or group-size planting.' The program's _build_table assigns data[pk_cols[0]] = list(range(1, n + 1)) for single-column PKs. For composite PKs (Customer_Payments), it fills remaining PK cols with sequential values and makes datetime_payment unique per customer_id group. The dedupe step removes duplicate PK tuples. This is correct. However, the specification's per_column_exceptions list Lessons.lesson_id and Vehicles.vehicle_id as duplicates_for_distinct targets, which contradicts the generic rule. The program follows the generic rule (does not plant duplicates on PKs), which is the safer choice. This is noted in issue 5.",
+     "requested_revision": "See issue 5."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies include Customer_Payments composite PK (customer_id, datetime_payment) with note 'datetime_payment sampled distinct per customer_id; composite PK dedupe must not drop rows needed for aggregate-boundary planting.' The program's _unique_datetime_per_group makes datetime_payment unique per customer_id group. The dedupe step removes duplicate PK tuples, but since datetime_payment is unique per group, no rows are dropped for that reason. However, if customer_id is NULL (which it shouldn't be, since it's NOT NULL), the dedupe would drop rows. Customer_Payments.customer_id is NOT NULL, so this is fine. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include Customers.date_became_customer >= date_of_birth, Staff.date_left_staff >= date_joined_staff, Staff.date_joined_staff >= date_of_birth. The program's _fix_date_order ensures these hold when both values are non-NULL. This is correct. However, the specification's uncertainty note says 'Staff.date_of_birth values in the sample include minors (2010-2015); no age constraint is asserted, and no minimum-age is intended.' The program's DateSampler samples in 2015-2018, so date_of_birth values are in that range, which means staff could be born in 2015-2018 and joined in 2015-2018, potentially violating date_joined_staff >= date_of_birth. The _fix_date_order handles this by setting date_joined_staff to date_of_birth + 1 day if needed. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's uncertainty note says 'The writer should enable foreign_keys=ON before any transaction (or run PRAGMA foreign_key_check after commit) and raise on violations; generated parent PKs must be a superset of the original PKs so compact child rows still resolve.' The program's writer.py sets pragma foreign_keys = ON before begin, runs PRAGMA foreign_key_check after commit, and asserts compact PKs are a subset of final PKs. This is correct. The execution feedback shows fk_violations: 0, not_null_violations: 0, pk_duplicates: 0, not_ok: 0. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's uncertainty note says 'The writer should open the compact DB read-only and use the sqlite3 backup API or VACUUM INTO to create a consistent copy, or ensure the original is not in WAL mode.' The program's _copy_compact uses sqlite3.connect('file:%s?mode=ro' % orig_path, uri=True) and src.backup(dst). This is correct.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's uncertainty note says 'max_l0 in the sampler must be at least 3 for columns in GROUP_SIZE_COLUMNS and large enough for 20-50% duplicates on DUPLICATE_COLUMNS, so that group_sizes and duplicates_for_distinct targets remain achievable.' The program's _max_l0_for returns 3 for GROUP_SIZE_COLUMNS and 4 for DUPLICATE_COLUMNS. This is correct.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's uncertainty note says 'After fixing aggregate-boundary and group-size planting, re-run the construction check and verify that construction_pairs_by_group is populated and separated count increases; add a post-generation assertion that for each AGGREGATE_BOUNDARY triple, the child-row counts per parent include 1, 2 and >=3, and that COUNT(counted_col) also includes 1, 2 and >=3.' The execution feedback shows construction_pairs_by_group: [] (empty) and separated: 7 out of 155 eligible. This indicates the aggregate-boundary and group-size planting is not working as intended. This is the most significant issue.",
+     "requested_revision": "Fix _plant_aggregate_boundary and _plant_group_sizes as described in issues 3 and 4. Add post-generation assertions for AGGREGATE_BOUNDARY triples. Re-run and confirm construction_pairs_by_group is populated and separated count increases."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions list Customers.customer_id aggregate_boundary with targets ['COUNT(*) > 2', '1,2,>=3'] and Customers.customer_id group_sizes with targets ['1,2,>=3']. The uncertainty note says 'the parent-side group sizes (Customers.customer_id) must take 1, 2 and >=3 across the full parent set, not just 3 parents with 1/2/3 and the rest 0.' However, the specification's AGGREGATE_BOUNDARY in spec.py (engineer's implementation) only plants 1, 2, 3 for three parents and 0 for the rest. The designer's specification is ambiguous: it says 'plant child-row counts so that COUNT(*) and COUNT(col) take the values 1, 2 and >=3 across parent groups' but also says 'the parent-side group sizes (Customers.customer_id) must take 1, 2 and >=3 across the full parent set, not just 3 parents with 1/2/3 and the rest 0.' These two statements are contradictory: if only three parents have children (1, 2, 3) and the rest have 0, then the group sizes across the full parent set are 0, 0, ..., 1, 2, 3 \u2014 which does include 1, 2, and >=3, but the note says 'not just 3 parents with 1/2/3 and the rest 0.' The designer should clarify what 'across the full parent set' means.",
+     "requested_revision": "Clarify the aggregate_boundary and group_sizes targets for Customers.customer_id. If the intent is that all parents have at least one child (so group sizes are 1, 2, >=3 with no 0s), then the specification should say so explicitly. If 0s are allowed, then the current implementation may be acceptable, but the note contradicts this. Resolve the ambiguity."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions list Lessons.lesson_id and Vehicles.vehicle_id as duplicates_for_distinct targets, but the generic_sampling_rules say 'never applied to primary-key columns.' This is a direct contradiction. The designer should resolve it.",
+     "requested_revision": "Remove Lessons.lesson_id and Vehicles.vehicle_id from per_column_exceptions, or clarify that the generic rule takes precedence. If duplicates on PKs are intended, explain how PK uniqueness is maintained."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets list includes Customers.customer_address_id, but this column is NOT NULL in the schema (FOREIGN KEY customer_address_id INTEGER NOT NULL). The null_targets list should not include NOT NULL columns. Similarly, the null_targets list includes Addresses.city, Addresses.country, etc., which are nullable, but the list also includes Staff.nickname, Staff.first_name, etc. The designer should ensure null_targets only includes nullable columns.",
+     "requested_revision": "Remove Customers.customer_address_id from null_targets (it is NOT NULL). Verify all other null_targets are nullable."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include Customers.customer_status_code enum with targets ['Good Customer', 'Bad Customer'], Customer_Payments.payment_method_code enum with ['Direct Debit', 'Credit Card'], Lessons.lesson_status_code enum with ['Completed', 'Cancelled'], Vehicles.vehicle_details enum with ['Van', 'Truck', 'Car']. These are supported by the supporting_evidence rows. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include amount_outstanding >= 0, amount_payment >= 0, price >= 0. These are supported by the supporting_evidence rows (Customers row 1: 255.0, Customer_Payments row 1: 9570.93, Lessons row 1: 199.0). Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include Staff.date_left_staff >= date_joined_staff and Staff.date_joined_staff >= date_of_birth. These are supported by the supporting_evidence rows. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include Customers.date_became_customer >= date_of_birth. This is supported by the supporting_evidence rows. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'No formula relates amount_outstanding to payments or lesson price; none is stated.' This is correct; no such formula is in the specification. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'lesson_time is a free-form VARCHAR(10); boundary values '' and 'x' are targeted and the column is also nullable, so boundary literals appear among non-NULL rows and NULLs are planted separately.' This is correct. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'No FK enforcement is enabled in the writer; FK targets are sampled from the final parent PK pool after all dedupe and NULL planting, and a post-generation FK validation is required.' The program's writer enables foreign_keys=ON and runs PRAGMA foreign_key_check. This is correct. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Duplicate planting is applied to primary-key columns only where the final PK is not required to be unique; the program should dedupe PKs after planting and re-validate FK references.' This is contradictory: PKs are always required to be unique. The note should be clarified.",
+     "requested_revision": "Clarify that duplicate planting is never applied to PK columns, and remove the contradictory statement."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'The instance file is the compact database plus appended generated rows; the original DB path must be passed through to the writer so compact rows are copied.' The program's writer copies the compact DB via backup API. This is correct. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Aggregate-boundary targets (COUNT(*) > 2 with counts 1,2,>=3) must be planted explicitly for Customers.customer_id and Customer_Payments.customer_id/amount_payment; the parent-side group sizes (Customers.customer_id) must take 1, 2 and >=3 across the full parent set, not just 3 parents with 1/2/3 and the rest 0.' This is the key issue. The designer should clarify what 'across the full parent set' means and whether 0s are allowed.",
+     "requested_revision": "See issue 22."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Customers.customer_id group_sizes is achieved via the child-side (Customer_Payments.customer_id) distribution, not by planting duplicates on the PK column; _plant_group_sizes must never be applied to a primary-key column.' This is correct. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Nullable FK NULL share must be computed once from _null_share(rng) and applied as a single target count; the previous double mechanism (0.15 pre-threshold plus _plant_nulls) could exceed the 5-30% cap. Lessons.staff_id is handled solely by the FK NULL path and must be removed from NULL_SHARE_COLUMNS.' The program's spec.NULL_SHARE_COLUMNS does not include Lessons.staff_id, and the FK NULL path in _build_table handles it. This is correct. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Each nullable column must receive at least one NULL per instance; a post-generation assertion should verify this across all instances.' The program's build_random_instance calls _ensure_one_null for each nullable column in NULL_SHARE_COLUMNS. However, as noted in issue 1, many nullable columns are missing from NULL_SHARE_COLUMNS, so they do not receive NULLs. This is an engineer issue (issue 1).",
+     "requested_revision": "See issue 1."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'The lesson_date >= '2015-01-01' rule is removed from semantic_rules_and_formulas; the DateSampler range (2015-01-01..2018-03-31) already satisfies it by construction.' The program's DateSampler satisfies this. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'The writer should enable foreign_keys=ON before any transaction (or run PRAGMA foreign_key_check after commit) and raise on violations; generated parent PKs must be a superset of the original PKs so compact child rows still resolve.' The program's writer does this. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'The writer should open the compact DB read-only and use the sqlite3 backup API or VACUUM INTO to create a consistent copy, or ensure the original is not in WAL mode.' The program's writer does this. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'max_l0 in the sampler must be at least 3 for columns in GROUP_SIZE_COLUMNS and large enough for 20-50% duplicates on DUPLICATE_COLUMNS, so that group_sizes and duplicates_for_distinct targets remain achievable.' The program's _max_l0_for does this. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'After fixing aggregate-boundary and group-size planting, re-run the construction check and verify that construction_pairs_by_group is populated and separated count increases; add a post-generation assertion that for each AGGREGATE_BOUNDARY triple, the child-row counts per parent include 1, 2 and >=3, and that COUNT(counted_col) also includes 1, 2 and >=3.' The execution feedback shows construction_pairs_by_group: [] and separated: 7. This is the key issue (see issue 3).",
+     "requested_revision": "See issue 3."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the aggregate_boundary and group_sizes targets for Customers.customer_id are satisfied across the full parent set (construction_pairs_by_group is empty, separated=7/155).",
+    "Whether all nullable columns receive at least one NULL per instance (feedback only reports a subset of nullable columns).",
+    "Whether unmatched_join_rows targets are satisfied for all UNMATCHED_JOIN entries (no feedback provided).",
+    "Whether Customers.date_became_customer rows_with_different_values target is satisfied (group definition unclear).",
+    "Whether the 40-name pool is used for first_name/last_name columns (BoundaryTextSampler is used instead, which only draws from boundary literals).",
+    "Whether one-char typos are required for boundary_text literals (program only uses the listed literals)."
+   ]
+  }
+ ]
 }

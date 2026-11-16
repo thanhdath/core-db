@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -231,5 +233,95 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, rng, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]
+
+
+def _boundary_numeric(rng, literals, lo=None, hi=None):
+    """Emit L-1, L, L+1 with equal probability (boundary_numeric)."""
+    L = rng.choice(literals)
+    v = L + rng.choice([-1, 0, 1])
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
+def _boundary_text(rng, literals):
+    """Emit S, lower(S), upper(S), one-char truncation (boundary_text)."""
+    S = rng.choice(literals)
+    return rng.choice([S, S.lower(), S.upper(), S[:-1] if len(S) > 1 else S])
+
+
+def _short_token(rng, lo=3, hi=12):
+    k = rng.randint(lo, hi)
+    return ''.join(rng.choice(string.ascii_letters) for _ in range(k))
+
+
+def _near_dup(rng, existing):
+    """Case / one-char variant of an existing value (varchar_short)."""
+    if not existing:
+        return _short_token(rng)
+    s = str(rng.choice(existing))
+    if not s:
+        return _short_token(rng)
+    u = rng.random()
+    if u < 0.4:
+        return s.swapcase() if s.swapcase() != s else s.upper()
+    if u < 0.7:
+        i = rng.randrange(len(s))
+        return s[:i] + rng.choice(string.ascii_letters) + s[i + 1:]
+    return s + rng.choice(string.ascii_letters)
+
+
+def spec_sampler(table, col, rng, original_values, pool_values):
+    """Return a zero-arg callable producing one non-NULL value for (table, col)."""
+    key = (table, col)
+    ov = [v for v in original_values if v is not None]
+    pv = [v for v in pool_values if v is not None]
+
+    if key in spec.ENUMS:
+        dom = spec.ENUMS[key]
+        return lambda: rng.choice(dom)
+
+    if key in spec.BOUNDARY_NUM:
+        lo, hi = spec.RANGES.get(key, (None, None))
+        lits = spec.BOUNDARY_NUM[key]
+        return lambda: _boundary_numeric(rng, lits, lo, hi)
+
+    if key in spec.BOUNDARY_TEXT:
+        lits = spec.BOUNDARY_TEXT[key]
+        return lambda: _boundary_text(rng, lits)
+
+    if key in spec.RANGES:
+        lo, hi = spec.RANGES[key]
+        return lambda: rng.randint(lo, hi)
+
+    if key in spec.SHORT_TEXT:
+        existing = ov + pv
+        def _short():
+            if rng.random() < 0.05:
+                return _near_dup(rng, existing)
+            return _short_token(rng)
+        return _short
+
+    if col == 'city_code':
+        return lambda: rng.choice(spec.CITY_CODES)
+
+    if key in spec.QUANTITY:
+        return lambda: rng.randint(1, 200)
+
+    if ov or pv:
+        vals = ov + pv
+        return lambda: rng.choice(vals)
+    return lambda: _short_token(rng)
+
+
+def null_share_for(column, original_values):
+    """NULL share following the compact database's share for that column (>= 1 row enforced by caller)."""
+    n = len(original_values)
+    if n == 0:
+        return 0.05
+    nulls = sum(1 for v in original_values if v is None)
+    return max(0.05, nulls / n)

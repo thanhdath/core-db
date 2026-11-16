@@ -127,8 +127,7 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -197,15 +196,34 @@ def _routing_items(tv: list) -> list:
     return [((best[k], k[0]), k[1]) for k in order]
 
 
+def _col_is_numeric(column) -> bool:
+    t = (column.type_str or '').lower()
+    return any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real'))
+
+
+def _column_types(schema) -> dict:
+    """(table, column) -> ColumnMeta, for the column-type routing."""
+    out = {}
+    for tn, tm in schema.tables.items():
+        for cm in tm.columns:
+            out[(tn, cm.name)] = cm
+    return out
+
+
 def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> dict:
     """Route literals to FK-root columns = type_values_w_db(loose=True) (value_typing.py:31-75)."""
     pool: dict = {}
     cache: dict = {}
+    ctypes = _column_types(schema)
 
     def vals(k):
         if k not in cache:
             cache[k] = {str(x) for x in schema.original_values.get(k, []) if x is not None}
         return cache[k]
+
+    def _is_numeric_col(k):
+        cm = ctypes.get(k)
+        return cm is not None and _col_is_numeric(cm)
 
     for sql in sqls:
         for (t, c), v in _routing_items(extract_typed_values(sql)):
@@ -227,6 +245,8 @@ def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> di
                             if any(vals(a) & vals(b) for b in contain):
                                 keep.add(a)
                     anc = sorted(keep)
+            vn = _isnum(v)
+            anc = [a for a in anc if _is_numeric_col(a) == vn]
             for a in anc:
                 pool.setdefault(a, []).append(str(v))
     return pool

@@ -34,6 +34,10 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    existing_pks: dict = field(default_factory=dict)
+    max_pk: dict = field(default_factory=dict)
+    existing_unique_tuples: dict = field(default_factory=dict)
+    existing_single_unique: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +62,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -123,6 +127,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
+        existing_pks, max_pk, existing_uniq, existing_single = {}, {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -137,6 +142,22 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+            pk = tables[t].primary_key
+            if pk:
+                pks = [tuple(r[tables[t].columns.index(next(c for c in tables[t].columns if c.name == kk))] for kk in pk)
+                       for r in rows]
+                existing_pks[t] = set(pks)
+                if len(pk) == 1:
+                    cname = pk[0]
+                    col_idx = tables[t].columns.index(next(c for c in tables[t].columns if c.name == cname))
+                    nums = [r[col_idx] for r in rows if isinstance(r[col_idx], int)]
+                    max_pk[t] = max(nums) if nums else 0
+            usel = [c for c in tables[t].columns if c.unique]
+            for c in usel:
+                ci = tables[t].columns.index(c)
+                existing_single[(t, c.name)] = {r[ci] for r in rows}
+        finally_ov = ov
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, finally_ov, sizes, from_index,
+                  existing_pks, max_pk, existing_uniq, existing_single)

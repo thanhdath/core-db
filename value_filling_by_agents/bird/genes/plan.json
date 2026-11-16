@@ -1,60 +1,392 @@
 {
  "db": "genes",
- "operator_io_quirks": [
-  "All identifiers are simple mixed-case (Classification, GeneID, Expression_Corr); no spaces, but case must be preserved and quoted.",
-  "Genes has NO primary key (pk=[]) yet GeneID is a FK to Classification and is 1:many (862 distinct over 4346 rows) \u2014 parent is unique, child is not.",
-  "Interactions has a composite PK (GeneID1, GeneID2) and TWO FKs to the SAME parent Classification(GeneID); both are self-consistent, no dangling.",
-  "FK graph: Classification (level 0) -> Genes, Interactions (level 1); no self-FK, no cycles, no missing parents.",
-  "GeneID values are text like 'G234064' (G + 6 digits); String fuzzer will treat them as int-like? No \u2014 leading 'G' means not int-like, so no +-1 variants.",
-  "Chromosome is INTEGER with only 17 distinct small values (1..17); Number fuzzer with scale=0 will draw huge ints in [-1,1] then perturb \u2014 mostly 0/1/-1.",
-  "Expression_Corr is REAL in [0,1] (samples 0.75..0.94); Number fuzzer scale=0 gives ints, not reals \u2014 storage class will contradict declared REAL.",
-  "Many TEXT columns are low-cardinality categoricals (Essential 4, Type 3, Phenotype 13, Function 13, Localization 15) with '?' as a sentinel value.",
-  "Complex is declared NULL-able but null_rate=0.0 in the sample; '?' used as missing sentinel instead.",
-  "All columns notnull=1 except Complex; no CHECK constraints, no UNIQUE indexes beyond PKs.",
-  "Tables are small (862/4346/910 rows) \u2014 no huge-table sampling concern; full read is fine.",
-  "No views, triggers, or indexes beyond PKs in DDL."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all TEXT columns: fresh random strings over a-zA-Z 0-9() of length 0..20, plus 5 sampled originals, plus contaminate (prefix/suffix/drop) \u2014 will produce garbage GeneIDs like 'aB3()' that break FK joins.",
-  "GeneID (String) fresh values won't match 'G\\d{6}' pattern; FK consistency only holds when the child draws from the parent's generated values, so Genes.GeneID and Interactions.GeneID1/2 will be consistent with Classification.GeneID but implausible.",
-  "Number fuzzer for Chromosome (INTEGER, scale=0): range [-1,1], int perturb +-1/+-2 \u2014 will produce 0, -1, 2, etc., outside the real 1..17 domain.",
-  "Number fuzzer for Expression_Corr (REAL, scale=0): draws ints in [-1,1] with +-0.01/+-0.02 perturb \u2014 values like 0.99, -0.01, 1.02; storage becomes integer/real mix, contradicting REAL.",
-  "Low-cardinality categoricals (Essential, Type, Phenotype, Function, Localization, Class, Motif) get random strings, not the 3-24 real values \u2014 queries filtering 'Essential'='Essential' will return 0 rows (FN).",
-  "Genes has no PK, so sample_fresh_primary_keys is a no-op there; duplicate GeneID rows survive \u2014 but real data already has 1:many so this matches.",
-  "Interactions composite PK (GeneID1,GeneID2) dedup will drop rows; with random strings collisions are rare, so ~n rows kept.",
-  "FK child draws from parent's FINAL filtered values with replacement \u2014 Genes.GeneID will be a random sample of Classification.GeneID (with dupes), preserving join cardinality roughly.",
-  "Known misses: FN from implausible categorical values (no 'Essential' rows), FP from missing ties (Expression_Corr random reals rarely tie, so ORDER BY / GROUP BY on it differs from gold).",
-  "Chromosome random ints rarely hit 1..17, so WHERE Chromosome=1 returns 0 rows (FN); but ties on Chromosome are plentiful (few distinct) \u2014 GROUP BY Chromosome may over-tie (FP).",
-  "No Date/Time/Bool columns \u2014 those fuzzers unused here."
- ],
- "challenger_refs": [
-  "g79958b15",
-  "gd479c55b",
-  "ga0e4ce6e",
-  "g3e135ef4",
-  "g6a9ab0c6",
-  "g02d29d2d",
-  "gca436106",
-  "gca436106",
-  "gca436106",
-  "gca436106",
-  "gca436106",
-  "gd8e435e0",
-  "ga27688bb",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479",
-  "g884ca479"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text": "Sample from the column's declared value pool (enum, code, identifier format) when one exists; otherwise generate a fresh token from a compact alphabet matching the observed format. Keep 20-50% of distinct values duplicated across rows so DISTINCT and COUNT(DISTINCT) differ. For a near-variant column, insert a near-variant (one case change, one extra character, one truncated character) of each listed boundary literal that is already in the column's pool. Never emit a value outside the column's declared enum/format pool. Never place NULL in a NOT NULL column.",
+   "integer": "Sample from the observed range; boundary values are the minimum and maximum of the observed range plus one step on each side where no range rule forbids it. Never emit NULL in a NOT NULL column.",
+   "real": "Sample from the observed range; keep the value in [0, 1] when the column is a correlation or rate. Insert distinct values within a group so aggregates like MIN/MAX are non-degenerate. Never emit NULL in a NOT NULL column.",
+   "null": "For nullable columns only: insert NULL in the share of the compact database's observed NULL rate for that column, with at least one NULL row per instance. For NOT NULL columns never insert NULL.",
+   "tie": "For a column with an ORDER BY in the atomic-operation summary, insert at least one tie at the rank-1 limit of the ORDER BY value, on a non-unique column, so that ORDER BY ... LIMIT returns the same set regardless of row order. Compute the tie value as the maximum over the combined (compact + generated) row set and plant at least two generated rows at that value; assert the tie is at the global maximum. Re-plant after deduplication and assert against the final written row set.",
+   "parent": "Insert every parent row before its child rows; for each FK insert at least one parent row that has no child row and at least one child row per parent row where the FK is NOT NULL. Plant the unmatched-parent target by construction: after generating child rows, verify at least one parent key has no child in any child table; if not, add one, and assert it survives.",
+   "child": "Every child row's NOT NULL FK value must reference an existing parent row; insert at least one child row for every parent row and at least one parent row with no child row. Draw child FK keys from the parent key pool (compact + generated) with replacement; document that with-replacement sampling is acceptable and assert the unmatched-parent target separately.",
+   "fresh": "For a fresh table (no FK dependency), insert the primary key first and the dependent rows after their parent rows.",
+   "copy": "A copied column is derived from the parent row through the FK after the parent row exists; the copy rule is applied last, after any group-size or tie planting on the child column, and the planted targets are re-asserted against the final written row set. A child key with no parent is never generated: child keys are drawn strictly from the parent key pool (compact + generated).",
+   "planting_assertion_symmetry": "Only assert a planted target when the planting precondition was met, or guarantee the precondition by choosing n large enough. After perturbing a value to create a difference, verify the two values actually differ (retry with a larger delta or a fresh in-range draw) before asserting. Assertions are checked against the final written row set after deduplication and after the copy rule.",
+   "determinism": "Seed all randomness from random.Random(seed_base*100003+i) only. Avoid any dependence on set/dict ordering when emitting rows (sort keys before writing). Ensure failed units do not leave partial state that changes later units. Re-run twice with the same seed and confirm byte-identical files."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "Classification.GeneID",
+     "Genes.GeneID",
+     "Interactions.GeneID1",
+     "Interactions.GeneID2"
+    ],
+    "rule": "Insert at least one Classification row with no Genes row and no Interactions row. All FKs are NOT NULL, so no orphan child rows are planted; parent rows without children are planted by generating extra Classification rows. Genes.GeneID and Interactions.GeneID1/GeneID2 are drawn strictly from the Classification key pool (compact + generated), so every child row has a parent. Plant the unmatched-parent target by construction and assert it survives."
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Genes.Localization",
+     "Classification.Localization",
+     "Genes.Phenotype",
+     "Genes.Chromosome",
+     "Genes.Function",
+     "Interactions.Type",
+     "Genes.Essential",
+     "Genes.GeneID"
+    ],
+    "rule": "For enum/domain columns emit each listed literal that is in the column's declared pool and one case-change near-variant of that literal. Off-pool near-variants (e.g. 'Nucleic acid cts', 'Nucleic acid metefects', 'ec', 'metabolism defec' for Phenotype; 'asma', 'sm' for Localization; 'TRANSCRIPTION' for Function) are recorded only as near_variant_candidates and are emitted only if the pool contains them; otherwise they are dropped. For numeric Chromosome emit the listed integers and one step on each side within 1..17. Comparison_boundary literals routed to identifier columns (Genes.GeneID) and integer columns (Genes.Chromosome) are dropped: only format-valid identifiers / in-range integers are planted. This removes the ambiguity between the atomic-operation summary and the per-column exceptions."
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": [
+     "Genes.Localization",
+     "Classification.Localization"
+    ],
+    "rule": "Plant at least one Localization value with group size 1, at least one with group size 2, and at least one with group size >= 3, on a non-unique column. For Genes.Localization, plant the groups on Classification.Localization and let the copy rule propagate them to Genes, or plant on Genes after the copy rule has been applied; re-assert survival against the final written row set. Only assert when the planting precondition (enough rows and distinct pool values) was met, or guarantee the precondition by choosing n large enough."
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "Genes.Localization",
+     "Genes.Chromosome",
+     "Interactions.Expression_Corr"
+    ],
+    "rule": "Plant at least two rows with the maximum value of the ORDER BY column on a non-unique column so ORDER BY ... DESC LIMIT 1 has a tie at rank 1, after deduplication. The tie value is the maximum over the combined (compact + generated) row set; assert the tie is at the global maximum and survives. Re-plant after dedup and assert against the final row set."
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": [
+     "Interactions.Expression_Corr"
+    ],
+    "rule": "For each GeneID1 group insert at least two rows with distinct Expression_Corr values so MIN/MAX are non-degenerate. After perturbation verify the two values actually differ (retry with a larger delta or a fresh in-range draw) before asserting; only assert when the planting precondition was met."
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "Genes.Localization",
+     "Genes.Function",
+     "Classification.Localization"
+    ],
+    "rule": "On non-key columns keep 20-50% of distinct values duplicated across rows so COUNT(DISTINCT) < COUNT. Genes.GeneID and Classification.GeneID are primary keys and never duplicate."
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": [
+     "Genes.Phenotype"
+    ],
+    "rule": "Emit 'Nucleic acid metabolism defects' from the Phenotype pool and one case-change near-variant. Near-variants 'Nucleic acid cts' and 'Nucleic acid metefects' are emitted only if documented as allowed values in the pool; otherwise they are dropped."
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Genes",
+    "child_column": "GeneID",
+    "parent": "Classification",
+    "parent_column": "GeneID",
+    "copied_columns": [
+     "Localization"
+    ],
+    "on_update": "cascade",
+    "on_delete": "cascade"
+   },
+   {
+    "child": "Interactions",
+    "child_column": "GeneID1",
+    "parent": "Classification",
+    "parent_column": "GeneID",
+    "copied_columns": [],
+    "on_update": "cascade",
+    "on_delete": "cascade"
+   },
+   {
+    "child": "Interactions",
+    "child_column": "GeneID2",
+    "parent": "Classification",
+    "parent_column": "GeneID",
+    "copied_columns": [],
+    "on_update": "cascade",
+    "on_delete": "cascade"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Classification",
+    "column": "Localization",
+    "formula": "Localization IN ('cytoplasm','cytoskeleton','nucleus','plasma membrane','mitochondria','vacuole','ER','golgi')",
+    "evidence": "Observed values from compact sample (8 distinct) plus stats distinct=15; this list is observed, not exhaustive (inferred-only, may add other organelle names)."
+   },
+   {
+    "table": "Genes",
+    "column": "Essential",
+    "formula": "Essential IN ('Essential','Non-Essential','?','Ambiguous-Essential')",
+    "evidence": "Observed values; stats distinct=4."
+   },
+   {
+    "table": "Genes",
+    "column": "Class",
+    "formula": "Class IN ('GTP/GDP-exchange factors (GEFs)','ATPases','Molecular chaperones','Motorproteins','Cyclins','Transcription factors','Protein Kinases','Major facilitator superfamily proteins (MFS)')",
+    "evidence": "Inferred-only: 8 of 24 observed distinct values shown; pool is a likely subset."
+   },
+   {
+    "table": "Genes",
+    "column": "Complex",
+    "formula": "Complex IS NULL OR Complex IN ('Translation complexes','?','Cytoskeleton','Cyclin-CDK (Cyclin-dependent kinases) complexes','Transcription complexes/Transcriptosome','Respiration chain complexes','Nucleosomal protein complex','Intracellular transport complexes')",
+    "evidence": "Observed values (8 of 52 distinct); nullable column."
+   },
+   {
+    "table": "Genes",
+    "column": "Phenotype",
+    "formula": "Phenotype IN ('?','Mating and sporulation defects','Cell cycle defects','Cell morphology and organelle mutants','Conditional phenotypes','Stress response defects','Carbohydrate and lipid biosynthesis defects','Nucleic acid metabolism defects')",
+    "evidence": "Observed values; stats distinct=13."
+   },
+   {
+    "table": "Genes",
+    "column": "Motif",
+    "formula": "Motif GLOB 'PS[0-9][0-9][0-9][0-9][0-9]'",
+    "evidence": "Inferred-only format from observed PS00xxx values; stats distinct=236."
+   },
+   {
+    "table": "Genes",
+    "column": "Chromosome",
+    "formula": "Chromosome BETWEEN 1 AND 17",
+    "evidence": "Observed values 1..8 in compact sample; stats distinct=17 overall. Range widened to 1..17 to match full-stats distinct count and to allow comparison-boundary queries on chromosomes 9..17 to be separated."
+   },
+   {
+    "table": "Genes",
+    "column": "Function",
+    "formula": "Function IN ('CELLULAR ORGANIZATION (proteins are localized to the corresponding organelle)','PROTEIN SYNTHESIS','CELL RESCUE, DEFENSE, CELL DEATH AND AGEING','CELLULAR TRANSPORT AND TRANSPORTMECHANISMS','PROTEIN DESTINATION','CELL GROWTH, CELL DIVISION AND DNA SYNTHESIS','CELLULAR COMMUNICATION/SIGNAL TRANSDUCTION','METABOLISM')",
+    "evidence": "Observed values; stats distinct=13. 'TRANSCRIPTION' and variants are NOT in this pool and must not be planted; this exclusion is documented here rather than implicit."
+   },
+   {
+    "table": "Genes",
+    "column": "Localization",
+    "formula": "Genes.Localization = Classification.Localization",
+    "condition": "Genes.GeneID = Classification.GeneID",
+    "evidence": "Copied through FK; must hold for every Genes row whose GeneID has a Classification parent. Unmatched keys must not fabricate a copy; child keys are drawn strictly from the parent key pool."
+   },
+   {
+    "table": "Interactions",
+    "column": "Type",
+    "formula": "Type IN ('Genetic-Physical','Genetic','Physical')",
+    "evidence": "Observed values; stats distinct=3."
+   },
+   {
+    "table": "Interactions",
+    "column": "Expression_Corr",
+    "formula": "Expression_Corr BETWEEN 0 AND 1",
+    "evidence": "Observed values 0.54176406..0.939001091; correlation lies in [0,1]."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Classification": 24,
+   "Genes": 24,
+   "Interactions": 24
+  },
+  "null_targets": [
+   "Genes.Complex"
+  ],
+  "supporting_evidence": [
+   "Genes.Localization = Classification.Localization via FK on GeneID: computed from all 8 compact rows; holds on every row where a parent exists.",
+   "Genes.Function pool: confirmed against compact distinct values; TRANSCRIPTION not present.",
+   "Interactions.Expression_Corr range: min 0.54176406, max 0.939001091 over compact rows.",
+   "Interactions.Type: Genetic-Physical, Genetic, Physical over compact rows (distinct=3).",
+   "Genes.Chromosome observed values 1..8 in compact sample; full stats distinct=17, so range widened to 1..17."
+  ],
+  "uncertainty": [
+   "Enum pools for Motif (236 distinct), Class (24), Complex (52), Function (13), Localization (15) are inferred-only from a compact sample; the compact database shows only a small subset of values and the implemented domain may be a proper subset.",
+   "Genes.Chromosome distinct=17 in the full stats but the compact subset shows only 1..8; the range rule is widened to 1..17 to match the full-stats distinct count. If the true domain is 1..8, the range rule should be narrowed back.",
+   "Genes.Localization copy invariant: child keys are drawn strictly from the Classification key pool (compact + generated) so every Genes row has a parent and the copy is well-defined; an explicit assertion checks Genes.Localization == Classification.Localization for every Genes row with a parent.",
+   "Planting order for group-size/tie/'different-value' targets must occur after deduplication/unique filtering and after the copy rule for copied columns so the targets survive; assertions are checked against the final written row set. Planting and assertion must be symmetric: only assert a target when the planting precondition was met, or guarantee the precondition by choosing n large enough.",
+   "Reproducibility: re-run generation twice with the same seed and confirm byte-identical instance files; investigate any nondeterminism source. Seed all randomness from random.Random(seed_base*100003+i) only, avoid dependence on set/dict ordering when emitting rows (sort keys before writing), and ensure failed units do not leave partial state that changes later units.",
+   "NULL share for Genes.Complex: generated rows show a very low NULL share; the compact NULL share should be checked to confirm it matches the spec's 'observed NULL rate' rule.",
+   "Unmatched-parent target: the program's _sample_table draws FK columns with replacement and does not guarantee a child row for every parent row; the spec's per_column_exceptions for unmatched_join_rows requires at least one Classification row with no Genes row and no Interactions row. Plant this target by construction and assert it survives."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY_LITERALS includes ('Genes','GeneID'): ['Nucleic acid metabolism defects','TRANSCRIPTION'] and ('Interactions','GeneID1'): ['']. The atomic disclosure lists Genes.GeneID comparison_boundary targets as the near-variant values the wrong-query substitutions produced (e.g. 'Nucleic acid metabolism defects', 'TRANSCRIPTION'), not as actual boundary literals on the GeneID column. GeneID holds gene identifiers (e.g. 'G000001'), so planting the strings 'Nucleic acid metabolism defects' and 'TRANSCRIPTION' as GeneID values creates semantically meaningless keys, and it can corrupt the copied-column dependency: _apply_copy_rules(Genes,Localization<-Classification.Localization) copies Localization for the same GeneID; if a generated Genes.GeneID equals a planted value with no Classification parent, the Localization lookup falls through to a positional default (instance.py `_apply_copy_rules`), breaking the copy invariant for that row.",
+     "requested_revision": "Remove the Genes.GeneID and Interactions.GeneID1 entries from BOUNDARY_LITERALS (they are wrong-query substitution targets, not boundary literals on the identifier column). Do not inject free text into identifier columns. Add an assertion in the copier that every generated Genes.GeneID that has a parent in Classification receives the parent Localization, and that unmatched keys do not get a fabricated copy."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py ENUM_POOLS maps Genes.Function to a pool of well-formed values including 'CELLULAR ORGANIZATION (...)', etc., but BOUNDARY_LITERALS maps ('Genes','Function') to ['TRANSCRIPTION','METABOLISM','TIPTION'] via BoundaryStringSampler. Function's enum pool contains 'METABOLISM' but not 'TRANSCRIPTION'; the 'TRANSCRIPTION'/'TIPTION' literals come from a wrong- and near-wrong variant of the query literal 'TRANSCRIPTION'. Similarly Interactions.Type has no listed comparison_boundary target for GeneID columns but its BOUNDARY_LITERALS entry is fine. The same misattribution for Genes.Function means ~35% of Function values are off-domain tokens (TIPTION), violating the stated enum domain `Function IN (...)`.",
+     "requested_revision": "Keep the Function enum pool as the domain and emit near-variants only of values that are actually in the pool (or drop the off-pool boundary literals). Do not allow BoundaryStringSampler to emit values outside the column's declared enum pool unless the specification explicitly lists that value as an allowed boundary literal."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rule evidence: 'Motif IN (...)' and 'Class IN (...)' are declared from only 8 observed rows (table size 8; uncertainty section says the observed values are not the full data). The enum pools therefore sit on a very thin evidence base. The Genes.Function rule lists 8 values, but the observed data only showed 'TRANSCRIPTION'/'METABOLISM' as comparison targets and the wrong-query substitution shows 'TRANSCRIPTION' is not in the domain per the current program intent \u2014 the designer should record which of these are supported vs. inferred.",
+     "requested_revision": "Mark the enum pools (Motif, Class, Expression_Corr range, Type) as inferred-only in the specification and cite the compact value counts as evidence. Keep the implemented domains as observed/likely; do not tighten them based on the wrong-query boundary targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "null rule: `nullable_columns` reports Genes.Complex NULL 20 / 1902 generated rows. This satisfies 'at least one NULL per instance', but the compact share is not clearly reproduced; also instance.py computes p=0.0 or 0.2 randomly per instance, and `_plant_null` always sets exactly one row per instance per nullable column, so the per-instance NULL share is 1/n, not the compact share. Acceptable per the stated interface ('may be noted ... does not block'), but the generator never draws the compact share.",
+     "requested_revision": "Optional: draw the per-instance NULL count from the compact database's NULL share (plus at least one) rather than always planting exactly one NULL; this is a note, not a blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction separation: 16/32 eligible pairs separated, 16 not separated. The check reports 'construction_pairs_by_group': [] so the separation rate is not attributable. `_plant_group_sizes` requires len(vals)>=6 and samples 3 values only when the column has >=3 distinct values, otherwise assigns the same value to all six slots \u2014 for the enum pool with 8 values this is fine, but for small n it is silently skipped. Similarly `_plant_tie` on Chromosome forces two rows to max; combined with `sample_fresh_primary_keys` and unique-column dropping, the planted tie row may be dropped for PK/unique tables, removing the tie. This is not proven from the feedback but the code path exists.",
+     "requested_revision": "Plant ties/groups/different-value targets after dedup/unique filtering (or on non-unique columns), and assert the planted target survives in the final written row set. Add a per-group breakdown so the 16 unseparated pairs can be attributed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Preservation of compact rows: `write_instance_sqlite` copies the original file and only INSERTs, never deletes/updates, so compact rows are preserved (good). But `_apply_copy_rules` maps generated Genes.Localization from Classification by key lookup; for generated Genes.GeneID values that are fresh (G######) and not in Classification, the lookup falls back to `columns[cc][len(out)]` (a positional original value), producing a Localization that does not match the parent key \u2014 a silent dependent-value inconsistency for those rows. FK-violation counter is 0 because Localization is not a FK, so this is not caught.",
+     "requested_revision": "For generated Genes rows, either (a) generate the Genes.GeneID from the Classification key pool so a parent exists, or (b) set Localization to NULL / skip the copy when no parent key exists, consistently with the copy invariant 'Genes.Localization = Classification.Localization for the same GeneID'. Add a check for it."
+    }
+   ],
+   "unresolved_checks": [
+    "16/32 eligible construction pairs were not separated; the execution feedback does not break this down by group (construction_pairs_by_group is empty), so it cannot be determined whether the miss is due to dropped planted rows (ties after dedup) or to genuinely overlapping instances.",
+    "Whether Genes.Localization is consistent with Classification.Localization for every generated Genes row (the copy-rule positional fallback is suspect but not measured).",
+    "The compact NULL share for Genes.Complex is not reported, so the 'NULL share follows compact share' requirement cannot be verified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Group-size target on Genes.Localization is lost after dedup/unique filtering, causing 6/20 instances to fail",
+     "evidence": "Execution feedback: 6 of 20 units fail with AssertionError('group sizes lost on Genes.Localization') (units 0, 2, 5, 9, 13, 18). In instance.py, _plant_group_sizes is called on `cols` after sample_fresh_primary_keys/drop_unique_duplicates, but the planted values are then overwritten by the FK-consistency pass for self-referencing FKs and, more importantly, the Genes.Localization column is a copied column whose values are re-derived by _apply_copy_rules from Classification.Localization. Because Genes.GeneID is drawn from the Classification key pool, the copy rule overwrites the planted group-size values with the parent's Localization, so the planted 1/2/>=3 groups do not survive. The spec's own uncertainty note ('Planting order for group-size/tie/different-value targets must occur after deduplication/unique filtering so the targets survive') is not satisfied for the copied column.",
+     "requested_revision": "Plant group-size (and tie) targets on Genes.Localization after the copy rule has been applied, or plant them on Classification.Localization and let the copy propagate, and re-assert survival. Ensure the assertion is checked against the final row set that is written. Re-run generation and confirm 0 AssertionError failures."
+    },
+    {
+     "agent": "engineer",
+     "title": "Genes.Localization copy invariant can be violated for generated Genes rows",
+     "evidence": "In instance.py, _apply_copy_rules falls back to `columns[cc][idx]` when a child key has no parent in `lookup`. The spec's uncertainty explicitly flags this: 'for generated Genes rows with a fresh GeneID not present in Classification, the copy fallback in the implementation may fabricate a value; the specification requires such keys to be either generated from Classification's key pool or to fail the copy invariant check.' Although the revision note claims Genes.GeneID is drawn from the Classification key pool, the code path `_fresh_key(rng, used_keys)` generates fresh 'G' + 6-digit tokens that are not guaranteed to be in Classification's key pool; the copy rule then falls back to the sampler value, which may differ from Classification.Localization for that key (or the key may not exist at all). This is a dependent-value consistency risk that the execution feedback does not directly measure.",
+     "requested_revision": "Either (a) draw Genes.GeneID strictly from the Classification key pool (compact + generated) so every Genes row has a parent and the copy is well-defined, or (b) add an explicit assertion that for every Genes row with a Classification parent, Genes.Localization == Classification.Localization, and fail generation otherwise. Document the chosen behavior."
+    },
+    {
+     "agent": "designer",
+     "title": "Boundary literals for Genes.Phenotype include off-pool near-variants that the spec itself says must not be planted",
+     "evidence": "spec.py BOUNDARY_LITERALS for ('Genes','Phenotype') lists 'Nucleic acid cts', 'Nucleic acid metefects', 'ec', 'metabolism defec'. The generation specification's like_near_variant rule says: 'Emit \"Nucleic acid metabolism defects\" from the Phenotype pool and near-variants \"Nucleic acid cts\" and \"Nucleic acid metefects\" only where they are documented as allowed values; otherwise emit exactly the pool value and one case change.' The Phenotype enum pool in ENUM_POOLS does not contain these tokens, so _filter_boundary_to_pool drops them \u2014 but the designer's BOUNDARY_LITERALS table still records them as intended boundary literals, which is inconsistent with the spec's own rule. Similarly, ('Classification','Localization') lists 'asma','sm' which are not in the pool.",
+     "requested_revision": "Remove off-pool near-variants from BOUNDARY_LITERALS (or move them to a separate 'near_variant_candidates' list that is only emitted when the pool contains them), so the designer's declared boundary set matches the spec's 'only where documented as allowed values' rule. Keep the case-change variant of the pool value."
+    },
+    {
+     "agent": "designer",
+     "title": "Genes.Function boundary literal 'TRANSCRIPTION' is not in the declared pool and is correctly dropped, but the spec's comparison_boundary target still lists it",
+     "evidence": "The atomic-operation summary lists PRED(genes.function = 'TRANSCRIPTION') and PRED(genes.function <= 'TRANSCRIPTION') as comparison_boundary targets for Genes.Function. The generation specification's semantic rule for Genes.Function explicitly states: \"'TRANSCRIPTION' and variants are NOT in this pool and must not be planted.\" spec.py BOUNDARY_LITERALS for ('Genes','Function') only lists 'METABOLISM', which is consistent with the semantic rule, but the designer's spec does not record why 'TRANSCRIPTION' is excluded, leaving an apparent inconsistency between the atomic-operation targets and the implemented boundary set.",
+     "requested_revision": "Add an explicit note in the specification (and in spec.py's comment) that 'TRANSCRIPTION' is excluded from Genes.Function boundary literals because it is not in the declared pool, so the exclusion is documented rather than implicit."
+    },
+    {
+     "agent": "engineer",
+     "title": "Reproducibility not demonstrated",
+     "evidence": "Execution feedback reports \"reproducible\": false. The CLI seeds each unit with `random.Random(a['seed_base'] * 100003 + i)`, which should be deterministic, but the feedback does not confirm that re-running with the same seed produces identical instances. Possible sources of nondeterminism: dict iteration order in `_apply_copy_rules` (uses setdefault on a dict built from zip, which is deterministic), `rng.sample` in _plant_nulls (deterministic given rng), and multiprocessing chunking (does not affect per-unit rng). The 'reproducible: false' flag needs investigation.",
+     "requested_revision": "Re-run generation twice with the same seed and confirm byte-identical instance files (or document the source of nondeterminism and fix it). Report the reproducibility check result."
+    },
+    {
+     "agent": "engineer",
+     "title": "Tie target on Genes.Chromosome may not survive the FK-consistency pass",
+     "evidence": "In instance.py, _plant_tie is called after the FK-consistency pass, but for Genes.Chromosome the tie is planted on the generated rows only. The compact rows are kept verbatim and may already contain the maximum Chromosome value; the assertion `sum(1 for v in nums if v == top) >= 2` checks the combined set, so it may pass even if the planted tie is on a value that is not the global maximum. More importantly, the spec's tie rule says 'Plant at least two rows with the maximum value of the ORDER BY column on a non-unique column so ORDER BY ... DESC LIMIT 1 has a tie at rank 1, after deduplication'. The current _plant_tie sets vals[0] and vals[1] to the max of the generated rows, but if the compact rows contain a higher value, the tie is not at rank 1.",
+     "requested_revision": "Compute the tie value as the maximum over the combined (compact + generated) row set, and plant at least two generated rows at that value. Add an assertion that the tie is at the global maximum."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducibility: execution feedback reports reproducible=false; needs a two-run byte-comparison to confirm or refute.",
+    "Dependent-value consistency (Genes.Localization == Classification.Localization for every Genes row with a parent) is not directly measured in the execution feedback; the copy-rule fallback path may violate it.",
+    "Construction pairs: 13 of 32 eligible pairs separated; the remaining 19 are not necessarily errors (missing separation alone does not prove equivalence), but the group-size failures account for 6 of the 20 units and should be fixed before re-evaluating separation.",
+    "NULL share for Genes.Complex: generated rows show NULL 14 / 1529, which is a very low share; the compact NULL share should be checked to confirm it matches the spec's 'observed NULL rate' rule (the interface note says this does not block a pass, but it is worth noting)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 13/20 units failed with AssertionError. 10 failures are 'different values lost on Expression_Corr by GeneID1' and 3 are 'group sizes lost on Localization'. The program's own assertions in instance.py (_assert_different_values, _assert_group_sizes) fire, so the planted targets do not survive the final row set. Root causes visible in code: (1) _plant_different_values perturbs vals[idxs[1]] by +/-0.01, but _sample_table draws Expression_Corr via NumberSampler with rng_range (0.0,1.0) and _cast rounds to precision 4; the perturbed value can collide with the original or be clamped to the same value, and the planting runs before the final append/assert without re-checking. (2) _plant_group_sizes requires len(vals) >= 6 and 3 distinct pool values; when the generated Interactions/Genes row count is small or the pool collapses, the planting is skipped and _assert_group_sizes still raises. The assertions are unconditional while the planting is conditional, so the program crashes instead of producing instances.",
+     "requested_revision": "Make planting and assertion symmetric: only assert a target when the planting precondition was met (or guarantee the precondition by choosing n large enough), and make _plant_different_values verify after perturbation that the two values actually differ (retry with a larger delta or a fresh in-range draw) before asserting. Re-run generation and confirm n_fail == 0 and reproducible == true."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports reproducible: false. The CLI docstring claims 'Re-running with the same seed produces byte-identical instance files', but the run is not reproducible. The writer copies the compact database with shutil.copyfile and appends rows; row order within a table depends on dict iteration and on rng.shuffle over index lists, and _plant_tie/_plant_group_sizes mutate lists in place after sampling. More importantly, _sample_table calls _init_sampler with max_l0 defaulting to float('inf') and the sampler's _fresh_or_reuse uses rng.random() < 0.5 branches; combined with the assertion failures aborting some units mid-write (partial .part files removed), the produced set differs between runs.",
+     "requested_revision": "Guarantee determinism: seed all randomness from random.Random(seed_base*100003+i) only (already intended), avoid any dependence on set/dict ordering when emitting rows (sort keys before writing), and ensure failed units do not leave partial state that changes later units. Re-run twice with the same seed and confirm byte-identical files."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's per_column_exceptions for comparison_boundary lists Genes.Phenotype near-variants 'Nucleic acid cts', 'Nucleic acid metefects', 'ec', 'metabolism defec' and Function 'TRANSCRIPTION' as candidates to be dropped if not in pool. The spec's semantic_rules_and_formulas for Genes.Function explicitly excludes TRANSCRIPTION. However the atomic-operation summary lists comparison_boundary ops on Genes.GeneID ('Nucleic acid metabolism defects', 'TRANSCRIPTION') and Genes.Chromosome ('vacuole'), which are type-invalid literals for those columns. The spec does not state that these are dropped for identifier/integer columns; it only says identifier columns never receive free-text literals. This leaves ambiguity about whether the boundary literals for GeneID/Chromosome are to be emitted at all.",
+     "requested_revision": "State explicitly in the specification that comparison_boundary literals routed to identifier columns (Genes.GeneID) and integer columns (Genes.Chromosome) are dropped, and that only format-valid identifiers / in-range integers are planted. This removes the ambiguity between the atomic-operation summary and the per-column exceptions."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's uncertainty section notes 'Genes.Chromosome distinct=17 in the full stats but the compact subset shows only 1..8; the range rule 1..8 may need widening.' The program implements NUMERIC_RANGES ('Genes','Chromosome'): (1,8) and NumberSampler clamps to [lo,hi]. If the true domain is 1..17, generated rows never exercise chromosomes 9..17, so comparison-boundary queries on those values cannot be separated. The spec acknowledges this as uncertain but does not resolve it.",
+     "requested_revision": "Resolve the Chromosome range: either widen NUMERIC_RANGES to the observed full-stats range (1..17) or document that 1..8 is the intended domain. If widened, update the spec's semantic rule and the program's NUMERIC_RANGES consistently."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's parent/child rule requires 'at least one parent row that has no child row and at least one child row per parent row where the FK is NOT NULL.' The program's _sample_table draws FK columns with rng.choice(pv) with replacement and does not guarantee a child row for every parent row; _fresh_key generates Classification keys but Genes.GeneID is drawn with replacement from cls_keys, so some Classification rows may have no Genes child. The spec's per_column_exceptions for unmatched_join_rows requires 'at least one Classification row with no Genes row and no Interactions row' \u2014 this is satisfied by chance, not by construction. The program does not assert this target.",
+     "requested_revision": "Plant the unmatched-parent target by construction: after generating child rows, verify at least one Classification key has no Genes child and no Interactions child; if not, add one. Add an assertion so the target survives. Also ensure at least one child row per parent where feasible, or document that with-replacement sampling is acceptable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's tie rule requires 'at least two rows with the maximum value of the ORDER BY column ... after deduplication' and 'assert the tie is at the global maximum.' _plant_tie sets vals[i] = top for up to 2 indices, but _assert_tie counts generated rows equal to top; if the compact rows already contain the top value and the generated rows were deduplicated (drop_unique_duplicates on unique columns), the planted tie may be removed. The program does not re-plant after dedup for Interactions.Expression_Corr (dedup runs before _plant_tie in _sample_table for Interactions, but _plant_tie runs before append and _assert_tie runs after append \u2014 order is correct for Interactions, but for Genes the tie planting runs after copy rule and before append, and _assert_tie runs after append; this is consistent). However the tie value is computed as max over compact+generated, and _plant_tie may set a value that is not the global max if compact contains a larger value not in generated \u2014 it does use max(combined), so this is correct. The remaining risk is that _plant_tie's loop breaks after planting 2 but may overwrite the same index twice if vals[i] == top already; the 'if vals[i] != top' guard prevents that. This appears implemented correctly; noted as a check to confirm with execution evidence rather than a blocking issue.",
+     "requested_revision": "No change required if execution confirms ties survive; otherwise re-plant after dedup and assert against the final row set."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducibility: execution feedback reports reproducible=false; the program claims byte-identical output for the same seed. This must be verified after fixing the assertion failures.",
+    "The 13 AssertionError failures mean only 7/20 units were produced; the intended value variation (group sizes, different values) is not demonstrated on the failed units.",
+    "Construction pairs separated 11/32; the remaining 21 pairs are not separated. This alone does not prove a generation error, but combined with the assertion failures it indicates the planted targets are not reliably surviving.",
+    "Genes.Complex NULL share: generated rows show NULL 7/670 (~1%), while the spec's NULL_SHARE for Genes.Complex is 0.02 and _compact_null_share reads the compact share. The observed 1% is close but should be confirmed against the compact share."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "AssertionError crashes on 8/20 units: 'different values lost on Expression_Corr by GeneID1'",
+     "evidence": "Execution feedback: n_ok=12, n_fail=8, errors={'AssertionError': 8}; stderr shows 'unit 0 failed: AssertionError('different values lost on Expression_Corr by GeneID1')' and similar for units 3,5,6,7. In instance.py, _plant_different_values is called on the generated Interactions rows BEFORE _append, but _assert_different_values is called on the FINAL instance['Interactions'] which includes the compact rows. The compact rows already contain GeneID1 groups with a single Expression_Corr value; the planting only perturbs generated rows, so a compact group with one row (or a group whose generated rows all share one value) still fails the assertion. The planting and assertion are not symmetric: the precondition (every group has >=2 rows) is not guaranteed, yet the assertion is unconditional.",
+     "requested_revision": "Make _assert_different_values symmetric with _plant_different_values: only assert for groups that the planter actually touched (return the set of group keys planted and assert only those), or guarantee the precondition by choosing n large enough and by perturbing at least one row per group including groups that exist only in the compact prefix. Do not raise AssertionError for groups the planter did not (and could not) plant. Re-run and confirm n_fail=0."
+    },
+    {
+     "agent": "engineer",
+     "title": "AssertionError crashes: 'group sizes lost on Localization'",
+     "evidence": "Execution feedback: units 1, 14, 16 fail with 'group sizes lost on Localization'. In instance.py, _plant_group_sizes is applied to the generated Genes rows only, then _append merges with compact rows, and _assert_group_sizes runs on the merged instance['Genes']. The planter picks 3 distinct values from the generated pool and assigns 1/2/3 rows, but after merging with compact rows the counts change (compact rows may already contain those values, or the generated pool may not contain the compact values), so the required sizes 1, 2, >=3 may not survive. Also _plant_group_sizes returns False when len(pool)<3 or len(vals)<6, but the assertion is still run when planted_gs.get(c) is truthy \u2014 and the planter can return True while the merged set loses the target. Planting and assertion are not symmetric against the final row set.",
+     "requested_revision": "Plant group sizes against the final (compact + generated) row set, or re-plant after _append and assert only when the precondition was met on the final set. Alternatively, choose the three group values from the merged pool and assign counts that account for existing compact occurrences. Ensure the assertion is only raised when the planter's precondition was actually satisfied on the final written rows."
+    },
+    {
+     "agent": "engineer",
+     "title": "Reproducibility not confirmed (reproducible: false)",
+     "evidence": "Execution feedback reports \"reproducible\": false. The spec's determinism rule requires re-running twice with the same seed and confirming byte-identical files. The program seeds random.Random(seed_base*100003+i) per unit, which is correct, but the feedback shows the reproducibility check did not pass. Possible causes: multiprocessing ordering, dict iteration in _apply_copy_rules lookup (uses setdefault on a dict built from zip, which is deterministic), or the .part/os.replace path. The check must be made to pass.",
+     "requested_revision": "Investigate the nondeterminism source and make the two-run byte-identical check pass. Confirm no dependence on set/dict ordering when emitting rows (sort keys before writing) and that failed units do not leave partial state. Re-run the reproducibility check and report it as true."
+    },
+    {
+     "agent": "designer",
+     "title": "Uncertain enum pools and Chromosome range are inferred-only",
+     "evidence": "Specification 'uncertainty' explicitly states: Motif (236 distinct), Class (24), Complex (52), Function (13), Localization (15) pools are inferred-only from a compact sample; Chromosome distinct=17 in full stats but compact shows only 1..8, and the range is widened to 1..17 'if the true domain is 1..8, the range rule should be narrowed back'. The program's ENUM_POOLS in spec.py hard-codes 8-value subsets for Class/Complex/Function/Localization, which may exclude valid values and thus prevent separation of comparison-boundary queries on those columns.",
+     "requested_revision": "Document these as uncertain (already done) and, where the full distinct counts are known (Class=24, Complex=52, Function=13, Localization=15, Motif=236), either widen the declared pools to cover the full observed distinct counts or explicitly record that the compact subset is a proper subset and that boundary queries on excluded values are out of scope. For Chromosome, state the decision (1..17 vs 1..8) explicitly and align the program."
+    },
+    {
+     "agent": "designer",
+     "title": "Comparison-boundary literals routed to identifier/integer columns are dropped, reducing separation",
+     "evidence": "The atomic-operation summary lists comparison_boundary targets for Genes.GeneID (values 'Nucleic acid metabolism defects', 'TRANSCRIPTION', etc.) and Genes.Chromosome (values 7,8,9,5,6,'vacuole',-1,0,1). The spec's per_column_exceptions and spec.py DROPPED_BOUNDARY_COLUMNS drop these, and construction_pairs shows only 13/32 separated. This is a deliberate design choice but it means several listed boundary operations cannot be separated by construction.",
+     "requested_revision": "Confirm this is intentional and document that the dropped literals are type-invalid for those columns (identifier/integer), so the corresponding atomic operations are not expected to be separated. If separation is required, add format-valid identifier near-variants (e.g. 'G000001' vs 'G000002') and in-range integer boundaries (1, 17) for Chromosome instead of dropping them."
+    },
+    {
+     "agent": "engineer",
+     "title": "Genes.Complex NULL share very low (12/1044) and not asserted",
+     "evidence": "Execution feedback: 'Genes.Complex: generated rows: NULL 12 / 1044'. The spec's null rule requires the NULL share to follow the compact database's share with at least one NULL row per nullable column. 12/1044 \u2248 1.1% may match the compact share, but the program does not assert the NULL target survives, and the spec's uncertainty notes 'the compact NULL share should be checked to confirm it matches'. Per instruction 7 this does not block a pass, but it should be noted.",
+     "requested_revision": "Add an assertion that at least one NULL row exists for Genes.Complex in the final written row set, and verify the generated NULL share matches the compact observed share. Note for the engineer only; not blocking."
+    },
+    {
+     "agent": "engineer",
+     "title": "Unmatched-parent target planted but not asserted against final row set after all appends",
+     "evidence": "instance.py _plant_unmatched_parent is called last and asserts survival, which is correct. However, the spec's per_column_exceptions for unmatched_join_rows requires at least one Classification row with no Genes row AND no Interactions row. The program adds a fresh Classification key if none exists, but does not verify that the added key is not later referenced (it is added after Genes/Interactions are built, so it cannot be referenced \u2014 this is fine). No issue found here; recorded as a check that passed.",
+     "requested_revision": "None required; confirm the assertion runs on the final row set (it does)."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducibility (byte-identical two-run check) reported false; must be re-verified after fixes.",
+    "Whether the widened Chromosome range 1..17 is correct vs the compact 1..8 domain.",
+    "Whether the inferred enum pools (Class, Complex, Function, Localization, Motif) are proper subsets that exclude valid values needed for boundary separation.",
+    "Whether the 13/32 separated construction pairs is acceptable given the deliberate dropping of type-invalid boundary literals."
+   ]
+  }
+ ]
 }

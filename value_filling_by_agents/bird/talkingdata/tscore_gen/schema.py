@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + compact-row key bookkeeping."""
 import math
 import sqlite3
 import warnings
@@ -34,6 +34,9 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    compact_pk: dict = field(default_factory=dict)
+    compact_max_int: dict = field(default_factory=dict)
+    compact_unique: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +61,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +76,11 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _is_int_type(t: str) -> bool:
+    t = (t or '').lower()
+    return 'int' in t
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -123,6 +131,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
+        compact_pk, compact_max, compact_uniq = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -137,6 +146,20 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+            tm = tables[t]
+            if tm.primary_key:
+                try:
+                    pkrows = con.execute('select %s from %s' % (', '.join(q(c) for c in tm.primary_key), q(t))).fetchall()
+                except sqlite3.Error:
+                    pkrows = []
+                compact_pk[t] = set(tuple(r) for r in pkrows)
+            for c in tm.columns:
+                if _is_int_type(c.type_str):
+                    vals = [v for v in ov[(t, c.name)] if isinstance(v, int)]
+                    compact_max[(t, c.name)] = max(vals) if vals else 0
+                if c.unique:
+                    compact_uniq[(t, c.name)] = set(v for v in ov[(t, c.name)] if v is not None)
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index,
+                  compact_pk, compact_max, compact_uniq)

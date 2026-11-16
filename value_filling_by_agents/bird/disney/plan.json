@@ -1,52 +1,898 @@
 {
  "db": "disney",
- "operator_io_quirks": [
-  "Table name 'voice-actors' contains a hyphen and must be double-quoted everywhere; column 'voice-actor' likewise.",
-  "Column names contain spaces, brackets, digits: 'Studio Entertainment[NI 1]', 'Disney Interactive[NI 3][Rev 1]', 'Walt Disney Parks and Resorts'.",
-  "Mixed-case identifiers: 'Year', 'Total', 'MPAA_rating', 'movie_title' vs 'Year' \u2014 case-insensitive lookup required.",
-  "FK cycle: characters.hero -> voice-actors.character, voice-actors.movie -> characters.movie_title, director.name -> characters.movie_title. Table-level cycle characters<->voice-actors must be broken deterministically.",
-  "director.name is PK and FK to characters.movie_title (1:1-ish); child PK values must come from parent, not fresh.",
-  "movies_total_gross has composite PK (movie_title, release_date) and FK movie_title -> characters.movie_title; PK member is also FK.",
-  "release_date stored as TEXT in two different formats: characters '21-Dec-37' (dd-Mon-yy) vs movies_total_gross 'Jan 25, 1961' (Mon dd, yyyy). Declared TEXT so TS dispatches String, not Date.",
-  "total_gross / inflation_adjusted_gross are TEXT holding '$184,925,485' \u2014 currency strings, not numbers.",
-  "Disney Media Networks is TEXT but holds numeric-looking strings '359','4,142','6522' (mixed comma formatting).",
-  "revenue.Year INTEGER PK with values 1991..2016; Number fuzzer will generate ints in [-10^0,10^0] range unless scale parsed \u2014 declared 'INTEGER' has no (a,b) args so scale=0.",
-  "High null rates: Disney Interactive[NI 3][Rev 1] 0.538, villian 0.179, song 0.161, Disney Media Networks 0.115 \u2014 but notnull=0 everywhere so TS won't enforce.",
-  "voice-actors.voice-actor has literal string 'None' as a value (not SQL NULL) \u2014 distinct from NULL storage."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns -> String fuzzer: random a-zA-Z0-9() strings length 0..20, plus 5 sampled originals, plus contaminate suffix/prefix/drop. Movie titles, dates, dollar amounts all become gibberish strings.",
-  "release_date (TEXT) -> String fuzzer, so '21-Dec-37' and 'Jan 25, 1961' formats are NOT preserved; date-comparison queries will mostly fail to match.",
-  "total_gross '$184,925,485' -> String fuzzer; numeric/currency comparisons in gold SQL will not match generated values -> likely FN.",
-  "revenue.Year INTEGER -> Number(scale=0): range [-1,1] ints, perturbed +-1/+-2; original 1991..2016 never reproduced -> year-range queries FN.",
-  "revenue REAL columns -> Number(scale=0) too (no args): range [-1,1] floats; original values 700..6000 -> FN on magnitude filters.",
-  "Disney Media Networks TEXT -> String; numeric-looking originals lost.",
-  "FK characters.hero -> voice-actors.character: TS draws from parent's FINAL character values (922 distinct names like 'Abu'); plausible but hero names in original are character names too, so ties may survive.",
-  "director.name PK+FK: TS fills from characters.movie_title then drops PK dups; director.director is String -> random names, original 29 distinct directors lost -> director-name queries FN.",
-  "movies_total_gross composite PK (movie_title, release_date): TS drops duplicate PK tuples; since both are String-fuzzed, collisions rare, but FK movie_title drawn from characters.movie_title gives plausible titles.",
-  "String fuzzer contaminate (0.5 prob) adds/drops chars -> near-miss values that break equality joins -> FP on join-heavy queries.",
-  "Empty-string values in genre/MPAA_rating originals: String fuzzer may produce '' via length-0 draw, so empty-string predicates may accidentally match.",
-  "voice-actors.voice-actor 'None' string: String fuzzer treats as normal element; queries filtering IS NULL vs ='None' diverge."
- ],
- "challenger_refs": [
-  "G4",
-  "g8a7ebf61",
-  "g625a9dae",
-  "G3",
-  "gaeacef52",
-  "G6",
-  "gffb425ab",
-  "G5",
-  "G11",
-  "g5e5e8bce",
-  "G12",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_primary_key": "fresh unique value per row; never NULL; no duplicates",
+   "text_fk": "copy from the parent key pool (compact + generated); never NULL for NOT NULL FKs; 5-10% NULL only where the column is nullable; no orphan values (every non-NULL value must exist in the parent pool); validate FK targets before insert",
+   "text_free": "sample from a small pool of realistic values; 20-50% duplicate share; 5-15% near-variants (case change, trailing space, one-char edit) of pool values",
+   "text_enum": "sample uniformly from the listed enum values; 20-50% duplicate share",
+   "text_money": "format '$<int>,<3-digit groups>' with no decimals; value in [1, 3,000,000,000]; 20-50% duplicate share",
+   "text_date": "format 'Mon D, YYYY' (e.g. 'Dec 21, 1937'); year in [1930, 2020]; 20-50% duplicate share",
+   "text_date_short": "format 'D-Mon-YY' (e.g. '21-Dec-37'); year in [1930, 2020]; 20-50% duplicate share",
+   "integer_pk": "fresh sequential integer; never NULL",
+   "integer_count": "integer >= 0; 5-10% NULL where nullable",
+   "real_amount": "real >= 0; 5-10% NULL where nullable",
+   "text_numeric_string": "string of digits with optional comma thousands separators; 5-10% NULL where nullable",
+   "boundary_rule": "for each listed literal L in a column's targets, include L, one step below and one step above (numbers by step 1, dates by one day, strings by case/whitespace variant)",
+   "like_near_variant_rule": "for each listed LIKE literal, include the literal's prefix match, a one-character edit, a case variant, and a value that does not match",
+   "tie_rule": "for each listed ORDER column and rank, include at least two rows with equal sort key at that rank; for ASC rank 1 the tie value must be the minimum of the generated range, for DESC rank 1 the maximum",
+   "null_rule": "every nullable column gets at least one NULL row per instance; NULL share follows the compact database's null_rate for that column; planted NULLs are never replaced to satisfy a rule; NOT NULL and primary-key columns never get NULL"
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "characters.movie_title": [
+      "joins_with:director.name",
+      "joins_with:movies_total_gross.movie_title",
+      "joins_with:voice-actors.movie",
+      "parent_rows_without_children"
+     ],
+     "director.name": [
+      "joins_with:characters.movie_title",
+      "joins_with:movies_total_gross.movie_title",
+      "parent_rows_without_children"
+     ],
+     "movies_total_gross.movie_title": [
+      "joins_with:characters.movie_title",
+      "joins_with:director.name",
+      "parent_rows_without_children"
+     ],
+     "voice-actors.movie": [
+      "joins_with:characters.movie_title",
+      "parent_rows_without_children",
+      "child_rows_with_null_fk"
+     ],
+     "voice-actors.character": [
+      "joins_with:characters.hero",
+      "parent_rows_without_children",
+      "child_rows_with_null_fk"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "characters.movie_title": [
+      "Alice in Wonderland",
+      "alice in wonderland",
+      "Pinocchio",
+      "pinocchio",
+      "Bambi",
+      "bambi"
+     ],
+     "characters.release_date": [
+      "year 36",
+      "year 37",
+      "year 38",
+      "year 49",
+      "year 50",
+      "year 51"
+     ],
+     "characters.villian": [
+      "Alice in Wonderland",
+      "alice in wonderland",
+      "Commander Rourke",
+      "commander rourke"
+     ],
+     "director.name": [
+      "Pinocchio",
+      "pinocchio",
+      "Wreck-It Ralph",
+      "wreck-it ralph"
+     ],
+     "movies_total_gross.movie_title": [
+      "Beauty and the Beast",
+      "beauty and the beast",
+      "Wreck-It Ralph",
+      "wreck-it ralph",
+      "The Great Mouse Detective",
+      "the great mouse detective"
+     ],
+     "movies_total_gross.total_gross": [
+      "99999999",
+      "100000000",
+      "100000001"
+     ],
+     "movies_total_gross.release_date": [
+      "year 1936",
+      "year 1937",
+      "year 1938",
+      "year 1989",
+      "year 1990",
+      "year 1991"
+     ],
+     "revenue.Year": [
+      1996,
+      1997,
+      1998,
+      1999
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "movies_total_gross.release_date": [
+      "Dec%",
+      "Ded",
+      "Dec x",
+      "dec",
+      "Mar 30, 2008",
+      "Mar 30, 2007x",
+      "mar 30, 2007",
+      "%1977",
+      "Apr%1970",
+      "%2016%"
+     ]
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "movies_total_gross.total_gross": [
+      "rank 1 ASC",
+      "rank 1 DESC"
+     ],
+     "movies_total_gross.inflation_adjusted_gross": [
+      "rank 1 DESC"
+     ],
+     "director.director": [
+      "rank 1 ASC",
+      "rank 1 DESC"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "characters.hero": [
+      "20-50% duplicate share"
+     ],
+     "characters.song": [
+      "20-50% duplicate share"
+     ],
+     "characters.villian": [
+      "20-50% duplicate share"
+     ],
+     "movies_total_gross.genre": [
+      "20-50% duplicate share"
+     ],
+     "movies_total_gross.MPAA_rating": [
+      "20-50% duplicate share"
+     ],
+     "director.director": [
+      "20-50% duplicate share"
+     ]
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "characters.movie_title": [
+      "COUNT(*)"
+     ],
+     "director.name": [
+      "COUNT(*)"
+     ],
+     "movies_total_gross.movie_title": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "movies_total_gross.total_gross": [
+      "IS NULL",
+      "IS NOT NULL"
+     ],
+     "movies_total_gross.release_date": [
+      "IS NULL",
+      "IS NOT NULL"
+     ],
+     "characters.villian": [
+      "IS NULL",
+      "IS NOT NULL"
+     ]
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "characters.movie_title": [
+      "group by movie_title"
+     ],
+     "characters.song": [
+      "group by song"
+     ],
+     "director.director": [
+      "group by director"
+     ]
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "movies_total_gross.total_gross": [
+      "AVG(CAST(REPLACE(REPLACE(total_gross,'$',''),',','') AS REAL))"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "characters.hero",
+    "parent_table": "voice-actors",
+    "parent_column": "character",
+    "copied_columns": [],
+    "note": "true FK per schema; no orphans; remaining values drawn from voice-actors.character pool; nullable"
+   },
+   {
+    "child": "director.name",
+    "parent_table": "characters",
+    "parent_column": "movie_title",
+    "copied_columns": [],
+    "note": "true FK per schema; no orphans; generate characters first"
+   },
+   {
+    "child": "movies_total_gross.movie_title",
+    "parent_table": "characters",
+    "parent_column": "movie_title",
+    "copied_columns": [],
+    "note": "true FK per schema; no orphans; generate characters first"
+   },
+   {
+    "child": "voice-actors.movie",
+    "parent_table": "characters",
+    "parent_column": "movie_title",
+    "copied_columns": [],
+    "note": "true FK per schema; no orphans; generate characters first; nullable"
+   },
+   {
+    "child": "characters.movie_title",
+    "parent_table": "director",
+    "parent_column": "name",
+    "copied_columns": [],
+    "note": "reverse join target; no orphans"
+   },
+   {
+    "child": "characters.movie_title",
+    "parent_table": "movies_total_gross",
+    "parent_column": "movie_title",
+    "copied_columns": [],
+    "note": "reverse join target; no orphans"
+   },
+   {
+    "child": "characters.movie_title",
+    "parent_table": "voice-actors",
+    "parent_column": "movie",
+    "copied_columns": [],
+    "note": "reverse join target; no orphans"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "characters",
+    "column": "movie_title",
+    "formula": "movie_title IS NOT NULL AND length(movie_title) > 0"
+   },
+   {
+    "table": "characters",
+    "column": "release_date",
+    "formula": "release_date IS NULL OR release_date LIKE '%-%-%'"
+   },
+   {
+    "table": "characters",
+    "column": "hero",
+    "formula": "hero IS NULL OR length(hero) > 0"
+   },
+   {
+    "table": "characters",
+    "column": "villian",
+    "formula": "villian IS NULL OR length(villian) > 0"
+   },
+   {
+    "table": "characters",
+    "column": "song",
+    "formula": "song IS NULL OR length(song) > 0"
+   },
+   {
+    "table": "director",
+    "column": "name",
+    "formula": "name IS NOT NULL AND length(name) > 0"
+   },
+   {
+    "table": "director",
+    "column": "director",
+    "formula": "director IS NULL OR length(director) > 0"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "movie_title",
+    "formula": "movie_title IS NOT NULL AND length(movie_title) > 0"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "release_date",
+    "formula": "release_date IS NOT NULL AND length(release_date) > 0"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "genre",
+    "formula": "genre IS NULL OR genre IN ('Musical','Adventure','Drama','Comedy','Action','Horror','Romantic Comedy','','Family','Animation','Sci-Fi','Fantasy','Thriller','Documentary')"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "MPAA_rating",
+    "formula": "MPAA_rating IS NULL OR MPAA_rating IN ('G','PG','PG-13','R','Not Rated','')"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "total_gross",
+    "formula": "total_gross IS NULL OR CAST(REPLACE(REPLACE(total_gross,'$',''),',','') AS REAL) >= 0"
+   },
+   {
+    "table": "movies_total_gross",
+    "column": "inflation_adjusted_gross",
+    "formula": "inflation_adjusted_gross IS NULL OR CAST(REPLACE(REPLACE(inflation_adjusted_gross,'$',''),',','') AS REAL) >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Year",
+    "formula": "Year BETWEEN 1991 AND 2016"
+   },
+   {
+    "table": "revenue",
+    "column": "Studio Entertainment[NI 1]",
+    "formula": "\"Studio Entertainment[NI 1]\" IS NULL OR \"Studio Entertainment[NI 1]\" >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Disney Consumer Products[NI 2]",
+    "formula": "\"Disney Consumer Products[NI 2]\" IS NULL OR \"Disney Consumer Products[NI 2]\" >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Disney Interactive[NI 3][Rev 1]",
+    "formula": "\"Disney Interactive[NI 3][Rev 1]\" IS NULL OR \"Disney Interactive[NI 3][Rev 1]\" >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Walt Disney Parks and Resorts",
+    "formula": "\"Walt Disney Parks and Resorts\" >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Disney Media Networks",
+    "formula": "\"Disney Media Networks\" IS NULL OR CAST(REPLACE(\"Disney Media Networks\",',','') AS REAL) >= 0"
+   },
+   {
+    "table": "revenue",
+    "column": "Total",
+    "formula": "Total >= 0"
+   },
+   {
+    "table": "voice-actors",
+    "column": "character",
+    "formula": "character IS NOT NULL AND length(character) > 0"
+   },
+   {
+    "table": "voice-actors",
+    "column": "voice-actor",
+    "formula": "\"voice-actor\" IS NULL OR length(\"voice-actor\") > 0"
+   },
+   {
+    "table": "voice-actors",
+    "column": "movie",
+    "formula": "movie IS NULL OR length(movie) > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "characters": 56,
+   "director": 56,
+   "movies_total_gross": 200,
+   "revenue": 26,
+   "voice-actors": 200
+  },
+  "null_targets": [
+   "characters.hero",
+   "characters.villian",
+   "characters.song",
+   "director.director",
+   "movies_total_gross.genre",
+   "movies_total_gross.MPAA_rating",
+   "movies_total_gross.total_gross",
+   "movies_total_gross.inflation_adjusted_gross",
+   "revenue.Studio Entertainment[NI 1]",
+   "revenue.Disney Consumer Products[NI 2]",
+   "revenue.Disney Interactive[NI 3][Rev 1]",
+   "revenue.Disney Media Networks",
+   "voice-actors.voice-actor",
+   "voice-actors.movie"
+  ],
+  "supporting_evidence": {
+   "characters.movie_title": "PK, 56 distinct, 0 nulls; join targets to director.name, movies_total_gross.movie_title, voice-actors.movie",
+   "characters.release_date": "56 distinct, 0 nulls; year boundary values 36,37,38,49,50,51 from SUBSTRING expression; format 'D-Mon-YY' satisfies LIKE '%-%-%'",
+   "characters.hero": "49 distinct, 7.1% null; true FK to voice-actors.character per schema",
+   "characters.villian": "46 distinct, 17.9% null; boundary values Alice in Wonderland, Commander Rourke",
+   "characters.song": "47 distinct, 16.1% null; duplicate share 20-50%",
+   "director.name": "PK, 56 distinct, 0 nulls; join target to characters.movie_title, movies_total_gross.movie_title",
+   "director.director": "29 distinct, 0 nulls; tie at rank 1 ASC/DESC on COUNT(director.name); nullable per interface NULL rule",
+   "movies_total_gross.movie_title": "573 distinct, 0 nulls; join target to characters.movie_title, director.name",
+   "movies_total_gross.release_date": "553 distinct, 0 nulls; LIKE 'Dec%' and year boundaries 1936-1991",
+   "movies_total_gross.genre": "13 distinct, 0 nulls; duplicate share 20-50%; 'Documentary' added to enum to match pools",
+   "movies_total_gross.MPAA_rating": "6 distinct, 0 nulls; duplicate share 20-50%",
+   "movies_total_gross.total_gross": "576 distinct, 0 nulls; boundary 99999999,100000000,100000001; tie at rank 1 ASC/DESC",
+   "movies_total_gross.inflation_adjusted_gross": "576 distinct, 0 nulls; tie at rank 1 DESC",
+   "revenue.Year": "26 distinct, 0 nulls; boundary 1996,1997,1998,1999",
+   "revenue.Disney Interactive[NI 3][Rev 1]": "53.8% null; integer >= 0",
+   "revenue.Disney Media Networks": "11.5% null; text numeric string",
+   "voice-actors.character": "922 distinct, 0 nulls; join target to characters.hero",
+   "voice-actors.voice-actor": "645 distinct, 0 nulls; nullable",
+   "voice-actors.movie": "139 distinct, 0 nulls; join target to characters.movie_title"
+  },
+  "uncertainty": "No formula holds on every shown row for revenue.Total (sum of parts does not match shown rows: 1991 parts sum to 6285 vs Total 6111); Total is generated independently. No date-order pair exists within a single table. Genre and MPAA_rating enum lists are inferred from distinct counts and sample values; additional values may exist. characters.hero is a true FK to voice-actors.character per schema; no orphans are injected for true FKs. FK enforcement must be validated in Python before insert (or foreign_keys ON with skip/repair) so fk_violations=0. Table sizes follow table_sizes_per_instance with only minor jitter centered on the specified sizes; revenue is capped at 26 years by the Year domain constraint. characters.release_date is NOT NULL in the compact data and is not in null_targets."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 911 across 20 instances (all 16 invalid instances fail with 'new_integrity_failures'). The generator disables FK enforcement (`pragma foreign_keys = OFF` in cli._append_rows) and never validates FK targets. In samplers.py, `sample_voice_actors` sets `movie` to `rng.choice(pools.MOVIE_TITLES)` (line ~'else: movie = rng.choice(pools.MOVIE_TITLES)') and `sample_characters` sets `hero = rng.choice(pools.HEROES)`; both pools contain values that are not present in the parent key pools (characters.movie_title / voice-actors.character), producing orphan FKs. The spec's generic_sampling_rules require '5-10% orphan values not in parent pool' for text_fk, but the observed orphan rate is far higher and, more importantly, the spec's per_column_exceptions for unmatched_join_rows and the dependencies list require FK consistency for the bulk of rows.",
+     "requested_revision": "Constrain FK generation so that the orphan share matches the spec (5-10% of FK rows), and ensure the remaining FK values are drawn from the actual parent key pool (compact + generated). Either enforce FK checks during append (turn foreign_keys ON and skip/repair violating rows) or validate FK targets in Python before insert. Re-run and confirm fk_violations is within the spec's orphan budget (roughly 5-10% of FK rows) rather than 911."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec table_sizes_per_instance fixes characters=56, director=56, movies_total_gross=200, revenue=26, voice-actors=200. samplers.generate_all instead uses `rng.randint(0, 230)` for voice-actors/characters/director/movies_total_gross and `rng.randint(0, 26)` for revenue. Execution feedback shows rows_added per instance averaging ~129 voice-actors, ~120 characters, ~127 director, ~107 movies_total_gross, ~12 revenue \u2014 i.e. roughly double the specified sizes for the first four tables and half for revenue. This also inflates the number of generated rows relative to the compact database, changing the intended instance shape.",
+     "requested_revision": "Use the specification's table_sizes_per_instance (with only minor per-instance jitter if desired, but centered on the specified sizes) instead of uniform 0-230 / 0-26 ranges. Confirm generated row counts per table match the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec null_targets and null_rule require every nullable column to get at least one NULL row per instance with NULL share following the compact database's share. Execution feedback shows `characters.release_date: generated rows: NULL 0 / 2410` and `director.director: generated rows: NULL 0 / 2537`. In samplers.py, `sample_characters` always sets release_date to a formatted string (no NULL branch), and `sample_director` always sets director via `_pick(...)` (no NULL branch). The spec's supporting_evidence lists characters.release_date as 0 nulls in compact, but the interface NULL rule (instruction 7) still requires at least one NULL row per nullable column per instance; the feedback line is flagged for the engineer.",
+     "requested_revision": "Add a NULL branch for characters.release_date and director.director in the samplers so each instance contains at least one NULL row for these nullable columns, consistent with the interface NULL rule. (Note: per instruction 7 this is a note for the engineer and does not by itself block a pass, but combined with the FK and size issues it should be fixed in the same revision.)"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's dependencies list includes `characters.hero -> voice-actors.character` and `voice-actors.movie -> characters.movie_title`, but the schema declares `characters.hero` as a FK to `voice-actors(character)` and `voice-actors.movie` as a FK to `characters(movie_title)`. The spec's uncertainty note acknowledges the hero->character FK is 'unusual ... treated as a join target only', yet the dependencies section still lists it as a real dependency. This ambiguity is what allows the engineer's samplers to treat hero as a free pool draw. The spec should clarify whether hero must be a valid voice-actors.character value (with the spec's 5-10% orphan allowance) or is purely a join target with no FK constraint.",
+     "requested_revision": "Clarify in the specification whether characters.hero is a true FK to voice-actors.character (and thus subject to the 5-10% orphan rule) or a non-constrained join target. Align the dependencies list and per_column_exceptions accordingly so the engineer has an unambiguous rule to implement."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 911 fk_violations are entirely attributable to the hero/movie orphan draws or also include other FK paths (e.g. director.name, movies_total_gross.movie_title) \u2014 the feedback aggregates all FKs.",
+    "Whether the compact rows are preserved unchanged: the program copies the compact DB and appends, and rows_skipped is 0, which is consistent with preservation, but no explicit before/after row-count check was provided.",
+    "Whether the intended value variation (boundary literals, LIKE near-variants, ties) is actually present in generated rows \u2014 construction_pairs separated 54/216, which is plausible but not conclusive; no per-pattern presence check was run.",
+    "Whether revenue.Total consistency (spec uncertainty notes sum-of-parts mismatch) is intentionally unconstrained; the program generates Total independently, which matches the spec's uncertainty but should be confirmed as intended."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=513 across 20 instances and validity.reasons.new_integrity_failures=20 (every instance invalid). The generator deliberately plants orphans: samplers._pick_fk uses pools.ORPHAN_SHARE=0.07 and sample_voice_actors/sample_characters/sample_director/sample_movies_total_gross all call _pick_fk with orphan pools. _append_rows sets 'pragma foreign_keys = OFF', so orphans are inserted silently. The spec's text_fk rule ('5-10% orphan values not in parent pool') is a sampling guideline, but the schema declares real FOREIGN KEY constraints; the integrity check counts these as violations, so every instance is invalid.",
+     "requested_revision": "Reconcile the orphan allowance with the declared FK constraints. Either (a) drop the deliberate orphan injection for columns that are true FKs (characters.hero, director.name, movies_total_gross.movie_title, voice-actors.movie) so fk_violations=0, or (b) if orphans are required by the spec, update the spec so the integrity checker treats them as expected and the instances are not marked invalid. As written, the program produces 0 valid instances out of 20, which blocks a pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "sample_voice_actors generates voice-actors before characters and draws movie from compact characters.movie_title plus literal-pool titles, but the generated characters.movie_title values (from _uniquify over pools.MOVIE_TITLES) are not in that parent pool. Many generated voice-actors.movie values therefore reference titles that only exist as generated characters rows, and _pick_fk additionally injects orphans. Combined with foreign_keys=OFF, this is the main source of the 513 FK violations. The spec dependency list requires voice-actors.movie -> characters.movie_title with 'validate FK targets before insert'.",
+     "requested_revision": "Generate characters.movie_title keys first (or pre-compute the full title pool including generated titles) and draw voice-actors.movie only from that pool, with FK validation before insert. Do not rely on foreign_keys=OFF to mask inconsistent references."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "sample_characters sets release_date to 'D-Mon-YY' (e.g. '21-Dec-37') and the spec's semantic rule for characters.release_date is \"release_date IS NULL OR release_date LIKE '%-%-%'\". '21-Dec-37' does not contain '--', so the rule fails for every non-NULL generated release_date. The spec's text_date_short format is 'D-Mon-YY', which is inconsistent with the LIKE '%-%-%' formula; the program follows the format but violates the formula.",
+     "requested_revision": "Align the characters.release_date format with the semantic rule (e.g. use 'YYYY-MM-DD' or 'Mon D, YYYY' style that satisfies LIKE '%-%-%'), or correct the semantic rule in the spec to match the 'D-Mon-YY' format. The two must agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic rule for movies_total_gross.genre lists enum values including '' (empty string) and the MPAA_rating rule includes ''. pools.GENRES includes 'Documentary' which is not in the spec's genre enum, and pools.MPAA_RATINGS includes '' which is in the spec. sample_movies_total_gross draws genre from pools.GENRES, so 'Documentary' can be generated even though the spec's genre IN (...) list does not contain it. This is a spec/program mismatch on the value domain.",
+     "requested_revision": "Either add 'Documentary' to the spec's genre enum (if it is a real value in the compact data) or remove it from pools.GENRES. Make the enum lists in the spec and the pools module identical."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's boundary_rule requires, for each listed literal, the literal plus one step below and one step above. For movies_total_gross.total_gross the targets are 99999999, 100000000, 100000001; pools.TOTAL_GROSS_BOUNDARY contains exactly these three, and sample_movies_total_gross picks from them with probability 0.20, so the boundary is covered. However, the tie_rule for total_gross rank 1 ASC and DESC requires at least two rows with equal sort key at rank 1; the program plants tie_total=100000000 in ~20% of rows, which is fine, but the same value is also a boundary value, so the 'rank 1' tie is satisfied by the boundary value rather than a distinct tie. This is acceptable but should be verified: the tie at rank 1 ASC would be the minimum, and 100000000 is not the minimum (values go down to 1,000,000), so the ASC rank-1 tie is not actually created. Only the DESC rank-1 tie (max = 100000000) is created.",
+     "requested_revision": "For the total_gross tie at rank 1 ASC, plant a value at the minimum of the generated range (e.g. two rows with the smallest total_gross) so the ASC tie is real. The current tie_total=100000000 only creates a DESC tie. Similarly verify inflation_adjusted_gross DESC tie (tie_infl=1236035515) is actually the maximum of generated values; if the range goes up to 6,000,000,000, the planted tie is not at rank 1."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_targets include characters.release_date, but the compact data shows characters.release_date has 0 nulls (supporting_evidence: '56 distinct, 0 nulls'). The program generates NULL release_date with probability 0.03 (sample_characters), producing 22 NULLs out of 1129. The NULL rule says the NULL share should follow the compact database's share for that column; for a column with 0 nulls in the compact data, generating NULLs deviates from the compact share. The spec lists it in null_targets, which conflicts with the compact evidence.",
+     "requested_revision": "Either remove characters.release_date from null_targets (since compact has 0 nulls) and stop generating NULLs for it, or document that the spec intentionally overrides the compact null rate. The spec and program should agree on whether this column is nullable in generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance specifies characters=56, director=56, movies_total_gross=200, revenue=26, voice-actors=200. The program's _jitter applies \u00b110% jitter, and execution feedback shows rows_added per instance averaged: voice-actors 4052/20\u2248203, characters 1129/20\u224856, director 1108/20\u224855, movies_total_gross 3962/20\u2248198, revenue 320/20=16. Revenue is capped at len(REVENUE_YEARS)=26 minus compact years, so it cannot reach 26 per instance; the spec says 'only minor jitter centered on the specified sizes', but revenue is systematically below target because the year domain is exhausted. This is a minor deviation but should be noted.",
+     "requested_revision": "Either widen the revenue year domain (the spec's revenue.Year formula is BETWEEN 1991 AND 2016, which is 26 years, and the compact already has 26 years, so no new years can be added without violating the formula) or accept that revenue cannot grow and document it. The spec's table size for revenue is unachievable given the Year domain constraint."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows eligible=216, separated=47, unknown_executions=0. This is a low separation rate but the instructions state a missing separation alone does not establish a generation error. No held-out pairs were used.",
+    "The spec's uncertainty note says revenue.Total does not equal the sum of parts; the program generates Total independently, which is consistent with the spec.",
+    "The spec's supporting_evidence claims movies_total_gross.movie_title has 573 distinct and 0 nulls, but the schema declares it NOT NULL and part of the PK; the program treats it as NOT NULL, consistent.",
+    "The spec's text_fk rule allows 5-10% orphans, but the integrity checker flags them as violations. This is the central conflict; the reviewer recommends resolving it in favor of the declared FK constraints unless the spec is amended."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "samplers.py sample_characters() generates release_date as '%d-%s-%02d' (e.g. '21-Dec-37'), but the specification's semantic rule for characters.release_date is \"release_date IS NULL OR release_date LIKE '%-%-%'\" and the supporting_evidence explicitly states \"format 'D-Mon-YY' satisfies LIKE '%-%-%'\". The generated format '21-Dec-37' contains only two hyphens, so it does NOT match '%-%-%' (which requires at least two hyphens with content between them \u2014 actually '%-%-%' matches strings with two hyphens, so '21-Dec-37' does match). However, the spec's generic_sampling_rules text_date says format 'Mon D, YYYY' (e.g. 'Dec 21, 1937'), and the supporting_evidence says characters.release_date uses 'D-Mon-YY'. The program uses 'D-Mon-YY' which is consistent with supporting_evidence but the semantic rule LIKE '%-%-%' is satisfied. This is consistent. No issue here.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "samplers.py sample_movies_total_gross() generates release_date using _fmt_date(month, day, year) = '%s %d, %d' (e.g. 'Dec 21, 1937'), which matches the spec's text_date format 'Mon D, YYYY'. However, the spec's like_near_variant targets for movies_total_gross.release_date include 'Dec%', 'Ded', 'Dec x', 'dec', 'Mar 30, 2008', 'Mar 30, 2007x', 'mar 30, 2007', '%1977', 'Apr%1970', '%2016%'. The program's RELEASE_LIKE_VARIANTS pool contains 'Dec 1, 1990', 'Ded 1, 1990', 'Dec x 1, 1990', 'dec 1, 1990', 'Mar 30, 2008', 'Mar 30, 2007x', 'mar 30, 2007', 'Jan 1, 1977', 'Apr 1, 1970', 'Jun 1, 2016'. These cover the LIKE variants (Dec%, Ded, Dec x, dec, Mar 30 2008/2007x/mar 30 2007, %1977 via Jan 1 1977, Apr%1970 via Apr 1 1970, %2016% via Jun 1 2016). This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's tie_rule states: 'for ASC rank 1 the tie value must be the minimum of the generated range, for DESC rank 1 the maximum'. For movies_total_gross.total_gross, the program plants TIE_TOTAL_MIN = TOTAL_GROSS_RANGE[0] = 1_000_000 and TIE_TOTAL_MAX = TOTAL_GROSS_RANGE[1] = 1_000_000_000. However, the program also plants boundary values 99999999, 100000000, 100000001 (TOTAL_GROSS_BOUNDARY) with 10% probability, and random values in [1_000_000, 1_000_000_000]. The minimum of the generated range is 1_000_000 (TIE_TOTAL_MIN), and the maximum is 1_000_000_000 (TIE_TOTAL_MAX). But the boundary value 99999999 is LESS than 1_000_000_000 and greater than 1_000_000, so it doesn't affect the min/max. However, 100000001 is also within range. The issue: the boundary values 99999999, 100000000, 100000001 are all less than TIE_TOTAL_MAX=1_000_000_000, so the max is still 1_000_000_000. The min is 1_000_000. So the tie at rank 1 ASC (min=1_000_000) and DESC (max=1_000_000_000) is satisfied. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_targets includes 'characters.hero', 'characters.villian', 'characters.song', 'director.director', 'movies_total_gross.genre', 'movies_total_gross.MPAA_rating', 'movies_total_gross.total_gross', 'movies_total_gross.inflation_adjusted_gross', 'revenue.Studio Entertainment[NI 1]', 'revenue.Disney Consumer Products[NI 2]', 'revenue.Disney Interactive[NI 3][Rev 1]', 'revenue.Disney Media Networks', 'voice-actors.voice-actor', 'voice-actors.movie'. The execution feedback shows nullable_columns with NULL counts for all these except 'revenue.Studio Entertainment[NI 1]', 'revenue.Disney Consumer Products[NI 2]', 'revenue.Disney Interactive[NI 3][Rev 1]', 'revenue.Disney Media Networks' are not listed in the nullable_columns feedback (only characters, director, movies_total_gross, voice-actors are listed). The revenue table's nullable columns are not shown in the feedback, but the program does generate NULLs for them (studio 3.8%, consumer 7.7%, interactive 53.8%, media 11.5%). The feedback only lists 11 nullable columns, missing the 4 revenue columns. This is a feedback reporting gap, not a program error. The program does generate NULLs for revenue columns.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's table_sizes_per_instance specifies characters: 56, director: 56, movies_total_gross: 200, revenue: 26, voice-actors: 200. The program's generate_all() uses _jitter(rng, base) which returns rng.randint(lo, hi) where lo = max(0, base - max(2, base // 10)) and hi = base + max(2, base // 10). For characters (base=56), jitter range is [50, 62]. For director (base=56), [50, 62]. For movies_total_gross (base=200), [180, 220]. For voice-actors (base=200), [180, 220]. For revenue (base=26), [23, 29] but capped at 26. The execution feedback shows rows_added: voice-actors: 4052 (avg 202.6), characters: 1129 (avg 56.45), director: 1108 (avg 55.4), movies_total_gross: 3962 (avg 198.1), revenue: 320 (avg 16). The revenue average is 16, which is below the jitter range [23, 26]. This is because the compact database already contains all 26 years (1991-2016), so candidates = [y for y in REVENUE_YEARS if y not in set(years)] is empty, and only 0 rows are generated per instance. Wait, the feedback shows revenue: 320 rows added over 20 instances = 16 per instance. But if compact has all 26 years, candidates should be empty. Let me check: the compact database may not have all 26 years. The spec says revenue: 26 distinct, 0 nulls. If compact has 26 years, candidates is empty. But feedback shows 16 rows per instance, so compact must have fewer than 26 years. The program's sample_revenue() uses candidates = [y for y in REVENUE_YEARS if y not in set(years)] where years = compact revenue years. If compact has 10 years, candidates has 16 years, and n=min(jitter, 26) but candidates[:n] gives at most 16 rows. This is consistent with the spec's note 'revenue is capped at 26 years by the Year domain constraint'. The jitter for revenue is [23, 29] capped at 26, but candidates may be fewer. This is a minor deviation from the spec's 'minor jitter centered on the specified sizes' but is documented as unavoidable. Not a blocking issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies list includes 'characters.hero' -> 'voice-actors.character' with note 'true FK per schema; no orphans; remaining values drawn from voice-actors.character pool; nullable'. The program's sample_characters() draws hero from hero_pool = compact voice-actors.character + generated voice_rows.character. This is correct. However, the spec's dependencies also list 'characters.movie_title' -> 'director.name' (reverse join target; no orphans), 'characters.movie_title' -> 'movies_total_gross.movie_title' (reverse join target; no orphans), 'characters.movie_title' -> 'voice-actors.movie' (reverse join target; no orphans). The program's sample_voice_actors() draws movie from parent_list = compact characters.movie_title + pool_movies (from pool_values). It does NOT include generated characters.movie_title values because voice-actors is generated before characters. This means voice-actors.movie values are only from compact characters, not from generated characters. The spec's dependency note says 'reverse join target; no orphans' for characters.movie_title -> voice-actors.movie, meaning every voice-actors.movie value should exist in characters.movie_title. Since voice-actors.movie draws from compact characters.movie_title, this is satisfied. But the spec's unmatched_join_rows pattern for voice-actors.movie includes 'parent_rows_without_children' and 'child_rows_with_null_fk'. The program generates NULL for voice-actors.movie with 10% probability, which is consistent with 'child_rows_with_null_fk'. The 'parent_rows_without_children' means some characters.movie_title values have no voice-actors.movie referencing them, which is naturally satisfied since not all characters are referenced. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for characters.movie_title include 'Alice in Wonderland', 'alice in wonderland', 'Pinocchio', 'pinocchio', 'Bambi', 'bambi'. The program's TITLE_BOUNDARY pool contains these values, but sample_characters() uses _pick(rng, pools.MOVIE_TITLES, None) for movie_title, not TITLE_BOUNDARY. The _pick function's boundary parameter is None for movie_title, so boundary values are never used for characters.movie_title. This means the comparison_boundary pattern for characters.movie_title is NOT implemented. The spec's per_column_exceptions explicitly lists comparison_boundary targets for characters.movie_title: ['Alice in Wonderland', 'alice in wonderland', 'Pinocchio', 'pinocchio', 'Bambi', 'bambi']. The program defines TITLE_BOUNDARY but never uses it. This is a missing implementation of the specified boundary rule.",
+     "requested_revision": "In sample_characters(), pass pools.TITLE_BOUNDARY as the boundary argument to _pick for movie_title, or otherwise ensure the boundary values are included in the generated movie_title values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for director.name include 'Pinocchio', 'pinocchio', 'Wreck-It Ralph', 'wreck-it ralph'. The program's DIRECTOR_NAME_BOUNDARY pool contains these values, but sample_director() uses _pick_fk(rng, title_pool) for name, which draws from title_pool (compact + generated characters.movie_title). The boundary values are not explicitly planted. Since title_pool includes compact characters.movie_title values, and 'Pinocchio' and 'Wreck-It Ralph' are in MOVIE_TITLES (used for characters.movie_title), they may appear in title_pool if generated. But the case variants 'pinocchio' and 'wreck-it ralph' are not in MOVIE_TITLES, so they will never appear. The comparison_boundary pattern for director.name is not fully implemented.",
+     "requested_revision": "In sample_director(), ensure the boundary values from pools.DIRECTOR_NAME_BOUNDARY are included in the generated name values (e.g., by occasionally selecting from the boundary pool when the value is a valid characters.movie_title)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for movies_total_gross.movie_title include 'Beauty and the Beast', 'beauty and the beast', 'Wreck-It Ralph', 'wreck-it ralph', 'The Great Mouse Detective', 'the great mouse detective'. The program's GROSS_TITLE_BOUNDARY pool contains these values, but sample_movies_total_gross() uses _pick_fk(rng, title_pool) for movie_title, which draws from title_pool (compact + generated characters.movie_title). The boundary values are not explicitly planted. The case variants 'beauty and the beast', 'wreck-it ralph', 'the great mouse detective' are not in MOVIE_TITLES, so they will never appear. The comparison_boundary pattern for movies_total_gross.movie_title is not fully implemented.",
+     "requested_revision": "In sample_movies_total_gross(), ensure the boundary values from pools.GROSS_TITLE_BOUNDARY are included in the generated movie_title values (e.g., by occasionally selecting from the boundary pool when the value is a valid characters.movie_title)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for characters.villian include 'Alice in Wonderland', 'alice in wonderland', 'Commander Rourke', 'commander rourke'. The program's VILLAIN_BOUNDARY pool contains these values, and sample_characters() uses _pick(rng, pools.VILLAINS, pools.VILLAIN_BOUNDARY) for villian, which does include boundary values with 15% probability. This is implemented correctly.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for characters.release_date include 'year 36', 'year 37', 'year 38', 'year 49', 'year 50', 'year 51'. The program's CHAR_YEAR_BOUNDARY = [36, 37, 38, 49, 50, 51] and sample_characters() uses these with 15% probability for the year part of release_date. This is implemented correctly.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for movies_total_gross.release_date include 'year 1936', 'year 1937', 'year 1938', 'year 1989', 'year 1990', 'year 1991'. The program's RELEASE_YEAR_BOUNDARY = [1936, 1937, 1938, 1989, 1990, 1991] and sample_movies_total_gross() uses these with 15% probability for the year part of release_date. This is implemented correctly.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for revenue.Year include 1996, 1997, 1998, 1999. The program's REVENUE_YEAR_BOUNDARY = [1996, 1997, 1998, 1999] but sample_revenue() does not use it. Instead, it uses candidates = [y for y in REVENUE_YEARS if y not in set(years)] and takes candidates[:n]. Since REVENUE_YEARS = range(1991, 2017), the boundary years 1996-1999 are included in candidates if not in compact. The program does not explicitly prioritize boundary years, but they are in the pool. This is partially implemented.",
+     "requested_revision": "In sample_revenue(), ensure the boundary years 1996, 1997, 1998, 1999 are included in the generated Year values (e.g., by prioritizing them in the candidates list)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary targets for movies_total_gross.total_gross include '99999999', '100000000', '100000001'. The program's TOTAL_GROSS_BOUNDARY = [99999999, 100000000, 100000001] and sample_movies_total_gross() uses these with 10% probability. This is implemented correctly.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit targets for movies_total_gross.inflation_adjusted_gross include 'rank 1 DESC'. The program plants TIE_INFL_MAX = INFLATION_GROSS_RANGE[1] = 6_000_000_000 with 15% probability. However, the program also generates random values in [10_000_000, 6_000_000_000], so the maximum is 6_000_000_000. The tie at rank 1 DESC is satisfied. This is implemented correctly.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's ties_for_order_limit targets for director.director include 'rank 1 ASC' and 'rank 1 DESC' on COUNT(director.name). The program's sample_director() uses _pick(rng, pools.DIRECTORS, None) for director, which draws from a pool of 26 values. With 56 rows, there will be duplicates, but the program does not explicitly plant ties at rank 1 for COUNT(director.name). The tie_rule requires 'at least two rows with equal sort key at that rank'. For COUNT(director.name), the sort key is the count of rows per director. The program does not ensure that the most frequent director has at least 2 rows (which is likely with 56 rows and 26 directors, but not guaranteed). This is a potential issue.",
+     "requested_revision": "In sample_director(), ensure that at least two rows share the most frequent director value (for ASC rank 1) and at least two rows share the least frequent director value (for DESC rank 1), or otherwise guarantee the tie condition for COUNT(director.name)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's duplicates_for_distinct targets include 'characters.hero', 'characters.song', 'characters.villian', 'movies_total_gross.genre', 'movies_total_gross.MPAA_rating', 'director.director' with '20-50% duplicate share'. The program's _pick function uses dup_share=0.35 by default, which is within 20-50%. For characters.hero, the program uses _pick_fk(rng, hero_pool) which draws uniformly from hero_pool (compact + generated voice-actors.character). With 56 rows and a large hero_pool, the duplicate share may be low. The execution feedback does not show duplicate shares, but the program's approach may not guarantee 20-50% duplicate share for characters.hero. This is a potential issue.",
+     "requested_revision": "In sample_characters(), ensure the hero column has a 20-50% duplicate share (e.g., by using a smaller pool or explicitly controlling duplicates)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_in_count_column targets include 'characters.movie_title', 'director.name', 'movies_total_gross.movie_title' with 'COUNT(*)'. The program does not implement any specific behavior for COUNT(*) vs COUNT(column). This pattern is about query behavior, not data generation. The program's data generation is consistent with the pattern (no NULLs in these columns). This is not a program issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_rows targets include 'movies_total_gross.total_gross', 'movies_total_gross.release_date', 'characters.villian' with 'IS NULL' and 'IS NOT NULL'. The program generates NULLs for total_gross (5%), villian (17.9%), but NOT for movies_total_gross.release_date (the program never generates NULL for release_date). The spec's null_targets does NOT include movies_total_gross.release_date, and the semantic rule says 'release_date IS NOT NULL AND length(release_date) > 0'. So the program is correct to not generate NULL for release_date. The null_rows pattern for release_date is about query behavior (IS NULL returns 0 rows), which is consistent. This is not a program issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's group_sizes targets include 'characters.movie_title', 'characters.song', 'director.director' with 'group by' queries. The program does not implement any specific behavior for group sizes. This pattern is about query behavior, not data generation. The program's data generation is consistent with the pattern (movie_title is PK so group size 1, song has duplicates, director has duplicates). This is not a program issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's rows_with_different_values targets include 'movies_total_gross.total_gross' with 'AVG(CAST(REPLACE(REPLACE(total_gross,'$',''),',','') AS REAL))'. The program generates total_gross as '$<int>,<3-digit groups>' with values in [1_000_000, 1_000_000_000] plus boundary values. The AVG query will work correctly. This is not a program issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for characters.release_date is 'release_date IS NULL OR release_date LIKE '%-%-%''. The program generates release_date as '%d-%s-%02d' (e.g., '21-Dec-37'), which matches '%-%-%' (two hyphens). This is correct. However, the spec's supporting_evidence says 'format 'D-Mon-YY' satisfies LIKE '%-%-%''. The program uses 'D-Mon-YY' which is consistent. This is not an issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.genre is 'genre IS NULL OR genre IN ('Musical','Adventure','Drama','Comedy','Action','Horror','Romantic Comedy','','Family','Animation','Sci-Fi','Fantasy','Thriller','Documentary')'. The program's GENRES list matches this exactly. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.MPAA_rating is 'MPAA_rating IS NULL OR MPAA_rating IN ('G','PG','PG-13','R','Not Rated','')'. The program's MPAA_RATINGS list matches this exactly. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Year is 'Year BETWEEN 1991 AND 2016'. The program's REVENUE_YEARS = list(range(1991, 2017)) matches this. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Disney Media Networks is 'Disney Media Networks IS NULL OR CAST(REPLACE(Disney Media Networks,',','') AS REAL) >= 0'. The program generates media as '%.0f' % rng.uniform(*pools.MEDIA_NETWORKS_RANGE) which is a string of digits (no commas). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Total is 'Total >= 0'. The program generates total as rng.randint(*pools.TOTAL_RANGE) where TOTAL_RANGE = (5000, 25000). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Walt Disney Parks and Resorts is 'Walt Disney Parks and Resorts >= 0'. The program generates parks as round(rng.uniform(*pools.PARKS_RANGE), 1) where PARKS_RANGE = (2500.0, 6000.0). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Studio Entertainment[NI 1] is 'Studio Entertainment[NI 1] IS NULL OR Studio Entertainment[NI 1] >= 0'. The program generates studio as None (3.8%) or round(rng.uniform(*pools.STUDIO_ENT_RANGE), 1) where STUDIO_ENT_RANGE = (2000.0, 8000.0). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Disney Consumer Products[NI 2] is 'Disney Consumer Products[NI 2] IS NULL OR Disney Consumer Products[NI 2] >= 0'. The program generates consumer as None (7.7%) or round(rng.uniform(*pools.CONSUMER_PROD_RANGE), 1) where CONSUMER_PROD_RANGE = (500.0, 4000.0). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for revenue.Disney Interactive[NI 3][Rev 1] is 'Disney Interactive[NI 3][Rev 1] IS NULL OR Disney Interactive[NI 3][Rev 1] >= 0'. The program generates interactive as None (53.8%) or rng.randint(*pools.INTERACTIVE_RANGE) where INTERACTIVE_RANGE = (100, 1200). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for voice-actors.character is 'character IS NOT NULL AND length(character) > 0'. The program generates character as _uniquify(used, base) where base is from pools.CHARACTERS. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for voice-actors.voice-actor is 'voice-actor IS NULL OR length(voice-actor) > 0'. The program generates voice-actor as None (5%) or rng.choice(pools.VOICE_ACTORS). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for voice-actors.movie is 'movie IS NULL OR length(movie) > 0'. The program generates movie as None (10%) or _pick_fk(rng, parent_list). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for characters.movie_title is 'movie_title IS NOT NULL AND length(movie_title) > 0'. The program generates movie_title as _uniquify(used, base) where base is from pools.MOVIE_TITLES. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for characters.hero is 'hero IS NULL OR length(hero) > 0'. The program generates hero as None (7.1%) or _pick_fk(rng, hero_pool). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for characters.villian is 'villian IS NULL OR length(villian) > 0'. The program generates villian as None (17.9%) or _pick(rng, pools.VILLAINS, pools.VILLAIN_BOUNDARY). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for characters.song is 'song IS NULL OR length(song) > 0'. The program generates song as None (16.1%) or _pick(rng, pools.SONGS, None). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for director.name is 'name IS NOT NULL AND length(name) > 0'. The program generates name as _pick_fk(rng, title_pool) which is a non-empty string. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for director.director is 'director IS NULL OR length(director) > 0'. The program generates director as None (3%) or _pick(rng, pools.DIRECTORS, None). This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.movie_title is 'movie_title IS NOT NULL AND length(movie_title) > 0'. The program generates movie_title as _pick_fk(rng, title_pool) which is a non-empty string. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.release_date is 'release_date IS NOT NULL AND length(release_date) > 0'. The program generates release_date as a non-empty string. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.total_gross is 'total_gross IS NULL OR CAST(REPLACE(REPLACE(total_gross,'$',''),',','') AS REAL) >= 0'. The program generates total_gross as None (5%) or _fmt_money(total) where total >= 1_000_000. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's semantic rule for movies_total_gross.inflation_adjusted_gross is 'inflation_adjusted_gross IS NULL OR CAST(REPLACE(REPLACE(inflation_adjusted_gross,'$',''),',','') AS REAL) >= 0'. The program generates infl_gross as None (5%) or _fmt_money(infl) where infl >= 10_000_000. This satisfies the rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows integrity: fk_violations: 0, not_null_violations: 0, pk_duplicates: 0, not_ok: 0. This confirms the program correctly enforces integrity constraints. The program's _append_rows() uses foreign_keys = OFF, but the generated FK values are drawn from parent pools, so no violations occur. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows reproducible: true, n_ok: 20, n_fail: 0, errors: []. This confirms the program runs without errors and is reproducible. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows construction_pairs: eligible: 216, separated: 54, unknown_executions: 0. This means 54 out of 216 construction pairs were separated. The spec's extracted atomic operations show 216 pairs. The program's generation may not separate all pairs, but this is not necessarily an error. The instructions say 'A missing separation alone does not establish a generation error or prove query equivalence.' This is not a blocking issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_money says 'format '$<int>,<3-digit groups>' with no decimals; value in [1, 3,000,000,000]'. The program's _fmt_money(v) returns '$%s' % format(int(v), ',') which produces '$1,000,000' etc. This matches the format. The value range is [1_000_000, 1_000_000_000] for total_gross and [10_000_000, 6_000_000_000] for inflation_adjusted_gross. The inflation range exceeds 3,000,000,000, which violates the spec's text_money rule. This is a potential issue.",
+     "requested_revision": "In pools.py, change INFLATION_GROSS_RANGE to (10_000_000, 3_000_000_000) to comply with the spec's text_money rule, or update the spec to allow the larger range."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_date says 'format 'Mon D, YYYY' (e.g. 'Dec 21, 1937'); year in [1930, 2020]'. The program's _fmt_date(month, day, year) returns '%s %d, %d' which matches. The year range is [1930, 2020] for movies_total_gross.release_date. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_date_short says 'format 'D-Mon-YY' (e.g. '21-Dec-37'); year in [1930, 2020]'. The program's sample_characters() generates release_date as '%d-%s-%02d' % (day, month, yy) where yy is either from CHAR_YEAR_BOUNDARY (36, 37, 38, 49, 50, 51) or rng.randint(30, 99). The year range is [30, 99] which corresponds to [1930, 1999], not [1930, 2020]. This is a potential issue.",
+     "requested_revision": "In sample_characters(), change the year range to rng.randint(30, 99) for 1930-1999, or extend to rng.randint(30, 120) for 1930-2020, to comply with the spec's text_date_short rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_free says 'sample from a small pool of realistic values; 20-50% duplicate share; 5-15% near-variants (case change, trailing space, one-char edit) of pool values'. The program's _pick function uses dup_share=0.35 and _perturb_str for near-variants. This is consistent. However, for characters.hero, the program uses _pick_fk which does not use _perturb_str, so near-variants are not generated for hero. This is a potential issue.",
+     "requested_revision": "In sample_characters(), for hero, use a sampling approach that includes near-variants (e.g., _pick with a pool of hero values) instead of _pick_fk."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_fk says 'copy from the parent key pool (compact + generated); never NULL for NOT NULL FKs; 5-10% NULL only where the column is nullable; no orphan values (every non-NULL value must exist in the parent pool); validate FK targets before insert'. The program's _pick_fk draws from parent pools, and NULL is generated for nullable FKs. This is consistent. However, the program does not validate FK targets before insert (it uses foreign_keys = OFF). The execution feedback shows fk_violations: 0, so the validation is effectively done by construction. This is acceptable.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_primary_key says 'fresh unique value per row; never NULL; no duplicates'. The program's _uniquify ensures fresh values for primary keys. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules integer_pk says 'fresh sequential integer; never NULL'. The program's sample_revenue() uses years from REVENUE_YEARS which are sequential integers. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules integer_count says 'integer >= 0; 5-10% NULL where nullable'. The program's revenue.Disney Interactive[NI 3][Rev 1] is INTEGER and nullable, with 53.8% NULL. This exceeds the 5-10% range. The spec's supporting_evidence says 'revenue.Disney Interactive[NI 3][Rev 1]: 53.8% null; integer >= 0'. So the 53.8% NULL is consistent with the compact data, not the generic 5-10% rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules real_amount says 'real >= 0; 5-10% NULL where nullable'. The program's revenue.Studio Entertainment[NI 1] has 3.8% NULL, revenue.Disney Consumer Products[NI 2] has 7.7% NULL, revenue.Walt Disney Parks and Resorts has 0% NULL (not nullable in the program). The spec's null_targets includes 'revenue.Studio Entertainment[NI 1]', 'revenue.Disney Consumer Products[NI 2]', 'revenue.Disney Interactive[NI 3][Rev 1]', 'revenue.Disney Media Networks' but NOT 'revenue.Walt Disney Parks and Resorts'. The program correctly does not generate NULL for Walt Disney Parks and Resorts. The NULL shares for Studio (3.8%) and Consumer (7.7%) are within 5-10% (Consumer is 7.7%, Studio is 3.8% which is slightly below 5%). This is a minor deviation.",
+     "requested_revision": "In sample_revenue(), adjust the NULL share for Studio Entertainment[NI 1] to be within 5-10% (e.g., 0.05 instead of 0.038)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules text_numeric_string says 'string of digits with optional comma thousands separators; 5-10% NULL where nullable'. The program's revenue.Disney Media Networks has 11.5% NULL, which exceeds 10%. The spec's supporting_evidence says 'revenue.Disney Media Networks: 11.5% null; text numeric string'. So the 11.5% NULL is consistent with the compact data, not the generic 5-10% rule. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules boundary_rule says 'for each listed literal L in a column's targets, include L, one step below and one step above (numbers by step 1, dates by one day, strings by case/whitespace variant)'. The program implements boundary values for total_gross (99999999, 100000000, 100000001), release_date years (1936-1938, 1989-1991), characters release_date years (36-38, 49-51), revenue years (1996-1999), and string boundaries for villian. However, the program does not implement boundary values for characters.movie_title, director.name, movies_total_gross.movie_title (as noted in issues above). This is a potential issue.",
+     "requested_revision": "Implement boundary values for characters.movie_title, director.name, and movies_total_gross.movie_title as specified in the comparison_boundary targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules like_near_variant_rule says 'for each listed LIKE literal, include the literal's prefix match, a one-character edit, a case variant, and a value that does not match'. The program's RELEASE_LIKE_VARIANTS pool includes these variants for movies_total_gross.release_date. This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules tie_rule says 'for each listed ORDER column and rank, include at least two rows with equal sort key at that rank; for ASC rank 1 the tie value must be the minimum of the generated range, for DESC rank 1 the maximum'. The program implements ties for total_gross (min and max) and inflation_adjusted_gross (max). However, the program does not implement ties for director.director (COUNT(director.name)). This is a potential issue.",
+     "requested_revision": "Implement ties for director.director at rank 1 ASC and DESC on COUNT(director.name)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules null_rule says 'every nullable column gets at least one NULL row per instance; NULL share follows the compact database's null_rate for that column; planted NULLs are never replaced to satisfy a rule; NOT NULL and primary-key columns never get NULL'. The program generates NULLs for all nullable columns. The execution feedback shows NULL counts for all nullable columns except revenue columns (which are not listed in the feedback but are generated). This is correct.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions includes 'unmatched_join_rows' with targets for characters.movie_title, director.name, movies_total_gross.movie_title, voice-actors.movie, voice-actors.character. The program's generation ensures no orphans (FK values drawn from parent pools). The 'parent_rows_without_children' pattern is naturally satisfied since not all parent rows are referenced. The 'child_rows_with_null_fk' pattern is satisfied for voice-actors.movie (10% NULL) and voice-actors.character (no NULL, but the spec says 'child_rows_with_null_fk' for voice-actors.character \u2014 wait, voice-actors.character is a PK and cannot be NULL. The spec's unmatched_join_rows for voice-actors.character includes 'child_rows_with_null_fk' which is inconsistent with the PK constraint. This is a spec issue, not a program issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for unmatched_join_rows includes 'voice-actors.character': ['joins_with:characters.hero', 'parent_rows_without_children', 'child_rows_with_null_fk']. However, voice-actors.character is a PRIMARY KEY and cannot be NULL. The 'child_rows_with_null_fk' target is inconsistent with the schema. This is a spec error.",
+     "requested_revision": "Remove 'child_rows_with_null_fk' from the unmatched_join_rows targets for voice-actors.character, since it is a PRIMARY KEY and cannot be NULL."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence says 'characters.release_date: 56 distinct, 0 nulls; year boundary values 36,37,38,49,50,51 from SUBSTRING expression; format 'D-Mon-YY' satisfies LIKE '%-%-%''. However, the semantic rule for characters.release_date is 'release_date IS NULL OR release_date LIKE '%-%-%''. The format 'D-Mon-YY' (e.g., '21-Dec-37') has two hyphens, so it matches '%-%-%'. This is consistent. No issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence says 'movies_total_gross.movie_title: 573 distinct, 0 nulls; join target to characters.movie_title, director.name'. However, the table_sizes_per_instance says movies_total_gross: 200. The compact data has 573 distinct movie_title values, but the generated instance has only 200 rows. This is a discrepancy between the compact data and the generated instance size. The spec's table_sizes_per_instance is the target for generated instances, not the compact data. This is not an issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence says 'voice-actors.character: 922 distinct, 0 nulls; join target to characters.hero'. However, the table_sizes_per_instance says voice-actors: 200. The compact data has 922 distinct character values, but the generated instance has only 200 rows. This is a discrepancy between the compact data and the generated instance size. The spec's table_sizes_per_instance is the target for generated instances, not the compact data. This is not an issue.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'No formula holds on every shown row for revenue.Total (sum of parts does not match shown rows: 1991 parts sum to 6285 vs Total 6111); Total is generated independently.' The program generates Total independently. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'No date-order pair exists within a single table.' The program does not enforce date ordering. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'Genre and MPAA_rating enum lists are inferred from distinct counts and sample values; additional values may exist.' The program uses the exact enum lists from the spec. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'characters.hero is a true FK to voice-actors.character per schema; no orphans are injected for true FKs.' The program draws hero from voice-actors.character pool. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'FK enforcement must be validated in Python before insert (or foreign_keys ON with skip/repair) so fk_violations=0.' The program uses foreign_keys = OFF but draws FK values from parent pools, so no violations occur. The execution feedback shows fk_violations: 0. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'Table sizes follow table_sizes_per_instance with only minor jitter centered on the specified sizes; revenue is capped at 26 years by the Year domain constraint.' The program uses _jitter for table sizes and caps revenue at 26. This is consistent.",
+     "requested_revision": "none"
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty says 'characters.release_date is NOT NULL in the compact data and is not in null_targets.' The program does not generate NULL for characters.release_date. This is consistent.",
+     "requested_revision": "none"
+    }
+   ],
+   "unresolved_checks": [
+    "The execution feedback does not show duplicate shares for characters.hero, characters.song, characters.villian, movies_total_gross.genre, movies_total_gross.MPAA_rating, director.director. The program's _pick function uses dup_share=0.35, but for characters.hero (which uses _pick_fk), the duplicate share may be lower than 20%. This needs verification.",
+    "The execution feedback does not show whether the boundary values for characters.movie_title, director.name, movies_total_gross.movie_title are present in the generated data. The program defines the boundary pools but does not use them for these columns.",
+    "The execution feedback does not show whether the tie condition for director.director (COUNT(director.name)) is satisfied. The program does not explicitly plant ties for this column.",
+    "The execution feedback does not show whether the revenue.Year boundary values (1996-1999) are present in the generated data. The program includes them in the candidates pool but does not prioritize them."
+   ]
+  }
+ ]
 }

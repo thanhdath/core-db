@@ -1,14 +1,4 @@
-"""Turn the CoRE-DB release layout into the database tree and members.json served during training.
-
-Input (HF dataset thanhdath/core-db):
-    <coredb>/dbs/<ds>/<db>/compact/<db>.sqlite
-    <coredb>/dbs/<ds>/<db>/units/<db>__dc_NNNN.sqlite
-Output:
-    <tree>/<ds>/<db>/<db>.sqlite                  -> compact database (member 0)
-    <tree>/<ds>/<unit>/<unit>.sqlite              -> one selected instance
-    <tree>/members.json                           {db: [db, unit, ...]}
-Files are symlinked (``--copy`` copies them instead).
-"""
+"""Turn the CoRE-DB release layout into the database tree and members.json served during training."""
 import argparse
 import json
 import os
@@ -45,7 +35,7 @@ def build_tree(coredb, tree, copy=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--coredb', required=True, help='local copy of thanhdath/core-db')
+    parser.add_argument('--coredb', required=True, help='local copy of the CoRE-DB dataset')
     parser.add_argument('--tree', required=True, help='output tree directory')
     parser.add_argument('--copy', action='store_true')
     args = parser.parse_args()

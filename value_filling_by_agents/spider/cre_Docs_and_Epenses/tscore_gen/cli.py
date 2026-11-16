@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -22,20 +22,21 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int) -> dict:
+    """Build and write unit i; returns a per-unit result dict."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return {'ok': True, 'err': '', 'added': {}, 'skipped': {}, 'unmet': []}
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        inst, unmet = build_random_instance(_G['schema'], _G['pool'], None, rng)
+        res = write_instance_sqlite(_G['schema'], inst, p)
+        return {'ok': True, 'err': '', 'added': res['rows_ok'], 'skipped': res['rows_failed'],
+                'unmet': unmet}
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return {'ok': False, 'err': type(e).__name__, 'added': {}, 'skipped': {}, 'unmet': []}
 
 
 def main(argv=None) -> None:
@@ -72,12 +73,25 @@ def main(argv=None) -> None:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
+    added: dict = {}
+    skipped_rows: dict = {}
+    unmet: dict = {}
+    n_ok = 0
     for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        if r['ok']:
+            n_ok += 1
+        else:
+            errs[r['err']] = errs.get(r['err'], 0) + 1
+        for t, v in r['added'].items():
+            added[t] = added.get(t, 0) + v
+        for t, v in r['skipped'].items():
+            skipped_rows[t] = skipped_rows.get(t, 0) + v
+        for u in r['unmet']:
+            unmet[u] = unmet.get(u, 0) + 1
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows, 'unmet_targets': unmet}))
 
 
 if __name__ == '__main__':

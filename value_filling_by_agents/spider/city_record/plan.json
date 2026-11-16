@@ -1,55 +1,444 @@
 {
  "db": "city_record",
- "operator_io_quirks": [
-  "Mixed-case identifiers: City_ID, Match_ID, Host_City, Hanyu_Pinyin, Regional_Population \u2014 must be double-quoted with original case.",
-  "DDL uses backtick-quoted FK refs (`City_ID`) inside CREATE TABLE; sqlite_master text must be replayed verbatim.",
-  "hosting_city.Host_City is declared TEXT but stores integer city ids ('1','2','6','12','11') \u2014 storage class contradicts declared type; FK to city.City_ID (INT).",
-  "hosting_city.Year is PK but semantically a year (2008..2013); declared INT dispatches to Number fuzzer, not Year fuzzer (type is 'INT' not 'YEAR').",
-  "match.Date is TEXT storing '18 February 1992' / '4 April 1993' \u2014 text-stored dates, day-month-name-year format, not ISO; String fuzzer will not produce these.",
-  "match.Score/Result mix ASCII hyphen '1-0' and en-dash '1\u20130' \u2014 two distinct spellings of the same score.",
-  "temperature has no 'May' column (Jan..Apr, Jun..Dec) \u2014 month set is incomplete; queries may reference May and fail.",
-  "temperature.City_ID FK to city.City_ID; only 8 of 13 cities have temperature rows (partial coverage, not all parents used).",
-  "hosting_city has two FKs (Match_ID->match, Host_City->city) plus PK Year; table order must place city and match before hosting_city.",
-  "All tables tiny (city 13, match 6, temperature 8, hosting_city 6) \u2014 choose_table_sizes will inflate to 30..2500 rows, far above original.",
-  "No NOT NULL constraints anywhere (notnull=0 on every column) \u2014 TS will freely emit NULLs; original has null_rate 0.0 everywhere.",
-  "City text values contain parenthesized region 'Nanjing ( Jiangsu )' and Hanzi contains '/' variants '\u82cf\u5dde/ \u8607\u5dde' \u2014 multi-form strings."
- ],
- "operator_ts_expectations": [
-  "City_ID/Match_ID/Year/Regional_Population/GDP/temperature months -> Number fuzzer: uniform in [-10^scale,10^scale] (INT scale 0 => [-1,1] mostly, REAL scale 4 => [-10000,10000]) then +-1/+-2 perturbation; implausible for ids, populations, GDP, temperatures.",
-  "City/Hanzi/Hanyu_Pinyin/Venue/Competition/Score/Result -> String fuzzer: random a-zA-Z0-9() strings length 0..20 plus contamination; will not resemble Chinese text, pinyin, or '1-0' scores.",
-  "match.Date declared TEXT -> String fuzzer (not Date fuzzer), so no '18 February 1992'-style values; date predicates on this column get random strings -> FN.",
-  "hosting_city.Host_City declared TEXT -> String fuzzer, but FK to city.City_ID (INT) means fill_foreign_keys_consistently draws integer city ids into a TEXT column \u2014 matches original storage, good.",
-  "FK child columns (temperature.City_ID, hosting_city.Match_ID, hosting_city.Host_City) draw from parent's FINAL filtered values with replacement -> duplicates and NULLs when parent empty; ties/duplicates likely where original had none (FP on DISTINCT/COUNT).",
-  "PK filtering (sample_fresh_primary_keys) keeps first occurrence; Year PK gets fresh Number draws in [-1,1] mostly -> many duplicate Years dropped, tiny hosting_city.",
-  "Number list-range quirk (list_max overwritten to full max) means literal-pool values like 2008, 23019148 do not constrain the upper end -> implausible large ids.",
-  "String contamination (+5 chars, drop first/last) will corrupt '1-0' scores and city names -> joins on City text likely miss (FN).",
-  "p=0.2 default with 0.3 chance of p=0 per instance: some instances are pure-element (near-original) and some pure-fresh (garbage) \u2014 high variance across the 800 units.",
-  "max_l0 cap (rng*30) reuses fresh draws after ~30 distinct values -> repeated implausible numbers, may create accidental ties (FP on GROUP BY).",
-  "Empty parent (e.g. if city filtered to 0 rows) yields NULL FKs -> temperature/hosting_city rows with NULL City_ID, breaking joins (FN).",
-  "temperature month columns are independent Number samplers \u2014 no monotonic seasonal structure; range predicates like 'Jan > Feb' get random truth values (FP/FN)."
- ],
- "challenger_refs": [
-  "G3",
-  "g5c404e26",
-  "G2",
-  "g677a409d",
-  "G1",
-  "g7a1910f4",
-  "g7a1910f4",
-  "g7a1910f4",
-  "g7a1910f4",
-  "g7a1910f4",
-  "g7a1910f4",
-  "G4",
-  "g079dd1bf",
-  "G5",
-  "g007762c2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL; generated rows use IDs above the compact maximum so compact rows are preserved; deduplicate before writing so the writer never rejects a row.",
+   "int_foreign_key": "Sample from the parent table's primary-key pool; include NULL rows when the column is nullable; never write a value with no matching parent (declared FOREIGN KEY constraints must hold); deduplicate and validate against the parent pool before writing.",
+   "int_quantity": "Positive integers; sample within [1, 100000000] unless a per-column range is given.",
+   "real_measure": "Real numbers with one decimal place; sample within the per-column range; include boundary values at listed literals and one step (0.1) on each side.",
+   "text_short": "Short ASCII/Unicode strings; include near-variants (case changes, trailing characters) of listed equality literals.",
+   "text_date": "Dates in 'D Month YYYY' format (e.g. '18 February 1992'); sample across years 1990-2010.",
+   "null_share": "For every nullable column, at least one NULL row per instance; NULL share follows the compact database's share for that column, with a fallback share of 0.08 when the compact share is zero and a minimum of one NULL row per nullable column; applied last, after all boundary, tie, group and formula planting, and a planted NULL is never overwritten.",
+   "fresh_value_share": "About 20% of non-key text values are fresh near-variants; the rest are drawn from the observed pool.",
+   "row_count": "Use table_sizes_per_instance exactly; no random size factor; every table receives at least one generated row per instance; the instance builder must produce exactly that many valid rows (deduplicate PKs and unique columns, validate FKs, never NULL a NOT NULL column) so rows_skipped is 0.",
+   "generation_order": "Fill parent tables (city, match) before children (temperature, hosting_city); apply formulas, boundary, tie and group planting first, then plant NULLs last; after NULL planting, re-verify group sizes and boundary cases among non-NULL values and repair deterministically if disturbed."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "city",
+    "column": "City_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "Parent rows without children in temperature and hosting_city (achieved by not generating a referencing child row, never by inventing a non-existent parent key)."
+   },
+   {
+    "table": "city",
+    "column": "City",
+    "pattern": "duplicates_for_distinct",
+    "targets": "Duplicate share 20-50% so DISTINCT reduces the row count; plant by copying existing city names into other rows before NULL planting."
+   },
+   {
+    "table": "city",
+    "column": "Regional_Population",
+    "pattern": "comparison_boundary",
+    "targets": "Values at 4999998, 4999999, 5000000, 5000001, 9813638, 9813639, 9813640, 9999999, 10000000, 10000001."
+   },
+   {
+    "table": "city",
+    "column": "Regional_Population",
+    "pattern": "ties_for_order_limit",
+    "targets": "Tie at rank 1 and rank 3 under ORDER BY Regional_Population DESC; assign equal values to the rows occupying those ranks after sorting."
+   },
+   {
+    "table": "city",
+    "column": "GDP",
+    "pattern": "ties_for_order_limit",
+    "targets": "Tie at rank 1 and rank 3 under ORDER BY GDP DESC; assign equal values to the rows occupying those ranks after sorting."
+   },
+   {
+    "table": "city",
+    "column": "Hanzi",
+    "pattern": "comparison_boundary",
+    "targets": "Values '\u4e0a\u6d77' and '\u4e0a\u6d77x'."
+   },
+   {
+    "table": "hosting_city",
+    "column": "Host_City",
+    "pattern": "group_sizes",
+    "targets": "Three distinct groups: one value appearing exactly once, one appearing exactly twice, one appearing three or more times, using distinct base values chosen from existing non-NULL city.City_ID values; plant on rows that will not be overwritten by NULL planting and verify group sizes among non-NULL values after NULL planting."
+   },
+   {
+    "table": "hosting_city",
+    "column": "Host_City",
+    "pattern": "unmatched_join_rows",
+    "targets": "Child rows with NULL FK (join-miss via NULL); no non-existent parent key is written."
+   },
+   {
+    "table": "hosting_city",
+    "column": "Match_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "Child rows with NULL FK (join-miss via NULL); no non-existent parent key is written."
+   },
+   {
+    "table": "match",
+    "column": "Match_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "Parent rows without children in hosting_city (achieved by not generating a referencing child row)."
+   },
+   {
+    "table": "match",
+    "column": "Competition",
+    "pattern": "comparison_boundary",
+    "targets": "Values '1994 FIFA World Cup qualification' and '1994 fifa world cup qualification'."
+   },
+   {
+    "table": "temperature",
+    "column": "City_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "Parent rows in city without children in temperature; no NULL FK (column is NOT NULL); no FK value without a matching parent."
+   },
+   {
+    "table": "temperature",
+    "column": "Mar",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Jul and Oct; plant deterministically at least one row with Mar = Jul, one with Mar = Jul + 0.1, one with Mar = Jul - 0.1, one with Mar = Oct, one with Mar = Oct + 0.1, one with Mar = Oct - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Feb",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Jun and Mar; plant deterministically at least one row with Feb = Jun, one with Feb = Jun + 0.1, one with Feb = Jun - 0.1, one with Feb = Mar, one with Feb = Mar + 0.1, one with Feb = Mar - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Jun",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Feb and Oct; plant deterministically at least one row with Jun = Feb, one with Jun = Feb + 0.1, one with Jun = Feb - 0.1, one with Jun = Oct, one with Jun = Oct + 0.1, one with Jun = Oct - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Jul",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Mar; plant deterministically at least one row with Jul = Mar, one with Jul = Mar + 0.1, one with Jul = Mar - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Oct",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Mar and Jun; plant deterministically at least one row with Oct = Mar, one with Oct = Mar + 0.1, one with Oct = Mar - 0.1, one with Oct = Jun, one with Oct = Jun + 0.1, one with Oct = Jun - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Nov",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Mar; plant deterministically at least one row with Nov = Mar, one with Nov = Mar + 0.1, one with Nov = Mar - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Dec",
+    "pattern": "comparison_boundary",
+    "targets": "Relative to other columns: equal to and one step (0.1) from Mar; plant deterministically at least one row with Dec = Mar, one with Dec = Mar + 0.1, one with Dec = Mar - 0.1 per instance."
+   },
+   {
+    "table": "temperature",
+    "column": "Mar",
+    "pattern": "compound_predicate",
+    "targets": "Make (Mar < Jul OR Mar > Oct) both true and false across instances; plant explicit rows for each case."
+   },
+   {
+    "table": "temperature",
+    "column": "Jun",
+    "pattern": "compound_predicate",
+    "targets": "Make (Jun < Oct OR Mar < Jun) both true and false across instances; plant explicit rows for each case."
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "temperature",
+    "child_column": "City_ID",
+    "parent_table": "city",
+    "parent_column": "City_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "hosting_city",
+    "child_column": "Host_City",
+    "parent_table": "city",
+    "parent_column": "City_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "hosting_city",
+    "child_column": "Match_ID",
+    "parent_table": "match",
+    "parent_column": "Match_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "city",
+    "column": "City_ID",
+    "formula": "City_ID > 0"
+   },
+   {
+    "table": "city",
+    "column": "Regional_Population",
+    "formula": "Regional_Population > 0"
+   },
+   {
+    "table": "city",
+    "column": "GDP",
+    "formula": "GDP >= 0"
+   },
+   {
+    "table": "match",
+    "column": "Match_ID",
+    "formula": "Match_ID > 0"
+   },
+   {
+    "table": "temperature",
+    "column": "City_ID",
+    "formula": "City_ID > 0"
+   },
+   {
+    "table": "hosting_city",
+    "column": "Year",
+    "formula": "Year BETWEEN 1990 AND 2030"
+   },
+   {
+    "table": "hosting_city",
+    "column": "Match_ID",
+    "formula": "Match_ID > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "city": 13,
+   "match": 6,
+   "temperature": 8,
+   "hosting_city": 6
+  },
+  "null_targets": [
+   "hosting_city.Host_City",
+   "hosting_city.Match_ID",
+   "city.City",
+   "city.Hanzi",
+   "city.Hanyu_Pinyin",
+   "city.Regional_Population",
+   "city.GDP",
+   "match.Date",
+   "match.Venue",
+   "match.Score",
+   "match.Result",
+   "match.Competition",
+   "temperature.Jan",
+   "temperature.Feb",
+   "temperature.Mar",
+   "temperature.Apr",
+   "temperature.Jun",
+   "temperature.Jul",
+   "temperature.Aug",
+   "temperature.Sep",
+   "temperature.Oct",
+   "temperature.Nov",
+   "temperature.Dec"
+  ],
+  "supporting_evidence": {
+   "city.City_ID": "Primary key; 13 distinct values in statistics.",
+   "city.Regional_Population": "All observed values positive; boundary literals from atomic summary.",
+   "city.GDP": "All observed values non-negative; tie ranks from atomic summary.",
+   "temperature.Mar": "Comparison boundaries against Jul and Oct from atomic summary.",
+   "temperature.Feb": "Comparison boundaries against Jun and Mar from atomic summary.",
+   "temperature.Jun": "Comparison boundaries against Feb and Oct from atomic summary.",
+   "temperature.Jul": "Comparison boundary against Mar from atomic summary.",
+   "temperature.Oct": "Comparison boundary against Mar and Jun from atomic summary.",
+   "temperature.Nov": "Comparison boundary against Mar from atomic summary.",
+   "temperature.Dec": "Comparison boundary against Mar from atomic summary.",
+   "hosting_city.Host_City": "Group sizes 1, 2, >=3 and unmatched join rows from atomic summary.",
+   "hosting_city.Match_ID": "Unmatched join rows from atomic summary.",
+   "match.Competition": "Equality near-variant from atomic summary.",
+   "city.Hanzi": "Equality near-variant '\u4e0a\u6d77'/'\u4e0a\u6d77x' from atomic summary."
+  },
+  "uncertainty": "The sample shows 0.0 NULL rate for all nullable columns, but the interface requires at least one NULL row per nullable column; the NULL share follows the compact share where non-zero and otherwise a fallback of 0.08 with a minimum of one NULL row per nullable column, planted last so boundary/tie/group planting cannot overwrite it. The hosting_city.Host_City values in the sample are numeric strings ('1','2','6','12','11') that do not all match city.City_ID (1-8); because the schema declares FOREIGN KEY constraints, unmatched join rows are produced only via NULL child FKs (Host_City, Match_ID are nullable) and via parent rows without children (city, match), never by writing a non-existent parent key. temperature.City_ID is NOT NULL and gets no FK violations. The temperature table lacks May in the schema; no rule is stated for it. No calculated column exists in the schema, so no arithmetic formulas are stated. Temperature comparison boundaries are relative to other columns, not literal values; the engineer must plant equal and \u00b10.1 values deterministically for each specified pair and make the compound predicates both true and false across instances. The instance builder must guarantee exactly table_sizes_per_instance valid rows per table (deduplicate PKs and unique columns, validate FKs, never NULL a NOT NULL column) so rows_skipped is 0; the writer must not be the mechanism that enforces sizes."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20, reasons include 'compact_rows_missing': 20 and 'no_rows_added': 19. writer.write_instance_sqlite is called from cli._one as write_instance_sqlite(_G['schema'], inst, p) with orig_path defaulting to None, so the compact database is never copied (the `if orig_path and os.path.exists(orig_path)` branch is skipped) and only generated rows are inserted. The docstring claims 'the instance file is a copy of the compact database plus appended generated rows', but the CLI never passes orig_path.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the worker args and call write_instance_sqlite(schema, inst, p, orig_path=orig)), so every instance is a copy of the compact DB plus appended generated rows, preserving all compact rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 62 and validity.reasons.new_integrity_failures = 20. instance._plant_unmatched deliberately writes a fresh FK value with no matching parent into child rows (child[idx] = fresh) for every dependency, and also sets child FK to None/fresh. The specification only requires unmatched join rows for hosting_city.Host_City and hosting_city.Match_ID (and parent rows without children); it does not authorize FK violations in temperature.City_ID, whose target is 'Parent rows in city without children in temperature; no NULL FK'. The blanket _plant_unmatched loop over all dependencies injects FK violations into temperature.City_ID as well.",
+     "requested_revision": "Restrict unmatched-child-FK planting to the columns the specification names (hosting_city.Host_City, hosting_city.Match_ID). For temperature.City_ID only ensure some city rows have no temperature child; do not write FK values without a matching parent. Ensure generated instances have zero FK violations (or only those explicitly required by the spec)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns: city.City, city.GDP, city.Hanyu_Pinyin, city.Hanzi, city.Regional_Population, match.Date, match.Result, match.Score all show 'generated rows: NULL 0 / n'. The NULL rule requires at least one NULL per nullable column per instance. instance._plant_nulls only plants NULLs for columns in spec['null_targets'], and spec.load_specification parses null_targets as 'table.column' strings; the specification's null_targets list uses that form, but the generated rows show zero NULLs for most columns, indicating the planting is not effective (e.g. columns dropped by sample_fresh_primary_keys/drop_unique_duplicates after planting, or null_targets not matching).",
+     "requested_revision": "Ensure _plant_nulls runs after all row-filtering steps (PK dedup, unique dedup, FK consistency) and that every nullable column listed in null_targets receives at least one NULL per instance with the specified share. Verify with the execution feedback that no nullable column reports 'NULL 0 / n'."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions for temperature.Mar/Feb/Jun/Jul/Oct/Nov/Dec require 'Values equal to and one step (0.1) from <other column>'. instance._plant_comparison_boundaries plants these by overwriting a random row's value in the *referenced* column (cols[b][i]) based on cols[a][i], but the pairs list is hard-coded and does not cover all specified pairs (e.g. Mar vs Jul/Oct, Feb vs Jun/Mar, Jun vs Feb/Oct, Jul vs Mar, Oct vs Mar/Jun, Nov vs Mar, Dec vs Mar are present, but the overwrite direction and the 'one step on each side' requirement are only probabilistically satisfied). More importantly, the specification's comparison_boundary targets for temperature columns are column references, and spec._parse_boundary_targets explicitly ignores 'equal_and_one_step_from' (the `pass` branch), so no literal pool entries are created for these columns.",
+     "requested_revision": "Clarify in the specification that temperature comparison boundaries are relative to other columns (not literal values), and have the engineer implement deterministic planting of equal and \u00b10.1 values for each specified pair, ensuring both the equal case and one-step-above/below cases occur per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets includes city.City, city.Hanzi, city.Hanyu_Pinyin, city.Regional_Population, city.GDP, match.Date, match.Venue, match.Score, match.Result, match.Competition, and all temperature month columns, but the supporting_evidence and uncertainty note state the compact DB has 0.0 NULL share. The generic_sampling_rules null_share says 'NULL share follows the compact database's observed share (0.0 in the sample, so use a small share such as 5-10% to guarantee at least one NULL)'. This is internally consistent with the interface rule, but the specification should state the per-column NULL share explicitly rather than relying on a generic 5-10%.",
+     "requested_revision": "Add explicit per-column NULL share targets (or confirm the 5-10% default applies uniformly) so the engineer's _NULL_SHARE = 0.08 is justified by the specification rather than an undocumented constant."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.choose_table_sizes applies a random factor 0.5..1.5 to the specification's table_sizes_per_instance and clamps to at least the compact size, but the specification states fixed sizes (city 13, match 6, temperature 8, hosting_city 6). The execution feedback shows 'no_rows_added' for 19/20 instances, consistent with generated row counts sometimes being zero or the compact rows not being preserved. The specification does not authorize per-instance size variation.",
+     "requested_revision": "Either (a) make the specification explicitly allow per-instance size variation with a stated range, or (b) remove the random factor and use the specified sizes exactly. Ensure generated instances always add rows (n > 0) for each table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._plant_group_sizes for hosting_city.Host_City sets vals[0]=base, vals[1]=vals[2]=base, and vals[3..5]=base, producing one group of size >= 6 rather than the specified group sizes 1, 2 and >= 3. The specification requires distinct groups of size 1, size 2, and size >= 3. The current implementation collapses all into a single large group.",
+     "requested_revision": "Rewrite _plant_group_sizes to produce three distinct groups: one value appearing exactly once, one appearing exactly twice, and one appearing three or more times, using distinct base values for each group."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._plant_ties for ties_for_order_limit sets vals[j] = vals[i] where j is the row at rank r (or r-1), which makes the value at rank r equal to the value at rank r-1, but does not guarantee a tie at the requested rank under ORDER BY ... DESC after the assignment (the sort order may change). Also, _plant_ties is called for both city.Regional_Population and city.GDP with ranks [1,3], but the specification requires ties at rank 1 and rank 3; the implementation may not produce a stable tie at those ranks.",
+     "requested_revision": "Implement tie planting by explicitly assigning equal values to the rows that will occupy the requested ranks after sorting, and verify with a post-plant sort that the tie exists at the specified rank."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._plant_unmatched for parent rows without children: 'if childset >= set(parent): ... child[i] = None if any(c.notnull is False ...) else fresh'. This can set a child FK to None even when the column is NOT NULL (temperature.City_ID is NOT NULL per the schema), or to a fresh value creating an FK violation. The specification requires parent rows without children but does not authorize NULL in NOT NULL columns or FK violations.",
+     "requested_revision": "For parent-rows-without-children, only remove child references to a parent key (set to another valid parent key or leave unused), never write NULL into a NOT NULL column and never write an FK value without a matching parent unless the specification explicitly requires it for that column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'The temperature table lacks May in the schema; no rule is stated for it.' The schema indeed has no May column, so this is consistent. However, the specification's per_column_exceptions for temperature columns reference pairs like ('Mar','Jul'), ('Mar','Oct'), etc., but the atomic operations also include predicates like 'temperature.mar < temperature.jul OR temperature.mar > temperature.oct' and 'temperature.jun < temperature.oct OR temperature.mar < temperature.jun'. The specification does not state which compound predicates must be satisfiable, only the pairwise boundaries.",
+     "requested_revision": "Add explicit targets for the compound comparison predicates (e.g. Mar < Jul OR Mar > Oct; Jun < Oct OR Mar < Jun) so the engineer can plant values that make these predicates both true and false across instances."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's original rows are preserved after the orig_path fix (currently not passed, so compact_rows_missing = 20).",
+    "Whether FK violations drop to zero after restricting _plant_unmatched to the specified columns.",
+    "Whether all nullable columns receive at least one NULL per instance after moving _plant_nulls after row filtering.",
+    "Whether the temperature comparison-boundary pairs produce both equal and one-step values deterministically.",
+    "Whether group sizes 1, 2, >=3 are produced as distinct groups for hosting_city.Host_City.",
+    "Whether ties at rank 1 and rank 3 are stable under ORDER BY ... DESC for city.Regional_Population and city.GDP."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 32 across 19/20 instances, all flagged as new_integrity_failures, making 19/20 instances invalid. The design explicitly limits unmatched child FKs to hosting_city.Host_City and hosting_city.Match_ID, and says temperature.City_ID gets no FK violations. However _plant_unmatched() in instance.py writes fresh values (max(parent)+1) into *every* dependency whose (child,col) is in allowed_unmatched and also runs the 'parent row without children' rewrite for every dependency. More importantly, the unmatched-planting loop does not distinguish generated rows from the copied compact rows: writer.py appends generated rows to a copy of the compact DB, so if a parent table (city) has generated parents without a child, or a child FK is rewritten to a value not present in the *final* pool of parent values, the copied DB plus appended rows violate the declared FOREIGN KEY constraints. The 32 FK violations confirm that unmatching is being applied in a way that breaks referential integrity rather than just producing JOIN-miss rows that the specification intended as *semantic* unmatched rows (child FK that no longer matches) \u2014 but the schema declares FOREIGN KEY constraints, so writing non-existent parent keys into child columns is itself a constraint violation.",
+     "requested_revision": "Do not write child FK values that have no matching parent into columns governed by declared FOREIGN KEY constraints. Instead achieve the 'unmatched join rows' pattern by (a) keeping child FK NULL where the column is nullable (already handles join-miss via NULL), and (b) ensuring parent rows without children by not generating a referencing child row \u2014 never by inventing a non-existent parent key. Confirm with an integrity re-run that fk_violations is 0 in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback shows temperature.Mar: NULL 0/82, temperature.Jun: NULL 0/82, temperature.Oct: NULL 0/82. These are nullable REAL columns and are listed in null_targets, so the interface rule 'each instance contains generated rows with NULL and rows with non-NULL' is not met for these columns. Root cause: _plant_nulls() runs before _plant_comparison_boundaries(), and the comparison-boundary planting skips positions where the source value is None but then overwrites the *target* column at index i only if source is non-NULL; conversely, where target was NULL it remains NULL only if not overwritten. The feedback shows Mar/Jun/Oct end with zero NULLs, meaning boundary planting overwrote all their planted NULLs. Per interface note, 'generated rows: NULL 0/n' may be noted but does not block a pass; however it signals the NULL planting order is fragile and conflicting with boundary planting for exactly the columns flagged above.",
+     "requested_revision": "Plant comparison boundaries first, then plant NULLs last (or make boundary planting never overwrite a NULL target). Verify that Mar, Jun, Oct (and all nullable columns) each show at least one generated NULL row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "_plant_ties() in instance.py ignores the requested ranks argument and hardcodes [1, 3] regardless of what the spec requests; per_column_exceptions for city.Regional_Population and city.GDP specify tie_at_rank [1,3] which happens to match, so this is not currently a correctness defect but is a latent bug. Separately, the tie verification uses a DESC sort keyed on '-(v if numeric else 0)', which for non-numeric values collapses to 0 and can produce incorrect tie placement if used on text columns. Not currently triggered for the two relevant columns.",
+     "requested_revision": "Pass ranks from the spec instead of hardcoding and restrict _plant_ties to numeric columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "_plant_group_sizes() is called for the (hosting_city, Host_City) exception but ignores which values are already present and overwrites positions 0..5 with base1/base2/base3 chosen from existing non-NULL values. Because _plant_nulls runs *before* it in build_random_instance (order: _plant_nulls then ties/group/comparison per exception, then _apply_formulas), group-size planting can overwrite NULLs that were just planted and can violate the intended 'distinct base values' invariant if the sampled values already match.",
+     "requested_revision": "Reorder specification application: formulas and boundary/tie/group planting first, then _plant_nulls last; and choose group base values guaranteed distinct from each other and from non-group rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty states temperature table lacks May; no rule is given for it and no null_targets entry exists for temperature.May. That is consistent with the schema (no May column), so fine. But the specification's uncertainty note says 'the observed NULL rate for all nullable columns is 0.0' while the interface requires at least one NULL and share following the compact share \u2014 the spec should either confirm the compact share is actually non-zero for those columns or state that a minimum-of-one-NULL overrides the observed zero share, otherwise the sampler's 8% flat share is arbitrary.",
+     "requested_revision": "Clarify in the specification the per-column NULL share (use the compact share where non-zero, minimum 1 row) rather than a flat 8%, and confirm the intended interaction with boundary planting."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 32 fk_violations are entirely from invented child FKs vs. from parent rows without children introduced by _plant_unmatched's rewrite branch \u2014 the execution feedback does not break this down, and it is the primary blocker.",
+    "Whether the hosting_city.Host_City and hosting_city.Match_ID unmatched rows actually produce intended JOIN-miss semantics while maintaining declared FOREIGN KEY integrity; the current implementation appears to violate the declared constraints."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped is large and non-zero for every table: city 134, match 76, temperature 69, hosting_city 79 skipped, versus rows_added city 78, match 26, temperature 44, hosting_city 15. The specification requires table_sizes_per_instance exactly (city 13, match 6, temperature 8, hosting_city 6) and 'every table receives at least one generated row per instance'. With 20 instances the expected added rows would be city 260, match 120, temperature 160, hosting_city 120; the actual added counts are far below that, and the skipped counts show that most generated rows are being rejected by the writer (writer.py falls back to row-by-row and counts failures). The cause is that instance.py generates rows with duplicate primary keys / unique values and FK values that violate constraints, and writer.py rejects them instead of the instance builder guaranteeing validity. This means the per-instance table sizes are not actually met.",
+     "requested_revision": "Make the instance builder produce exactly table_sizes_per_instance valid rows per table (deduplicate PKs and unique columns before writing, ensure FK values reference existing parents, and ensure NOT NULL columns are never NULL). The writer should not be the mechanism that enforces sizes; rows_skipped should be 0 for all tables. Re-run and confirm rows_added equals table_sizes_per_instance * n_instances and rows_skipped is 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires for temperature.Mar comparison_boundary: 'equal to and one step (0.1) from Jul and Oct; both equal and one-step-above/below cases occur per instance', and similarly for Feb/Jun/Mar, Jun/Feb/Oct, Jul/Mar, Oct/Mar/Jun, Nov/Mar, Dec/Mar. In instance.py `_plant_comparison_boundaries` only plants a single equal value and a single \u00b10.1 value per pair, chosen at random indices, and it does not guarantee that both the equal case and the one-step-above and one-step-below cases occur per instance. It also does not guarantee that the compound predicates (Mar < Jul OR Mar > Oct) and (Jun < Oct OR Mar < Jun) are both true and false across instances. The construction_pairs feedback shows only 25 of 39 eligible pairs separated, which is consistent with the boundary planting not being deterministic/complete.",
+     "requested_revision": "Plant the comparison boundaries deterministically: for each specified pair, ensure at least one row has the two columns equal, at least one row has the second column one step (0.1) above, and at least one row has it one step below, per instance. Also explicitly plant rows making the compound predicates (Mar < Jul OR Mar > Oct) and (Jun < Oct OR Mar < Jun) both true and false. Do not rely on random index selection."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires city.Regional_Population comparison_boundary values at 4999998, 4999999, 5000000, 5000001, 9813638, 9813639, 9813640, 9999999, 10000000, 10000001, and city.Hanzi values '\u4e0a\u6d77' and '\u4e0a\u6d77x', and match.Competition values '1994 FIFA World Cup qualification' and '1994 fifa world cup qualification'. In spec.py `_parse_boundary_targets` only extracts numeric literals from a dict target with a 'values' key; the specification's targets for these columns are given as strings (e.g. 'Values at 4999998, ...' and \"Values '\u4e0a\u6d77' and '\u4e0a\u6d77x'\"), so `_parse_boundary_targets` returns an empty list for Regional_Population and the string targets are only parsed by `_parse_string_targets` for comparison_boundary exceptions. For Regional_Population the targets string is 'Values at 4999998, ...' which `_parse_string_targets` will not extract (no quoted strings), so the boundary literals are never added to the literal pool. Similarly the Hanzi and Competition string targets are parsed only if the targets is a string with quoted values; the specification uses \"Values '\u4e0a\u6d77' and '\u4e0a\u6d77x'\" which does contain quotes, so those may be parsed, but the numeric boundary values for Regional_Population are not.",
+     "requested_revision": "Extend `_parse_boundary_targets` to also extract numeric literals from string target descriptions (e.g. via the existing `_NUM` regex on the string), so that the Regional_Population boundary values are added to the literal pool. Verify that the boundary values appear in generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires city.City duplicates_for_distinct with duplicate share 20-50% so DISTINCT reduces the row count. The program does not implement any duplicate planting for city.City; `_plant_group_sizes` and `_plant_ties` are the only planting functions, and neither targets city.City. The `drop_unique_duplicates` function only drops duplicates for unique columns, and city.City is not unique. There is no code that ensures a 20-50% duplicate share for city.City.",
+     "requested_revision": "Add a planting step for city.City that ensures a 20-50% duplicate share (e.g. by copying some existing city names into other rows) so that DISTINCT reduces the row count. Verify the duplicate share in the generated instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires hosting_city.Host_City group_sizes: 'Three distinct groups: one value appearing exactly once, one appearing exactly twice, one appearing three or more times, using distinct base values chosen from existing non-NULL city.City_ID values.' The program's `_plant_group_sizes` uses `existing[0], existing[1], existing[2]` from the column's own values, which for hosting_city.Host_City are FK values drawn from city.City_ID, so they are existing city IDs. However, the function requires n >= 6 and only plants if there are at least 3 distinct existing values; with table size 6 for hosting_city this is borderline, and the function overwrites vals[0..5] which may conflict with the FK consistency and NULL planting. More importantly, the specification also requires hosting_city.Host_City unmatched_join_rows via NULL FK, and the NULL planting happens after group planting, so the group sizes may be disturbed by NULLs. The execution feedback shows hosting_city.Host_City NULL 4/19, which is a high share and may break the group size requirement.",
+     "requested_revision": "Ensure the group size planting for hosting_city.Host_City is done on rows that will not be overwritten by NULL planting, or account for NULLs when computing group sizes. Verify that after NULL planting the three group sizes (1, 2, >=3) still hold among non-NULL values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty section states 'The sample shows 0.0 NULL rate for all nullable columns, but the interface requires at least one NULL row per nullable column'. The null_targets list includes all nullable columns, and the program plants NULLs with a fallback share of 0.08 when the compact share is zero. The execution feedback shows NULL shares of roughly 8-20% for many columns, which is consistent with the fallback. However, the specification does not state a per-column NULL share target beyond 'follows the compact database's share ... with a minimum of one NULL row per nullable column'. The program's `_NULL_SHARE = 0.08` fallback is a reasonable interpretation, but the specification should explicitly state the fallback share to avoid ambiguity.",
+     "requested_revision": "Clarify in the specification the fallback NULL share to use when the compact share is zero (e.g. 0.08 or 'at least one row'), so the engineer's implementation is unambiguously specified."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 25 of 39 eligible pairs separated, with 0 unknown executions. It is not clear from the feedback which pairs were not separated; without held-out query pairs this cannot be fully verified, but the boundary planting issues above suggest the separation is incomplete.",
+    "The exact duplicate share for city.City after generation is not reported in the feedback; it should be verified after the fix.",
+    "The group sizes for hosting_city.Host_City after NULL planting are not reported; they should be verified after the fix."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped = {city: 35, match: 21, temperature: 48, hosting_city: 5} across 20 instances, and validity.reasons.no_rows_added = 1. The specification's generic_sampling_rules.row_count states 'the instance builder must produce exactly that many valid rows (deduplicate PKs and unique columns, validate FKs, never NULL a NOT NULL column) so rows_skipped is 0', and the CLI docstring claims 'rows_skipped is 0 for every table'. The writer's row-by-row fallback (writer.py) is being exercised, so the builder is not guaranteeing valid rows.",
+     "requested_revision": "Fix the instance builder so every generated row is valid before it reaches the writer: (a) PK deduplication must run against the compact PKs AND against generated rows for the same table (sample_fresh_primary_keys does this, but the subsequent drop_unique_duplicates and _plant_* mutations can reintroduce PK collisions or duplicate unique values after dedup); (b) re-run PK/unique dedup after all planting (ties, groups, duplicates, boundaries, compound predicates, formulas) and before NULL planting, or make the planters PK/unique-safe; (c) ensure the writer's executemany path succeeds for every table so rows_skipped is 0. Add an assertion in build_random_instance that len(rows) == table_sizes_per_instance[t] for every table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_comparison_boundaries: for each (t,c) pair it writes cols[c][i] = round(float(cols[other][i]), 1) for i = j % n, i.e. it only plants the EQUAL case (Mar = Jul, Mar = Oct, etc.). The specification per_column_exceptions for temperature.Mar/Feb/Jun/Jul/Oct/Nov/Dec require 'equal to and one step (0.1) from' each referenced column, i.e. equal, +0.1 and -0.1 per pair. The 'step' value parsed by spec._parse_relative_pairs is ignored in the planting loop (the loop variable `step` is unused).",
+     "requested_revision": "Plant all three cases per pair: for each referenced column, write one row with c = other, one with c = other + 0.1, one with c = other - 0.1 (using the parsed step). Use distinct rows so the three cases are simultaneously present, and ensure the referenced column value is not itself overwritten by a later pair in a way that breaks the relation (or re-verify after all pairs are planted)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_compound_predicates hard-codes Mar/Jul/Oct and Jun/Oct/Mar values (1.0/2.0/3.0, 5.0/4.0/6.0) on rows 0-3 unconditionally. This runs AFTER _plant_comparison_boundaries in the same loop iteration order (boundaries are planted inside the per-exception loop, compound predicates after the loop), so it overwrites the boundary plantings on rows 0-3 for Mar, Jul, Oct, Jun. The specification requires both the boundary pairs and the compound predicates to hold; the current ordering makes them mutually destructive on the same rows.",
+     "requested_revision": "Plant compound-predicate witnesses on rows disjoint from the boundary-pair rows (e.g. reserve the last rows of the table for compound predicates, or track used row indices), and re-verify both the boundary relations and the compound-predicate truth values after all planting. Also make the compound-predicate planting respect the boundary pairs (e.g. choose values that satisfy both where possible, or use separate rows)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes requires n >= 6 and uses existing[0..2] as base values, then writes vals[0]=base1, vals[1]=vals[2]=base2, vals[3..5]=base3. For hosting_city the specification size is 6, so this is exactly at the threshold; but _plant_nulls runs afterwards and may NULL some of rows 0-5 (hosting_city.Host_City is a null target), which the code comment claims is avoided ('plant on rows that will not be overwritten by NULL planting') but _plant_nulls samples uniformly at random with no exclusion of the group rows. Execution feedback shows hosting_city.Host_City NULL 14/22, so group rows are at risk. The specification requires group sizes 1, 2, >=3 to survive NULL planting and be re-verified.",
+     "requested_revision": "Exclude the group-planted row indices from _plant_nulls (pass a protected-index set), or re-verify and repair group sizes among non-NULL values after NULL planting as the specification's generation_order rule requires ('after NULL planting, re-verify group sizes and boundary cases among non-NULL values and repair deterministically if disturbed')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_duplicates copies existing[i % len(existing)] into vals[0..target-1], which can overwrite PK-adjacent or unique-constrained values and, more importantly, runs before _plant_nulls but after PK/unique dedup, so it can reintroduce duplicate unique values (city.City is not unique here, so this is benign for city, but the pattern is applied generically). More concretely, the duplicate planting targets city.City with share 20-50%; execution feedback does not report a DISTINCT-reduction check, and the specification requires 'Duplicate share 20-50% so DISTINCT reduces the row count'. The current implementation copies values but does not verify the resulting duplicate share is in [0.2, 0.5] after NULL planting (NULLs reduce the non-NULL duplicate share).",
+     "requested_revision": "After NULL planting, compute the duplicate share among non-NULL city.City values and repair deterministically if it falls outside 20-50% (e.g. by copying additional non-NULL values). Also ensure duplicate planting does not violate any unique constraint by re-running drop_unique_duplicates or by restricting duplicate planting to non-unique columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _ensure_parents_without_children only rewrites a child FK when childset >= set(parent); it does not guarantee that at least one parent row has no child when the child table is small (hosting_city size 6, match size 6). With 6 child rows and 6 parent rows, it is possible (and likely) that every parent has a child, violating the specification's unmatched_join_rows target for city.City_ID and match.Match_ID ('Parent rows without children'). Execution feedback does not report a check for this, and construction_pairs separated = 23/39 suggests several targets are not separated.",
+     "requested_revision": "Deterministically reserve at least one parent key that no child row references: after filling child FKs, pick a parent key not in the child set (or rewrite one child FK to a different existing parent key) so that at least one parent row has no child, for both city (vs temperature and hosting_city) and match (vs hosting_city). Verify this explicitly and add it to the construction checks."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for temperature.Mar/Feb/Jun/Jul/Oct/Nov/Dec describe relative boundary targets ('equal to and one step (0.1) from Jul and Oct', etc.) but do not state which rows or how many rows must carry each case, nor how to reconcile them with the compound_predicate targets on the same columns. The compound_predicate targets for Mar and Jun ('Make (Mar < Jul OR Mar > Oct) both true and false across instances') are stated per-instance, but the boundary targets are stated per-instance too, and the two sets of constraints can conflict on the same rows. The specification should state the precedence or the disjoint-row requirement.",
+     "requested_revision": "Clarify in the specification that boundary-pair witnesses and compound-predicate witnesses must be planted on disjoint rows (or state a precedence), and state the minimum number of rows per case (e.g. one row per (column, other, step) triple). This removes the ambiguity that led the engineer to overwrite boundary rows with compound-predicate values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets includes city.City, city.Hanzi, city.Hanyu_Pinyin, city.Regional_Population, city.GDP, match.Date, match.Venue, match.Score, match.Result, match.Competition, and all temperature month columns, but the compact database's NULL share is 0.0 for all of them (per the specification's own uncertainty note). The fallback share of 0.08 with a minimum of one NULL row is applied, which is fine, but the specification does not state whether the duplicate-share (20-50%) and group-size (1,2,>=3) targets are computed over all rows or only non-NULL rows. The engineer's _plant_duplicates and _plant_group_sizes operate before NULL planting, so the targets are computed over all rows, but NULL planting then reduces the non-NULL share. The specification should state the denominator.",
+     "requested_revision": "State explicitly whether duplicates_for_distinct and group_sizes targets are evaluated over all rows or over non-NULL rows only, and whether they must be re-verified after NULL planting. This determines whether the engineer's current pre-NULL planting is correct or must be followed by a repair step."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 23/39 separated construction pairs are due to the boundary/compound-predicate overwrite (issue 2/3) or to other causes; the execution feedback does not break down which pairs failed.",
+    "Whether the one invalid instance (no_rows_added) is caused by the same rows_skipped problem (issue 1) or by a separate builder failure; the feedback does not identify the instance or table.",
+    "Whether the compact rows are preserved in every instance: the writer copies the compact DB and appends, and integrity reports 0 FK/NOT NULL/PK violations, but the feedback does not explicitly confirm compact row counts per instance.",
+    "Whether the temperature table's missing May column (noted in the specification's uncertainty) causes any sampler or formula issue; the schema has no May column and the specification states no rule for it, so this appears benign but is not explicitly verified."
+   ]
+  }
+ ]
 }

@@ -1,4 +1,4 @@
-"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224; fuzz/{base,number,string,date,time,bool}.py)."""
+"""Per-type value generators (fuzz/*.py) with spec pools and NULL policy."""
 import datetime as dt
 import re
 import string
@@ -9,8 +9,6 @@ _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y
 
 
 class ColumnSampler:
-    """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
-
     def __init__(self, elements: list, p: float, max_l0: float, rng):
         self.elements = [e for e in elements if e is not None]
         self.p = p if self.elements else 1.0
@@ -37,8 +35,6 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
-
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
@@ -71,15 +67,20 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
-
     def __init__(self, elements, p, max_l0, rng, length=20):
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
         for e in els:
             if re.fullmatch(r'-?\d+', e):
                 extra += [str(int(e) + 1), str(int(e) - 1)]
-        super().__init__(els + extra, p, max_l0, rng)
+        casevars = []
+        for e in els:
+            if any(ch.isalpha() for ch in e):
+                if e.lower() != e:
+                    casevars.append(e.lower())
+                if e.upper() != e:
+                    casevars.append(e.upper())
+        super().__init__(els + extra + casevars, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
 
@@ -118,8 +119,6 @@ def _parse_date(s: str):
 
 
 class DateSampler(ColumnSampler):
-    """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
-
     def __init__(self, elements, p, max_l0, rng):
         super().__init__(elements, p, max_l0, rng)
         self.p = p
@@ -153,8 +152,6 @@ class DateSampler(ColumnSampler):
 
 
 class TimeSampler(ColumnSampler):
-    """fuzz/time.py."""
-
     def sample(self):
         r = self.rng
         if self.elements and r.random() >= self.p:
@@ -170,8 +167,6 @@ class TimeSampler(ColumnSampler):
 
 
 class BoolSampler(ColumnSampler):
-    """fuzz/bool.py (Bool True/False, Bit 1/0)."""
-
     def __init__(self, elements, p, max_l0, rng, bit=False):
         super().__init__(elements, p, max_l0, rng)
         self.vals = (1, 0) if bit else (True, False)
@@ -182,11 +177,33 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class YearSampler(ColumnSampler):
+    """Integer year in [lo, hi]; includes boundary values and pools."""
+
+    def __init__(self, elements, p, max_l0, rng, lo=1980, hi=2020):
+        super().__init__([int(e) for e in elements if _num(e) is not None], p, max_l0, rng)
+        self.lo, self.hi = lo, hi
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = int(r.choice(self.elements))
+        else:
+            v = self._fresh_or_reuse(lambda: r.randint(self.lo, self.hi))
+        if r.random() < 0.15:
+            v += 1
+        elif r.random() < 0.15:
+            v -= 1
+        return max(self.lo, min(self.hi, int(v)))
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
-    """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    name = column.name.lower()
+    if name == 'release_year' or t == 'year':
+        return YearSampler(els, p, max_l0, rng)
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
@@ -201,7 +218,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
-        return NumberSampler(els, p, max_l0, rng, scale=4)
+        return YearSampler(els, p, max_l0, rng)
     if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
         is_int = 'int' in t
         scale, prec = 10, (0 if is_int else 4)
@@ -216,7 +233,6 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -230,6 +246,5 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
-    """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]

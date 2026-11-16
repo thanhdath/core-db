@@ -1,67 +1,376 @@
 {
  "db": "workshop_paper",
- "operator_io_quirks": [
-  "Table 'Acceptance' has mixed case; must be double-quoted in generated SQL.",
-  "Column names mixed case (Workshop_ID, Submission_ID, Date, Name, Scores, Result); case-insensitive lookup needed.",
-  "DDL uses backtick-quoted parent refs (`submission`, `workshop`) inside FK clauses; sqlite_master text must be replayed verbatim.",
-  "All columns notnull=0 despite being PKs; sqlite PK implies NOT NULL only for INTEGER PK, so composite PK Acceptance allows NULLs in principle.",
-  "Date column declared TEXT but stores 'August 18, 2007' style dates; TS dispatches to String fuzzer, not Date.",
-  "Scores declared REAL, storage real, values like 72.0; Number fuzzer with scale from 'real' (no args) -> default scale.",
-  "Workshop_ID / Submission_ID declared INT with no args; Number fuzzer is_int=True, scale default.",
-  "Acceptance composite PK (Submission_ID, Workshop_ID); both are also FKs to distinct parents.",
-  "FK parent tables exist and are unique on parent col; no dangling FKs, no self-references.",
-  "Tiny tables (6, 10, 6 rows); original_values fully read, no sampling cap hit.",
-  "Result column has only 2 distinct values ('Accepted','Rejected'); String fuzzer will not preserve this enum.",
-  "Venue/College/Author are free text with spaces and parentheses ('Miami (OH)'); String fuzzer charset includes space and parens."
- ],
- "operator_ts_expectations": [
-  "Date column: String fuzzer with length range from samples (~15 chars), produces random a-zA-Z0-9() strings, not dates -> queries filtering on date format will miss (FN).",
-  "Result column: String fuzzer produces random strings, so 'Result = Accepted' predicates rarely match -> FN on enum-like filters.",
-  "Venue/College/Author: random strings; joins/group-bys on these produce implausible values -> FN for value-specific queries.",
-  "Workshop_ID/Submission_ID: Number fuzzer with int perturbation (+-1,+-2) around sampled values; small range so collisions and near-duplicates likely.",
-  "Scores: Number fuzzer float perturbation +-0.01/+-0.02; range from scale, may exceed [72,89] -> FP for range predicates.",
-  "Acceptance FK columns drawn from parent final values with replacement; composite PK dedup drops duplicate (Sub,Work) pairs -> ties reduced.",
-  "PK dedup on workshop/submission keeps first occurrence; with small n, distinct counts shrink -> missing ties (FP on COUNT DISTINCT).",
-  "String fuzzer contaminate (suffix/prefix/drop) makes 'ABC 2007' style names unlikely to recur -> FN on LIKE 'ABC%'.",
-  "No NOT NULL enforcement: NULLs may appear in PK columns of Acceptance (composite) -> queries with IS NULL may fire (FP).",
-  "Table sizes: level-based or rand_lin; with 3 tables and 2 FK levels, sizes small (1+30u, x4) -> few rows, weak coverage.",
-  "Date strings like 'August 18, 2007' contain commas; String fuzzer charset lacks comma -> format never reproduced (FN).",
-  "Number fuzzer list_max quirk: upper bound overwritten to full range, so fresh draws span [-10^scale,10^scale] -> implausible IDs (FN)."
- ],
- "challenger_refs": [
-  "G2",
-  "g3c8d9d94",
-  "gadb67c11",
-  "gfdfd7cf0",
-  "g24375ef6",
-  "g4fe20172",
-  "g4fe20172",
-  "gd5a425bc",
-  "gd5a425bc",
-  "gd5a425bc",
-  "G1",
-  "gebdde7e5",
-  "gebdde7e5",
-  "G3",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g38c5e75d",
-  "g156c16f1",
-  "g156c16f1",
-  "g156c16f1",
-  "g156c16f1",
-  "g78c27b92"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1; unique per table; never NULL; never overwritten by group/tie/duplicate stages.",
+   "int_foreign_key": "Copy an existing parent primary-key value; never NULL unless the column is nullable; guarantee parent rows without children by skipping at least one parent value in the FK draw, never by nulling a child FK.",
+   "real_numeric": "Uniform real values within the column's semantic range rule; include the range bounds themselves; do not generate values outside a declared BETWEEN range; allow ties at ORDER/LIMIT ranks.",
+   "text_short": "Draw from a small pool of realistic short strings; allow near-duplicate variants and duplicates on DISTINCT columns.",
+   "text_date": "Format 'Month D, YYYY' (e.g. 'August 18, 2007'); keep any table-level date order rule.",
+   "text_enum": "Draw only from the column's enum list.",
+   "null_share": "For nullable columns, generate at least one NULL row per instance and a NULL share matching the compact database's share for that column; never replace a planted NULL; force at least one NULL when the materialized instance shows none. When the compact share is 0, the effective target is exactly one NULL per nullable column (share = 1/n).",
+   "composite_pk_aware_duplicates": "When a table has a composite primary key, the duplicate stage on its key columns must preserve uniqueness of the full key tuple: after forcing duplicates on one key column, re-draw the other key column (or deduplicate on the tuple) so no (key1, key2) pair repeats; verify zero rows are skipped for that table and report the skipped-row count in the stats sidecar.",
+   "unmatched_parents_before_duplicates": "Run the parent-unmatched stage before the duplicate stage on child FK columns, then re-validate both the duplicate share and the parent-unmatched invariant; re-plant duplicates if the share fell below its floor while keeping at least one parent unreferenced; exclude the chosen unreferenced parent value from any composite-PK repair pool; report the parent-unmatched invariant in the stats sidecar.",
+   "duplicate_share_floor": "For a duplicate_share target of 20-50 %, set k = max(ceil(0.2 * n), round(share * n)) with share drawn from [0.2, 0.5], capped at n - 1, so the share never falls below the 20 % floor on small tables.",
+   "group_sizes_after_null": "Run the NULL stage before the group-size stage, or re-verify the group-size distribution after the NULL stage and re-plant if the target is broken; the group-size stage must guarantee groups of size 1, 2 and >= 3 whenever the non-NULL count is at least 6, and must lower its guard (or re-plant after NULL) so the target is actually achieved for the specified table size; report the observed group-size distribution in a stats sidecar.",
+   "tie_rank_vacuous": "A tie_at_rank r is vacuous when the table has fewer than r rows (LIMIT(r) returns all rows, so any tie at rank 1 also ties at the LIMIT boundary); record this in the spec and do not treat it as unsatisfied.",
+   "rows_with_different_values": "For a scalar MAX/MIN target, verify that the non-NULL value distribution retains at least two distinct values (>= 2 per group with different values); the tie stage must not collapse the distribution so far that the target fails; report the distinct non-NULL count in the stats sidecar."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "submission",
+    "column": "Author",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "submission",
+    "column": "College",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "submission",
+    "column": "Scores",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      1000
+     ],
+     "direction": "ASC and DESC",
+     "qualifying_rows": ">= 2 per group with different values",
+     "note": "rank 1000 is vacuous at table size 10 (LIMIT(1000) returns all rows); only rank 1 is materialized; verify distinct non-NULL count >= 2"
+    }
+   },
+   {
+    "table": "Acceptance",
+    "column": "Workshop_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "aggregate": [
+      "COUNT(DISTINCT acceptance.workshop_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ],
+     "composite_pk": [
+      "Submission_ID",
+      "Workshop_ID"
+     ]
+    }
+   },
+   {
+    "table": "Acceptance",
+    "column": "Submission_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "composite_pk": [
+      "Submission_ID",
+      "Workshop_ID"
+     ]
+    }
+   },
+   {
+    "table": "workshop",
+    "column": "Workshop_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Acceptance.Workshop_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "aggregate": [
+      "COUNT(DISTINCT workshop.workshop_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "workshop",
+    "column": "Date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "workshop",
+    "column": "Venue",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Acceptance",
+    "child_column": "Submission_ID",
+    "parent_table": "submission",
+    "parent_column": "Submission_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Acceptance",
+    "child_column": "Workshop_ID",
+    "parent_table": "workshop",
+    "parent_column": "Workshop_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "submission",
+    "column": "Scores",
+    "formula": "Scores BETWEEN 0 AND 100",
+    "evidence": "Rows 72.0, 79.0, 78.0, 82.0, 89.0, 92.0, 93.0, 83.0 all within [0,100]; inferred from sample, no CHECK constraint shown."
+   },
+   {
+    "table": "Acceptance",
+    "column": "Result",
+    "formula": "Result IN ('Accepted', 'Rejected')",
+    "evidence": "Only 'Accepted' and 'Rejected' appear in the sample."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "workshop": 6,
+   "submission": 10,
+   "Acceptance": 6
+  },
+  "null_targets": [
+   "submission.Scores",
+   "submission.Author",
+   "submission.College",
+   "workshop.Date",
+   "workshop.Venue",
+   "workshop.Name",
+   "Acceptance.Result"
+  ],
+  "supporting_evidence": {
+   "Scores_range": "Rows: 72.0, 79.0, 78.0, 82.0, 89.0, 92.0, 93.0, 83.0 all within [0,100]; inferred, not a declared CHECK.",
+   "Result_enum": "Rows: 'Accepted', 'Rejected' only.",
+   "Workshop_ID_unmatched": "Compact data does NOT contain an unmatched parent: Acceptance.Workshop_ID values 1,3,5,2,6 are all valid workshop IDs (workshop has 1-6). The parent_rows_without_children invariant is a generation target enforced by the unmatched-parent stage, not an observed compact-data property.",
+   "Author_duplicates": "Author list has 8 distinct names over 10 rows (duplicate share ~20%).",
+   "College_duplicates": "College list has 8 distinct values over 10 rows.",
+   "Acceptance_composite_pk": "Acceptance PK is (Submission_ID, Workshop_ID); duplicate stage must preserve tuple uniqueness and report zero skipped rows.",
+   "Scores_tie_rank_1000": "Table size 10 < 1000, so LIMIT(1000) returns all rows; rank-1000 tie is vacuous.",
+   "Scores_distinct_values": "Tie stage must leave at least two distinct non-NULL Scores values; report distinct count in stats sidecar.",
+   "Group_sizes_report": "Observed group-size distribution for Author and College must be written to the stats sidecar; guard must allow the '1, 2, >=3' target at table size 10 after NULL planting."
+  },
+  "uncertain_patterns": [
+   {
+    "table": "submission",
+    "column": "Scores",
+    "pattern": "range",
+    "note": "Scores BETWEEN 0 AND 100 is inferred from the sample; no explicit CHECK constraint is shown in the schema."
+   }
+  ],
+  "uncertainty": "No date-pair order rule exists (single Date column). No calculated columns identified. Scores range assumed [0,100] from sample; no explicit CHECK constraint shown, so it is listed under uncertain_patterns as well as enforced by the sampler. Compact DB NULL share per nullable column is not shown; the interface rule forces at least one NULL per nullable column, so the effective share is max(1/n, compact_share); when compact share is 0 the target is exactly one NULL. For tables of size 6 the 20-50 % duplicate-share target is only approximately achievable; the floor rule (ceil(0.2*n)) is used. The unmatched-parent invariant for workshop.Workshop_ID is a generation target, not evidenced by the compact data."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite is called in cli._one as write_instance_sqlite(_G['schema'], inst, p) with no orig_path argument, so the 'copy the compact DB then append' path (orig_path truthy) is never taken. Execution feedback shows validity.invalid=20 with 'compact_rows_missing': 20, and rows_skipped submission=146 / Acceptance=69 from PK collisions (fresh PKs start at max(original)+1, but compact rows are absent so the generated PKs collide with nothing yet the compact rows are missing). The docstring claims 'Each instance is a copy of the compact database plus appended generated rows' but the program never copies it.",
+     "requested_revision": "Pass orig_path (the --orig value) through to write_instance_sqlite in cli._one (and the worker path), so each instance is a copy of the compact DB with generated rows appended. Re-run and confirm validity.invalid drops and compact_rows_missing is gone."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "execution feedback: validity.reasons 'no_rows_added': 18 of 20 instances. rows_added workshop=121 over 20 instances (~6/instance expected, ok) but submission rows_added=59 vs rows_skipped=146 and Acceptance added=55/skipped=69. Root cause: build_random_instance overrides fresh PKs via _fresh_pk_values starting at max(existing)+1, but with the compact DB not present in written instances the FK/duplicate sampling plus drop_unique_duplicates / sample_fresh_primary_keys interplay drops most rows, and the 'copy' bug compounds it. The spec table_sizes_per_instance (workshop 6, submission 10, Acceptance 6) is not respected in written output.",
+     "requested_revision": "After fixing the compact-copy bug, verify per-instance added row counts match specification table_sizes_per_instance (6/10/6) up to jitter, and that rows_skipped is not dominating rows_added. Adjust _spec_size jitter and the PK-collision handling so the intended sizes survive PK/unique dedup."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rule 'Scores BETWEEN 0 AND 100' is marked with evidence 'All shown Scores values ... lie in [0,100]' and uncertainty 'Scores range assumed [0,100] from sample; no explicit CHECK constraint shown.' This is a reasonable domain but the program's _apply_range additionally plants lo-1.0 and hi+1.0 (e.g. -1.0 and 101.0) into Scores, which violates the stated BETWEEN 0 AND 100 rule. The generic_sampling_rules 'real_numeric' says 'include boundary values and one step on each side', which contradicts the semantic formula. The construction_pairs / query pairs for Scores range predicates would break.",
+     "requested_revision": "Designer: resolve the conflict between the real_numeric 'one step on each side' rule and the Scores BETWEEN 0 AND 100 semantic rule. Either drop the out-of-range planting for constrained columns, or scope 'one step on each side' to unconstrained reals. Engineer: make _apply_range not plant values outside the semantic range when a BETWEEN rule is specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._ensure_unmatched_parents sets a child FK to None to guarantee an unmatched parent, but the spec says 'child_rows_with_null_fk: false' for Acceptance.Workshop_ID and workshop.Workshop_ID unmatched_join_rows. Introducing NULL child FKs contradicts that target and also conflicts with the interface NULL rule (nullable FK NULLs only per nullable-column rule, not as a forced filler).",
+     "requested_revision": "Guarantee parent rows without children by choosing FK draws that skip at least one parent, not by nulling a child FK, so child_rows_with_null_fk stays false."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable NULL feedback: 'workshop.Venue: generated rows: NULL 0 / 9', 'workshop.Date: NULL 3/9', 'workshop.Name: NULL 2/9', 'Acceptance.Result: NULL 1/5'. The interface NULL rule requires at least one NULL per nullable column per instance and a share following compact DB. Generated rows show 0 NULLs for Venue. _apply_null_rule computes target from _null_share of the compact DB, but because the compact DB is not copied (issue 1) and the spec null_targets include Venue with unknown compact share, the application can leave 0. The instruction note says this may be flagged without blocking, but combined with missing compact shares it is a real gap.",
+     "requested_revision": "Ensure _apply_null_rule forces at least one NULL for every listed nullable column (including Venue) regardless of the compact share when the materialized instance shows none, subject to the 'never replace a planted NULL' clause. Confirm generated-row NULL counts are >= 1 per nullable column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions for submission.Submission_ID pattern 'group_sizes' with target '1, 2 and >= 3' is odd: Submission_ID is the primary key, so each group has size exactly 1. The program's SPEC_GROUP_COLS includes ('submission','Submission_ID') and _apply_group_sizes overwrites PK values with 'g1_...', 'g2_...', 'g3_...' strings, which both corrupts the int PK and is meaningless. This is a design inconsistency; similarly submission.Author group_sizes and duplicates_for_distinct both apply, and sample_fresh_primary_keys then bad rows.",
+     "requested_revision": "Designer: remove the group_sizes exception for a primary-key column (Submission_ID can only have group size 1), or clarify the intended column. Engineer: remove ('submission','Submission_ID') from SPEC_GROUP_COLS and ensure _apply_group_sizes never overwrites primary-key values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "_apply_group_sizes and _apply_ties overwrite values unconditionally after the PK/unique/duplicate stages, including values that may be primary keys (College tie for rank 1 is fine as College is not PK, but the Student grouping writes 'g1_/g2_/g3_' into submission columns that are then re-checked by drop_unique_duplicates earlier). Also _apply_enum/_apply_range run before _apply_duplicates, then _apply_ties overrides College with 'Z...' after duplicate enforcement; the ordering can violate the duplicate_share target that was just enforced.",
+     "requested_revision": "Apply specification constraints in an order that does not undo prior targets (e.g. ties before duplicates, or reconcile), and exclude PK/unique columns from the group_sizes and tie overwrites."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB copy is expected in this harness configuration (no orig_path passed) or a harness wiring gap; validity feedback says compact_rows_missing: 20, indicating the copy is required.",
+    "The compact DB NULL share for Venue is not shown, so whether 'at least one NULL per nullable column' is exceeded beyond required sharing cannot be fully confirmed.",
+    "Construction harness reported 14/42 separated pairs; with no compact rows this separation is not meaningful and must be re-run after the copy fix."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_duplicates` is applied to `Acceptance.Workshop_ID` and `Acceptance.Submission_ID` (both in SPEC_DUP_COLS) *after* `fill_foreign_keys_consistently` and `_ensure_unmatched_parents`. `_apply_duplicates` overwrites values with `vals[src]` where `src` is an existing value, so FK validity is preserved \u2014 but the duplicate stage runs before `_ensure_unmatched_parents`, and `_ensure_unmatched_parents` re-draws child values away from a skipped parent. Execution feedback shows `rows_skipped: {Acceptance: 72}` out of 20 instances \u00d7 6 = 120 intended Acceptance rows, i.e. ~60% of generated Acceptance rows fail to insert. This is consistent with the composite PK (Submission_ID, Workshop_ID) being violated: `_apply_duplicates` forces repeated Workshop_ID and repeated Submission_ID values independently, and `_apply_group_sizes`/`_apply_duplicates` on the two FK columns can produce identical (Submission_ID, Workshop_ID) tuples. The writer silently drops these rows (`rows_failed`), so the intended Acceptance size of 6 per instance is not achieved and the duplicate_share target for the FK columns is not reliably realized.",
+     "requested_revision": "Make the duplicate stage for `Acceptance.Workshop_ID` / `Acceptance.Submission_ID` aware of the composite primary key: after forcing duplicates, deduplicate on the PK tuple (or re-draw one of the two FK values) so that no (Submission_ID, Workshop_ID) pair repeats. Also reorder so `_ensure_unmatched_parents` runs before the duplicate stage, or re-validate FK/parent-unmatched invariants after duplicates. Verify that `rows_skipped` for Acceptance is 0 across instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_ties` for `submission.Scores` plants `top = 100.0` twice and `0.0` twice, but `_apply_range` runs *before* `_apply_ties` and clamps into [0,100] and plants the bounds. The tie target is `tie_at_rank: [1, 1000]` with `direction: ASC and DESC`. With only ~10 submission rows per instance, rank 1000 is unreachable, so the LIMIT(1000) tie target cannot be satisfied by construction. The spec's `ties_for_order_limit` for Scores lists `tie_at_rank: [1, 1000]`; the program only addresses rank 1. This is a spec/program mismatch: the spec target is not implementable at the specified table size (10 rows), and the program does not flag or adjust it.",
+     "requested_revision": "Either (a) the designer should relax the Scores tie target to ranks reachable at the specified table size (e.g. rank 1 only, or note that rank 1000 is vacuous for 10 rows), or (b) the engineer should document that rank-1000 ties are trivially satisfied because the table has fewer than 1000 rows (LIMIT(1000) returns all rows, so any tie at rank 1 also ties at the LIMIT boundary). Confirm which interpretation is intended and make the spec and code agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` includes `Acceptance.Result`, `submission.Scores/Author/College`, `workshop.Date/Venue/Name`. The generic rule says 'NULL share matching the compact database's share for that column'. Execution feedback shows generated NULL shares of exactly 20/200 (10%) for submission columns and 20/121 (~16.5%) for workshop columns, and 15/95 (~15.8%) for Acceptance.Result. These look like `max(1, round(share*n))` with share\u22480.1\u20130.2, but the spec does not state the compact DB's actual NULL shares, and `_null_share` returns 0.0 when no NULLs are observed in `original_values` \u2014 in which case `target = max(1, 0) = 1`, forcing exactly one NULL. The spec's `uncertainty` field admits 'Compact DB NULL share for Venue not shown.' The NULL share target is therefore under-specified and the program's behavior (force \u22651 NULL even when compact share is 0) is a reasonable reading of the interface rule but not derivable from the spec text alone.",
+     "requested_revision": "Designer: state the compact DB NULL share per nullable column explicitly (or state that the share is 0 and the interface rule forces \u22651 NULL). Engineer: confirm `_null_share` handling of the 'no NULLs observed' case matches the intended interface rule (it does force \u22651 NULL, which matches instruction 7)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_group_sizes` requires `n >= 6` and `len(nonnull) >= 6` to plant groups of size 1, 2, and \u22653. `_spec_size` for `submission` is 10 \u00b1 1, so n is 9\u201311 and the guard passes. However, `_apply_group_sizes` runs *after* `_apply_duplicates`, which may have set some Author/College values to NULL? No \u2014 `_apply_duplicates` only copies non-NULL values. But `_apply_null_rule` runs *after* `_apply_group_sizes` and can NULL out rows that were part of the planted size-1/2/\u22653 groups, potentially destroying the group-size target. The spec target `group_sizes: '1, 2 and >= 3'` is not re-checked after the NULL stage. Execution feedback does not report group-size verification, so this is an unresolved check.",
+     "requested_revision": "Engineer: either run `_apply_null_rule` before `_apply_group_sizes`, or re-verify group sizes after the NULL stage and re-plant if the target is broken. Add a post-construction assertion (or stats sidecar field) reporting the observed group-size distribution for Author and College so the target can be verified from execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_duplicates` computes `k = max(1, int(round(share * n)))` with `share = rng.uniform(0.2, 0.5)`, then `k = min(k, len(nonnull) - 1)`. For `workshop.Date` and `workshop.Venue` with n\u22486, this forces 1\u20132 duplicates, giving a duplicate share of ~17\u201333%, which is within the 20\u201350% target only at the low end. For `Acceptance.Workshop_ID`/`Submission_ID` with n=6, the same applies. The spec target is '20-50 %' but the program's `round(share*n)` with n=6 and share=0.2 gives `round(1.2)=1`, i.e. 16.7% \u2014 below the 20% floor. This is a minor spec/program mismatch on small tables.",
+     "requested_revision": "Engineer: use `math.ceil(share * n)` or clamp `k` to at least `ceil(0.2 * n)` so the duplicate share never falls below the 20% floor for small tables. Alternatively, designer: note that for tables of size 6 the 20\u201350% target is only approximately achievable and state the tolerance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the compact DB and appends generated rows, with `pragma foreign_keys = OFF` and a single `executemany` per table. Execution feedback reports `fk_violations: 0`, `pk_duplicates: 0`, `not_null_violations: 0`, `not_ok: 0`, and `valid: 20/20`. Compact rows are preserved (copy-then-append). Reproducibility is confirmed (`reproducible: true`, seed `seed_base * 100003 + i`). This part is consistent.",
+     "requested_revision": "None \u2014 this is a positive finding, recorded for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_ensure_unmatched_parents` re-draws child FK values away from a skipped parent, but it runs *after* `_apply_duplicates` on `Acceptance.Workshop_ID`. If `_apply_duplicates` forced many child rows to point at the same parent value, `_ensure_unmatched_parents` may re-draw them all to `others`, potentially collapsing the duplicate share below the 20% target. The spec target for `Acceptance.Workshop_ID` includes both `duplicate_share: 20-50 %` and `parent_rows_without_children: true`; the program does not verify both hold simultaneously after `_ensure_unmatched_parents`.",
+     "requested_revision": "Engineer: after `_ensure_unmatched_parents`, re-check the duplicate share for `Acceptance.Workshop_ID` and re-plant duplicates if the share fell below 20%, while keeping at least one parent unreferenced. Add a stats field reporting the observed duplicate share and unmatched-parent count per instance."
+    }
+   ],
+   "unresolved_checks": [
+    "Group-size target for submission.Author and submission.College is not verified after the NULL stage; execution feedback does not report observed group sizes.",
+    "Duplicate share for Acceptance.Workshop_ID after _ensure_unmatched_parents is not verified; the two targets (duplicate_share 20-50% and parent_rows_without_children) may conflict.",
+    "Scores tie_at_rank [1, 1000] is not implementable at table size 10; spec and program disagree on whether rank 1000 is vacuous.",
+    "Compact DB NULL shares per nullable column are not stated in the spec; the program's force-\u22651-NULL behavior is consistent with instruction 7 but not derivable from the spec text.",
+    "Construction pairs: 15/42 separated, 0 unknown executions. Missing separation alone does not establish a generation error, but the Acceptance row-skipping (72/120) suggests the FK/duplicate interaction is suppressing intended value variation; this should be re-checked after the fix."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_group_sizes` plants groups of size 1, 2, and >=3 for Author and College, but it runs AFTER `_apply_duplicates` and `_apply_null_rule`. The duplicate stage (`_apply_duplicates`) forces k values to copy a single source value, which can create a large group; then `_apply_group_sizes` overwrites indices nonnull[0..5] with fresh 'g1_/g2_/g3_' strings. However, the duplicate stage's source value (nonnull[0]) is overwritten by the size-1 group, and the remaining duplicated copies of the old source value (indices beyond 6) may still form a group of size >=3 \u2014 but the spec's group_sizes target is '1, 2 and >= 3', which is satisfied. The real problem: `_apply_group_sizes` requires n >= 6 and len(nonnull) >= 6, but the spec table size for submission is 10 with jitter [-1,0,0,0,1], so n can be 9; with NULL rule planting ~1-2 NULLs in Author/College, nonnull can drop below 6, silently skipping the group-size stage. No stats sidecar records the observed distribution (the `_group_size_stats` helper is defined but never called; `_group_size_stats` also contains dead/broken code `cnt[k] = groups = None`). The spec's `group_sizes_after_null` rule requires re-verification and reporting in a stats sidecar; neither is done.",
+     "requested_revision": "Call `_group_size_stats` (after fixing the broken placeholder line) for Author and College and write the observed distribution into the .stats sidecar; and either lower the n>=6 guard or re-plant after NULL so the '1, 2, >=3' target is actually guaranteed for the specified table size of 10."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_ties` for Scores sets nonnull[0]=nonnull[1]=100.0 and (if >=4 nonnull) nonnull[2]=nonnull[3]=0.0. But `_apply_range` runs BEFORE `_apply_ties` and plants the boundary values lo=0.0 and hi=100.0 at two random indices; `_apply_ties` then overwrites two more indices with 100.0 and two with 0.0. The spec's `rows_with_different_values` target for Scores is '>= 2 per group with different values' (scalar MAX). With table size 10 and NULL rule planting ~1 NULL, there are ~9 nonnull; after ties, at least 4 are 100.0 and 2-4 are 0.0, leaving few distinct values. The spec's `qualifying_rows` target is not verified or reported. More importantly, the spec's `tie_at_rank [1,1000]` for Scores with 'ASC and DESC' direction: `_apply_ties` only plants a DESC top tie (100.0) and an ASC bottom tie (0.0), which is consistent, but the spec's `rows_with_different_values` (>=2 per group with different values) is not checked.",
+     "requested_revision": "Add a verification/report of the `rows_with_different_values` target for Scores (count of distinct non-NULL values >= 2) in the stats sidecar, and ensure `_apply_ties` does not collapse the value distribution so far that the target fails."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_duplicates` for Acceptance.Workshop_ID and Acceptance.Submission_ID: the spec requires duplicate_share 20-50% on BOTH columns while preserving composite-PK uniqueness. `_apply_duplicates` processes SPEC_DUP_COLS in set-iteration order; for Acceptance it forces duplicates on Workshop_ID, then calls `_repair_composite_pk` which re-draws the LAST key column (Workshop_ID) from existing non-NULL values. Then it processes Submission_ID, forces duplicates, and again calls `_repair_composite_pk` re-drawing Workshop_ID. The second repair can undo the Workshop_ID duplicate share planted in the first pass. Execution feedback shows `rows_skipped: {Acceptance: 39}` out of 79 attempted \u2014 i.e. ~49% of Acceptance rows were rejected by the writer (PK/unique dedup), which is consistent with the composite-PK repair failing to preserve both duplicate shares. The spec's `composite_pk_aware_duplicates` rule requires 'verify zero rows are skipped for that table'; 39 skipped rows violates this.",
+     "requested_revision": "Rework the composite-PK duplicate stage so that after forcing duplicates on both key columns, the full tuple uniqueness is restored without dropping rows (e.g. re-draw the non-duplicated key column from a pool that guarantees a fresh tuple, or deduplicate on the tuple before writing). Verify and report zero skipped rows for Acceptance in the stats sidecar."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_ensure_unmatched_parents` picks a parent value to leave unreferenced and re-draws every child pointing at it to `rng.choice(others)`. For Acceptance.Workshop_ID this can collapse the Workshop_ID distribution and reduce the duplicate share below 20%. `_revalidate_duplicates` then re-plants duplicates, but for Acceptance it calls `_repair_composite_pk` again, which can re-introduce the skipped parent value (the repair draws from `pool = [v for v in cols[other] if v is not None]`, which includes the skip value if it still appears elsewhere). The spec's `unmatched_parents_before_duplicates` rule requires re-validating BOTH the duplicate share and the parent-unmatched invariant after re-planting; the code only re-validates the duplicate share and does not re-check that at least one parent remains unreferenced.",
+     "requested_revision": "After `_revalidate_duplicates`, re-check that at least one parent PK value is still unreferenced for each FK; if not, re-run `_ensure_unmatched_parents` (or exclude the skip value from the repair pool). Report the parent-unmatched invariant in the stats sidecar."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` states 'Acceptance.Workshop_ID includes 6 while workshop has 1-6; parent rows without children possible.' But the schema shows workshop PK is Workshop_ID and Acceptance.Workshop_ID is a FK to it; if Acceptance.Workshop_ID includes 6 and workshop has 1-6, then 6 IS a valid parent \u2014 there is no unmatched parent in the compact data. The spec's `unmatched_join_rows` target for workshop.Workshop_ID requires `parent_rows_without_children: true`, which is not evidenced by the compact data. The spec's `uncertainty` section does not flag this. The program's `_ensure_unmatched_parents` forces an unmatched parent by construction, which is a reasonable interpretation, but the spec should state that the unmatched-parent invariant is a generation target, not an observed compact-data property.",
+     "requested_revision": "Correct the `Workshop_ID_unmatched` supporting evidence to clarify that the compact data does NOT contain an unmatched parent (6 is a valid workshop ID), and that the unmatched-parent invariant is a generation target enforced by `_ensure_unmatched_parents`. Alternatively, if the compact data does contain an unmatched parent, provide the actual evidence (e.g. a workshop ID not present in Acceptance)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Scores BETWEEN 0 AND 100` with evidence 'Rows 72.0, 79.0, 78.0, 82.0, 89.0, 92.0, 93.0, 83.0 all within [0,100].' This is a sample-based inference, not a declared CHECK constraint (the schema shows no CHECK on Scores). The spec's `uncertainty` acknowledges 'Scores range assumed [0,100] from sample; no explicit CHECK constraint shown.' This is acceptable as an uncertain pattern, but the spec should mark it as `uncertain` rather than `semantic_rules_and_formulas` (which implies a hard rule). The program's `_apply_range` clamps to [0,100] and plants boundaries, which is consistent with the assumed range.",
+     "requested_revision": "Move the Scores range rule to an `uncertain_patterns` section (or annotate it as inferred) so it is not treated as a hard semantic rule. No program change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` computes `target = max(1, int(round(share * n)))` where `share = _null_share(schema, key)` is the compact DB's NULL share. The spec's `null_share` rule says 'generate at least one NULL row per instance and a NULL share matching the compact database's share for that column; never replace a planted NULL; force at least one NULL when the materialized instance shows none.' The code does force at least one NULL (via `max(1, ...)`), but it does NOT force a NULL when the materialized instance shows none if `share` is 0 and `n` is large \u2014 actually `max(1, ...)` does force at least one. However, the code only ADDS NULLs (it never removes them), so if the base sampler already produced more NULLs than the target, the share can exceed the compact share. The spec's `null_share` rule says 'matching the compact database's share', which implies both directions. Execution feedback shows NULL shares of ~10% for most columns (e.g. Author 20/200 = 10%, Scores 20/200 = 10%), which is consistent with `max(1, round(share*n))` for small shares, but the spec does not state the compact shares, so this cannot be verified.",
+     "requested_revision": "Report the compact DB's NULL share per nullable column in the spec (or in the stats sidecar) so the generated NULL share can be verified against it. If the compact share is 0, the spec's `null_share` rule should be clarified to say 'at least one NULL' rather than 'matching the compact share'."
+    }
+   ],
+   "unresolved_checks": [
+    "The compact DB's NULL share per nullable column is not shown in the spec or execution feedback, so the 'NULL share following the compact database's share' rule cannot be verified.",
+    "The `rows_with_different_values` target for Scores (>=2 per group with different values) is not verified or reported.",
+    "The `group_sizes` target for Author and College ('1, 2 and >=3') is not verified or reported in a stats sidecar; the `_group_size_stats` helper is defined but never called and contains broken code.",
+    "The `composite_pk_aware_duplicates` rule's 'verify zero rows are skipped for that table' is violated: execution feedback shows 39 skipped rows for Acceptance.",
+    "The `unmatched_parents_before_duplicates` rule's re-validation of the parent-unmatched invariant after re-planting duplicates is not performed.",
+    "The `Workshop_ID_unmatched` supporting evidence is inconsistent with the schema (6 is a valid workshop ID, so no unmatched parent exists in the compact data)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped = {\"workshop\": 0, \"submission\": 0, \"Acceptance\": 39}. The specification's composite_pk_aware_duplicates rule requires 'verify zero rows are skipped for that table and report the skipped-row count in the stats sidecar.' Acceptance is the composite-PK table (PK = Submission_ID, Workshop_ID), and 39 of its generated rows were rejected by the writer (writer.py falls back to row-by-row and counts failures in rows_failed). The duplicate stage in _apply_duplicates/_repair_composite_pk is not preserving tuple uniqueness: _repair_composite_pk only re-draws the last key column from the existing pool of that column, and when the pool is exhausted (or the 8-attempt loop fails) it leaves the duplicate tuple in place; also _revalidate_duplicates re-plants duplicates on Workshop_ID/Submission_ID and calls _repair_composite_pk, which can again fail to break the tuple. The spec explicitly requires zero skipped rows for Acceptance.",
+     "requested_revision": "Fix the composite-PK duplicate stage so that after forcing duplicates on one key column the other key column is re-drawn from a pool guaranteed to yield a fresh tuple (e.g. draw fresh integer values for the other key column, or deduplicate on the full tuple), and assert/report rows_skipped['Acceptance'] == 0 in the stats sidecar. Re-run and confirm the execution feedback shows 0 skipped rows for Acceptance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification table_sizes_per_instance = {workshop: 6, submission: 10, Acceptance: 6}, but execution feedback shows rows_added = {workshop: 121, submission: 200, Acceptance: 79} over 20 instances, i.e. ~6.05, ~10, ~3.95 per instance. workshop and submission match, but Acceptance averages ~4 rows/instance instead of 6 \u2014 consistent with the 39 skipped rows above (79+39=118 \u2248 6\u00d720). This is a direct consequence of the composite-PK bug and also means the Acceptance duplicate-share target (20-50%) is computed on rows that are then dropped.",
+     "requested_revision": "After fixing the composite-PK repair, verify that Acceptance rows_added per instance equals the specified size (6) and that the duplicate share on Acceptance.Workshop_ID and Acceptance.Submission_ID is measured on the actually-written rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists null_targets including submission.Scores, submission.Author, submission.College, workshop.Date, workshop.Venue, workshop.Name, Acceptance.Result, and the interface NULL rule requires 'each instance contains generated rows with NULL and rows with non-NULL values ... at least one NULL row per nullable column'. Execution feedback shows NULL counts of 20/200, 20/200, 20/200, 20/121, 20/121, 20/121, 19/110 \u2014 i.e. exactly one NULL per instance per column, which satisfies the interface rule. However, the specification's null_share rule says the share should follow the compact database's share; the compact share is not shown and the spec acknowledges 'Compact DB NULL share per nullable column is not shown'. This is acceptable per the interface rule (effective share = 1/n when compact share is 0), so no change is strictly required, but the spec should state the compact NULL share explicitly so the 'following the compact database's share' clause is verifiable rather than assumed.",
+     "requested_revision": "Add the observed compact NULL share per nullable column to the specification (or explicitly state it is 0 for all listed columns) so the null_share rule is grounded in evidence rather than the fallback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic rule 'Scores BETWEEN 0 AND 100' is listed both under semantic_rules_and_formulas and under uncertain_patterns, with evidence 'inferred from sample, no CHECK constraint shown'. The schema DDL confirms no CHECK constraint on submission.Scores. The program enforces the range by construction (_apply_range clamps and plants 0.0 and 100.0), which is consistent with the spec, but the rule remains an inference, not a declared constraint. Similarly 'Result IN (Accepted, Rejected)' is inferred from sample values only; the DDL has no CHECK. These are correctly flagged as uncertain, so they are supported-as-inferred rather than as hard constraints.",
+     "requested_revision": "No program change required; keep these as uncertain/inferred rules and do not treat them as integrity constraints in validation. Optionally note in the spec that the range/enum are sampler constraints, not DB constraints."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires group_sizes '1, 2 and >= 3' for submission.Author and submission.College, and the stats sidecar must report the observed distribution. The program's _apply_group_sizes runs after _apply_null_rule and plants groups, and _verify_targets records group_sizes. However, _apply_group_sizes is called before _ensure_unmatched_parents and _revalidate_duplicates, and _revalidate_duplicates can overwrite Author/College values (they are in SPEC_DUP_COLS) after the group-size stage, potentially destroying the planted size-1/size-2/size-3 groups. The spec's group_sizes_after_null rule requires re-verification after later stages. The execution feedback does not include the group_sizes sidecar contents, so this cannot be confirmed as satisfied.",
+     "requested_revision": "Move the group-size planting after _revalidate_duplicates (or re-run _apply_group_sizes and re-verify after duplicate re-planting), and include the observed group_sizes distribution in the execution feedback so the '1, 2 and >= 3' target is demonstrably met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires ties_for_order_limit for submission.Scores at tie_at_rank [1, 1000] with direction 'ASC and DESC', and rows_with_different_values '>= 2 per group with different values'. The program's _apply_ties plants two 100.0 values and (if >=4 non-NULL) two 0.0 values, then _apply_duplicates and _apply_null_rule run afterward and can overwrite or NULL these values, and _revalidate_duplicates can also overwrite Scores? (Scores is not in SPEC_DUP_COLS, so duplicates do not touch it, but _apply_null_rule can NULL some of the planted tie values). The spec's tie_rank_vacuous note correctly handles rank 1000, but the rank-1 tie and the distinct-value target are not re-verified after the NULL stage. The execution feedback does not report scores_distinct, so the '>= 2 distinct non-NULL' target is unconfirmed.",
+     "requested_revision": "Re-verify the rank-1 tie and the distinct non-NULL Scores count after the NULL stage (or run _apply_ties after _apply_null_rule), and surface scores_distinct in the execution feedback."
+    }
+   ],
+   "unresolved_checks": [
+    "Compact NULL share per nullable column is not provided; the null_share rule is satisfied only via the 1/n fallback.",
+    "Group-size distribution for submission.Author and submission.College is not shown in the execution feedback; cannot confirm '1, 2 and >= 3' survives the duplicate re-planting stage.",
+    "Distinct non-NULL Scores count (rows_with_different_values target) is not shown in the execution feedback.",
+    "The 39 skipped Acceptance rows indicate the composite-PK invariant is violated; this is the primary blocking issue."
+   ]
+  }
+ ]
 }

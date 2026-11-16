@@ -1,5 +1,5 @@
 """Random instance construction (fuzz/fuzz.py:83-196)."""
-from .values import _init_sampler
+from .values import _init_sampler, spec_sampler
 
 
 def _filter(columns: dict, keep: list) -> dict:
@@ -33,8 +33,9 @@ def drop_unique_duplicates(table_meta, columns: dict) -> dict:
     return columns
 
 
-def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
-    """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
+def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng,
+                                   fk_null_share: float = 0.10) -> dict:
+    """FK child columns draw from the parent's values with replacement; NULL by the NULL rule."""
     out = {}
     for cm in schema.tables[table].columns:
         key = (table, cm.name)
@@ -42,41 +43,74 @@ def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, r
             continue
         pt, pc = schema.fks[key]
         pv = instance.get(pt, {}).get(pc) or []
-        out[cm.name] = [rng.choice(pv) for _ in range(n)] if pv else [None] * n
+        vals = []
+        for _ in range(n):
+            if not pv or rng.random() < fk_null_share:
+                vals.append(None)
+            else:
+                vals.append(rng.choice(pv))
+        out[cm.name] = vals
     return out
 
 
-def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+def choose_table_sizes(schema, rng, spec: dict = None) -> dict:
+    """Specification table sizes (per instance) with a small random jitter."""
     sizes = {}
-    if rng.random() < 0.5:
-        for lvl in schema.table_order:
-            for t in lvl:
-                min_c = 30 * rng.random()
-                sizes[t] = int(min_c + int(rng.random() * 200))
-    else:
-        s = 1 + 30 * rng.random()
-        for lvl in schema.table_order:
-            for t in lvl:
-                sizes[t] = int(min(s, 2500))
-            s *= 4
+    spec_sizes = (spec or {}).get('table_sizes', {})
+    for lvl in schema.table_order:
+        for t in lvl:
+            base = int(spec_sizes.get(t, 0))
+            if base <= 0:
+                base = int(30 * rng.random() + int(rng.random() * 200))
+            jitter = int(base * 0.1)
+            sizes[t] = max(0, base + rng.randint(-jitter, jitter))
     return sizes
 
 
-def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
+def _apply_null_rule(table: str, columns: dict, spec: dict, rng) -> dict:
+    """Each nullable column: NULL share from the specification, at least one NULL row."""
+    shares = spec.get('null_share', {})
+    for col, vals in columns.items():
+        key = '%s.%s' % (table, col)
+        share = shares.get(key)
+        if share is None:
+            continue
+        n = len(vals)
+        if n == 0:
+            continue
+        k = max(1, int(round(share * n)))
+        idx = list(range(n))
+        rng.shuffle(idx)
+        for i in idx[:k]:
+            vals[i] = None
+    return columns
+
+
+def build_random_instance(schema, literal_pool: dict, size, rng, spec: dict = None) -> dict:
+    """Build one random instance (fuzz.py:111-196) with specification-driven samplers."""
+    spec = spec or {}
     p = 0.0 if rng.random() < 0.3 else 0.2
     order = [t for lvl in schema.table_order for t in lvl]
     samplers = {}
     for t in order:
         tm = schema.tables[t]
         for cm in tm.columns:
-            if (t, cm.name) not in schema.fks:
-                samplers[(t, cm.name)] = _init_sampler(cm, literal_pool.get((t, cm.name), []),
-                                                       schema.original_values.get((t, cm.name), []), p, rng,
-                                                       len(tm.primary_key))
+            if (t, cm.name) in schema.fks:
+                continue
+            ov = schema.original_values.get((t, cm.name), [])
+            els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + \
+                  sorted({str(v) for v in literal_pool.get((t, cm.name), [])})
+            max_l0 = float('inf')
+            if rng.random() < 0.5:
+                max_l0 = rng.random() * 30
+                if cm.pk_pos > 0:
+                    max_l0 = float('inf') if len(tm.primary_key) == 1 else 30
+            s = spec_sampler(t, cm.name, spec, rng, els, p, max_l0)
+            if s is None:
+                s = _init_sampler(cm, literal_pool.get((t, cm.name), []), ov, p, rng, len(tm.primary_key))
+            samplers[(t, cm.name)] = s
     if size is None:
-        size = choose_table_sizes(schema, rng)
+        size = choose_table_sizes(schema, rng, spec)
     inst: dict = {}
     for t in order:
         tm = schema.tables[t]
@@ -84,7 +118,8 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
         cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)]
                 for cm in tm.columns if (t, cm.name) in samplers}
         inst[t] = cols
-        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
+        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng,
+                                                   spec.get('fk_null_share', 0.10)))
         cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
         cols = drop_unique_duplicates(tm, cols)
         for cm in tm.columns:
@@ -94,5 +129,6 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
                 fs = set(final)
                 cols[cm.name] = [v if v is None or v in fs else (rng.choice(final) if final else None)
                                  for v in cols[cm.name]]
+        cols = _apply_null_rule(t, cols, spec, rng)
         inst[t] = cols
     return {t: inst[t] for t in schema.tables}

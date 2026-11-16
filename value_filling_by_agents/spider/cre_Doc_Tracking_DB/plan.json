@@ -1,52 +1,540 @@
 {
  "db": "cre_Doc_Tracking_DB",
- "operator_io_quirks": [
-  "All identifiers are mixed-case with underscores (Ref_Document_Types, Date_in_Locaton_To); must be double-quoted verbatim in generated SQL.",
-  "Typo in schema: 'Date_in_Locaton_To' (missing 'i') \u2014 must be preserved exactly, not corrected.",
-  "DATETIME columns store text like '1972-03-31 09:47:22' (space-separated, no T, no timezone); ts_fuzzer dispatches to Date|Number(int elements) \u2014 first element is not int so Date path.",
-  "Ref_Calendar.Calendar_Date is a DATETIME PK and is the FK parent for 6 child date columns (Date_Stored, Date_in_Location_From, Date_in_Locaton_To, Planned_Destruction_Date, Actual_Destruction_Date) \u2014 date values must be drawn from parent's generated set, not fresh.",
-  "Document_Locations has composite PK (Document_ID, Location_Code, Date_in_Location_From) \u2014 composite-PK members get max_l0=30 cap.",
-  "Documents_to_be_Destroyed has two FKs to Employees (Destruction_Authorised_by_Employee_ID, Destroyed_by_Employee_ID) \u2014 same parent, two child columns.",
-  "All_Documents.Document_ID is parent of both Document_Locations.Document_ID and Documents_to_be_Destroyed.Document_ID (1:1-ish child PKs).",
-  "Document_Description, Other_Details (All_Documents, Employees, Documents_to_be_Destroyed) are 100% NULL, distinct=0 \u2014 String sampler gets empty element list, p:=1, all fresh random strings.",
-  "Gender_MFU CHAR(1) has samples ['', '1'] \u2014 storage text, distinct=2, values are empty string and '1' (not 'M'/'F'/'U').",
-  "Ref_Document_Types.Document_Type_Description and Ref_Locations.Location_Description are all empty string (distinct=1) \u2014 String sampler with single '' element.",
-  "Ref_Locations.Location_Code values are single lowercase letters ('b','c','e','n','x') \u2014 CHAR(15) but 1-char values.",
-  "All tables are tiny (4\u201315 rows); no huge-table sampling needed, but read_schema must still handle rowid ORDER BY."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template inferred from first parsable element = '%Y-%m-%d %H:%M:%S'; range = [min,max] of parsed originals (e.g. 1972..2017); fresh dates uniform in that range.",
-  "Ref_Calendar.Calendar_Date is a single-column PK -> max_l0=inf, so fresh dates never reused; child FK date columns draw from parent's final filtered set with replacement.",
-  "String fuzzer on CHAR/VARCHAR: length range from originals (e.g. [0,20] default for empty columns, [1,15] for codes); 50% contaminate adds/drops chars \u2014 likely produces implausible codes like 'BKx' or 'B'.",
-  "Number fuzzer on INTEGER PKs (Document_ID, Employee_ID): range [-10^4,10^4] (scale=4 default), perturbed by \u00b11/\u00b12 \u2014 likely produces negative or huge IDs, driving FN on range predicates.",
-  "Number fuzzer on Day_Number (INTEGER, distinct 7, values 1\u20138): list range [min(el), 10^4] due to upstream quirk (list_max overwritten by full max) \u2014 fresh draws can be huge.",
-  "Gender_MFU CHAR(1) with elements ['','1']: String sampler length range [0,1], 50% contaminate may produce 2-char strings violating CHAR(1) affinity (sqlite accepts, no error).",
-  "Empty-string-only columns (Document_Type_Description, Location_Description): String sampler with one '' element, p=1 -> all fresh random strings, no empty strings \u2014 likely FP on '= ''' predicates.",
-  "100% NULL columns: String sampler with no elements -> p:=1, all fresh random strings (never NULL) \u2014 likely FP on IS NULL predicates.",
-  "FK consistency: child FK columns draw from parent's FINAL filtered values; if parent PK dedup drops rows, child may reference missing parent (FK pragma OFF, no error) \u2014 likely FP on join predicates.",
-  "Composite PK (Document_Locations): sample_fresh_primary_keys drops duplicate tuples; Date_in_Location_From drawn from Ref_Calendar (15 values) so collisions likely, many rows dropped.",
-  "Documents_to_be_Destroyed.Document_ID FK to All_Documents: 1:1 child PK, drawn from parent's 15 IDs; dedup keeps first occurrence \u2014 small table.",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs \u2014 drop_unique_duplicates only acts on PKs; NOT NULL violations (e.g. Gender_MFU='') pass sqlite affinity."
- ],
- "challenger_refs": [
-  "g5665c7c9",
-  "g5665c7c9",
-  "g5665c7c9",
-  "g2a6eb5d7",
-  "gcf4f96f3",
-  "g4094ac61",
-  "gdb34bbf2",
-  "g83462bad",
-  "g74c91f31",
-  "gd7dbfdc5",
-  "g340a7e33",
-  "g3fead494"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; PK columns never receive duplicates.",
+   "integer_fk": "Sample from the parent table's generated key pool; allow NULL only if the column is nullable; planted NULLs are preserved through all post-processing.",
+   "char_code": "Uppercase alphanumeric codes of length 1-15 drawn from the table's enum pool; never NULL when NOT NULL; case variants used only as boundary literals where the enum rule is case-insensitive.",
+   "varchar_text": "Short human-readable strings; 20-50% near-duplicate variants (case/whitespace changes) on DISTINCT-targeted non-PK columns; NULL only when nullable.",
+   "datetime": "Random timestamps in '%Y-%m-%d %H:%M:%S' between 1970-01-01 and 2020-12-31; NULL only when nullable.",
+   "numeric_range": "Integers within the observed min/max; quantities > 0, amounts >= 0.",
+   "enum_flag": "Pick uniformly from the listed enum values; never NULL when NOT NULL.",
+   "boundary": "For each listed literal, include the literal itself, one step below and one step above (numbers by 1, dates by 1 day, strings by case/whitespace variant); boundary literals must survive semantic-rule post-processing (rules are case-insensitive where case variants are targeted).",
+   "tie": "For ORDER-targeted columns, plant at least two rows sharing the rank-1 value.",
+   "null_share": "Each nullable column gets at least one NULL row per instance; share follows the compact database's null_rate for that column (derived from schema.original_values, not hard-coded); a planted NULL is never replaced to satisfy a rule (three-valued logic).",
+   "group_and_aggregate": "Group-size and aggregate-boundary shaping on the same column is done in a single joint pass; post-generation assertion verifies each target group size and COUNT value occurs.",
+   "reference_table_fill": "Reference tables (Ref_Document_Types, Ref_Locations, Roles) are filled to their table_sizes_per_instance with fresh PKs above the compact max; post-write assertion checks rows_added equals the specified size."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Employees",
+    "column": "Role_Code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "HR",
+     "hr",
+     "ED",
+     "ed"
+    ]
+   },
+   {
+    "table": "Employees",
+    "column": "Role_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     ">=3"
+    ]
+   },
+   {
+    "table": "Employees",
+    "column": "Role_Code",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) = 2",
+     "COUNT(*) = 3",
+     "COUNT(*) = 4"
+    ]
+   },
+   {
+    "table": "Roles",
+    "column": "Role_Code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "HR",
+     "hr"
+    ]
+   },
+   {
+    "table": "Roles",
+    "column": "Role_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     ">=3"
+    ]
+   },
+   {
+    "table": "Roles",
+    "column": "Role_Code",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) = 2",
+     "COUNT(*) = 3",
+     "COUNT(*) = 4"
+    ]
+   },
+   {
+    "table": "Roles",
+    "column": "Role_Name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Editor",
+     "editor"
+    ]
+   },
+   {
+    "table": "Employees",
+    "column": "Employee_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children",
+     "child NULL FK"
+    ]
+   },
+   {
+    "table": "Employees",
+    "column": "Employee_ID",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(DISTINCT employee_id) = 2/3/4",
+     "COUNT(employee_id) = 2/3/4"
+    ]
+   },
+   {
+    "table": "Employees",
+    "column": "Employee_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Location_Code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Location_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     ">=3"
+    ]
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Location_Code",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Location_Code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 ASC",
+     "rank 1 DESC",
+     "tie on COUNT(*)"
+    ]
+   },
+   {
+    "table": "Ref_Locations",
+    "column": "Location_Code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "Ref_Locations",
+    "column": "Location_Code",
+    "pattern": "group_sizes",
+    "targets": [
+     "1",
+     "2",
+     "3+"
+    ]
+   },
+   {
+    "table": "Ref_Locations",
+    "column": "Location_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "Ref_Calendar",
+    "column": "Calendar_Date",
+    "pattern": "not_null",
+    "targets": [
+     "no NULL"
+    ]
+   },
+   {
+    "table": "Documents_to_be_Destroyed",
+    "column": "Destruction_Authorised_by_Employee_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children",
+     "child NULL FK"
+    ]
+   },
+   {
+    "table": "Documents_to_be_Destroyed",
+    "column": "Destroyed_by_Employee_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children",
+     "child NULL FK"
+    ]
+   },
+   {
+    "table": "Documents_to_be_Destroyed",
+    "column": "Destruction_Authorised_by_Employee_ID",
+    "pattern": "null_rows",
+    "targets": [
+     "at least one NULL"
+    ]
+   },
+   {
+    "table": "Documents_to_be_Destroyed",
+    "column": "Destroyed_by_Employee_ID",
+    "pattern": "null_rows",
+    "targets": [
+     "at least one NULL"
+    ]
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Document_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "All_Documents",
+    "column": "Document_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "All_Documents",
+    "column": "Date_Stored",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 unordered"
+    ]
+   },
+   {
+    "table": "Ref_Document_Types",
+    "column": "Document_Type_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   },
+   {
+    "table": "Ref_Document_Types",
+    "column": "Document_Type_Code",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50%"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "All_Documents.Document_Type_Code",
+    "parent": "Ref_Document_Types.Document_Type_Code",
+    "copied": []
+   },
+   {
+    "child": "All_Documents.Date_Stored",
+    "parent": "Ref_Calendar.Calendar_Date",
+    "copied": []
+   },
+   {
+    "child": "Employees.Role_Code",
+    "parent": "Roles.Role_Code",
+    "copied": []
+   },
+   {
+    "child": "Document_Locations.Location_Code",
+    "parent": "Ref_Locations.Location_Code",
+    "copied": []
+   },
+   {
+    "child": "Document_Locations.Date_in_Location_From",
+    "parent": "Ref_Calendar.Calendar_Date",
+    "copied": []
+   },
+   {
+    "child": "Document_Locations.Date_in_Locaton_To",
+    "parent": "Ref_Calendar.Calendar_Date",
+    "copied": []
+   },
+   {
+    "child": "Document_Locations.Document_ID",
+    "parent": "All_Documents.Document_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_to_be_Destroyed.Document_ID",
+    "parent": "All_Documents.Document_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_to_be_Destroyed.Destruction_Authorised_by_Employee_ID",
+    "parent": "Employees.Employee_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_to_be_Destroyed.Destroyed_by_Employee_ID",
+    "parent": "Employees.Employee_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_to_be_Destroyed.Planned_Destruction_Date",
+    "parent": "Ref_Calendar.Calendar_Date",
+    "copied": []
+   },
+   {
+    "child": "Documents_to_be_Destroyed.Actual_Destruction_Date",
+    "parent": "Ref_Calendar.Calendar_Date",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Employees",
+    "column": "Role_Code",
+    "formula": "lower(Role_Code) IN ('ed','hr','mg','pr','pt')"
+   },
+   {
+    "table": "Employees",
+    "column": "Gender_MFU",
+    "formula": "Gender_MFU IN ('M','F','U')",
+    "evidence": "assumption from column name; observed values '' and '1'"
+   },
+   {
+    "table": "Employees",
+    "column": "Date_of_Birth",
+    "formula": "Date_of_Birth >= '1900-01-01 00:00:00' AND Date_of_Birth <= '2020-12-31 23:59:59'"
+   },
+   {
+    "table": "Roles",
+    "column": "Role_Code",
+    "formula": "lower(Role_Code) IN ('ed','hr','mg','pr','pt')"
+   },
+   {
+    "table": "Ref_Document_Types",
+    "column": "Document_Type_Code",
+    "formula": "Document_Type_Code IN ('BK','CV','PR','RV')"
+   },
+   {
+    "table": "Ref_Locations",
+    "column": "Location_Code",
+    "formula": "Location_Code IN ('b','c','e','n','x')"
+   },
+   {
+    "table": "All_Documents",
+    "column": "Document_Type_Code",
+    "formula": "Document_Type_Code IN ('BK','CV','PR','RV')"
+   },
+   {
+    "table": "Document_Locations",
+    "column": "Date_in_Locaton_To",
+    "formula": "Date_in_Locaton_To IS NULL OR Date_in_Locaton_To >= Date_in_Location_From"
+   },
+   {
+    "table": "Documents_to_be_Destroyed",
+    "column": "Actual_Destruction_Date",
+    "formula": "Actual_Destruction_Date IS NULL OR Planned_Destruction_Date IS NULL OR Actual_Destruction_Date >= Planned_Destruction_Date"
+   },
+   {
+    "table": "Ref_Calendar",
+    "column": "Day_Number",
+    "formula": "Day_Number BETWEEN 1 AND 31",
+    "evidence": "assumption from calendar semantics; observed values 1-9"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Ref_Document_Types": 4,
+   "Ref_Locations": 5,
+   "Roles": 5,
+   "Ref_Calendar": 15,
+   "All_Documents": 15,
+   "Employees": 15,
+   "Document_Locations": 15,
+   "Documents_to_be_Destroyed": 11
+  },
+  "null_targets": [
+   "All_Documents.Date_Stored",
+   "All_Documents.Document_Description",
+   "All_Documents.Other_Details",
+   "Document_Locations.Date_in_Locaton_To",
+   "Documents_to_be_Destroyed.Destruction_Authorised_by_Employee_ID",
+   "Documents_to_be_Destroyed.Destroyed_by_Employee_ID",
+   "Documents_to_be_Destroyed.Planned_Destruction_Date",
+   "Documents_to_be_Destroyed.Actual_Destruction_Date",
+   "Documents_to_be_Destroyed.Other_Details",
+   "Employees.Employee_Name",
+   "Employees.Other_Details",
+   "Ref_Calendar.Day_Number",
+   "Roles.Role_Name",
+   "Roles.Role_Description"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "Document_Locations.Date_in_Locaton_To >= Date_in_Location_From",
+    "rows": [
+     "(7,e,2017-01-06,2008-06-08)",
+     "(11,x,1972-03-31,2012-07-03)",
+     "(81,c,2008-06-08,1987-11-05)"
+    ]
+   },
+   {
+    "formula": "Documents_to_be_Destroyed.Actual_Destruction_Date >= Planned_Destruction_Date",
+    "rows": [
+     "(7,1988-02-01,2017-01-06)",
+     "(11,2010-11-26,1986-10-14)",
+     "(25,2009-08-18,1995-01-01)"
+    ]
+   },
+   {
+    "formula": "Employees.Role_Code IN ('ED','HR','MG','PR','PT')",
+    "rows": [
+     "HR",
+     "MG",
+     "ED",
+     "PT",
+     "PR"
+    ]
+   },
+   {
+    "formula": "Ref_Document_Types.Document_Type_Code IN ('BK','CV','PR','RV')",
+    "rows": [
+     "BK",
+     "CV",
+     "PR",
+     "RV"
+    ]
+   },
+   {
+    "formula": "Ref_Locations.Location_Code IN ('b','c','e','n','x')",
+    "rows": [
+     "b",
+     "c",
+     "e",
+     "n",
+     "x"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "Gender_MFU observed values are '' and '1'; enum M/F/U assumed from column name and flagged as an assumption in the semantic rule.",
+   "Day_Number observed values 1-9; range 1-31 assumed from calendar semantics and flagged as an assumption in the semantic rule.",
+   "Date order rules hold on shown rows but NULL end dates are permitted by schema.",
+   "Document_Description and Other_Details are 100% NULL in sample; treated as nullable with at least one NULL.",
+   "Compact null_rate for columns previously hard-coded as 0.0 must be read from schema.original_values; if genuinely 0, the at-least-one-NULL rule is documented explicitly rather than encoded as a 0.0 share.",
+   "PK columns (Employees.Employee_ID, Ref_Document_Types.Document_Type_Code) cannot carry duplicates; duplicates_for_distinct targets on them are removed and replaced by non-PK surrogate targets where applicable."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "specification.py NULLABLE sets ('All_Documents','Date_Stored'): 0.0, ('Document_Locations','Date_in_Locaton_To'): 0.0, ('Documents_to_be_Destroyed','Destruction_Authorised_by_Employee_ID'): 0.0, ('Documents_to_be_Destroyed','Destroyed_by_Employee_ID'): 0.0, ('Documents_to_be_Destroyed','Planned_Destruction_Date'): 0.0, ('Documents_to_be_Destroyed','Actual_Destruction_Date'): 0.0, ('Employees','Employee_Name'): 0.0, ('Ref_Calendar','Day_Number'): 0.0, ('Roles','Role_Name'): 0.0, ('Roles','Role_Description'): 0.0. In instance.py _apply_nulls, k = max(1, int(round(n*share))) so share 0.0 still yields exactly 1 NULL. Execution feedback confirms this: e.g. All_Documents.Date_Stored NULL 20/300 (\u22486.7%, not 0), Document_Locations.Date_in_Locaton_To NULL 19/299, Employees.Employee_Name NULL 20/300, Ref_Calendar.Day_Number NULL 17/251. The spec's null_targets list these columns as nullable, but the compact null_rate is not 0.0 for all of them; the hard-coded 0.0 shares do not follow the compact database's share as required by the interface rule.",
+     "requested_revision": "Derive NULLABLE shares from the compact DB's actual null_rate per column (schema.original_values) rather than hard-coding 0.0, so the generated NULL share follows the compact share while still guaranteeing at least one NULL row per nullable column. Alternatively, if the compact share is genuinely 0 for a column, document that and keep the at-least-one-NULL rule explicit; do not silently encode 0.0 as the share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specification.py SEMANTIC_RULES includes ('Employees','Role_Code') and ('Roles','Role_Code') restricted to ENUM_POOLS['Role_Code'] = ['ED','HR','MG','PR','PT'], and BOUNDARY_LITERALS for these columns include lowercase 'hr' and 'ed'. instance.py _apply_semantic_rules replaces any value failing the predicate with a valid alternative, so the planted lowercase boundary literals 'hr'/'ed' are overwritten and never survive. The comparison_boundary targets for Employees.Role_Code ('HR','hr','ED','ed') and Roles.Role_Code ('HR','hr') therefore cannot be realized. Similarly Roles.Role_Name boundary 'Editor'/'editor' is not covered by any semantic rule but is also not enforced anywhere, so it is only planted probabilistically by _apply_boundary.",
+     "requested_revision": "Reconcile the enum semantic rule with the comparison-boundary targets: either widen the enum predicate to accept the case variants used as boundary literals (e.g. case-insensitive membership), or drop the lowercase boundary literals from BOUNDARY_LITERALS and the spec targets. Ensure _apply_semantic_rules does not clobber planted boundary values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_sizes and _apply_aggregate_boundary build a multiset from distinct values but then truncate with out[:len(values)] after shuffle; when the sum of targets exceeds n (e.g. GROUP_SIZE_TARGETS [1,2,3] sum=6 vs n=15 is fine, but AGGREGATE_BOUNDARY [2,3,4] sum=9 vs n=15 fine), the truncation can drop the >=3 group or the COUNT=4 group depending on shuffle. More importantly, _apply_group_sizes and _apply_aggregate_boundary both operate on the same column (Employees.Role_Code, Roles.Role_Code) sequentially, so the second overwrites the first's shaping; the two patterns are not jointly satisfied. Execution feedback shows construction_pairs separated=14 of 124 eligible, with no per-group breakdown, so the group-size/aggregate-boundary targets are not demonstrably met.",
+     "requested_revision": "Combine group-size and aggregate-boundary shaping into a single pass that jointly satisfies both target sets (e.g. construct a multiset whose group sizes are exactly {1,2,3} and whose counts include 2,3,4), and verify with a post-generation assertion that each target group size and COUNT value occurs. Add execution evidence per group."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_duplicates for ('Employees','Employee_ID') and ('Ref_Document_Types','Document_Type_Code') attempts to plant duplicates, but Employee_ID is an integer PK and Document_Type_Code is a PK; _build_table overwrites integer PKs with sequential values (cols[pk] = range(start, start+n)) after _apply_duplicates, and sample_fresh_primary_keys drops any duplicate PK tuple. So duplicates_for_distinct on PK columns cannot be realized. The spec lists these as duplicates_for_distinct targets (20-50%), which is inconsistent with PK uniqueness.",
+     "requested_revision": "Remove PK columns from DUPLICATE_SHARE targets (they cannot have duplicates by definition), or reinterpret the target as duplicates on a non-PK surrogate. Update the specification's per_column_exceptions accordingly so the program and spec agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty notes: 'Gender_MFU observed values are \"\" and \"1\"; enum M/F/U assumed from column name' and 'Day_Number observed values 1-9; range 1-31 assumed'. The semantic rules Gender_MFU IN ('M','F','U') and Day_Number BETWEEN 1 AND 31 are therefore assumptions, not evidence-backed. The supporting_evidence block does not include rows demonstrating Gender_MFU or Day_Number values. These are uncertain patterns, not supported rules.",
+     "requested_revision": "Mark Gender_MFU and Day_Number domain rules as uncertain in the specification (or supply compact-DB evidence). If kept, ensure the program's ENUM_POOLS['Gender_MFU'] and _day_in_range are flagged as assumptions so downstream consumers do not treat them as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the compact DB and appends rows with foreign_keys=OFF and no explicit preservation check; execution feedback reports rows_added for Ref_Document_Types=0, Ref_Locations=0, Roles=0 (table sizes 4/5/5 but all rows dropped by sample_fresh_primary_keys because generated PKs collide with compact keys or because _apply_enum/_apply_boundary produced duplicates). The spec's table_sizes_per_instance expects 4/5/5 generated rows for these reference tables, but zero are added, so the intended value variation (unmatched_join_rows parent_rows_without_children, group_sizes, comparison_boundary on Roles.Role_Code) cannot be exercised on generated rows.",
+     "requested_revision": "Fix reference-table generation so the specified table sizes are actually appended (e.g. generate fresh PKs above compact max for CHAR PKs, or allow appending distinct enum values). Add a post-write assertion that rows_added matches table_sizes_per_instance for reference tables, and report per-table added counts in execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_nulls is applied to FK columns after fill_foreign_keys_consistently, but _apply_semantic_rules and _fix_date_order run afterward and can replace NULLs? _fix_date_order only touches non-NULL pairs, so NULLs survive; however _apply_semantic_rules iterates rows and for a failing row replaces the offending value with a non-NULL candidate, which can overwrite a planted NULL in a nullable column if that column is in SEMANTIC_RULES. For nullable FK columns not in SEMANTIC_RULES this is fine, but the interface rule 'a planted NULL is never replaced to satisfy a rule' is not explicitly enforced in code.",
+     "requested_revision": "In _apply_semantic_rules, skip replacement when the current value is NULL (three-valued logic: rule holds when expression is not FALSE), and add an assertion that planted NULLs in nullable columns are preserved through all post-processing."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's actual null_rate for the columns hard-coded as 0.0 is truly 0; the execution feedback shows non-zero generated NULL shares, suggesting the compact share is non-zero and the 0.0 constants are wrong.",
+    "Whether construction_pairs separated=14/124 is due to genuine query equivalence or to the group-size/aggregate-boundary shaping not being jointly satisfied; no per-group breakdown was provided.",
+    "Whether the reference tables (Ref_Document_Types, Ref_Locations, Roles) receiving 0 generated rows is acceptable given the spec's table_sizes_per_instance, or whether it blocks the unmatched_join_rows/group_sizes targets on those tables."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Semantic rule for Employees.Gender_MFU ('M','F','U') is flagged as an assumption; observed compact values are '' and '1', which are not in the assumed domain. Similarly Ref_Calendar.Day_Number range 1-31 is assumed from calendar semantics (observed 1-9). Both are explicitly documented in specification.uncertainty and ASSUMED_DOMAINS.",
+     "requested_revision": "No blocking change. Optionally widen Gender_MFU domain to include observed '' and '1' or document that the assumption intentionally overrides observed values; keep the assumption flag."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Employees.Role_Code and Roles.Role_Code group_sizes/aggregate_boundary targets are applied to the same column via _apply_group_and_aggregate, but the aggregate targets (COUNT=2,3,4) and group-size targets (1,2,>=3) are drawn from the same distinct pool and may overlap; the joint pass satisfies both target sets but does not guarantee the aggregate counts are realized on distinct groups (e.g. a group of size 3 also satisfies '>=3' but not COUNT=3 unless the same value is reused). The construction_pairs feedback shows 18/124 separated, which is consistent with the spec but not proof of full coverage.",
+     "requested_revision": "No blocking change; the joint pass is a reasonable implementation. If stricter coverage is desired, add a post-generation assertion that each aggregate target count occurs on a distinct value."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: All_Documents.Document_Name shows 'NULL 0 / 300' but Document_Name is not in NULLABLE and is not declared nullable in the schema (CHAR(255) with no NOT NULL, so it is nullable in SQLite). The spec's null_targets list omits it, so the program correctly does not plant NULLs there. This is a spec/feedback mismatch, not a program error.",
+     "requested_revision": "No blocking change. Optionally add All_Documents.Document_Name to NULLABLE if the intent is to exercise NULLs there; otherwise note the feedback line is informational."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Documents_to_be_Destroyed rows_added is 120 across 20 instances (6/instance) while TABLE_SIZES specifies 11. The shortfall is because sample_fresh_primary_keys drops rows whose Document_ID collides with compact keys or earlier generated keys, and Documents_to_be_Destroyed.Document_ID is an FK to All_Documents.Document_ID (not a fresh PK). The writer's ref_shortfall check only covers Ref_* tables, so this is not flagged.",
+     "requested_revision": "No blocking change for integrity (0 FK violations, 0 PK duplicates). If exact table sizes are required, the engineer should draw Documents_to_be_Destroyed.Document_ID from the All_Documents generated pool without PK-dedup (it is not a PK of this table) or extend the shortfall assertion to all tables."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_semantic_rules replaces failing values with the first valid candidate from the same column, which can collapse variation (e.g. all invalid Role_Code values become the same valid code). Combined with _apply_enum forcing enum membership, boundary literals 'hr'/'ed' survive only because _role_code_ok is case-insensitive, as intended.",
+     "requested_revision": "No blocking change; behavior matches the spec's case-insensitive boundary rule. Optionally randomize the replacement candidate to preserve variation."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the joint group/aggregate pass actually realizes COUNT=2,3,4 on distinct values (not just overlapping groups) was not verified by an explicit assertion; construction_pairs separated=18/124 is consistent but not conclusive.",
+    "Documents_to_be_Destroyed per-instance row count (6 vs specified 11) is a size shortfall not covered by the writer's ref_shortfall assertion; integrity is intact but the specified table size is not met.",
+    "All_Documents.Document_Name nullable-in-schema but not in NULLABLE list: feedback shows 0 NULLs; this is a spec choice, not a program defect."
+   ]
+  }
+ ]
 }

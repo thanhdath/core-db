@@ -1,49 +1,752 @@
 {
  "db": "book_publishing_company",
- "operator_io_quirks": [
-  "All tables/columns are lowercase, no spaces; identifiers still need double-quoting (e.g. \"type\", \"contract\").",
-  "Tiny DB (max 86 rows in roysched); read_schema row sampling is a no-op here, full read is cheap.",
-  "DATETIME columns (hire_date, pubdate, ord_date) store TEXT like '1991-10-26 00:00:00.0' \u2014 declared type dispatches to Date|Number(int elements) branch; first element is not int so Date fuzzer, but template must parse the 'YYYY-MM-DD HH:MM:SS.0' form.",
-  "pub_info.logo is BLOB but storage class is text (hex strings '0x4749...'); declared BLOB dispatches to String fuzzer, not blob branch.",
-  "discounts has NO primary key (pk=[]); sample_fresh_primary_keys must handle empty PK (no dedup).",
-  "roysched has NO primary key either; same empty-PK path.",
-  "Composite PKs: sales(stor_id,ord_num,title_id), titleauthor(au_id,title_id) \u2014 composite-PK members get max_l0=30 cap.",
-  "FK employee.pub_id -> publishers.pub_id, but employee.pub_id samples include '9999','9952' not in publishers (8 rows) \u2014 dangling child values exist in original; FK fill must draw from parent's generated values, not original.",
-  "discounts.stor_id has null_rate 0.667 and only value '8042' (not in stores) \u2014 FK column mostly NULL, single non-null dangling value.",
-  "authors.contract has distinct=1 ('0') \u2014 String fuzzer will see one element; int-like string '0' triggers +1/-1 neighbors ('1','-1').",
-  "employee.minit has empty-string sample '' \u2014 String fuzzer length range includes 0.",
-  "titles.type has 'UNDECIDED' mixed with lowercase enum values \u2014 case-sensitive string comparisons matter."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all TEXT columns: random a-zA-Z0-9() strings length 0-20 plus contaminate; names/phones/cities become gibberish \u2014 drives FN on queries filtering real names (e.g. 'White', 'CA').",
-  "Date fuzzer on hire_date/pubdate/ord_date: template from first parsable element likely '%Y-%m-%d %H:%M:%S.0' or similar; range 1800-2100 if <2 distinct parsed \u2014 dates scatter widely, breaking year/month predicates (e.g. pubdate in 1991).",
-  "Number fuzzer on INTEGER/REAL: full range [-10^scale,10^scale] with scale from type args (none here -> default), so job_lvl, qty, price, discount get implausible magnitudes \u2014 FN on range predicates (qty>50, price<20).",
-  "Number list_max quirk: upper end overwritten to full-range max, so even with elements the fresh draws dominate \u2014 ties/duplicates rare, FP on GROUP BY / DISTINCT / COUNT(DISTINCT) queries.",
-  "String fuzzer on PK columns (au_id, emp_id, title_id, stor_id, pub_id) generates random strings, not the '172-32-1176' / 'BU1032' patterns \u2014 joins still work (FK drawn from parent) but literal predicates on PKs fail.",
-  "FK fill draws from parent's FINAL filtered values with replacement; small parents (publishers=8, stores=6, jobs=14) mean heavy duplication in child FK columns \u2014 good for joins, bad for COUNT(DISTINCT pub_id).",
-  "Empty-PK tables (discounts, roysched) get no PK dedup; roysched.title_id drawn from titles (18 rows) with replacement -> many duplicate title_id rows, plausible for range joins but inflates counts.",
-  "discounts.stor_id mostly NULL in original; TS will draw from stores (6 values) or NULL \u2014 changes null_rate, may flip IS NULL predicates.",
-  "authors.contract single value '0' -> String fuzzer with 1 element: p=1 path returns element mostly, but contaminate w.p. 0.5 corrupts it \u2014 contract='0' predicates become unreliable.",
-  "BLOB logo as String: random strings inserted into BLOB column, sqlite stores as text \u2014 queries on logo (rare) get type-mismatched results.",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs \u2014 drop_unique_duplicates only acts on PKs; NOT NULL violations (e.g. NULL in fname) fail at insert and are skipped, shrinking tables."
- ],
- "challenger_refs": [
-  "G4",
-  "g2c9a8711",
-  "G12",
-  "g3be70b6c",
-  "G13",
-  "G3",
-  "G9",
-  "G11",
-  "G5",
-  "G7"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generation_notes": {
+   "strategy": "Copy the compact (original) database, then append generated rows. Never delete or modify compact rows. Insert with foreign_keys=ON and fail loudly on any constraint violation.",
+   "row_counts": "For each table, append the number of rows given in table_sizes_per_instance; these are added to the compact rows.",
+   "order": "publishers, jobs, stores, authors, titles, employee, pub_info, roysched, sales, titleauthor, discounts.",
+   "fk_consistency": "Child FK values are drawn only from parent key values that exist in the written DB (compact rows plus successfully inserted generated parent rows). No synthetic parent values are appended without a full valid parent row.",
+   "null_rule": "For every nullable column (including nullable FKs), each instance contains at least one NULL and at least one non-NULL value when parent values exist; NULL share follows the compact share. NOT NULL and PK columns never get NULL. Planted NULLs are never replaced.",
+   "boundary_rule": "For each column with a comparison_boundary pattern, include the listed literal(s) and one step on each side (numbers by 1, dates by one day in the column format, text by case variants). Literals are normalized to the declared column type. Boundary literals are planted as-is and are not clamped by range rules.",
+   "pk_rule": "Primary keys and UNIQUE tuples are generated fresh and unique against BOTH the compact rows and the generated batch. Text PKs use a stable prefix + zero-padded counter; integer PKs use fresh integers above the compact max. Never reuse an original value.",
+   "group_sizes_rule": "For columns with a group_sizes pattern, draw values so that some groups have size 1, some 2, and some >= 3 (for FK columns, draw parent keys with that multiplicity).",
+   "ties_rule": "For columns with a ties_for_order_limit pattern, ensure the value with the highest COUNT(*) is shared by at least two rows (a genuine tie at rank 1), for both ASC and DESC where specified."
+  },
+  "generic_sampling_rules": {
+   "text_primary_key": "Fresh unique value per row: stable prefix + zero-padded counter; guaranteed unique against compact and generated rows; never reuse an original value.",
+   "integer_primary_key": "Fresh integer above the compact max; unique against compact and generated rows.",
+   "text_not_null": "Sample from a small realistic pool; allow case near-variants only where the column is not a key.",
+   "text_nullable": "Emit NULL with the compact NULL share (at least one NULL per instance); otherwise sample from a small realistic pool.",
+   "integer_not_null": "Sample uniformly from the observed min..max range; keep integer type.",
+   "integer_nullable": "Emit NULL with the compact NULL share (at least one NULL per instance); otherwise sample uniformly from the observed min..max range.",
+   "real_not_null": "Sample uniformly from the observed min..max range, rounded to 2 decimals.",
+   "real_nullable": "Emit NULL with the compact NULL share (at least one NULL per instance); otherwise sample from the observed range, rounded to 2 decimals.",
+   "datetime_not_null": "Sample a datetime between the observed min and max, formatted 'YYYY-MM-DD HH:MM:SS.0'.",
+   "datetime_nullable": "Emit NULL with the observed share; otherwise sample a datetime in range.",
+   "text_enum": "Choose uniformly from the enumerated values.",
+   "integer_range": "Sample uniformly within the stated inclusive bounds.",
+   "fresh_value_share": "At least 60% of generated values in each column are fresh (not copied from original rows)."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "publishers",
+    "column": "pub_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "publishers",
+    "column": "pub_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "publishers",
+    "column": "pub_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "GGG&G",
+      "ggg&g",
+      "Binnet & Hardley",
+      "binnet & hardley"
+     ]
+    }
+   },
+   {
+    "table": "publishers",
+    "column": "country",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "publishers",
+    "column": "city",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "unordered"
+    }
+   },
+   {
+    "table": "titles",
+    "column": "title",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Life Without Fear",
+      "life without fear"
+     ]
+    }
+   },
+   {
+    "table": "titles",
+    "column": "pub_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "titles",
+    "column": "price",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "titles",
+    "column": "price",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "titles",
+    "column": "pubdate",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1990-12-31 00:00:00.0",
+      "1991-01-01 00:00:00.0",
+      "1991-12-31 00:00:00.0",
+      "1992-01-01 00:00:00.0"
+     ]
+    }
+   },
+   {
+    "table": "titles",
+    "column": "pubdate",
+    "pattern": "like_near_variant",
+    "targets": {
+     "values": [
+      "1991%"
+     ]
+    }
+   },
+   {
+    "table": "titles",
+    "column": "title_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "14",
+      "15",
+      "16",
+      "BU2075",
+      "bu2075"
+     ]
+    }
+   },
+   {
+    "table": "jobs",
+    "column": "job_desc",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Designer",
+      "designer",
+      "Editor",
+      "editor",
+      "DESIGNER"
+     ]
+    }
+   },
+   {
+    "table": "jobs",
+    "column": "job_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "employee.job_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "employee",
+    "column": "job_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "jobs.job_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "employee",
+    "column": "fname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "employee",
+    "column": "lname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "employee",
+    "column": "minit",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "P",
+      "p",
+      "S",
+      "s",
+      "W",
+      "w"
+     ]
+    }
+   },
+   {
+    "table": "employee",
+    "column": "hire_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1989-12-31 00:00:00.0",
+      "1990-01-01 00:00:00.0",
+      "1990-01-02 00:00:00.0",
+      "1990-12-31 00:00:00.0",
+      "1991-01-01 00:00:00.0"
+     ]
+    }
+   },
+   {
+    "table": "stores",
+    "column": "stor_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "stores",
+    "column": "stor_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "7065",
+      "7066",
+      "7067"
+     ]
+    }
+   },
+   {
+    "table": "stores",
+    "column": "stor_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "stores",
+    "column": "city",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "stores",
+    "column": "state",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Massachusetts",
+      "massachusetts",
+      "MA",
+      "ma",
+      "%Massachusetts%",
+      "%massachusetts%"
+     ]
+    }
+   },
+   {
+    "table": "sales",
+    "column": "stor_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "7065",
+      "7066",
+      "7067"
+     ]
+    }
+   },
+   {
+    "table": "sales",
+    "column": "qty",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "sales",
+    "column": "ord_num",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "roysched",
+    "column": "lorange",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1
+     ]
+    }
+   },
+   {
+    "table": "roysched",
+    "column": "royalty",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9,
+      10,
+      11
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "employee",
+    "child_column": "job_id",
+    "parent_table": "jobs",
+    "parent_column": "job_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "employee",
+    "child_column": "pub_id",
+    "parent_table": "publishers",
+    "parent_column": "pub_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "pub_info",
+    "child_column": "pub_id",
+    "parent_table": "publishers",
+    "parent_column": "pub_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "titles",
+    "child_column": "pub_id",
+    "parent_table": "publishers",
+    "parent_column": "pub_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "roysched",
+    "child_column": "title_id",
+    "parent_table": "titles",
+    "parent_column": "title_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "sales",
+    "child_column": "stor_id",
+    "parent_table": "stores",
+    "parent_column": "stor_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "sales",
+    "child_column": "title_id",
+    "parent_table": "titles",
+    "parent_column": "title_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "titleauthor",
+    "child_column": "au_id",
+    "parent_table": "authors",
+    "parent_column": "au_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "titleauthor",
+    "child_column": "title_id",
+    "parent_table": "titles",
+    "parent_column": "title_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "discounts",
+    "child_column": "stor_id",
+    "parent_table": "stores",
+    "parent_column": "stor_id",
+    "copied_columns": []
+   },
+   {
+    "table": "sales",
+    "unique_tuple": [
+     "stor_id",
+     "ord_num",
+     "title_id"
+    ]
+   },
+   {
+    "table": "titleauthor",
+    "unique_tuple": [
+     "au_id",
+     "title_id"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "jobs",
+    "column": "min_lvl",
+    "formula": "min_lvl >= 0"
+   },
+   {
+    "table": "jobs",
+    "column": "max_lvl",
+    "formula": "max_lvl >= min_lvl"
+   },
+   {
+    "table": "employee",
+    "column": "job_lvl",
+    "formula": "job_lvl BETWEEN (SELECT min_lvl FROM jobs WHERE jobs.job_id = employee.job_id) AND (SELECT max_lvl FROM jobs WHERE jobs.job_id = employee.job_id)",
+    "condition": "job_lvl IS NOT NULL",
+    "evidence": "A-C71970F job_id=10 job_lvl=87 in [10,10]; A-R89858F job_id=6 job_lvl=152 in [120,165]; AMD15433F job_id=3 job_lvl=200 in [175,225]."
+   },
+   {
+    "table": "titles",
+    "column": "price",
+    "formula": "price >= 0",
+    "condition": "price IS NOT NULL"
+   },
+   {
+    "table": "titles",
+    "column": "advance",
+    "formula": "advance >= 0",
+    "condition": "advance IS NOT NULL"
+   },
+   {
+    "table": "titles",
+    "column": "royalty",
+    "formula": "royalty BETWEEN 0 AND 100",
+    "condition": "royalty IS NOT NULL",
+    "evidence": "BU1032 royalty=10, BU1111 royalty=24, BU2075 royalty=12 all in [0,100]."
+   },
+   {
+    "table": "titles",
+    "column": "ytd_sales",
+    "formula": "ytd_sales >= 0",
+    "condition": "ytd_sales IS NOT NULL"
+   },
+   {
+    "table": "titles",
+    "column": "type",
+    "formula": "type IN ('business','mod_cook','UNDECIDED','popular_comp','psychology','trad_cook')"
+   },
+   {
+    "table": "discounts",
+    "column": "discount",
+    "formula": "discount BETWEEN 0 AND 100"
+   },
+   {
+    "table": "discounts",
+    "column": "lowqty",
+    "formula": "lowqty >= 0",
+    "condition": "lowqty IS NOT NULL"
+   },
+   {
+    "table": "discounts",
+    "column": "highqty",
+    "formula": "highqty >= lowqty",
+    "condition": "highqty IS NOT NULL AND lowqty IS NOT NULL",
+    "evidence": "Row (8042,100,1000,10.5) satisfies highqty>=lowqty."
+   },
+   {
+    "table": "roysched",
+    "column": "lorange",
+    "formula": "lorange >= 0",
+    "condition": "lorange IS NOT NULL"
+   },
+   {
+    "table": "roysched",
+    "column": "royalty",
+    "formula": "royalty BETWEEN 0 AND 100",
+    "condition": "royalty IS NOT NULL"
+   },
+   {
+    "table": "sales",
+    "column": "qty",
+    "formula": "qty > 0",
+    "evidence": "Rows qty=5,3,50,75,10,40,20,25 all > 0."
+   },
+   {
+    "table": "sales",
+    "column": "payterms",
+    "formula": "payterms IN ('Net 60','Net 30','ON invoice')"
+   },
+   {
+    "table": "titleauthor",
+    "column": "au_ord",
+    "formula": "au_ord >= 1",
+    "condition": "au_ord IS NOT NULL"
+   },
+   {
+    "table": "titleauthor",
+    "column": "royaltyper",
+    "formula": "royaltyper BETWEEN 0 AND 100",
+    "condition": "royaltyper IS NOT NULL"
+   },
+   {
+    "table": "authors",
+    "column": "contract",
+    "formula": "contract IN ('0','1')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "publishers": 8,
+   "jobs": 14,
+   "authors": 23,
+   "stores": 6,
+   "titles": 18,
+   "employee": 43,
+   "pub_info": 7,
+   "roysched": 86,
+   "sales": 21,
+   "titleauthor": 25,
+   "discounts": 3
+  },
+  "null_targets": [
+   "authors.address",
+   "authors.city",
+   "authors.state",
+   "authors.zip",
+   "discounts.stor_id",
+   "discounts.lowqty",
+   "discounts.highqty",
+   "employee.minit",
+   "employee.job_lvl",
+   "pub_info.logo",
+   "pub_info.pr_info",
+   "publishers.pub_name",
+   "publishers.city",
+   "publishers.state",
+   "publishers.country",
+   "roysched.lorange",
+   "roysched.hirange",
+   "roysched.royalty",
+   "stores.stor_name",
+   "stores.stor_address",
+   "stores.city",
+   "stores.state",
+   "stores.zip",
+   "titleauthor.au_ord",
+   "titleauthor.royaltyper",
+   "titles.pub_id",
+   "titles.price",
+   "titles.advance",
+   "titles.royalty",
+   "titles.ytd_sales",
+   "titles.notes"
+  ],
+  "supporting_evidence": {
+   "employee.job_lvl": "Rows: (A-C71970F, job_id=10, job_lvl=87) within jobs(10,10,10); (A-R89858F, job_id=6, job_lvl=152) within jobs(6,120,165); (AMD15433F, job_id=3, job_lvl=200) within jobs(3,175,225).",
+   "discounts.highqty": "Row (8042,100,1000,10.5) satisfies highqty>=lowqty.",
+   "titles.royalty": "Rows: BU1032 royalty=10, BU1111 royalty=24, BU2075 royalty=12 all in [0,100].",
+   "sales.qty": "Rows: qty=5,3,50,75,10,40,20,25 all > 0."
+  },
+  "uncertainty": "The roysched sample contains one row (BU2075, lorange=2001, hirange=2000) that violates hirange>=lorange; the rule is therefore NOT stated as a hard constraint and the program must not clamp hirange. The employee.job_lvl range rule uses a correlated subquery which may not be supported by the checker; it is stated as a semantic rule with condition. The titles.pubdate lower bound 1990-01-01 and employee.hire_date lower bound 1989-01-01 are NOT stated as hard rules (no observed data supports them); the boundary literals are planted as-is and are not clamped. The stores.state comparison_boundary targets include full state names not present in the original data; these are planted near-variants for the boundary pattern. The stores.stor_id / sales.stor_id boundary is a per-column literal list only; no cross-table ordering relation is enforced."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 2284 across 20 instances, pk_duplicates = 7, and validity.reasons shows 'new_integrity_failures' for all 20 instances. The writer (writer.py) sets 'pragma foreign_keys = OFF' and inserts generated rows with executemany, silently skipping failing rows; instance.py's fill_foreign_keys_consistently draws child FK values from _parent_values, which includes compact parent values, but the generated child rows are appended to a copy of the compact DB whose parent rows may have been filtered/dropped by sample_fresh_primary_keys/drop_unique_* on the generated side, and _ensure_unmatched_parent appends a fresh parent value to instance[table][column] without a matching row in the actual DB (it appends None to other columns, which for NOT NULL columns like jobs.job_desc would fail insertion). The net effect is thousands of FK violations and PK duplicates in the written instances.",
+     "requested_revision": "Make FK generation consistent with what is actually written: (a) do not append synthetic parent values in _ensure_unmatched_parent that are not inserted as full valid rows (or insert them as complete rows satisfying NOT NULL/PK); (b) ensure child FK values are drawn only from parent values that will actually exist in the written DB (compact + successfully inserted generated rows); (c) do not silently skip rows that violate constraints \u2014 either fix generation so all rows insert, or report and fail; (d) verify with foreign_keys=ON that fk_violations=0 and pk_duplicates=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "validity.reasons shows 'compact_rows_missing' for all 20 instances. writer.py copies the compact DB via shutil.copyfile only when orig_path is passed, but cli.py calls write_instance_sqlite(_G['schema'], inst, p) with no orig_path, so the writer falls back to creating tables from schema.ddl and inserting only generated rows \u2014 the compact rows are never present. This also explains why the 'append to a copy' design in the docstring is not realized.",
+     "requested_revision": "Pass the original DB path through to write_instance_sqlite (e.g. store it in args and forward it), so the compact rows are preserved and generated rows are appended, as the specification and docstring require."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable-column feedback shows many nullable columns with 'NULL 0 / n' (authors.address/city/state/zip, discounts.stor_id, roysched.hirange/lorange/royalty, titleauthor.au_ord/royaltyper). Per instruction 7 this is noted but not blocking; however it indicates the NULL rule is not being applied for these columns. In values.py, _want_null returns True only when self.nullable; but for FK columns (discounts.stor_id) the sampler is bypassed entirely \u2014 fill_foreign_keys_consistently always emits rng.choice(pv) with no NULL option, so nullable FKs never get NULL. For roysched/titleauthor columns the samplers are created but _apply_semantic_rules clamps values and the null_share from compact data may be 0, and _want_null's 'at least one NULL' branch requires nonnull_emitted >= n_rows-1 which may not trigger before rows run out.",
+     "requested_revision": "Apply the NULL rule to nullable FK columns in fill_foreign_keys_consistently (emit NULL with the compact share, at least one per instance), and ensure _want_null reliably plants at least one NULL per nullable column regardless of ordering. This is a noted issue per instruction 7 but should be fixed for spec compliance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rule for roysched.hirange states 'hirange >= lorange' with condition, but supporting_evidence admits a violating row (BU2075, lorange=2001, hirange=2000) and the uncertainty note says the rule 'constrains only rows where it holds'. This is not a well-defined constraint. Similarly, the employee.job_lvl correlated-subquery rule is flagged as possibly unsupported by the checker. The stores.state comparison_boundary targets include values ('Massachusetts', 'MA', '%Massachusetts%') not present in the original data, and the spec itself notes these are 'planted near-variants'.",
+     "requested_revision": "Either state roysched.hirange >= lorange as an unconditional rule (and fix the violating compact row handling) or drop it; clarify whether employee.job_lvl range is enforced; and confirm that planting state values absent from the compact data is intended (it changes the domain). These are specification clarity issues, not blocking, but should be resolved so the program and spec agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py EXCEPTIONS for ('stores','stor_id') and ('sales','stor_id') list comparison_boundary values [7065,7066,7067] but the schema declares stor_id as TEXT; the sampler will coerce via StringSampler and the boundary values are ints, so _coerce returns them unchanged (StringSampler has no _coerce override), producing mixed int/str values in a TEXT column. Also ('titles','title_id') boundary values include ints 14,15,16 for a TEXT PK, and ('stores','stor_id') group_sizes is applied to a primary key column, which conflicts with sample_fresh_primary_keys deduplication.",
+     "requested_revision": "Normalize boundary literals to the declared column type (str for TEXT columns) before sampling, and do not apply group_sizes/duplicates patterns to primary-key columns in a way that conflicts with PK uniqueness."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 66/159 separated construction pairs reflect genuine value variation or are an artifact of the integrity failures (FK/PK violations and missing compact rows) \u2014 cannot be assessed until integrity is fixed.",
+    "Whether the compact-row preservation fix restores the intended 'append to copy' semantics and whether generated FK values then match existing parent rows.",
+    "Whether the roysched.hirange and employee.job_lvl semantic rules are intended to be enforced or are soft/uncertain."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with RuntimeError('row insert failed for table authors: IntegrityError(UNIQUE constraint failed: authors.au_id)'). The failing rows show au_id values copied from the compact database (e.g. '486-29-1786', '213-46-8915', '409-56-7008', '341-22-1782') being re-inserted. In tscore_gen/values.py, _init_sampler builds `els` from `rng.choices(ov, ...)` (original values) plus the literal pool, and for single-column PKs like au_id it sets `max_l0 = float('inf')` so `_fresh_or_reuse` never caps the fresh list and `_draw`/`_coerce` can return original values. instance.sample_fresh_primary_keys only dedups within the generated batch, not against compact rows already present in the copied DB, so a generated au_id equal to an existing compact au_id violates the PK on insert.",
+     "requested_revision": "Ensure generated primary-key values never collide with compact rows. Either (a) exclude original PK values from the sampler pool for PK columns and generate fresh unique values (e.g. prefix+counter) as the spec's pk_rule requires, or (b) in instance.sample_fresh_primary_keys / writer, dedup generated PK tuples against the compact PK set read from schema.original_values before insert. The spec's pk_rule ('Primary keys and UNIQUE tuples are generated fresh and unique; never reuse an original value') must be enforced against the compact rows, not only within the generated batch. Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's generic_sampling_rules.text_primary_key says 'Fresh unique value per row: stable prefix + zero-padded counter; never reuse an original value.' The program does not implement this: values._init_sampler for PK columns (au_id, emp_id, pub_id, stor_id, title_id, job_id) samples from original values and the literal pool, and StringSampler._draw produces random CHARSET strings, not a stable prefix + counter. This is the root cause of the PK collision above and also means PK values are not reproducible in the specified form.",
+     "requested_revision": "Implement the text_primary_key rule as specified: for text PK columns, generate a stable prefix + zero-padded counter that is guaranteed unique against both compact and generated rows. For integer PKs (jobs.job_id) generate fresh integers above the compact max. Keep the existing dedup as a safety net."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec lists comparison_boundary targets for stores.stor_id and sales.stor_id as ['7065','7066','7067'] with 'equal_and_one_step_from': ['sales.stor_id'] / ['stores.stor_id']. These are TEXT columns, but the boundary values are numeric strings and the pattern is a cross-table comparison (sales.stor_id < stores.stor_id). The spec does not state how the 'one step' relation between the two tables' stor_id values is to be realized (e.g. which side gets 7065 vs 7066 vs 7067), and the program's _boundary_values only plants the literals per column independently, so the cross-table ordering relation is not guaranteed. This is an under-specified pattern.",
+     "requested_revision": "Clarify the intended construction for the cross-table stor_id boundary (which table holds which of 7065/7066/7067, and how 'equal and one step from' is realized), or downgrade it to a per-column boundary literal list. If the cross-table relation is intended, specify it as a dependency the program must enforce."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty note admits the roysched sample contains a row (BU2075, lorange=2001, hirange=2000) violating hirange>=lorange, and states the rule 'with a condition so it constrains only rows where it holds.' The program's _apply_semantic_rules for roysched clamps hirange up to lorange, which enforces the rule unconditionally on generated rows. This is a mismatch between the stated (conditional) rule and the implemented (unconditional) rule, and the evidence for the rule is weak (one violating row in the compact data).",
+     "requested_revision": "Decide whether hirange>=lorange is a hard rule (then state it unconditionally and keep the clamp) or a soft/conditional rule (then the program should not clamp). Align spec and program. Given the compact data violates it, either drop the rule or state it as a soft preference; do not silently enforce a rule the evidence contradicts."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty note says the titles.pubdate lower bound 1990-01-01 is 'inferred from the observed minimum 1991-06-09 and the boundary targets; it is a soft bound.' The program enforces it as a hard clamp in _apply_semantic_rules (pubdate < 1990-01-01 -> 1990-01-01) and in DateSampler._coerce. Similarly employee.hire_date >= 1989-01-01 is stated as a rule but the supporting evidence is only the boundary targets, not observed data. These are weakly supported rules being enforced as hard constraints.",
+     "requested_revision": "Either provide evidence that these lower bounds hold in the compact data (and state them as hard rules), or mark them as soft and have the program not clamp. The boundary targets alone (which are planted near-variants) are not evidence for a domain lower bound."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_rule says 'For every nullable column (including nullable FKs), each instance contains at least one NULL and at least one non-NULL value.' In instance.fill_foreign_keys_consistently, when `pv` is empty (no parent rows) the code appends None for every row, which can produce an all-NULL nullable FK column (no non-NULL value), violating the 'at least one non-NULL' half of the rule. Also, for nullable FK columns the null logic uses `rng.random() < 0.5` for the first row, which can emit NULL on row 0 and then rely on the share; the 'at least one non-NULL' guarantee is not explicitly enforced.",
+     "requested_revision": "In fill_foreign_keys_consistently, guarantee at least one non-NULL value for nullable FK columns when parent values exist, and handle the empty-parent case explicitly (either skip generating child rows or document that the column is all-NULL because no parent exists). Add an explicit non-NULL counter analogous to null_emitted."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's boundary_rule says 'For each column with a comparison_boundary pattern, include the listed literal(s) and one step on each side (numbers by 1, dates by one day in the column format, text by case variants).' For date columns (employee.hire_date, titles.pubdate) the spec lists explicit boundary values including one-day steps, and the program's _boundary_values for date literals only adds case variants (which are no-ops for dates) and does not add +/- one day. The DateSampler._coerce clamps to the lower bound, so a boundary value below the lower bound (e.g. 1989-12-31 for hire_date) is silently replaced by 1989-01-01, losing the intended boundary.",
+     "requested_revision": "For date boundary literals, add one-day steps in the column format (as the spec's boundary_rule requires) and do not clamp boundary literals to the lower bound; the boundary values are explicitly listed and should be planted as-is. If a listed boundary value is below the stated lower bound, the spec should be reconciled (either the lower bound is wrong or the boundary value is not intended)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions include ('titles','pub_id') group_sizes with targets '1, 2 and >= 3', and ('stores','city') group_sizes. The program's ColumnSampler._group_plan returns [1,2,3,3] but the plan is never actually used to control group sizes: `_group_i` is incremented but the value is not used to repeat or vary values, and for FK columns (titles.pub_id) the sampler is bypassed entirely (fill_foreign_keys_consistently draws uniformly from parent values). So the group_sizes pattern is not implemented for titles.pub_id or stores.city.",
+     "requested_revision": "Implement group_sizes for the specified columns: for titles.pub_id, draw parent pub_id values so that some groups have size 1, some 2, and some >=3; for stores.city, produce city values with the specified group-size distribution. The current _group_plan is dead code."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions include ('publishers','pub_name') and ('publishers','city') ties_for_order_limit with tie_at_rank [1]. The program's ColumnSampler._tie_target returns True and _tie_emitted caps at 2, but the tie value is only set from the first non-NULL drawn value and the tie is emitted at most twice; there is no guarantee that the top-ranked group (by COUNT(*)) is actually tied. The pattern is nominally present but not verified to produce a tie at rank 1.",
+     "requested_revision": "Implement ties_for_order_limit so that the value with the highest COUNT(*) is shared by at least two rows (a genuine tie at rank 1), for both ASC and DESC as the spec requires. The current implementation does not guarantee the tie is at rank 1."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include employee.job_lvl BETWEEN (SELECT min_lvl FROM jobs WHERE jobs.job_id = employee.job_id) AND (SELECT max_lvl ...), with the uncertainty note that 'the correlated subquery ... may not be supported by the checker.' The program implements this in _apply_semantic_rules by clamping job_lvl to [min_lvl, max_lvl] of the referenced job. This is a reasonable implementation, but the rule's evidence is only three sample rows and the spec itself flags uncertainty. It is supported but weakly.",
+     "requested_revision": "No change required if the clamp is kept; note that the rule is supported by only three sample rows and the correlated-subquery form may not be checkable. Consider restating it as a plain range rule per job_id to make it checkable."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify that generated rows preserve compact rows: the writer copies the compact DB and appends, which is correct in principle, but all units failed before commit, so preservation was not exercised end-to-end.",
+    "Could not verify FK consistency for generated child rows (employee.job_id, titles.pub_id, sales.stor_id/title_id, etc.) because generation aborted at the authors table before those tables were written.",
+    "Could not verify reproducible generation (same seed -> same instance) because no instance was successfully written.",
+    "Could not verify the NULL share matches the compact share for each nullable column, since no instance was produced.",
+    "The comparison_boundary for stores.stor_id / sales.stor_id cross-table relation and the roysched.hirange>=lorange conditional rule remain under-specified; these need designer clarification before they can be checked."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The spec's uncertainty note says the roysched sample contains a row (BU2075, lorange=2001, hirange=2000) violating hirange>=lorange, so the rule is not stated as a hard constraint. However, the spec's semantic_rules_and_formulas list does not include a hirange>=lorange rule at all, and the program's _apply_semantic_rules correctly does not clamp hirange. This is consistent, but the spec's uncertainty text is slightly misleading by implying the rule was considered and rejected rather than simply omitted.",
+     "requested_revision": "Clarify in the spec that hirange>=lorange is intentionally not enforced (already reflected in the program). No code change required."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The spec lists stores.state comparison_boundary targets including 'Massachusetts', 'massachusetts', 'MA', 'ma', '%Massachusetts%', '%massachusetts%'. The '%...%' forms are LIKE patterns, not equality literals; the program's _boundary_values strips '%' via _like_variants and also plants the raw '%Massachusetts%' string as a value. This is a reasonable interpretation but the spec does not distinguish equality vs LIKE boundary literals.",
+     "requested_revision": "Optionally annotate which boundary literals are LIKE patterns vs equality literals. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In values.py, ColumnSampler._boundary_values for numeric boundary literals adds v-1 and v+1, but for roysched.lorange the spec target is [-1, 0, 1] and BOUNDS has ('roysched','lorange'): (0, None). The NumberSampler._cast clamps v to bound_lo=0, so the planted -1 boundary literal is clamped to 0, defeating the boundary pattern. Similarly roysched.royalty target [9,10,11] is within [0,100] so fine, but lorange=-1 is clamped.",
+     "requested_revision": "In NumberSampler._cast, do not clamp boundary literals (or exempt boundary values from BOUNDS clamping), consistent with the spec's boundary_rule: 'Boundary literals are planted as-is and are not clamped by range rules.'"
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In instance.py fill_foreign_keys_consistently, the group_sizes plan for FK columns (titles.pub_id, stores.stor_id via sales.stor_id) uses _group_size_plan but the logic `if gi == 0 or col[-1] is None: cur = rng.choice(pv); gi = group_plan[i]` can produce group sizes that don't match the plan when NULLs intervene, and the plan is applied per-row index rather than per-group. The execution feedback shows construction_pairs separated=67/159, which is plausible but the group_sizes pattern for titles.pub_id may not be reliably realized.",
+     "requested_revision": "Verify group_sizes realization for titles.pub_id and stores.stor_id (via sales) by checking actual group multiplicities in generated instances; adjust the plan application if groups of size 1, 2, and >=3 are not all present."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In values.py StringSampler._draw, when self.enum is set (titles.type, sales.payterms, authors.contract), it returns enum values 70% of the time but otherwise falls through to random string generation, which can produce values outside the enum. The spec's semantic_rules_and_formulas state type IN (...), payterms IN (...), contract IN ('0','1') as hard rules. The execution feedback shows no validity failures, but this is a latent risk.",
+     "requested_revision": "For enum columns, always draw from the enum (100%), or add a post-sampling clamp in _apply_semantic_rules for titles.type, sales.payterms, authors.contract."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In instance.py _apply_semantic_rules for employee.job_lvl, the clamp uses jobs from instance.get('jobs',...) which includes generated jobs, but the compact employee rows reference compact jobs. Since generated employee rows draw job_id from _parent_values (compact + generated jobs), the lookup is consistent. However, the clamp only applies to generated employee rows, and the spec's evidence cites compact rows (A-C71970F etc.) \u2014 those are preserved unchanged, which is correct.",
+     "requested_revision": "No change required; note that compact rows are preserved and the rule applies only to generated rows, consistent with 'never modify compact rows'."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The spec's null_targets list includes discounts.stor_id, discounts.lowqty, discounts.highqty, but the execution feedback shows discounts.stor_id NULL 26/60, lowqty 23/60, highqty 27/60 \u2014 these are high NULL shares. The compact discounts table has stor_id nullable with FK to stores; the NULL rule requires at least one NULL and at least one non-NULL per instance, which is satisfied. The high share follows the compact share (compact discounts has 3 rows, likely with NULLs). This is consistent.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In writer.py, the retry row-by-row loop raises RuntimeError on any failing row, which is correct per spec ('fail loudly'). However, the executemany failure could be due to a single bad row, and the retry re-inserts all rows including ones already inserted by the failed executemany (SQLite executemany is atomic per statement in a transaction, so no partial insert). This is safe.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Group_sizes realization for titles.pub_id and stores.stor_id (via sales) not directly verified from execution feedback; construction_pairs separated=67/159 suggests some patterns are realized but per-pattern breakdown is empty.",
+    "Enum domain enforcement for titles.type, sales.payterms, authors.contract relies on 70% enum draw; no validity failures observed but not guaranteed.",
+    "Boundary literal clamping for roysched.lorange=-1 (BOUNDS lo=0) may prevent the -1 boundary from appearing; not verified in generated data.",
+    "ties_for_order_limit for publishers.pub_name and publishers.city: tie_at_rank=1 requires at least two rows sharing the max COUNT(*); not verified from execution feedback."
+   ],
+   "summary": "The program ran successfully (20/20 instances, 0 failures, 0 integrity violations, reproducible). The specification and program are largely consistent: FK dependencies are respected, compact rows are preserved, NULL rules are implemented, semantic rules with evidence are enforced, and boundary literals are planted. Minor issues: (1) roysched.lorange=-1 boundary literal is clamped by BOUNDS lo=0, contradicting the spec's 'boundary literals are not clamped' rule; (2) enum columns may occasionally emit out-of-domain values; (3) group_sizes realization for FK columns is not fully verified. None of these block a pass, but the lorange clamping is a genuine spec-program inconsistency worth fixing."
+  }
+ ]
 }

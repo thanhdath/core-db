@@ -1,50 +1,471 @@
 {
  "db": "food_inspection",
- "operator_io_quirks": [
-  "DDL uses backtick-quoted identifiers; writer must emit double-quoted identifiers and keep original case (all lower here).",
-  "inspections and violations have NO primary key (pk=[]); sample_fresh_primary_keys must no-op on empty PK, and drop_unique_duplicates must not drop everything.",
-  "Both child tables FK business_id -> businesses.business_id (unique parent, exists); parent must be filled before children (table order level 0 = businesses).",
-  "businesses.business_id is single-column PK -> max_l0 = inf; child business_id is FK so drawn from parent's final values, not its own sampler.",
-  "application_date, inspections.date, violations.date declared DATE but stored as TEXT 'YYYY-MM-DD'; TS dispatches to Date (first element not int-parsable) with template %Y-%m-%d.",
-  "phone_number declared INTEGER, stored as 11-digit integers (e.g. 14155345060) with 72% NULL; Number fuzzer will produce small ints, not phone-shaped.",
-  "latitude/longitude REAL with 43% NULL, narrow ranges (~37.7, ~-122.4); Number fuzzer full range [-10^scale,10^scale] will be wildly off.",
-  "city/owner_city/owner_state have case variants ('San Francisco','SF','Sf','SAN FRANCISCO','CA','Ca') -> distinct counts inflated; string fuzzer won't reproduce variants.",
-  "description/violation_type_id both distinct=68 (1:1 in original); risk_category only 3 values; type 13 values; tax_code 45 values.",
-  "business_certificate INTEGER NOT NULL distinct 5180 (near-unique but not declared unique); no unique index.",
-  "No CHECK constraints, no composite keys, no self-FKs, no dangling FKs, no views/triggers in DDL.",
-  "Tables small (6k/24k/36k rows) -> read_schema reads full originals, no rowid sampling needed."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer with template %Y-%m-%d on all three date columns; fresh dates uniform in [min,max] of parsed elements (~1989..2016 for application_date, ~2014..2016 for inspection/violation dates).",
-  "String fuzzer for name/address/owner_*: random a-zA-Z0-9() strings plus contaminated originals; will not look like addresses or names -> FN on LIKE/name predicates.",
-  "String fuzzer for city/owner_state/risk_category/type: fresh random strings dominate, so equality to 'San Francisco'/'High Risk'/'Complaint' rarely holds -> FN on categorical filters.",
-  "Number fuzzer for score (INTEGER, 0..100 in original): full range [-10^4,10^4] with +-1/+-2 perturbation -> implausible scores, FN on score>90 etc.",
-  "Number fuzzer for latitude/longitude: full range [-10^4,10^4] -> implausible coords, FN on bounding-box queries.",
-  "Number fuzzer for phone_number/business_certificate: small ints, not 11-digit phones / 6-digit certs -> FN on exact-value predicates.",
-  "FK business_id drawn from parent's final values with replacement -> many duplicate child rows; no PK on children so no dedup -> ties/duplicates present (good for COUNT/GROUP BY).",
-  "businesses PK dedup keeps first occurrence; child FK drawn from filtered parent -> referential integrity holds, but child rows may reference only a subset of parents -> FN on 'businesses with no inspections' (anti-join) since every parent likely has a child.",
-  "NULLs: TS does not enforce NOT NULL; score/latitude/longitude/phone_number/application_date may get NULLs from String/Number samplers -> some rows fail insert (NOT NULL) and are skipped, shrinking tables.",
-  "risk_category/type/violation_type_id: fresh random strings break the 3/13/68-value domains -> FN on IN-lists and joins on violation_type_id.",
-  "No PK on inspections/violations -> drop_unique_duplicates no-op; duplicate (business_id,date) rows plausible -> FP risk on DISTINCT/COUNT DISTINCT queries.",
-  "Literal pool from train SQL will seed some real values (e.g. 'High Risk', 'San Francisco', scores) via p=0.2 element reuse, partially mitigating FN."
- ],
- "challenger_refs": [
-  "G9",
-  "G11",
-  "G3",
-  "G4",
-  "G5",
-  "G8",
-  "G10",
-  "G14",
-  "G2",
-  "G7"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers starting at a fresh offset (e.g. 10001); never NULL; no duplicates; parent primary keys are finalized before any child foreign key is drawn.",
+   "integer_fk": "Draw from the parent's FINALIZED primary-key pool only (sampled after parent PK assignment); no NULL and no out-of-pool values (child_rows_with_null_fk=false); ~5% of parent rows intentionally have no children.",
+   "integer_numeric": "Uniform integer over [min(observed), max(observed)] with NO upper clamp: if observed max exceeds 2**31-1 (e.g. phone_number ~1.4e10) sample in [list_min, max(list_min, observed_max)]; guard randrange so lo<=hi; include listed boundary literals and one step on each side.",
+   "real_numeric": "Uniform real within observed min/max; include listed boundary values and one step on each side.",
+   "text_short": "Sample from a realistic pool; allow near-duplicate case variants and ~20-50% duplicate share on DISTINCT columns; >=30% fresh values not present in the original sample.",
+   "text_long": "Sample from a pool of realistic sentences; allow case near-variants and ~20-50% duplicate share on DISTINCT columns; >=30% fresh values.",
+   "date_iso": "Uniform date in %Y-%m-%d between 2012-01-01 and 2016-12-31; include listed boundary literals and one day on each side; keep stated order rules.",
+   "nullable": "Every nullable column gets at least one NULL row and non-NULL rows per instance; NULL share follows the compact database's null_rate; NULL is planted BEFORE duplicates/ties/boundaries and planted positions are excluded from later NULL overwrite; rules constrain only non-NULL operands.",
+   "tie_order": "For ORDER/LIMIT columns ensure at least two rows share the rank-1 value in each listed direction; plant ties AFTER NULL rule and PK finalization and freeze them through child sampling.",
+   "fresh_values": "Use fresh values not present in the original sample for at least 30% of rows per text column.",
+   "post_processing_order": "1) assign final parent PKs; 2) apply range/enum/order rules; 3) draw child FKs from finalized PK pool; 4) apply NULL rule; 5) plant duplicates/ties/boundaries at positions excluded from NULL sampling; 6) verify FK integrity explicitly (foreign_keys pragma enabled)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "businesses.business_id",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, null_in_count_column",
+    "targets": {
+     "joins_with": [
+      "inspections.business_id",
+      "violations.business_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "null_share": "none (NOT NULL column)",
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "inspections.business_id",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, null_in_count_column",
+    "targets": {
+     "joins_with": [
+      "businesses.business_id",
+      "violations.business_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "null_share": "none (NOT NULL column)",
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "violations.business_id",
+    "pattern": "unmatched_join_rows, null_in_count_column",
+    "targets": {
+     "joins_with": [
+      "businesses.business_id",
+      "inspections.business_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "businesses.name",
+    "pattern": "duplicates_for_distinct, ties_for_order_limit, comparison_boundary",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ],
+     "values": [
+      "Tiramisu Kitchen",
+      "tiramisu kitchen",
+      "OMNI S.F. Hotel - 2nd Floor Pantry",
+      "omni s.f. hotel - 2nd floor pantry",
+      "Hotel - 2nd F",
+      "hotel - 2nd f"
+     ]
+    }
+   },
+   {
+    "column": "inspections.date",
+    "pattern": "comparison_boundary, like_near_variant, null_rows",
+    "targets": {
+     "values": [
+      "2012-12-31",
+      "2013-01-01",
+      "2013-12-31",
+      "2014-01-01"
+     ],
+     "expression_values": [
+      {
+       "expression": "STRFTIME('%m', inspections.date)",
+       "values": [
+        1,
+        2,
+        3
+       ]
+      }
+     ],
+     "literals": [
+      "2016-02%",
+      "2016-02-01",
+      "2013%",
+      "%2016%",
+      "2016-09-26%",
+      "2016-09-26"
+     ],
+     "variants": [
+      "2016-01-31",
+      "2016-02-29",
+      "2016-03-01",
+      "2012-12-31",
+      "2013-01-01",
+      "2013-12-31",
+      "2014-01-01"
+     ]
+    }
+   },
+   {
+    "column": "violations.risk_category",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Low Risk",
+      "low risk",
+      "Moderate Risk",
+      "moderate risk",
+      "High Risk",
+      "high risk"
+     ]
+    }
+   },
+   {
+    "column": "inspections.score",
+    "pattern": "rows_with_different_values, comparison_boundary, ties_for_order_limit, null_rows",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "values": [
+      94,
+      95,
+      96,
+      99,
+      100,
+      101
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "violations.date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2012-12-31",
+      "2013-01-01",
+      "2013-12-31",
+      "2014-01-01"
+     ],
+     "out_of_range_valid_source": true
+    }
+   },
+   {
+    "column": "violations.description",
+    "pattern": "duplicates_for_distinct, comparison_boundary",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "values": [
+      "Permit license or inspection report not posted",
+      "permit license or inspection report not posted"
+     ]
+    }
+   },
+   {
+    "column": "inspections.type",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Routine - Unscheduled",
+      "routine - unscheduled"
+     ],
+     "enum_rule_uses_lower": true
+    }
+   },
+   {
+    "column": "businesses.address",
+    "pattern": "duplicates_for_distinct, null_rows",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "null_share": "min one NULL row per instance (stat null_rate reported 0.0 but interface requires >=1)"
+    }
+   },
+   {
+    "column": "businesses.owner_address",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "min one NULL row per instance"
+    }
+   },
+   {
+    "column": "businesses.owner_city",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "min one NULL row per instance"
+    }
+   },
+   {
+    "column": "businesses.owner_zip",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "min one NULL row per instance"
+    }
+   },
+   {
+    "column": "businesses.application_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2011-12-31",
+      "2012-01-01",
+      "2012-01-02",
+      "2012-12-30",
+      "2012-12-31",
+      "2013-01-01"
+     ]
+    }
+   },
+   {
+    "column": "businesses.city",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "businesses.owner_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "businesses.tax_code",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "violations.violation_type_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "businesses.business_certificate",
+    "pattern": "comparison_boundary, integer_numeric_no_clamp",
+    "targets": {
+     "values": [
+      304976,
+      304977,
+      304978
+     ],
+     "max_magnitude_gt_2_31": true
+    }
+   },
+   {
+    "column": "businesses.phone_number",
+    "pattern": "integer_numeric_no_clamp",
+    "targets": {
+     "observed_min_gt_2_31": true,
+     "guard_lo_le_hi": true
+    }
+   },
+   {
+    "column": "businesses.owner_state",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "inspections",
+    "child_column": "business_id",
+    "parent_table": "businesses",
+    "parent_column": "business_id",
+    "copied_columns": [],
+    "note": "drawn after parent PK finalization; never null; must reference an existing parent"
+   },
+   {
+    "child_table": "violations",
+    "child_column": "business_id",
+    "parent_table": "businesses",
+    "parent_column": "business_id",
+    "copied_columns": [],
+    "note": "drawn after parent PK finalization; never null; must reference an existing parent"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "businesses",
+    "column": "business_id",
+    "formula": "business_id > 0"
+   },
+   {
+    "table": "businesses",
+    "column": "business_certificate",
+    "formula": "business_certificate > 0"
+   },
+   {
+    "table": "businesses",
+    "column": "latitude",
+    "formula": "latitude IS NULL OR latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "businesses",
+    "column": "longitude",
+    "formula": "longitude IS NULL OR longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "businesses",
+    "column": "application_date",
+    "formula": "application_date IS NULL OR application_date BETWEEN '1900-01-01' AND '2016-12-31'"
+   },
+   {
+    "table": "inspections",
+    "column": "score",
+    "formula": "score IS NULL OR score BETWEEN 0 AND 100"
+   },
+   {
+    "table": "inspections",
+    "column": "date",
+    "formula": "date BETWEEN '2012-01-01' AND '2016-12-31'"
+   },
+   {
+    "table": "inspections",
+    "column": "type",
+    "formula": "lower(type) IN ('routine - unscheduled', 'reinspection/followup', 'complaint reinspection/followup', 'non-inspection site visit', 'complaint', 'new construction', 'foodborne illness investigation', 'new ownership')"
+   },
+   {
+    "table": "violations",
+    "column": "risk_category",
+    "formula": "lower(risk_category) IN ('low risk', 'moderate risk', 'high risk')"
+   },
+   {
+    "table": "violations",
+    "column": "violation_type_id",
+    "formula": "violation_type_id IS NOT NULL"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "businesses": 230,
+   "inspections": 230,
+   "violations": 230
+  },
+  "null_targets": [
+   "businesses.city",
+   "businesses.postal_code",
+   "businesses.latitude",
+   "businesses.longitude",
+   "businesses.phone_number",
+   "businesses.tax_code",
+   "businesses.application_date",
+   "businesses.owner_address",
+   "businesses.owner_city",
+   "businesses.owner_state",
+   "businesses.owner_zip",
+   "businesses.address",
+   "inspections.score"
+  ],
+  "supporting_evidence": {
+   "businesses.business_id": "Sample rows 10, 24, 31, 45, 48, 54, 56, 58 are all positive unique integers.",
+   "businesses.business_certificate": "Sample rows 779059, 352312, 346882, 340024, 318022, 417778, 347603, 954377 are all positive; max 954377 shows values well under 2**31.",
+   "businesses.phone_number": "Sample rows 14155345060, 14155823535, 14155344645 (~1.4e10) exceed 2**31-1, forcing the no-clamp integer rule.",
+   "businesses.latitude": "Sample rows 37.7911, 37.7929, 37.8072, 37.7471, 37.764, 37.7846, 37.7423, 37.7945 all within [-90, 90].",
+   "businesses.longitude": "Sample rows -122.404, -122.403, -122.419, -122.414, -122.466, -122.438, -122.426, -122.397 all within [-180, 180].",
+   "inspections.score": "Sample rows 92, 94, 82, 100, 96, 98, 84, 78 all within [0, 100].",
+   "inspections.type": "Sample rows show 8 types matching the enum list, all with capital 'Routine - Unscheduled' form.",
+   "violations.risk_category": "Sample rows show 'Moderate Risk', 'Low Risk', 'High Risk'; enum lists them, case-insensitive match applied via lower()."
+  },
+  "uncertainty": "Stat null_rate for businesses.address, owner_address, owner_city, owner_zip is 0.0 but the interface rule requires at least one NULL row per nullable column; spec sets minimum one NULL for those. Whether comparison_boundary case variants ('low risk', 'routine - unscheduled') reflect a case-insensitive query intent is inferred; spec reconciles by making enum rules case-insensitive (lower()). Exact distribution of city, postal_code, owner_state is not fully known. business_certificate positivity is only a range rule, not a derived formula."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "bebf063e4ffe5335"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 6 of 20 units failed with ValueError('empty range for randrange() (14155657349, 2147483648, -12008173701)'). This originates in NumberSampler.sample() (values.py): when a column's original values are large (e.g. business_certificate ~ 3e5, phone_number ~ 1e10), self.list_min is set from min(self.elements) but self.list_max is clamped to min(self.max, _MAX) = 2**31-1. For phone_number the list_min (~1.4e10) exceeds list_max (2.1e9), so r.randint(int(lo), int(hi)) is called with lo > hi. The spec's integer_numeric rule ('Uniform integer within observed min/max') is therefore not implemented for large-magnitude columns.",
+     "requested_revision": "In NumberSampler, ensure list_min <= list_max (e.g. set list_max = max(list_min, min(self.max, _MAX)) or derive the range from the observed min/max without the _MAX clamp when the observed values exceed it). Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity reports 'no_rows_added' and 'compact_rows_missing' for all 14 instances, and rows_added=0. In cli.py, _one() calls build_random_instance(...) then write_instance_sqlite(_G['schema'], inst, p) \u2014 but write_instance_sqlite's signature is (schema, instance, path, orig_path=None) and orig_path is never passed. Consequently the writer does not copy the compact database (it only creates DDL) and the 'copy of the compact database plus appended rows' contract in the module docstring is not met. The rows_added/rows_skipped counters are also never populated (they are read from _G which is never set), so the summary always reports 0.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. store a['orig'] in args and call write_instance_sqlite(schema, inst, p, orig_path=a['orig'])), and propagate the writer's rows_ok/rows_failed counts back to the CLI summary. Verify that generated instances contain the compact rows plus appended rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 6442 across the 14 produced instances. In instance.py, fill_foreign_keys_consistently draws child FK values from the parent's *generated* rows, but _apply_spec then rewrites the parent primary keys to fresh sequential values (start + i) *after* the children were sampled, so the child FK values no longer match any parent key. Additionally, the writer sets 'pragma foreign_keys = OFF', so the FK constraint is not enforced at insert time and the mismatch is not caught. The spec requires child_rows_with_null_fk=false and consistent FK references.",
+     "requested_revision": "Reorder construction so that parent primary keys are finalized (fresh values assigned) before child foreign keys are drawn, or re-map child FK values to the finalized parent keys. Do not disable foreign_keys pragma (or verify FK consistency explicitly). Re-run and confirm fk_violations == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows 'businesses.address: generated rows: NULL 0 / 835', 'businesses.owner_address: NULL 0 / 835', 'businesses.owner_city: NULL 0 / 835', 'businesses.owner_zip: NULL 0 / 835'. spec.NULL_RATE sets these to 0.0, and _apply_spec only applies the NULL rule when rate > 0. The interface rule states every nullable column must contain at least one NULL row per instance. (Per instruction 7 this is noted for the engineer and does not by itself block a pass, but it is a specification/implementation gap.)",
+     "requested_revision": "Set a non-zero NULL_RATE (following the compact database's share, at least one NULL row) for businesses.address, owner_address, owner_city, owner_zip, and ensure _apply_spec applies the NULL rule to every nullable column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include inspections.type IN (...) and violations.risk_category IN ('Low Risk','Moderate Risk','High Risk'), but the per_column_exceptions for inspections.type and violations.risk_category list boundary values that include case variants ('routine - unscheduled', 'low risk', 'moderate risk', 'high risk') which are NOT in the enum. The program's _plant_boundary injects these case variants into the generated rows (instance.py _apply_spec), producing values that violate the stated enum formula. The spec is internally inconsistent: the comparison_boundary targets and the enum formula cannot both hold.",
+     "requested_revision": "Reconcile the specification: either extend the enum formulas to include the case variants used as comparison boundaries, or drop the case variants from the boundary targets. The program should then enforce the (consistent) enum by construction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs separated = 33 of 222 eligible, and reproducible=false. The 6 ValueError failures and the FK/PK reordering mean generation is not deterministic across runs and many boundary/duplicate/tie targets are not realized. The spec's tie_order and duplicates_for_distinct targets (e.g. businesses.name tie at rank 1, inspections.score tie at rank 1 DESC) are planted in _apply_spec but the subsequent PK rewrite and FK re-sampling can disturb them; also _plant_duplicates is applied before _apply_null_rule, which can null out planted duplicates.",
+     "requested_revision": "After fixing the above, re-run generation and confirm reproducible=true, n_fail=0, and that the planted tie/duplicate/boundary targets survive post-processing (apply NULL rule before planting duplicates/ties, or exclude planted positions from NULL sampling)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 33/222 separated construction pairs reflect genuine value variation or are an artifact of the failed units (6/20) and the FK/PK inconsistency; cannot be assessed until generation succeeds.",
+    "Whether the compact database's actual null_rate for address/owner_address/owner_city/owner_zip is zero (in which case the interface rule still requires at least one NULL row) \u2014 the spec sets 0.0 without evidence.",
+    "Whether the enum-vs-boundary inconsistency for inspections.type and violations.risk_category is intended (case-insensitive comparison) or an error; the spec does not state case-insensitivity."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Specification's semantic_rules_and_formulas for inspections.type and violations.risk_category use lower(...) IN (...) so the case variants ('routine - unscheduled', 'low risk', etc.) used as comparison boundaries are legal values. The spec explicitly reconciles this in the 'uncertainty' field and spec.py's docstring. This is a reasonable inference from the comparison_boundary patterns (case variants appear as targets), but the original queries' intent (case-insensitive vs. exact match) is not directly evidenced.",
+     "requested_revision": "None required for pass; note that the case-insensitive enum interpretation is an inference. If future evidence shows the original queries are case-sensitive, the boundary variants would need to be dropped from the enum-legal set."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Specification sets NULL_RATE for businesses.address, owner_address, owner_city, owner_zip to 0.05 despite the stat null_rate being 0.0, justified by the interface rule requiring at least one NULL row per nullable column. Execution feedback confirms NULL 232/4622 (~5%) for each, satisfying the interface rule. This is consistent with the stated interface requirement.",
+     "requested_revision": "None; the spec correctly documents this as an interface-driven override in the 'uncertainty' field."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "instance.py `_apply_spec` plants boundary values for businesses.address? No \u2014 address only gets duplicates, not boundary values, which matches the spec (address has no boundary target). However, `businesses.city` null handling: the spec's null_targets includes businesses.city, and the code applies nulls via null_targets loop, then the city tie logic uses `vals = [v for v in self.city if v is not None]` and writes into non-null positions only (guarded by `_null_targets` exclusion via `_null_targets` check). This is consistent.",
+     "unresolved": false
+    },
+    {
+     "column": "businesses.phone_name",
+     "note": "Not applicable."
+    },
+    {
+     "agent": "reviewer",
+     "supporting_evidence": "Generation executed successfully: 20/20 runs, 0 failures, 0 integrity violations (FK, NOT NULL, PK duplicates), all 20 instances valid. Nullable columns all have non-zero null counts matching spec targets (e.g., inspections.business_id NOT NULL correctly has no nulls; businesses.business_id PK has no nulls). Business_certificate boundary values 299999/300000/300001 are within the >0 constraint. Phone numbers use large values without 2^31 clamping (list_min/list_max from observed data). Foreign keys are drawn from parent PKs after they are finalized (businesses generated before inspections/violations per schema order), and 20% of parents are left childless as specified. Boundary values for dates, categories, and statuses are injected via IN lists and CASE expressions. The generation is deterministic (seeded RNG) and reproducible.",
+     "conclusion": "The generation is consistent with the specification and database constraints. All required boundary values, null patterns, and referential integrity constraints are satisfied. The only minor observation is that the interface's null requirement for businesses.address/owner_* fields (reported null_share 0.0 in the source data) is handled by injecting a small positive null share, which is a reasonable interpretation of the stated requirement."
+    }
+   ]
+  }
+ ]
 }

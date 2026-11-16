@@ -1,52 +1,368 @@
 {
  "db": "swimming",
- "operator_io_quirks": [
-  "All identifiers are simple ASCII (ID, name, Nationality, meter_100, Stadium_ID, Opening_year); no spaces or mixed-case table names, but column case varies (ID vs name vs Nationality) so case-insensitive column lookup is exercised.",
-  "Tiny DB: swimmer=8, stadium=10, event=6, record=13 rows; max_rows_per_table sampling never triggers, original_values are complete.",
-  "record has composite PK (Swimmer_ID, Event_ID) and a non-PK 'ID' column that is NOT unique in the DDL sense but is distinct=13 in data; composite-PK member -> max_l0=30 path is exercised.",
-  "record.Swimmer_ID and record.Event_ID are FK children of swimmer.ID and event.ID; event.Stadium_ID -> stadium.ID; all parents exist and are unique (PK).",
-  "No self-references, no dangling FKs, no NOT NULL, no CHECK, no UNIQUE constraints, no indexes/views/triggers in DDL.",
-  "Declared types: INT/REAL/TEXT only; no date/timestamp/bool/bit/year/char(n) types, so Date/Time/Bool/Bit fuzzers are never selected.",
-  "event.Year is TEXT storing 4-digit years ('2016','2011',...) -> dispatches to String fuzzer, not Number/Date; text-stored dates are NOT detected.",
-  "swimmer.meter_200..meter_700 and Time are TEXT storing 'M:SS.ss' lap times ('1:57.10','7:47.91') -> String fuzzer; storage class text matches declared TEXT.",
-  "swimmer.meter_100 is REAL storing floats (57.31) -> Number fuzzer with scale from REAL (no args -> default scale).",
-  "stadium.Opening_year is INT storing 2004..2007 -> Number fuzzer; small distinct (4) so literal pool reuse dominates.",
-  "record.Result is TEXT with only 3 distinct values ('NC','Win','Loss') -> String fuzzer with tiny element set; contaminate will produce implausible strings.",
-  "No storage-class/declared-type contradictions observed (INT->integer, REAL->real, TEXT->text everywhere)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on swimmer.ID, stadium.ID, event.ID, record.ID, stadium.Capacity, stadium.Opening_year, event.Stadium_ID, record.Swimmer_ID, record.Event_ID: uniform in [-10^scale,10^scale] plus +-1/+-2 perturbation; Capacity/Opening_year will get negative and huge values (implausible) -> likely FN on range predicates like Capacity > 60000 or Opening_year BETWEEN 2004 AND 2007.",
-  "Number fuzzer on swimmer.meter_100 (REAL): floats in [-10^scale,10^scale] with +-0.01/+-0.02 perturbation; real lap times ~55-58 will be replaced by implausible magnitudes -> FN on meter_100 < 58 style predicates.",
-  "String fuzzer on swimmer.name, stadium.name, stadium.City, stadium.Country, event.Name: random a-zA-Z0-9() strings of length 0-20 plus contaminate; real names/cities/countries lost -> FN on equality/IN/LIKE predicates over these columns unless literal pool supplies them.",
-  "String fuzzer on event.Year (TEXT): random strings, not 4-digit years -> FN on Year = '2016' / Year BETWEEN '2011' AND '2016' unless pool seeds them; also breaks any implicit numeric comparison.",
-  "String fuzzer on swimmer.meter_200..meter_700 and Time (TEXT 'M:SS.ss'): random strings, format lost -> FN on any predicate comparing lap times or ordering by Time.",
-  "String fuzzer on record.Result (3 distinct): elements NC/Win/Loss reused with p=0.2 fresh; contaminate may corrupt them -> some FN on Result = 'Win' but ties/duplicates preserved so fewer FP.",
-  "FK fill: record.Swimmer_ID drawn from swimmer.ID final values, record.Event_ID from event.ID, event.Stadium_ID from stadium.ID; consistent joins preserved, so join-count queries mostly survive.",
-  "Composite PK (Swimmer_ID,Event_ID) on record: sample_fresh_primary_keys drops duplicate pairs; with small parent sizes (6-8) many rows collapse -> record row count may be much smaller than chosen size, affecting COUNT(*) predicates.",
-  "record.ID is not PK and not unique-declared, so drop_unique_duplicates does not filter it; duplicates possible -> FP risk on COUNT(DISTINCT ID) or ID-based joins if queries assume uniqueness.",
-  "Small table sizes (choose_table_sizes: level 0 = 1+30u, x4 per level, cap 2500) mean stadium/swimmer/event get tens of rows, record hundreds; original has 6-13 rows so TS instances are much larger -> COUNT comparisons like '> 5' may flip.",
-  "No Date/Time/Bool/Bit fuzzers fire (no such declared types), so TS misses on this DB are dominated by Number implausibility and String format loss, not date-template issues.",
-  "Literal pool from train SQL will seed some real values (e.g. 'Win','NC','2016', country names) via loose ancestor mapping; columns with no train literals fall back to pure fuzz -> FN concentrated there."
- ],
- "challenger_refs": [
-  "G2",
-  "G3",
-  "G6",
-  "G5",
-  "G4",
-  "G1",
-  "gdf035a06",
-  "gdf035a06",
-  "g926dfe9e",
-  "g0542112e",
-  "g223d2419",
-  "g223d2419"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL.",
+   "int_foreign_key": "Copy an existing parent primary-key value from the parent's generated rows; for nullable FKs include NULL rows and rows referencing parents that have no children; never copy for NOT NULL FK members.",
+   "text_short": "Draw from a small pool of realistic values; allow near-duplicates (case/whitespace variants) and repeated values to create ties and duplicate groups.",
+   "text_name": "Draw from a pool of realistic names; allow duplicates and near-duplicates to create group sizes 1, 2 and >=3.",
+   "real_positive": "Uniform real in a plausible positive range; include boundary values at listed literals and one step on each side.",
+   "text_time": "Always emit a string 'M:SS.ss' or 'MM:SS.ss'. Validate observed pool entries with isinstance(v, str) and a time regex before use; skip invalid ones. Monotone increasing across the 100/200/.../700/Time ladder within a row (inferred rule: rows violating the ladder are dropped and counted in rows_failed).",
+   "text_year": "Four-digit year string in a plausible range; include ties at the top rank for DESC ordering.",
+   "text_enum": "Draw from the explicit enum pool; include near-variants (case variants) of listed equality literals.",
+   "null_share": "For every nullable column, at least one NULL row per instance; NULL share follows the compact database share (0.0 observed, so keep NULLs sparse but present). NOT NULL columns never receive NULL."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "record.Swimmer_ID",
+    "pattern": "group_sizes, aggregate_boundary",
+    "targets": "group sizes 1, 2 and >=3; COUNT(*) values 0,1,2,3; NOT NULL (composite PK member) so no NULL rows and excluded from null_targets"
+   },
+   {
+    "column": "swimmer.name",
+    "pattern": "group_sizes, duplicates_for_distinct, aggregate_boundary",
+    "targets": "group sizes 1, 2 and >=3; duplicate share 20-50%; COUNT(*) values 0,1,2,3"
+   },
+   {
+    "column": "swimmer.ID",
+    "pattern": "group_sizes, aggregate_boundary, comparison_boundary, unmatched_join_rows",
+    "targets": "group sizes 1, 2 and >=3; COUNT(*) values 0,1,2,3; no numeric boundary applies (equality-only comparison); parent rows without children"
+   },
+   {
+    "column": "stadium.Capacity",
+    "pattern": "rows_with_different_values, ties_for_order_limit, comparison_boundary",
+    "targets": ">=2 rows with different values per group; tie at rank 1 for DESC; boundary at 60000"
+   },
+   {
+    "column": "event.Stadium_ID",
+    "pattern": "unmatched_join_rows, group_sizes",
+    "targets": "parent rows without children; child rows with NULL FK (schema is nullable, so NULLs allowed); group sizes 1, 2 and >=3"
+   },
+   {
+    "column": "stadium.ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "parent rows without children; child rows with NULL FK"
+   },
+   {
+    "column": "event.ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "parent rows without children"
+   },
+   {
+    "column": "record.ID",
+    "pattern": "aggregate_boundary, null_rows",
+    "targets": "COUNT(record.id) values 0,1,2,3; include NULL rows (record.ID is a non-key nullable column, distinct from the composite PK (Swimmer_ID, Event_ID))"
+   },
+   {
+    "column": "stadium.name",
+    "pattern": "group_sizes",
+    "targets": "group sizes 1, 2 and >=3"
+   },
+   {
+    "column": "record.Event_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "parent rows without children"
+   },
+   {
+    "column": "stadium.City",
+    "pattern": "duplicates_for_distinct",
+    "targets": "duplicate share 20-50%"
+   },
+   {
+    "column": "stadium.Country",
+    "pattern": "aggregate_boundary, group_sizes",
+    "targets": "COUNT(*) values 1,2,3,4; group sizes 1, 2 and >=3"
+   },
+   {
+    "column": "swimmer.Nationality",
+    "pattern": "duplicates_for_distinct, group_sizes",
+    "targets": "duplicate share 20-50%; group sizes 1, 2 and >=3"
+   },
+   {
+    "column": "event.Name",
+    "pattern": "ties_for_order_limit",
+    "targets": "ties at any rank for ASC ordering"
+   },
+   {
+    "column": "event.Year",
+    "pattern": "ties_for_order_limit",
+    "targets": "tie at rank 1 for DESC ordering; four-digit year string in range 1900..2030"
+   },
+   {
+    "column": "record.Result",
+    "pattern": "comparison_boundary",
+    "targets": "values 'Win','win','Loss','loss','NC'"
+   },
+   {
+    "column": "swimmer.meter_100",
+    "pattern": "ties_for_order_limit",
+    "targets": "ties at any rank for ASC ordering on CAST(REPLACE(meter_100,':','') AS REAL)"
+   },
+   {
+    "column": "stadium.Opening_year",
+    "pattern": "literal_pool",
+    "targets": "include 2005 and 2006"
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "event.Stadium_ID",
+    "parent_table": "stadium",
+    "parent_column": "ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "record.Swimmer_ID",
+    "parent_table": "swimmer",
+    "parent_column": "ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "record.Event_ID",
+    "parent_table": "event",
+    "parent_column": "ID",
+    "copied_columns": []
+   },
+   {
+    "unique_tuple": "record(Swimmer_ID, Event_ID)",
+    "note": "composite primary key; no duplicate (Swimmer_ID, Event_ID) pairs against compact and generated rows"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "swimmer",
+    "column": "meter_100",
+    "formula": "meter_100 > 0"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_200",
+    "formula": "meter_200 IS NULL OR meter_200 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_300",
+    "formula": "meter_300 IS NULL OR meter_300 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_400",
+    "formula": "meter_400 IS NULL OR meter_400 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_500",
+    "formula": "meter_500 IS NULL OR meter_500 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_600",
+    "formula": "meter_600 IS NULL OR meter_600 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "meter_700",
+    "formula": "meter_700 IS NULL OR meter_700 > '0:00.00'"
+   },
+   {
+    "table": "swimmer",
+    "column": "Time",
+    "formula": "Time IS NULL OR Time > '0:00.00'"
+   },
+   {
+    "table": "stadium",
+    "column": "Capacity",
+    "formula": "Capacity IS NULL OR Capacity > 0"
+   },
+   {
+    "table": "stadium",
+    "column": "Opening_year",
+    "formula": "Opening_year IS NULL OR Opening_year BETWEEN 1900 AND 2030"
+   },
+   {
+    "table": "record",
+    "column": "Result",
+    "formula": "Result IS NULL OR Result IN ('Win','win','Loss','loss','NC')"
+   },
+   {
+    "table": "event",
+    "column": "Year",
+    "formula": "Year IS NULL OR CAST(Year AS INTEGER) BETWEEN 1900 AND 2030"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "swimmer": 8,
+   "stadium": 10,
+   "event": 6,
+   "record": 13
+  },
+  "null_targets": [
+   "record.ID"
+  ],
+  "supporting_evidence": {
+   "swimmer.meter_100": "Rows 1-6 show positive real values 57.31, 57.35, 57.66, 55.67, 57.34, 57.84.",
+   "swimmer.Time": "Rows 1-8 show positive time strings 7:47.91 ... 7:46.95.",
+   "stadium.Capacity": "Rows 1-8 show positive capacities 75000 ... 47659.",
+   "stadium.Opening_year": "Rows show 2004, 2005, 2006, 2007.",
+   "record.Result": "Rows show 'NC', 'Win', 'Loss'.",
+   "event.Year": "Rows show 2016, 2011, 2012, 2013, 2014, 2017."
+  },
+  "uncertainty": {
+   "record.Swimmer_ID_null": "Schema declares NOT NULL (composite PK member); excluded from null_targets and no NULL rows generated by fill_foreign_keys_consistently.",
+   "record.ID_null": "Schema declares nullable; record.ID is a non-key nullable column distinct from the composite PK (Swimmer_ID, Event_ID), so the NULL target is valid.",
+   "swimmer.meter_200_to_700_monotonicity": "Inferred pattern, not a declared constraint: observed rows are monotone increasing; enforced as a hard constraint (rows violating the ladder are dropped and counted in rows_failed).",
+   "stadium.Country_enum": "Observed 6 distinct countries; no explicit enum constraint, so treated as open text pool.",
+   "event.Year_text": "Observed as TEXT; range enforced via CAST(Year AS INTEGER) BETWEEN 1900 AND 2030; NULLs allowed by rule.",
+   "text_time_sampler": "Time samplers must validate observed pool entries with isinstance(v, str) and a time regex before use; skip non-string entries to avoid AttributeError.",
+   "sec_to_time_time_to_sec": "Helper functions must delegate to values.py implementations (or be imported directly); self-recursive wrappers caused RecursionError in all units and must not be reintroduced."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, errors={\"TypeError\": 20}, stderr shows \"_init_sampler() got multiple values for argument 'literal_pool'\" for every unit. In instance.py build_random_instance, _init_sampler is called as `_init_sampler(cm, literal_pool.get(...), schema.original_values.get(...), p, rng, len(tm.primary_key), kind=kind, lo=lo, hi=hi, boundary=boundary, literal_pool=lit, enum=enum)`. The signature in values.py is `_init_sampler(column, literal_pool, original_values, p, rng, n_pk, max_l0=..., **kw)`, so `literal_pool` is passed both positionally (2nd arg) and as a keyword (`literal_pool=lit`), raising TypeError on every instance.",
+     "requested_revision": "Rename the keyword argument passed from instance.py (e.g. pass the per-column literal pool under a distinct name such as `pool_literals=lit` and forward it to make_column_sampler as `literal_pool=`), or rename the positional parameter in _init_sampler. Ensure the two literal-pool concepts (query-derived pool vs. spec literal_pool for Opening_year) are not conflated. Re-run generation and confirm n_ok>0, n_fail=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit failed, no instances were produced (n_instances=0, rows_added all 0). None of the specified patterns (group sizes, aggregate boundaries, NULL rows, unmatched joins, ties, duplicates, enum variants, time ladder, literal pool 2005/2006) can be verified as implemented. The construction feedback is empty (construction_pairs_by_group=[]).",
+     "requested_revision": "After fixing the TypeError, regenerate and provide execution feedback showing rows added per table, NULL counts per nullable column, and construction pairs per group so the specification's targets can be checked."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets lists record.Swimmer_ID, but the schema declares record.Swimmer_ID as part of the composite PRIMARY KEY (Swimmer_ID, Event_ID), hence NOT NULL. The spec's own per_column_exceptions note this ('column declared NOT NULL in schema, so NULL only if schema relaxed; otherwise no NULL') and uncertainty.record.Swimmer_ID_null flags it. The program's NULL rule (instance.py) skips pk_pos>0 columns, so no NULL will be planted \u2014 consistent with the schema but contradicting the null_targets entry.",
+     "requested_revision": "Remove record.Swimmer_ID from null_targets (or explicitly mark it as schema-relaxed-only and not required), so the specification does not demand NULLs in a NOT NULL primary-key column. Keep record.ID (nullable, not PK) as the NULL target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rule for swimmer.meter_100 is `meter_100 > 0` and the supporting evidence cites positive reals; the program's NumberSampler for a REAL column with lo/hi from compact min/max will produce values in that range, which is fine. However, the spec's time-ladder monotonicity is described as a 'soft generation preference' and the program drops violating rows (instance.py time_ladder_ok filter) \u2014 this is acceptable, but the spec does not state a hard constraint, so the drop behavior is an implementation choice not mandated by the spec. This is a minor consistency note, not blocking.",
+     "requested_revision": "Optionally clarify in the specification whether the meter_100..700/Time ladder is a hard constraint (rows violating it are dropped) or a soft preference, to align spec and program."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the fixed program actually produces the specified group sizes (1, 2, >=3), aggregate boundary counts (0,1,2,3), duplicate shares (20-50%), tie-at-rank-1 for stadium.Capacity DESC and event.Year DESC, unmatched join rows (parent without children, child NULL FK), enum variants Win/win/Loss/loss, and literal pool 2005/2006 \u2014 cannot be verified because generation produced zero instances.",
+    "Whether compact rows are preserved (writer copies orig then appends) \u2014 code path looks correct but unverified at runtime.",
+    "Whether composite PK (Swimmer_ID, Event_ID) uniqueness and FK consistency hold in generated rows \u2014 unverified at runtime."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances fail with AttributeError(\"'float' object has no attribute 'strip'\"). tscore_gen/values.py TimeLadderSampler._sec does v.strip().split(':'), and TimeLadderSampler.__init__ builds observed pools from schema.original_values that may include non-string values; also the sample_row path calls _sec on r.choice(pool). The crash is raised for every unit (n_ok=0, all rows_added=0), so no instance is produced.",
+     "requested_revision": "Make the time samplers robust to non-string / NULL observed values (coerce/validate with isinstance(v, str) and a time regex before calling .strip(), skipping invalid entries) so that all sampled rows are strings in 'M:SS.ss' form. Re-run generation and confirm n_ok == n_instances with zero AttributeErrors before claiming compliance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because instance construction threw on every unit, the writer never ran; execution feedback shows rows_added all zero and construction_pairs_by_group empty. Consequently nothing verifies: (a) compact-row preservation (writer copies orig via shutil.copyfile and applies only INSERTs \u2014 plausible but unexercised), (b) FK/NULL generation (fill_foreign_keys_consistently), (c) composite PK uniqueness dedup for record(Swimmer_ID, Event_ID), and (d) the spec rules such as Opening_year in [2005,2006] and Capacity boundary 60000.",
+     "requested_revision": "After fixing the crash, provide execution evidence that instances were written: rows_added > 0 per table, n_ok == n_instances, no rows_failed beyond intentional time-ladder drops, and confirm compact rows are unchanged (spot-check original row count plus appended rows)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In instance.py build_random_instance the FK columns are filled via fill_foreign_keys_consistently only after inst[t] was assigned the sampler columns; then `cols.update(fill_foreign_keys_consistently(...))` is applied to `cols`, and `inst[t] = cols` is reassigned later \u2014 but the NULL/integer-PK dedup and time-ladder filtering operate on `cols`, and the final `inst[t] = cols` overwrites the earlier assignment. The control flow here is difficult to verify statically and the failure traces indicate it was never reached. No evidence that the composite-PK (record.Swimmer_ID, Event_ID) uniqueness is enforced against compact + generated rows in practice.",
+     "requested_revision": "Clarify and test the build order so that: FK values are generated from compact+generated parent PKs (or NULL for nullable FKs per the null rule), record(Swimmer_ID, Event_ID) tuples never repeat compact or generated pairs, and the time-ladder drop is applied to the final column set. Supply a post-generation check (e.g., count duplicate record PK pairs, NULL share per nullable column vs compact share) in the execution report."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's semantic rule 'event.Year IS NULL OR CAST(Year AS INTEGER) BETWEEN 1900 AND 2030' conflicts with the per-column exceptions for event.Year ('tie at rank 1 for DESC ordering') with no range targeted in the generation spec; and stadium.Opening_year rule 'IS NULL OR BETWEEN 1900 AND 2030' alongside literal pool 2005/2006 is consistent, but the Year rule is not given support in 'supporting_evidence' beyond observed values 2011-2017 (within range) \u2014 this is a year-shaped TEXT column but spec_from_compact classifies by regexp only, whereas the declared type is TEXT; load_specification only applies ranges when a BETWEEN is found in the formula, which should work, but the year TEXT stinger of enum \u2192 number sampler transition was not evidenced. Also 'record.Swimmer_ID pattern null_rows' appears in the extracted operations yet is removed from null_targets \u2014 the specification correctly notes it is a NOT NULL composite-PK member, matching the schema, so this is fine, but the spec text does not say how the removal interacts with the null_share rule for record.Swimmer_ID.",
+     "requested_revision": "Add explicit evidence for event.Year range constraint (how the sampler produces 1900..2030 and how NULL years interact), and state in the spec that record.Swimmer_ID is excluded from null_targets by PK membership so that fill_foreign_keys_consistently does not attempt NULL insertion for it."
+    }
+   ],
+   "unresolved_checks": [
+    "No executable instance was produced, so preservation of compact rows, dependent FK consistency, NULL share per nullable column, and composite-PK uniqueness are unverified from execution feedback.",
+    "Value variation (distinct values per group, duplicate share for swimmer.Nationality/stadium.City, tie at rank 1 for stadium.Capacity DESC / event.Year DESC, record.Result case variants) cannot be confirmed until instances are generated.",
+    "The dependency spec (event.Stadium_ID -> stadium.ID, record -> swimmer/event) and the 'child rows with NULL FK' target for event.Stadium_ID are in tension with the schema declaring Stadium_ID NOT NULL implicitly (no NULL in schema), so the designer should clarify whether the FK NULL target is intended only when the schema permits NULLs."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with RecursionError('maximum recursion depth exceeded'); n_ok=0, n_fail=20, rows_added all zero. The failure occurs before any row is written, so no instance was produced.",
+     "requested_revision": "Fix the infinite recursion. The most likely cause is in tscore_gen/spec.py: `sec_to_time` and `time_to_sec` are defined as thin wrappers that call themselves (`def sec_to_time(x): return sec_to_time(x)` and `def time_to_sec(v): return time_to_sec(v)`), which recurse forever. They should delegate to the implementations in values.py (e.g. `from .values import sec_to_time as _sec_to_time` and return `_sec_to_time(x)`), or be removed and imported directly. Re-run generation and confirm n_ok>0 with no RecursionError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit failed, none of the required integrity/consistency checks could be exercised: compact_preserved is trivially true, dup_pk_pairs and null_share are empty, and rows_added/rows_skipped are all zero. There is no execution evidence that FK consistency, composite-PK uniqueness, NULL planting, or time-ladder monotonicity actually hold in written instances.",
+     "requested_revision": "After fixing the recursion, provide execution feedback showing successful units with non-zero rows_added per table, dup_pk_pairs empty for record, null_share populated for nullable columns (record.ID, event.Stadium_ID, stadium.Capacity, etc.), and compact_preserved true."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `record.ID` says pattern `aggregate_boundary, null_rows` with target 'include NULL rows', and `null_targets` lists `record.ID`. However the schema declares `record.ID` as `int` with PRIMARY KEY only on `(Swimmer_ID, Event_ID)`; `record.ID` is not a PK member and is nullable, so this is consistent. But the spec's `uncertainty` note and the program's `load_specification` skip NULL targets that are composite-PK members \u2014 `record.ID` is not one, so it is kept. This is consistent; no change needed here, but the spec should clarify that `record.ID` is nullable (it is not part of the composite PK) to avoid confusion with `record.Swimmer_ID`.",
+     "requested_revision": "Optional clarification only: state explicitly that `record.ID` is a non-key nullable column distinct from the composite PK `(Swimmer_ID, Event_ID)`, so the NULL target is valid."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `swimmer.meter_100 > 0` and `meter_200..700/Time IS NULL OR > '0:00.00'`, plus a hard monotone-increasing ladder constraint. The compact data (rows 1-8) shows monotone increasing times, but the spec's `uncertainty` admits monotonicity is inferred, not schema-enforced. The program enforces it as a hard constraint (drops violating rows), which is a defensible design choice, but the spec should mark this as an inferred (not schema-guaranteed) rule so reviewers know it is a modeling decision rather than a database constraint.",
+     "requested_revision": "Mark the meter ladder monotonicity as an inferred/uncertain pattern in the specification (it is not a declared constraint), and note that rows violating it are dropped and counted in rows_failed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In tscore_gen/instance.py, `fill_foreign_keys_consistently` is called with `inst` before `inst[t]` is assigned, and it reads `instance.get(pt, {}).get(pc)` for parent values. Because tables are processed in topological order this is generally fine, but for `event.Stadium_ID` the parent `stadium` is processed first, so it works. However, the NULL planting step (step 4) runs after FK fill and can overwrite FK values with NULL for nullable FKs, which is intended. No bug found here, but the interaction between step 3 (FK fill) and step 4 (NULL planting) means a nullable FK may get NULL from either path; the spec's 'at least one NULL per nullable column' is satisfied. This is consistent.",
+     "requested_revision": "No change required; noted as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py `load_specification` parses `boundary at (\\d+)` from targets, but the spec's `stadium.Capacity` target says 'boundary at 60000' \u2014 this matches. However `swimmer.ID` target says 'boundary at equality' (no number), so no boundary is set for swimmer.ID; the spec's comparison_boundary for swimmer.ID is vague ('boundary at equality'). This is a minor spec ambiguity, not a blocking error.",
+     "requested_revision": "Clarify the swimmer.ID comparison_boundary target with a concrete value or state that no numeric boundary applies."
+    }
+   ],
+   "unresolved_checks": [
+    "No successful instance was generated, so integrity constraints (FK consistency, composite-PK uniqueness, NULL shares, compact-row preservation) could not be verified from execution evidence.",
+    "Reproducibility (seeded RNG per unit) could not be confirmed because all units failed before writing.",
+    "Value variation (group sizes 1/2/>=3, duplicate shares 20-50%, tie at rank 1) could not be observed in output."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's `uncertainty.swimmer.meter_200_to_700_monotonicity` explicitly labels the meter_100..700/Time ladder as an *inferred* pattern, not a declared constraint, and enforces it as a hard drop rule. The schema declares meter_200..700 and Time as TEXT with no CHECK constraint; the only declared formulas are `> '0:00.00'` (or NULL). The ladder monotonicity is therefore a heuristic, not a supported semantic rule.",
+     "requested_revision": "Keep the ladder as a soft/inferred pattern (or document it as such in the spec's `uncertainty` block, which it already does). No change required for pass, but the designer should not present the ladder as a database rule; it is a sampling heuristic. This is already correctly flagged, so no blocking change."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `stadium.Capacity` targets 'boundary at 60000', but the atomic-operations evidence shows the comparison_boundary example was *removed* (`set:PRED(stadium.capacity > 60000)` removed) and the surviving pattern is `scalar:SELECT(MAX(stadium.capacity))` / `rows_with_different_values`. The 60000 boundary is not supported by the extracted operations.",
+     "requested_revision": "Downgrade the 60000 boundary to optional/uncertain in the spec (it is harmless \u2014 the sampler only emits it with 20% probability and it stays within the positive range). Not blocking, but the designer should mark it as inferred rather than evidence-backed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`values.NumberSampler.sample` applies boundary perturbation `self.boundary + r.choice([-2,-1,0,1,2])` and literal-pool draws; for `stadium.Capacity` the boundary 60000 is fine, but the same code path is used for `swimmer.meter_100` (REAL) where `_cast` rounds to int when `is_int` \u2014 meter_100 is REAL so `is_int=False`, OK. No integrity violation observed (fk_violations=0, not_null_violations=0, pk_duplicates=0).",
+     "requested_revision": "No change; noted only that boundary/literal perturbation is bounded and did not break the `Capacity > 0` / `meter_100 > 0` formulas in execution (validity 20/20)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.fill_foreign_keys_consistently` sets `nullable = not cm.notnull and cm.pk_pos == 0`. For `event.Stadium_ID` (nullable FK) this yields NULLs (25/120 observed) and non-NULL parent references \u2014 consistent with the NULL rule. For `record.Swimmer_ID`/`record.Event_ID` (composite PK members, pk_pos>0) no NULLs are emitted, matching the spec's `uncertainty.record.Swimmer_ID_null`. Execution shows 0 FK violations.",
+     "requested_revision": "No change; FK NULL/non-NULL behavior matches the interface NULL rule and the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.load_specification` skips `null_targets` entries that are composite-PK members (`if c in tm.primary_key: continue`), so `record.Swimmer_ID` is correctly excluded from NULL planting. `record.ID` (non-key nullable) is planted (15/228 NULLs observed). `writer._post_checks` confirms `compact_preserved: true` and `dup_pk_pairs.record: 0`.",
+     "requested_revision": "No change; NULL targeting and composite-PK dedup are implemented as specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.sec_to_time`/`time_to_sec` delegate to `values` (no self-recursion), and `TimeLadderSampler` validates observed entries with `is_time_string` before use. Execution: 0 errors, 0 rows_skipped, reproducible=true, 20/20 valid. `build_random_instance` returns `(instance, dropped)` and the writer adds `dropped` to `rows_failed` (0 here since ladder is monotone by construction).",
+     "requested_revision": "No change; the round-3 fixes are present and effective."
+    },
+    {
+     "agent": "designer",
+     "evidence": "`construction_pairs`: 26/67 separated, 0 unknown executions. The unseparated pairs are not evidence of a generation error per the instructions; the spec's value domains (group sizes 1/2/>=3, duplicate share 20-50%, ties at rank 1, enum Win/win/Loss/loss/NC, year range 1900-2030, Opening_year 2005/2006) are all implemented by construction in the samplers.",
+     "requested_revision": "No change; missing separation alone does not establish a generation error."
+    }
+   ],
+   "unresolved_checks": [
+    "The meter_100..700/Time monotonicity is an inferred heuristic, not a schema-declared rule; it is correctly documented as uncertain in the spec and enforced as a soft drop (0 drops observed). It should not be treated as a database semantic rule.",
+    "The stadium.Capacity boundary 60000 is not supported by the surviving extracted operations (the >60000 predicate was removed); it is harmless but should be marked inferred.",
+    "Construction separation is partial (26/67); this is expected for a random generator and does not by itself indicate a defect."
+   ]
+  }
+ ]
 }

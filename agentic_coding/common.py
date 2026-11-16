@@ -1,9 +1,4 @@
-"""SQL execution, result comparison and JSON helpers shared by every CoRE-DB build step.
-
-Two results are equal when their row multisets are equal, or their row
-sequences when the gold query has a top-level ORDER BY.  A result is *informative* when it has at least one
-row with a non-NULL value.  Execution errors and timeouts are ``unknown`` and never count as a separation.
-"""
+"""SQL execution, result comparison and JSON helpers shared by every CoRE-DB build step."""
 from collections import Counter
 from pathlib import Path
 import hashlib

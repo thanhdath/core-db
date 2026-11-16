@@ -1,8 +1,14 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) plus spec-driven FK augmentation."""
 import math
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
+
+SPEC_FKS = {
+    ('copyright', 'msid'): ('movie', 'mid'),
+    ('copyright', 'cid'): ('company', 'id'),
+    ('tags', 'kid'): ('keyword', 'id'),
+}
 
 
 @dataclass
@@ -58,7 +64,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -120,6 +126,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
                     continue
                 fks[(t, child)] = (pt, pc)
+        for (ct, cc), (pt, pc) in SPEC_FKS.items():
+            if ct in tables and pt in tables:
+                child = next((c.name for c in tables[ct].columns if c.name.lower() == cc.lower()), None)
+                parent = next((c.name for c in tables[pt].columns if c.name.lower() == pc.lower()), None)
+                if child is not None and parent is not None:
+                    fks[(ct, child)] = (pt, parent)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}

@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,6 +184,114 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class DomainSampler(ColumnSampler):
+    """Draws from an enumerated domain; plants boundary values with a fixed share."""
+
+    def __init__(self, domain, boundary, p, max_l0, rng, boundary_share=0.25):
+        super().__init__(list(domain), p, max_l0, rng)
+        self.domain = list(domain)
+        self.boundary = list(boundary)
+        self.boundary_share = boundary_share
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < self.boundary_share:
+            return r.choice(self.boundary)
+        return r.choice(self.domain)
+
+
+class MajorSampler(ColumnSampler):
+    """Student.Major: domain + boundary values + group-size / tie structure."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.MAJOR_DOMAIN), p, max_l0, rng)
+        self.boundary = list(spec.MAJOR_BOUNDARY)
+        pool = []
+        for v, k in zip(spec.MAJOR_DOMAIN, spec.MAJOR_GROUP_SIZES):
+            pool.extend([v] * k)
+        self.pool = pool
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.20:
+            return r.choice(self.boundary)
+        return r.choice(self.pool)
+
+
+class AdvisorSampler(ColumnSampler):
+    """Student.Advisor: boundary values + near variants (LIKE patterns without '%')."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.ADVISOR_BOUNDARY), p, max_l0, rng)
+        self.boundary = list(spec.ADVISOR_BOUNDARY)
+        self.near = [n.replace('%', '') for n in spec.ADVISOR_NEAR]
+        self.non_boundary = list(spec.ADVISOR_BOUNDARY) + self.near
+
+    def sample(self):
+        r = self.rng
+        u = r.random()
+        if u < spec.ADVISOR_BOUNDARY_SHARE:
+            return r.choice(self.boundary)
+        if u < spec.ADVISOR_BOUNDARY_SHARE + 0.10:
+            return r.choice(self.near)
+        return r.choice(self.non_boundary)
+
+
+class CitySampler(ColumnSampler):
+    """Student.city_code: 3-letter codes + boundary values (case variants)."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.CITY_POOL), p, max_l0, rng)
+        self.boundary = list(spec.CITY_BOUNDARY)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < spec.CITY_BOUNDARY_SHARE:
+            return r.choice(self.boundary)
+        return r.choice(spec.CITY_POOL)
+
+
+class CycleSampler(ColumnSampler):
+    """Voting_record.Election_Cycle: domain + boundary values."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__(list(spec.CYCLE_DOMAIN), p, max_l0, rng)
+        self.boundary = list(spec.CYCLE_BOUNDARY)
+
+    def sample(self):
+        r = self.rng
+        if r.random() < spec.CYCLE_BOUNDARY_SHARE:
+            return r.choice(self.boundary)
+        return r.choice(spec.CYCLE_DOMAIN)
+
+
+class AgeSampler(ColumnSampler):
+    """Student.Age: uniform in [AGE_MIN, AGE_MAX]."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+
+    def sample(self):
+        return self.rng.randint(spec.AGE_MIN, spec.AGE_MAX)
+
+
+class RegDateSampler(ColumnSampler):
+    """Voting_record.Registration_Date: %m/%d/%Y within DATE_YEARS, with duplicates."""
+
+    def __init__(self, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+        self.lo = dt.datetime(spec.DATE_YEARS[0], 1, 1)
+        self.hi = dt.datetime(spec.DATE_YEARS[1], 12, 31)
+
+    def _draw(self):
+        r = self.rng
+        d = self.lo + dt.timedelta(days=r.randint(0, (self.hi - self.lo).days))
+        return d.strftime(spec.DATE_FORMAT)
+
+    def sample(self):
+        return self._fresh_or_reuse(self._draw)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -216,7 +326,23 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224, with spec-driven overrides."""
+    key = (column.table, column.name)
+    if key == ('Student', 'Major'):
+        return MajorSampler(p, max_l0, rng)
+    if key == ('Student', 'Advisor'):
+        return AdvisorSampler(p, max_l0, rng)
+    if key == ('Student', 'city_code'):
+        return CitySampler(p, max_l0, rng)
+    if key == ('Student', 'Sex'):
+        return DomainSampler(spec.SEX_DOMAIN, spec.SEX_BOUNDARY, p, max_l0, rng, boundary_share=0.5)
+    if key == ('Student', 'Age'):
+        return AgeSampler(p, max_l0, rng)
+    if key == ('Voting_record', 'Election_Cycle'):
+        return CycleSampler(p, max_l0, rng)
+    if key == ('Voting_record', 'Registration_Date'):
+        return RegDateSampler(p, max_l0, rng)
+
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -231,5 +357,5 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, rng, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]

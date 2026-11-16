@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -33,7 +33,7 @@ def _one(i: int) -> str:
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
         write_instance_sqlite(_G['schema'], inst, p)
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
         return type(e).__name__
 

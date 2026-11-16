@@ -1,5 +1,8 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + specification loading."""
+import json
 import math
+import os
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +37,9 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: list = field(default_factory=list)
+    checks: dict = field(default_factory=dict)
+    spec: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +64,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,6 +81,45 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _split_top(s: str) -> list:
+    """Split a parenthesised column list on top-level commas."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(''.join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append(''.join(cur).strip())
+    return [x.strip('"`[] ') for x in out if x.strip()]
+
+
+def _parse_unique_tuples(create_sql: str, low: dict) -> list:
+    """Composite UNIQUE(...) column lists from a CREATE TABLE statement."""
+    out = []
+    for m in re.finditer(r'unique\s*\(([^()]*)\)', create_sql, re.I):
+        cols = [low.get(c.lower(), c) for c in _split_top(m.group(1))]
+        if len(cols) >= 2:
+            out.append(cols)
+    return out
+
+
+def _parse_checks(create_sql: str, low: dict) -> dict:
+    """Map column -> [CHECK expression text] for single-column checks (best effort)."""
+    out: dict = {}
+    for m in re.finditer(r'check\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', create_sql, re.I):
+        expr = m.group(1).strip()
+        for c in low:
+            if re.search(r'(?<![\w])%s(?![\w])' % re.escape(c), expr, re.I):
+                out.setdefault(low[c], []).append(expr)
+    return out
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
@@ -85,6 +130,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        unique_tuples = []
+        checks: dict = {}
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -99,9 +146,16 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
+                    names = [c[2] for c in cols if c[2]]
+                    if len(names) == 1 and names[0].lower() not in uniq:
+                        uniq.add(names[0].lower())
+                        from_index.append((t, names[0]))
+                    elif len(names) >= 2:
+                        unique_tuples.append((t, [low.get(n.lower(), n) for n in names]))
+            for cols in _parse_unique_tuples(create[t], low):
+                unique_tuples.append((t, cols))
+            for c, exprs in _parse_checks(create[t], low).items():
+                checks[(t, c)] = exprs
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
@@ -139,4 +193,15 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_tuples, checks)
+
+
+def load_specification(path: str = None) -> dict:
+    """Read tscore_gen/specification.json (written by the pipeline); {} when absent."""
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'specification.json')
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}

@@ -1,50 +1,514 @@
 {
  "db": "debate",
- "operator_io_quirks": [
-  "All identifiers are simple lowercase ASCII (people, debate, debate_people); no spaces or mixed case, but columns like People_ID, Debate_ID, Num_of_Audience, If_Affirmative_Win are mixed case and must be double-quoted.",
-  "Tiny DB: people=10, debate=6, debate_people=5 rows; read_schema original_values is complete, no rowid sampling needed.",
-  "debate_people has a 3-column composite PK (Debate_ID, Affirmative, Negative); sample_fresh_primary_keys must dedupe on the full tuple, and composite-PK members get max_l0=30.",
-  "debate_people has two FKs to the SAME parent people (Affirmative, Negative) plus one to debate; fill_foreign_keys_consistently must handle multiple child columns drawing from the same parent column independently.",
-  "FK parent people.People_ID is a single-column PK (unique) and debate.Debate_ID likewise; no dangling or non-unique parents here.",
-  "No self-references, no cycles; table order is trivially people, debate -> debate_people.",
-  "debate.Date is declared TEXT and stores 'October 21, 2011' style strings -> dispatches to String fuzzer, NOT Date; TS will not parse these as dates.",
-  "debate_people.If_Affirmative_Win declared 'bool' but storage class is text with values 'T'/'F' -> Bool fuzzer emits True/False (Python bools), which sqlite stores as 1/0, contradicting the original 'T'/'F' text.",
-  "All columns notnull=0 and null_rate=0.0; no NOT NULL/CHECK constraints, so no insert-time row rejection expected.",
-  "No unique single-column constraints beyond PKs; drop_unique_duplicates is a no-op here.",
-  "Party has only 4 distinct values, Venue 4, District 10 -> low-cardinality text columns where TS String fuzzer will produce many fresh random strings.",
-  "Age range 35-48, Num_of_Audience 90-342, People_ID 1-10, Debate_ID 1-6 -> small integer ranges; Number fuzzer full range is [-10^scale,10^scale] with scale from INT args (none) so default scale."
- ],
- "operator_ts_expectations": [
-  "People_ID/Debate_ID/Affirmative/Negative/Age/Num_of_Audience -> Number fuzzer (int family, no args -> scale default, is_int True); values perturbed by +-1/+-2 from pool or uniform in full range.",
-  "District/Name/Party/Venue/Date -> String fuzzer (TEXT/char family, length default 20); fresh strings over a-zA-Z 0-9() plus 50% contaminate (prefix/suffix/drop char).",
-  "If_Affirmative_Win -> Bool fuzzer: w.p. p an element ('T'/'F' as strings), else True/False; mixed types in one column.",
-  "debate.Date stays String: TS will NOT generate 'October 21, 2011' style dates, so queries filtering on date format/ordering will see random strings -> likely FN (implausible values) and FP (missing real date ties).",
-  "Party/Venue low cardinality: TS fresh strings rarely equal 'Republican'/'Democratic'/'Doha , Qatar' -> queries with equality on these values get empty results -> FN risk.",
-  "debate_people FK columns draw from parent's FINAL filtered values with replacement; with tiny parents (10, 6) many duplicate (Debate_ID,Affirmative,Negative) tuples -> PK dedupe drops most rows, shrinking debate_people below requested size.",
-  "Composite PK dedupe on 3 columns over small domains (6*10*10) means debate_people effectively caps near 600 distinct tuples; requested sizes up to 2500 will be truncated.",
-  "Bool column storing True/False (1/0) vs original 'T'/'F': queries comparing If_Affirmative_Win = 'T' will miss -> FN; queries on = 1 may spuriously match -> FP.",
-  "Age/Num_of_Audience Number fuzzer full-range draws (up to 10^scale) produce implausible ages/audiences -> FN for range predicates like Age BETWEEN 35 AND 50.",
-  "No NOT NULL/CHECK so no insert failures; rows_ok should equal requested sizes minus PK/unique dedupe.",
-  "String fuzzer contaminate and fresh draws break joins on Name/District text equality -> FP/FN on text-join queries."
- ],
- "challenger_refs": [
-  "G1",
-  "gc14ee8dc",
-  "G5",
-  "ga5cce95d",
-  "ga5cce95d",
-  "ga5cce95d",
-  "g2b9427a8",
-  "G3",
-  "gf39d34c2",
-  "G4",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL; generated rows use fresh keys above the compact maximum.",
+   "int_foreign_key": "Copy an existing parent primary-key value; never NULL for NOT NULL FK columns; reserve a share of generated parent keys that are never drawn as FK values so parent_rows_without_children holds.",
+   "int_quantity": "Uniform integer in [1, 500] unless a per-column range rule narrows it; never NULL for NOT NULL columns.",
+   "int_age": "Uniform integer in [30, 60] unless a per-column range rule narrows it.",
+   "text_short": "Pick from a small pool of realistic strings; allow near-duplicate variants (case, spacing, punctuation) at ~10% of rows; NULL only if column is nullable.",
+   "text_date": "Format 'Month D, YYYY' (e.g. 'October 21, 2011'); sample dates in [2005-01-01, 2020-12-31].",
+   "bool_flag": "Uniform choice of 0/1 (SQLite bool); NULL only if column is nullable.",
+   "fresh_value_share": "0.2 of text values are fresh near-variants not seen in the original pool.",
+   "null_planting": "Plant NULL only in columns listed in null_targets, at the compact database's NULL share (0 here) with at least one NULL row per listed column; never plant NULL in NOT NULL or primary-key columns; a planted NULL is never replaced to satisfy a rule.",
+   "boundary_coverage": "For every comparison_boundary column, guarantee at least one value on each side of each predicate threshold in every instance.",
+   "duplicate_and_group_joint": "For columns carrying both duplicates_for_distinct and group_sizes, build a group-size plan first (sizes 1, 2 and >= 3), then assign values so the duplicate share falls in 20-50%; assert both targets post-construction.",
+   "unmatched_join_construction": "For every FK, reserve a share of generated parent keys never drawn as FK values and keep at least one compact parent key unreferenced by generated child rows; report parent rows without children per FK.",
+   "compact_preservation": "Compact rows are never deleted or changed; post-write check compares compact rows against the original compact database and reports the result."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "people",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "distinct": true
+    }
+   },
+   {
+    "table": "people",
+    "column": "Name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ],
+     "having": "COUNT(*) >= 2"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Party",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "distinct": true
+    }
+   },
+   {
+    "table": "people",
+    "column": "Party",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(people.party)"
+     ]
+    }
+   },
+   {
+    "table": "people",
+    "column": "Party",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      34,
+      35,
+      36,
+      37
+     ],
+     "predicates": [
+      "IN (35,36)",
+      "BETWEEN 35 AND 36"
+     ],
+     "coverage": "at least one of 34 and 37 per instance"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Age",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "people",
+    "column": "Age",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "scalar": "MIN(people.age)"
+    }
+   },
+   {
+    "table": "people",
+    "column": "People_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "debate_people.Negative"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "people",
+    "column": "People_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "debate_people",
+    "column": "Negative",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "people.People_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "debate_people",
+    "column": "Negative",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(debate_people.negative)",
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ],
+     "having": "COUNT(debate_people.negative) >= 2"
+    }
+   },
+   {
+    "table": "debate_people",
+    "column": "Negative",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "debate_people",
+    "column": "Negative",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "debate",
+    "column": "Debate_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "debate_people.Debate_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "debate_people",
+    "column": "Debate_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "debate.Debate_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "debate",
+    "column": "Num_of_Audience",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      177,
+      178,
+      179,
+      199,
+      200,
+      201
+     ],
+     "predicates": [
+      "> 178",
+      "> 200"
+     ],
+     "coverage": "at least one of 177, 179, 199, 201 per instance"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "debate_people",
+    "child_column": "Debate_ID",
+    "parent_table": "debate",
+    "parent_column": "Debate_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "debate_people",
+    "child_column": "Affirmative",
+    "parent_table": "people",
+    "parent_column": "People_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "debate_people",
+    "child_column": "Negative",
+    "parent_table": "people",
+    "parent_column": "People_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "people",
+    "column": "People_ID",
+    "formula": "People_ID > 0"
+   },
+   {
+    "table": "people",
+    "column": "Age",
+    "formula": "Age BETWEEN 18 AND 100"
+   },
+   {
+    "table": "people",
+    "column": "Party",
+    "formula": "Party IN ('Republican','Democratic','Independent Democrat','Anti-Lecompton Democrat')"
+   },
+   {
+    "table": "debate",
+    "column": "Debate_ID",
+    "formula": "Debate_ID > 0"
+   },
+   {
+    "table": "debate",
+    "column": "Num_of_Audience",
+    "formula": "Num_of_Audience >= 0"
+   },
+   {
+    "table": "debate_people",
+    "column": "If_Affirmative_Win",
+    "formula": "If_Affirmative_Win IN (0, 1)"
+   },
+   {
+    "table": "debate_people",
+    "column": "Affirmative",
+    "formula": "Affirmative <> Negative"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "people": 10,
+   "debate": 6,
+   "debate_people": 5
+  },
+  "null_targets": [],
+  "supporting_evidence": {
+   "people.Party enum": "Observed values: Republican, Democratic, Independent Democrat, Anti-Lecompton Democrat.",
+   "people.Age range": "Observed ages 35-48; widened to 18-100 for realism.",
+   "debate.Num_of_Audience >= 0": "Observed values 90-342, all non-negative.",
+   "debate_people.Affirmative <> Negative": "No shown row has Affirmative = Negative.",
+   "debate_people.If_Affirmative_Win IN (0,1)": "Observed 'T'/'F' mapped to 1/0.",
+   "null_targets empty": "All nullable columns have observed null_rate 0.0; no COUNT(col)/IS NULL/LEFT JOIN/COALESCE atomic operations target a nullable column, so no NULL planting is required."
+  },
+  "uncertainty": "No calculated columns or date-order pairs exist in the schema; no formulas were derived. Null shares are 0 for all nullable columns in the observed data, so null_targets is empty and no NULLs are planted; debate_people.Negative is NOT NULL and gets no NULLs. Party enum is taken from observed values only. Affirmative <> Negative is enforced by resampling, never by planting NULL. If_Affirmative_Win IN (0,1) is enforced by a dedicated 0/1 sampler. Boundary coverage, duplicate-share/group-size joint construction, unmatched-join reservation and compact-row preservation are asserted post-construction and reported in execution feedback."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py defines NULLABLE_COLUMNS = [('debate_people','Negative')] and NOT_NULL_COLUMNS = [('debate_people','Negative')], and is_nullable() returns True for every column that is not NOT NULL/PK. instance.py then plants a NULL in every such column ('NULL rule: at least one NULL row per nullable column'). Execution feedback confirms this: debate.Date, debate.Num_of_Audience, debate.Venue, debate_people.If_Affirmative_Win, people.Age, people.District, people.Name, people.Party all get 'NULL 20 / n' generated rows. The specification's null_targets is only ['debate_people.Negative'] and its uncertainty note states 'Null shares are 0 for all nullable columns in the observed data, so NULL generation is limited to at least one NULL row per nullable column where allowed; debate_people.Negative is NOT NULL and gets no NULLs.' The program therefore contradicts the specification: it plants NULLs in columns the spec does not target, and it treats debate_people.Negative as both nullable and NOT NULL (the spec says it is NOT NULL and gets no NULLs).",
+     "requested_revision": "Align the program with the specification: restrict NULL planting to the columns listed in null_targets (and honour the compact NULL share, which is 0 here), and never plant NULL in debate_people.Negative. Remove the contradictory NULLABLE_COLUMNS/NOT_NULL_COLUMNS entries for debate_people.Negative. Alternatively, if the interface rule (item 7) is intended to override the spec, update the specification's null_targets and uncertainty text to list every nullable column and state the intended NULL share, so spec and program agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py fill_foreign_keys_consistently() draws FK values from 'pool = list(pv) + compact_pv' where pv is the generated parent column and compact_pv the compact parent keys, with 40% of draws from 'unmatched' compact keys. But the generated parent rows use fresh keys starting after the compact maximum (_fresh_pk_values), and the compact parent keys are already present in the copied database. So FK values can point to compact parent rows that already have children, and the 'unmatched' set is computed from compact child rows only, not from the generated child rows. The result is that the unmatched_join_rows target ('parent_rows_without_children': true) is not guaranteed for generated parents: every generated parent key is drawn from the same pool as the FK values, so a generated parent may or may not be referenced. The construction_pairs feedback shows only 12 of 42 eligible pairs separated, and construction_pairs_by_group is empty, so the unmatched-join pattern is not demonstrably constructed.",
+     "requested_revision": "Make the unmatched-join construction explicit: reserve a share of generated parent keys that are never drawn as FK values (and, for the compact side, keep at least one compact parent key unreferenced by generated child rows), so that parent_rows_without_children holds for both compact and generated parents. Add a construction check that reports, per instance, the number of parent rows without children for each FK, and surface it in the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py applies _apply_group_plan to people.Name, people.Party, people.Age and debate_people.Negative, and _apply_duplicate_share to people.Name and people.Party. But _apply_group_plan reshapes the value list by repeating rng.choice(values) and then truncating/padding, which can destroy the duplicate share set by _apply_duplicate_share (the two are applied in sequence, group plan last). Also, _apply_duplicate_share picks random indices and copies values, which can create group sizes larger than 3 and can remove the 1/2/>=3 structure. The specification requires both duplicates_for_distinct (20-50%) and group_sizes (1, 2 and >= 3) simultaneously on the same columns; the program does not verify that both hold after the second transformation. The construction_pairs feedback (12/42 separated, no per-group breakdown) does not confirm these targets are met.",
+     "requested_revision": "Apply the duplicate-share and group-size plans jointly (e.g. build a group-size plan first, then assign values so that the duplicate share falls in 20-50% and group sizes include 1, 2 and >= 3), and add a post-construction assertion per column that checks both targets. Report the achieved duplicate share and group-size histogram in the execution feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'debate_people.Affirmative <> Negative' and 'debate_people.If_Affirmative_Win IN (0,1)', and the supporting_evidence cites observed values. The Affirmative<>Negative rule is implemented in instance.py by setting neg[i] = None when aff[i] == neg[i] and Negative is nullable \u2014 but the spec says Negative is NOT NULL, so the fallback leaves the violation in place (neg[i] = neg[i]). The program therefore does not enforce the rule for NOT NULL Negative. The If_Affirmative_Win IN (0,1) rule is not enforced at all in instance.py; BoolSampler emits True/False, which SQLite stores as 1/0, so this happens to hold, but it is not by construction.",
+     "requested_revision": "Enforce Affirmative <> Negative by construction (e.g. resample Negative or Affirmative until they differ, never by planting NULL in a NOT NULL column), and enforce If_Affirmative_Win IN (0,1) explicitly (e.g. a dedicated sampler or a post-check). Add these to the construction checks reported in the execution feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions list comparison_boundary targets for people.Age (values [34,35,36,37], predicates IN (35,36) and BETWEEN 35 AND 36) and debate.Num_of_Audience (values [177,178,179,199,200,201], predicates > 178 and > 200). The program routes these to NumberSampler via _column_kwargs, which sets boundary values and lo/hi. However, NumberSampler.sample() only emits a boundary value with probability 0.5 and cycles through the list; with table sizes of 10 (people) and 6 (debate) per instance, the boundary values are not guaranteed to appear, and the lo/hi ranges (AGE_SEMANTIC_RANGE = (18,100), audience (0,500)) do not guarantee that values on both sides of the boundary (e.g. 34 and 37, 177 and 179, 199 and 201) are present. The construction_pairs feedback does not report boundary coverage.",
+     "requested_revision": "Guarantee boundary coverage by construction: for each comparison_boundary column, ensure at least one value on each side of each predicate threshold (e.g. 34 and 37 for Age; 177, 179, 199, 201 for Num_of_Audience) appears in every instance, and report the achieved boundary values in the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the compact database and appends generated rows, but it does not verify that compact rows are preserved unchanged. The execution feedback reports rows_added and rows_skipped but not a compact-row preservation check. The specification and the program docstring both claim 'compact rows are never deleted or changed', but there is no assertion or feedback confirming this.",
+     "requested_revision": "Add a post-write check that compares the compact rows in the generated instance against the original compact database (row counts and values per table) and report the result in the execution feedback. This is a verification gap, not necessarily a bug, but it should be confirmed."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the duplicate-share and group-size targets are simultaneously satisfied on people.Name and people.Party after both transformations (no per-column feedback).",
+    "Whether the unmatched-join target (parent_rows_without_children) holds for generated parents and for compact parents after generated child rows are appended (construction_pairs_by_group is empty).",
+    "Whether comparison_boundary values (Age 34/35/36/37; Num_of_Audience 177/178/179/199/200/201) actually appear in every instance (no boundary coverage feedback).",
+    "Whether compact rows are preserved unchanged (no preservation check in the feedback).",
+    "Whether Affirmative <> Negative and If_Affirmative_Win IN (0,1) hold in every generated debate_people row (no rule-check feedback)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_joint_plan` and `_apply_group_plan` build a group-size plan (e.g. [1,2,3,...]) but then assign each group a value via `rng.choice(values)` independently. Two different groups can draw the same value, so the realized group sizes are not the planned sizes. The post-construction checks `_check_duplicate_share` and `_check_group_sizes` are recorded in `_checks` but never asserted or used to resample; the CLI/writer only report them. Execution feedback shows `construction_pairs: eligible 42, separated 12` and `construction_pairs_by_group: []`, i.e. the group-size / duplicate-share / boundary targets are not actually guaranteed. For example, with n=10 and plan [1,2,3,4], if the size-1 group and the size-2 group both draw 'Republican', the realized sizes become 3 and 1, and the '1, 2 and >=3' target can silently fail.",
+     "requested_revision": "Make the joint plan deterministic: assign distinct values to distinct groups (draw without replacement from the value pool, or track used values), and after construction assert `_check_duplicate_share(...)['ok']` and `_check_group_sizes(...)['ok']`; on failure, resample the column (bounded retries) rather than only recording the check. Same for `_apply_boundary` / `_check_boundary` on Age and Num_of_Audience: assert coverage and resample if a boundary value is missing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_boundary` calls `spec.boundary_plan(n, boundary, rng)` which returns `out[:n]` after shuffling `list(values) + random choices`. When `n < len(values)` (e.g. people table size 10 with AGE_BOUNDARY_VALUES of length 4 is fine, but debate table size 6 with AUDIENCE_BOUNDARY_VALUES of length 6 is borderline, and jitter `rng.randint(-2,2)` in `choose_table_sizes` can make debate size 4), the truncation `out[:n]` drops boundary values, so `_check_boundary` will report `ok: False`. The check is recorded but not enforced. Execution feedback does not show per-instance boundary coverage, and `construction_pairs_by_group` is empty, so this is unverified.",
+     "requested_revision": "In `boundary_plan`, when `n < len(values)`, either raise the table size to at least `len(values)` for that column or select a subset of boundary values that still covers each predicate threshold (e.g. for `> 178` and `> 200` need at least one of {177,179} and one of {199,201}). Assert `_check_boundary(...)['ok']` and resample on failure."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `fill_foreign_keys_consistently` computes `compact_unmatched` from `schema.original_values` of the parent PK minus values used by *compact* child rows, then draws from `compact_unmatched` with probability 0.4. But the spec's `unmatched_join_rows` target is `parent_rows_without_children: true` for *generated* parent rows (reserved keys never drawn as FK). The reserved set is computed in `build_random_instance` *after* `fill_foreign_keys_consistently` is called for the same table (the `reserved[(t, pk)] = _reserve_unmatched(...)` line runs after `cols.update(fill_foreign_keys_consistently(...))`), so when a child table is processed later, `reserved` for the parent is populated \u2014 but for the parent table itself the reservation happens after its own FK fill, which is fine. However, the `unmatched` check at the end uses `inst.get(pt, {}).get(pc)` which includes *all* generated parent keys, and `child_vals` from generated child rows; it asserts `len(without) >= 1`. This can pass trivially because compact parent keys are also in `parent_keys` and may be unreferenced. The spec asks for *generated* parent rows without children, and the reservation share (0.3) is not verified against the realized count. Execution feedback shows `construction_pairs_by_group: []` and no per-FK unmatched counts, so this is unverified.",
+     "requested_revision": "Move the `reserved` computation for a table's PK *before* any child table's `fill_foreign_keys_consistently` runs (i.e. reserve immediately after generating the parent PK, before processing children), and add an explicit post-construction assertion that `len(reserved[(pt,pc)] - child_vals) >= 1` for each FK, resampling child FKs if violated. Report the realized unmatched count per FK in the checks side-car."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_column_kwargs` sets `kw['near_dup_share'] = rng.uniform(*spec.NAME_DUPLICATE_SHARE) / 2.0` for people.Name, i.e. 10-25%. But the spec's `duplicates_for_distinct` target for Name is 20-50% duplicate share, and `_apply_joint_plan` is applied *after* sampling, overwriting the sampler's near-dup behavior. The `near_dup_share` kwarg is therefore dead for Name (the joint plan replaces the column). More importantly, `_apply_joint_plan` uses `spec.joint_plan` which starts from `[1,2,3]` and adjusts, but as noted in issue 1 the realized share is not guaranteed. The spec's `duplicates_for_distinct` for Party is also handled by `_apply_joint_plan` with `PARTY_DUPLICATE_SHARE`, but the sampler's `enum` path in `StringSampler.sample` returns early without applying `near_dup_share` or `fresh_variant` for enum values except `fresh_variant` at 20% \u2014 which can produce values outside the Party enum (e.g. 'Dr. Republican'), violating the semantic rule `Party IN ('Republican','Democratic','Independent Democrat','Anti-Lecompton Democrat')`.",
+     "requested_revision": "For enum columns, do not apply `fresh_variant` (it can produce out-of-enum values); restrict to the enum. Remove the dead `near_dup_share` kwarg for Name or make it consistent with the joint plan. Assert the realized duplicate share for Name and Party is in [0.20, 0.50] and resample on failure."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `Party IN ('Republican','Democratic','Independent Democrat','Anti-Lecompton Democrat')` and `Age BETWEEN 18 AND 100`, but the generic sampling rule `int_age` says `Uniform integer in [30, 60]` and `AGE_SEMANTIC_RANGE = (18, 100)` is used in `_column_kwargs`. The spec's `comparison_boundary` for Age targets values [34,35,36,37] with predicates `IN (35,36)` and `BETWEEN 35 AND 36`, and `boundary_plan` guarantees all four values appear. This is consistent. However, the spec's `rows_with_different_values` target for Age (`>= 2 per group with different values`, scalar `MIN(people.age)`) is not implemented anywhere in the program: `_check_group_sizes` is recorded for Age but there is no check or construction for `rows_with_different_values`. The spec lists it as a per-column exception but the program has no corresponding logic.",
+     "requested_revision": "Either implement `rows_with_different_values` for Age (ensure each group of equal Age has at least 2 rows with different values, or document that the scalar MIN query is satisfied by construction) or remove it from the spec's per_column_exceptions if it is not intended to be enforced. As written, the spec and program are inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` applies `_apply_group_plan(cols['Negative'], spec.group_size_plan(n, rng), rng)` for debate_people.Negative, but `Negative` is a foreign key to people.People_ID. The group plan reshapes the FK values, potentially producing values not in the parent pool (since `_apply_group_plan` draws from `values` which is the already-filled FK column, so values are in the pool \u2014 OK). However, the `Affirmative <> Negative` resampling loop runs *after* the group plan and may replace `neg[i]` with a value from the parent pool, breaking the group-size plan for Negative. The `_check_group_sizes` for Negative is recorded *before* the Affirmative<>Negative resampling (the check is set in the `if t == 'debate_people' and 'Negative' in cols` block, then the resampling block runs later), so the recorded check may not reflect the final column. Execution feedback shows `construction_pairs_by_group: []`, so this is unverified.",
+     "requested_revision": "Move the `_check_group_sizes` for Negative to after the Affirmative<>Negative resampling, and if the resampling breaks the group plan, re-apply the group plan with the constraint that values differ from Affirmative. Assert the final check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_reserve_unmatched` uses `share=0.3` and `rng.sample(list(parent_keys), k)`. For small tables (people size 10, debate size 6), `k = max(1, round(10*0.3)) = 3` and `k = max(1, round(6*0.3)) = 2`. The reservation is applied to *generated* parent keys only (`cols[pk]` after `_fresh_pk_values`), which is correct. But the `unmatched` check at the end uses `parent_keys = set(inst.get(pt, {}).get(pc) or [])` which includes *all* generated parent keys, and `child_vals` from generated child rows. Since `reserved` keys are never drawn as FK (by `gen_pool = [v for v in pv if v not in res]`), the check should pass. However, the `fill_foreign_keys_consistently` also draws from `compact_pv` (compact parent keys), and the `unmatched` check includes compact parent keys in `parent_keys` \u2014 so `without` includes compact keys not referenced by generated children, which may be 0 if all compact keys are referenced. The check `len(without) >= 1` could pass only due to reserved generated keys, which is the intent, but the spec's `parent_rows_without_children: true` is about *generated* parent rows. The check is not specific enough.",
+     "requested_revision": "Make the `unmatched` check specific to generated parent keys: `without = set(reserved[(pt,pc)]) - child_vals` and assert `len(without) >= 1`. Report this per FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` calls `sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})` and `drop_unique_duplicates(tm, cols)` *after* the group plans and boundary plans are applied. `sample_fresh_primary_keys` drops rows with duplicate PK tuples, and `drop_unique_duplicates` drops rows with duplicate unique column values. This can reduce the row count below the planned `n`, breaking the group-size plan (e.g. if a group of size 3 has its rows dropped). The `_check_group_sizes` and `_check_duplicate_share` are recorded *before* these drops, so the recorded checks may not reflect the final column. Execution feedback shows `rows_added: people 190, debate 120, debate_people 96` for 20 instances, i.e. 9.5, 6, 4.8 rows per instance on average \u2014 close to the planned 10, 6, 5, but the drops are not reported.",
+     "requested_revision": "Apply `sample_fresh_primary_keys` and `drop_unique_duplicates` *before* the group/boundary plans, or re-apply the plans after the drops and re-check. Report the number of dropped rows per table in the checks side-car."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `generic_sampling_rules.null_planting` says 'Plant NULL only in columns listed in null_targets, at the compact database's NULL share (0 here) with at least one NULL row per listed column'. The spec's `null_targets` is empty, so no NULLs are planted. The program's `spec.NULL_TARGETS = []` and `null_target` returns False for all columns, so no NULLs are planted. This is consistent with the spec. However, the program interface rule (instruction 7) says 'for every nullable column (including nullable foreign keys), each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The execution feedback shows all nullable columns have 'NULL 0 / n', which is consistent with the compact share of 0, but the interface rule says 'at least one NULL row per nullable column' \u2014 this conflicts with the compact share of 0. The spec's `null_targets` empty is justified by 'All nullable columns have observed null_rate 0.0', but the interface rule says 'at least one NULL row per nullable column'. This is a spec/interface inconsistency.",
+     "requested_revision": "Clarify the NULL rule: if the compact share is 0, should NULLs be planted? The spec says no (null_targets empty), the interface rule says yes (at least one NULL per nullable column). The program follows the spec (no NULLs). Recommend the designer confirm the intended behavior and update the spec or interface rule accordingly. If the interface rule is authoritative, add the nullable columns to `null_targets` and plant at least one NULL per nullable column."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance boundary coverage for Age and Num_of_Audience is not reported in execution feedback; `construction_pairs_by_group` is empty, so the 42 eligible construction pairs are not broken down by pattern.",
+    "Realized duplicate share and group sizes for Name, Party, Age, Negative are recorded in `_checks` but not asserted; execution feedback does not show whether they pass.",
+    "Realized unmatched-join counts per FK are not reported; the `unmatched` check is not specific to generated parent keys.",
+    "The `rows_with_different_values` target for Age is not implemented; it is unclear whether the spec intends it to be enforced.",
+    "The NULL rule conflict between the spec (null_targets empty, no NULLs) and the interface rule (at least one NULL per nullable column) is unresolved."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'<' not supported between instances of 'int' and 'tuple'\"), n_ok=0, rows_added all 0. The error originates in the construction path. In instance.py, `_reserve_unmatched` is called with `cols[pk]` (a list of ints) and returns a set of ints; but `fill_foreign_keys_consistently` is invoked BEFORE the reservation is stored, and more importantly the reservation is keyed by `(t, pk)` while `fill_foreign_keys_consistently` looks up `reserved.get((pt, pc), set())` \u2014 consistent. The actual crash is in `_reserve_unmatched`: `rng.sample(list(parent_keys), k)` is fine, but `_reserve_unmatched` is called with `cols[pk]` where `cols` may already contain tuple-valued PKs? More concretely, `_fresh_pk_values` returns ints, but `sample_fresh_primary_keys`/`drop_unique_duplicates` run AFTER reservation, so that is not it. The traceback is a comparison of int vs tuple, which occurs in `min`/`max`/`sorted` over mixed values \u2014 e.g. `compact_max` computation `max(vals)` where `vals` mixes ints and tuples, or `_reserve_unmatched`'s `rng.sample` is fine. The most likely culprit: `_init_sampler`/`NumberSampler` `min(self.elements)` where elements include tuples from `literal_pool` (pool values are strings, but `_num` filters). Regardless of exact line, the program does not run: 0 instances produced.",
+     "requested_revision": "Fix the TypeError so that generation completes. Add a unit test that builds one instance end-to-end for the debate schema and asserts n_ok>0. Re-run and confirm rows_added>0 for all three tables and construction_pairs_by_group is populated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` returns `{t: inst[t] for t in schema.tables}` at the end, dropping the `_checks` key that was set on `inst`. writer.py then does `checks = instance.get('_checks', {})`, which is always empty, so `<path>.checks.json` never contains the construction checks (duplicate share, group sizes, boundary coverage, unmatched-join, Affirmative<>Negative, If_Affirmative_Win). The specification requires these to be 'asserted post-construction and reported in execution feedback'.",
+     "requested_revision": "Return the checks alongside the instance (e.g. return `(inst, checks)` or keep `_checks` in the returned dict and have writer read it), and ensure the checks file is written and surfaced in the CLI summary."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py: `_reserve_unmatched` is called with `cols[pk]` AFTER `fill_foreign_keys_consistently` has already filled child FKs for the current table, but the reservation is meant to happen 'immediately after the parent PK is generated, before any child FK fill'. For the `people` table, `debate_people` is a later table so ordering is fine; however for `debate`, `debate_people` is also later. The real ordering bug: `reserved[(t, pk)]` is set after `fill_foreign_keys_consistently(inst, schema, t, ...)` for the SAME table t, which is harmless for self-FKs but the spec says reserve before any child FK fill \u2014 for a self-referencing FK this would be violated. More importantly, `fill_foreign_keys_consistently` computes `gen_pool = [v for v in pv if v not in res]` but `res` is empty at the time the child table is filled only if the parent's reservation was stored \u2014 which it is, since parent tables come first in `table_order`. This part is OK; the ordering note is a minor spec deviation for self-FKs only.",
+     "requested_revision": "Move the `_reserve_unmatched` call to immediately after `_fresh_pk_values` and before `fill_foreign_keys_consistently` for the same table, so the reservation is guaranteed to precede any FK fill including self-references."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_joint_plan` and `_apply_group_plan` call `_assign_groups(plan, values, rng)` where `values` is the current column list. `_assign_groups` draws distinct values from `dict.fromkeys(pool)` \u2014 but `pool` is the *current column values*, which for `Name`/`Party` may already contain duplicates from the sampler. `dict.fromkeys` dedupes them, so distinct groups get distinct values, which is correct. However `_apply_joint_plan` is used for BOTH the duplicates check and the groups check in sequence: the first call reshapes to satisfy duplicate share, the second call reshapes again to satisfy group sizes, potentially breaking the duplicate share. The checks are recorded separately but the final column only satisfies the last applied plan. The spec requires both targets simultaneously ('assert both targets post-construction').",
+     "requested_revision": "Apply a single joint plan that satisfies both duplicate share and group sizes (the `joint_plan` already targets both), and assert both on the final column; do not run two independent reshapes that can undo each other."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py: `_check_boundary` with `thresholds` only checks `any(v < t)` and `any(v > t)` for each threshold, not that the specific boundary values (34, 37, 177, 179, 199, 201) appear. The spec's `comparison_boundary` targets list explicit values `[34,35,36,37]` and `[177,178,179,199,200,201]` and require 'at least one value on each side of each predicate threshold'. The check is weaker than the target but the `boundary_plan` does insert the values; still, the assertion does not verify the listed values are present, so a resample could pass while missing e.g. 34.",
+     "requested_revision": "Strengthen `_check_boundary` to also assert the required boundary values (or a covering subset per the spec's 'at least one of 34 and 37' wording) are present, and report which values were realized."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` is empty and the supporting evidence states 'All nullable columns have observed null_rate 0.0 ... no NULL planting is required'. The program interface rule (instruction 7) says every nullable column should contain NULL and non-NULL rows with the compact share. The spec's override is defensible given compact share 0, but the spec should explicitly state that the interface NULL rule is satisfied vacuously when the compact share is 0, and list which columns are nullable (District, Name, Party, Age, Date, Venue, Num_of_Audience, Affirmative, If_Affirmative_Win) so the engineer can confirm none are accidentally NOT NULL.",
+     "requested_revision": "Add an explicit nullable-column list and a statement that the interface NULL rule is satisfied with zero NULLs because the compact share is 0 for every nullable column; confirm `debate_people.Negative` is the only NOT NULL FK and gets no NULLs."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `table_sizes_per_instance` is `{people:10, debate:6, debate_people:5}` but `choose_table_sizes` applies jitter `rng.randint(-2,2)`, so sizes can be 8-12, 4-8, 3-7. With `debate_people` as small as 3, the `Negative` group-size plan (needs 1, 2, >=3 = at least 6 rows) cannot be satisfied, and the `Affirmative<>Negative` resampling plus group plan may conflict. The spec does not authorize jitter.",
+     "requested_revision": "Either remove the jitter (use exact sizes) or raise the minimum `debate_people` size to at least 6 and document the jitter range in the spec; ensure the group-size plan is feasible for the minimum size."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py: after the group/boundary plans, the code re-filters FK values to stay in the parent pool (`for cm in tm.columns: ... if pt == t`), but this only handles self-referencing FKs (`pt == t`). For `debate_people.Negative` and `Affirmative` pointing to `people`, the group plan on `Negative` may replace values with values not in `people.People_ID`, breaking the FK. The `_apply_group_plan` draws from the current column values (which are valid FKs), so it is likely safe, but there is no explicit assertion that `Negative`/`Affirmative` values are in `people.People_ID` after the plan.",
+     "requested_revision": "Add an explicit post-plan assertion that every non-NULL FK value exists in the parent column, and resample if violated; report the check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `_check_compact_preserved` compares `orig_rows == gen_rows` where `gen_rows` is `limit n_orig` ordered by rowid. Since generated rows are appended after compact rows, this is correct, but the check is only written to the checks file which (per issue 2) is empty. Also `write_instance_sqlite` sets `pragma foreign_keys = OFF`, so FK integrity is not enforced by SQLite; the program must assert it in Python (see issue 8).",
+     "requested_revision": "Ensure the compact-preservation result is actually written and surfaced; add a Python-side FK integrity assertion over the final instance and report it."
+    }
+   ],
+   "unresolved_checks": [
+    "Exact line of the TypeError could not be pinpointed from the stderr tail; the engineer must reproduce and fix.",
+    "Whether the joint plan simultaneously satisfies duplicate share and group sizes after the two sequential reshapes (issue 4) is unverified because no instance was produced.",
+    "Whether `debate_people` size jitter can make the Negative group-size plan infeasible (issue 7) is unverified.",
+    "Semantic rules (Party enum, Age 18-100, Num_of_Audience >= 0, Affirmative <> Negative, If_Affirmative_Win IN (0,1)) are supported by observed values and implemented by construction, but could not be verified in execution because generation failed."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'<' not supported between instances of 'int' and 'tuple'\"), n_ok=0, rows_added all zero. The traceback tail shows the failure occurs during build_random_instance. The most likely source is in instance.py: `_reserve_unmatched` is called with `cols[pk]` (fresh int PKs) \u2014 fine \u2014 but `fill_foreign_keys_consistently` builds `compact_pv` from `schema.original_values.get((pt, pc), [])` and `gen_pool` from `pv`; then `pool = list(gen_pool) + list(compact_pv)`. If `pv` (generated parent values) contains tuples (e.g. composite PKs) while compact values are ints, `rng.choice(pool)` is fine, but the later `_check_fk_integrity` and the FK re-pooling loop in build_random_instance do `set(parent_vals)` and membership tests \u2014 those are fine. The actual comparison `v not in res` in `gen_pool = [v for v in pv if v not in res]` is fine. However `_reserve_unmatched` does `keys = [k for k in parent_keys if k is not None]` then `rng.sample(keys, k)` \u2014 fine. The TypeError with int vs tuple strongly suggests `compact_max` or `_fresh_pk_values` interacting with a tuple-valued PK, OR `NumberSampler.list_min = min(self.elements)` where elements mix ints and tuples (values.py: `self.list_min = min(self.elements) if self.elements else self.min`). Since `_init_sampler` passes `sorted({str(v) for v in literal_pool})` (strings) plus `rng.choices(ov, ...)` (original values), and `NumberSampler.__init__` filters via `_num` which returns None for tuples \u2014 but `_num` returns `float(x)` for a tuple? No, `float(tuple)` raises TypeError caught by `except (TypeError, ValueError): return None`. So that path is safe. The remaining candidate is `_reserve_unmatched` being called with `cols[pk]` where `cols[pk]` was overwritten by `_fresh_pk_values` returning `[None]*n` for composite PKs \u2014 but then `k is not None` filters them. The failure is reproducible on every unit, so it is a hard blocker regardless of exact line: the program does not run.",
+     "requested_revision": "Reproduce the TypeError locally (run one unit with a traceback), identify the exact line, and fix it. Likely candidates to audit: (a) `NumberSampler.list_min = min(self.elements)` when `self.elements` can contain mixed types after `_num` filtering \u2014 confirm `_num` rejects tuples; (b) `_reserve_unmatched` / `_fresh_pk_values` when a table has a composite PK; (c) `fill_foreign_keys_consistently` when `pv` mixes ints and tuples. Add a unit test that builds one instance for the `debate` schema and asserts it returns without exception. Re-run the 20-unit generation and confirm n_ok=20, n_fail=0, and non-zero rows_added."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit failed, none of the construction checks were exercised: no `checks.json` was written, no `compact_preserved` result, no `fk_integrity` result, no `dropped_rows` counts, no boundary/group/duplicate assertions. The specification requires these to be asserted post-construction and reported (compact_preservation, fk_integrity_assertion, boundary_coverage, duplicate_and_group_joint, unmatched_join_construction). The execution feedback therefore provides zero evidence that any of these hold.",
+     "requested_revision": "After fixing the TypeError, re-run generation and attach the resulting `*.checks.json` contents (or a summary) showing: compact_preserved.ok=true for all tables; fk_integrity.ok=true; per-FK unmatched counts >= 1; boundary present values for Age and Num_of_Audience; duplicate share and group sizes for Name, Party, Negative; dropped_rows per table. Without this evidence the specification's assertion requirements are unverified."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` is empty and the supporting_evidence argues the interface NULL rule is satisfied vacuously because compact NULL share is 0. However the program interface rule (instruction 7) states: 'for every nullable column ... each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The spec's `NULLABLE_COLUMNS` list includes District, Name, Party, Age, Date, Venue, Num_of_Audience, Affirmative, If_Affirmative_Win, yet `null_target` returns False for all of them, so `build_random_instance` plants no NULLs. The spec's own note ('overrides the generic at least one NULL per nullable column wording') is a deliberate deviation from the interface rule, not a satisfaction of it.",
+     "requested_revision": "Either (a) populate `null_targets` with the nullable columns and plant at least one NULL per such column per instance (with share following the compact share, which is 0 \u2014 in which case the interface rule's 'at least one NULL' clause still requires one NULL row, so the spec must reconcile this), or (b) explicitly document in the specification that the interface NULL rule is being waived for this database and obtain sign-off. As written, the spec and the interface rule conflict; the program follows the spec, so the spec must be corrected."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `people.Age` comparison_boundary targets list values [34,35,36,37] with predicates IN (35,36) and BETWEEN 35 AND 36, and coverage 'at least one of 34 and 37 per instance'. But `AGE_THRESHOLDS = [(35, 36), (35, 36)]` in spec.py is used by `_check_boundary` as `for t in thresholds: if not any(v < t ...) or not any(v > t ...)`. With t=35 and t=36, the check requires values below 35 and above 35, and below 36 and above 36 \u2014 i.e. it requires a value <35 and a value >36, which is consistent with 'at least one of 34 and 37'. However the spec's stated coverage is 'at least one of 34 and 37' (either), while the code requires both a value <35 and a value >36 (i.e. both 34-side and 37-side). This is a stricter check than the spec text; if the spec intends 'at least one of 34 and 37', the code over-constrains and may resample unnecessarily. Conversely if the spec intends both sides, the spec text is ambiguous.",
+     "requested_revision": "Clarify the Age boundary coverage requirement: does 'at least one of 34 and 37' mean at least one value on each side of the BETWEEN range (i.e. both a <35 and a >36 value), or at least one of the two specific values? Align `AGE_THRESHOLDS` and `_check_boundary` with the clarified text. Same ambiguity applies to `AUDIENCE_THRESHOLDS = [178, 200]` vs the spec's 'at least one of 177, 179, 199, 201'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In `build_random_instance`, the `Negative` group plan is applied AFTER the `Affirmative <> Negative` resampling, and the FK re-pooling loop runs after that. The group plan (`_apply_group_plan`) reshapes `Negative` values by drawing from the existing value list, which may reintroduce `Affirmative == Negative` collisions (the plan does not re-check the semantic rule). The `Affirmative<>Negative` check is recorded before the group plan, so the recorded check may not reflect the final column. This is a latent correctness gap even though the current run failed earlier.",
+     "requested_revision": "Re-apply the `Affirmative <> Negative` resampling after the `Negative` group plan (or fold the constraint into the group-plan resampler), and record the semantic-rule check on the final column values. Add an assertion that the final `Affirmative`/`Negative` columns satisfy the rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_check_boundary` for the non-threshold branch uses `ok = len(present) == len(boundary)`, requiring every boundary value to appear. For `people.Age` with n=10 and boundary [34,35,36,37] this is satisfiable, but `boundary_plan` when n >= len(values) fills with random boundary values and shuffles \u2014 it does not guarantee all boundary values appear (it appends `rng.choice(values)` to reach n, which may duplicate and omit some). The check would then fail and trigger resampling, but `_apply_boundary` is deterministic given the same rng state, so resampling may loop without progress. This is a robustness concern for the boundary assertion.",
+     "requested_revision": "Make `boundary_plan` guarantee that every boundary value appears when n >= len(values) (e.g. start with the full list, then pad with random values, then shuffle). Confirm the boundary check passes deterministically for Age and Num_of_Audience across all 20 units."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was produced, so compact-row preservation, FK integrity, unmatched-join reservation, boundary coverage, duplicate/group-size targets, and dropped-row counts are all unverified.",
+    "The exact source of the TypeError is not pinpointed from the feedback alone; the engineer must reproduce with a traceback.",
+    "The NULL-rule conflict between the specification (null_targets empty) and the program interface rule (at least one NULL per nullable column) is unresolved and requires a designer decision.",
+    "The Age and Num_of_Audience boundary coverage semantics ('at least one of X and Y' vs 'one on each side') are ambiguous and need clarification."
+   ]
+  }
+ ]
 }

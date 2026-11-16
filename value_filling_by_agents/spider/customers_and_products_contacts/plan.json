@@ -1,52 +1,354 @@
 {
  "db": "customers_and_products_contacts",
- "operator_io_quirks": [
-  "All table names are mixed-case (Addresses, Products, Customers, Contacts, Customer_Address_History, Customer_Orders, Order_Items); DDL uses backticks, generated SQL must double-quote.",
-  "Tiny DB: every table has 15-20 rows; no huge-table sampling path exercised here.",
-  "DATETIME columns (date_from, date_to, order_date) store TEXT like '2015-07-23 14:37:18' (space separator, no T, no fractional seconds); declared type contains 'date' so TS dispatches to Date|Number(int elements) \u2014 first element is not int, so Date fuzzer with template '%Y-%m-%d %H:%M:%S'.",
-  "Customer_Address_History and Order_Items have NO primary key (pk=[]); upstream sample_fresh_primary_keys must no-op on empty PK, and drop_unique_duplicates has no unique columns to filter.",
-  "Order_Items.order_item_id is INTEGER NOT NULL but NOT a PK and NOT unique \u2014 it is a plain Number column, not a key.",
-  "FKs: Customer_Address_History -> Customers, Addresses; Customer_Orders -> Customers; Order_Items -> Customer_Orders, Products. All parents exist and are unique PKs; no dangling FKs, no self-references, no composite keys.",
-  "Contacts.customer_id is INTEGER NOT NULL with 9 distinct values over 15 rows (duplicates) but has NO declared FK to Customers \u2014 TS will treat it as a free Number column, not a FK.",
-  "gender VARCHAR(1) stores 'male'/'female' (length 4-6, exceeds declared length 1) \u2014 storage class text contradicts declared width; sqlite does not enforce VARCHAR length so inserts succeed.",
-  "order_quantity VARCHAR(80) mixes numeric strings ('3','7','9') with 'male' \u2014 String fuzzer will see int-like elements and add str(i\u00b11) variants plus contaminated strings.",
-  "product_price DOUBLE stores huge reals (5.4e7, 3.0e7) \u2014 Number fuzzer with scale=4 gives range [-10^4,10^4], so fresh draws are far smaller than originals; list range quirk (min(el), 10^4) applies.",
-  "zip_postcode / customer_number are VARCHAR storing short numeric strings ('740','041','456') \u2014 String fuzzer int-like branch adds \u00b11 variants; leading-zero strings ('041') may be perturbed.",
-  "country has distinct=1 ('USA'); state_province_county distinct=14; product_type_code/payment_method_code/order_status_code distinct=2 \u2014 low-cardinality ENUM-like columns."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on date_from/date_to/order_date: template '%Y-%m-%d %H:%M:%S', range from min/max of 5 sampled originals; fresh draws uniform in that range, so dates stay plausible but lose the original's clustering (date_to clustered in 2018-03).",
-  "Number fuzzer on *_id INTEGER PKs: scale=4, range [-10^4,10^4], int perturbation \u00b11/\u00b12; PKs will be small ints, not the original 1..15 \u2014 joins still work because FKs draw from parent's final values.",
-  "Number fuzzer on product_price DOUBLE: scale=4 -> fresh draws in [-10^4,10^4], far below originals (1e7); list-range quirk (min(el), 10^4) means even 'element' branch is bounded by 10^4 \u2014 likely FN on price-threshold queries.",
-  "String fuzzer on names/cities/addresses: fresh random strings over a-zA-Z0-9() of length 0-20 (or declared length), plus 50% contamination; original names like 'Kayley' will be replaced by gibberish \u2014 FN on LIKE/name-equality queries, FP on queries that only check non-null.",
-  "String fuzzer on low-cardinality ENUMs (product_type_code, payment_method_code, order_status_code, gender): 5 sampled originals + pool values, p=0.2 fresh; contamination may produce 'Hardwarex' etc. \u2014 FN on exact-match, FP on 'not in' style.",
-  "String fuzzer on customer_phone/contact_phone: originals have varied formats ('+87(9)...', '896.685.8228x2786', '(192)144-4687'); fresh strings are random charset \u2014 FN on phone-format queries, FP on length/prefix checks.",
-  "String fuzzer on customer_email: originals are 'x@example.com'; fresh strings lack '@' \u2014 FN on email-pattern queries.",
-  "FK columns (Customer_Address_History.customer_id/address_id, Customer_Orders.customer_id, Order_Items.order_id/product_id) draw from parent's FINAL filtered values with replacement \u2014 referential integrity holds, but cardinality of distinct FK values may differ from original (9 distinct customer_id over 15 rows).",
-  "Contacts.customer_id (no FK) is a free Number column \u2014 TS will NOT tie it to Customers.customer_id, so joins Contacts-Customers may return fewer/more rows than original \u2014 likely FP/FN on join-count queries.",
-  "Order_Items has no PK: sample_fresh_primary_keys no-ops, so duplicate (order_id, product_id) pairs are allowed \u2014 FP on DISTINCT/count queries that assume uniqueness.",
-  "order_quantity mixes '3' and 'male': String fuzzer's int-like branch adds '4','2' etc., contamination adds suffixes \u2014 FN on numeric-cast queries, FP on 'male' equality.",
-  "Tiny tables (15-20 rows): choose_table_sizes level-0 = 1+30*u (1-31 rows) or rand_lin 30+int(u*200) (30-230) \u2014 generated instances are 1-15x larger than original, so count-based queries will differ \u2014 FP on exact-count, FN on 'no rows' predicates."
- ],
- "challenger_refs": [
-  "G1",
-  "g1e53b249",
-  "g794470f0",
-  "g3702415b",
-  "G2",
-  "g68681cd1",
-  "g7ffef132",
-  "g9cd82eaf",
-  "g9cd82eaf",
-  "g9cd82eaf",
-  "g09eea5fc",
-  "ge96b1ecd"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential integers starting at 1; unique per table; never NULL.",
+   "integer_foreign_key": "Copy from parent table's primary key pool; include parent rows without children and NULL where nullable.",
+   "varchar_short": "Random words 3-15 chars; include near-variants of listed literals; allow NULL where nullable.",
+   "varchar_name": "Random capitalized first/last names; include near-variants; allow NULL where nullable.",
+   "varchar_address": "Random street address format; allow NULL where nullable.",
+   "varchar_phone": "Random phone format with digits and separators; allow NULL where nullable.",
+   "varchar_email": "Random lowercase name@domain; allow NULL where nullable.",
+   "varchar_code": "Random short uppercase code 2-15 chars; allow NULL where nullable.",
+   "varchar_status": "Pick from enum values; allow NULL where nullable.",
+   "double_price": "Random positive decimal with 2-6 decimal places; allow NULL where nullable.",
+   "datetime": "Random datetime between 1970-01-01 and 2020-12-31; allow NULL where nullable.",
+   "varchar_quantity": "Random integer string 1-20; allow NULL where nullable.",
+   "boundary_values": "For numeric columns include min, min-1, max, max+1; for dates include one day before/after listed literals.",
+   "near_variants": "For equality literals include case variants and one-character edits.",
+   "null_share": "Each nullable column gets at least one NULL row; share follows compact database.",
+   "duplicates_for_distinct": "Ensure 20-50% duplicate values on DISTINCT columns.",
+   "ties_for_order_limit": "Ensure ties at listed LIMIT ranks on ORDER columns.",
+   "unmatched_join_rows": "Include parent rows without children and NULL foreign keys where nullable."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Addresses.country = 'USA'",
+     "Addresses.country = 'usa'"
+    ],
+    "columns": [
+     "Addresses.country"
+    ]
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Customer_Orders.order_status_code = 'Completed'",
+     "Customer_Orders.order_status_code = 'Part'",
+     "Customer_Orders.order_status_code = 'completed'",
+     "Customer_Orders.order_status_code = 'part'"
+    ],
+    "columns": [
+     "Customer_Orders.order_status_code"
+    ]
+   },
+   {
+    "pattern": "enum",
+    "targets": [
+     "Completed",
+     "Part"
+    ],
+    "columns": [
+     "Customer_Orders.order_status_code"
+    ]
+   },
+   {
+    "pattern": "enum",
+    "targets": [
+     "Credit Card",
+     "Direct Debit"
+    ],
+    "columns": [
+     "Customers.payment_method_code"
+    ]
+   },
+   {
+    "pattern": "enum",
+    "targets": [
+     "Hardware",
+     "Clothes"
+    ],
+    "columns": [
+     "Products.product_type_code"
+    ]
+   },
+   {
+    "pattern": "enum",
+    "targets": [
+     "male",
+     "female"
+    ],
+    "columns": [
+     "Contacts.gender"
+    ]
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 % duplicate share"
+    ],
+    "columns": [
+     "Customers.customer_name",
+     "Customers.customer_phone",
+     "Customers.payment_method_code",
+     "Products.product_type_code",
+     "Addresses.city"
+    ]
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ],
+    "columns": [
+     "Customers.customer_id",
+     "Customers.customer_name",
+     "Customers.customer_phone"
+    ]
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) > 2",
+     "COUNT(*) >= 2",
+     "COUNT(*) > 1",
+     "COUNT(DISTINCT order_items.product_id) >= 2",
+     "COUNT(customer_orders.order_id) > 2"
+    ],
+    "columns": [
+     "Customers.customer_id",
+     "Customers.customer_name",
+     "Products.product_type_code",
+     "Order_Items.product_id",
+     "Customer_Orders.order_id"
+    ]
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "ORDER(SUM(order_items.order_quantity), DESC)",
+     "ORDER(customers.customer_name, ASC)",
+     "ORDER(SUM(CAST(order_items.order_quantity AS INTEGER)), DESC)",
+     "LIMIT(1000)"
+    ],
+    "columns": [
+     "Customers.customer_id",
+     "Customers.customer_name",
+     "Customers.customer_phone",
+     "Customers.customer_number"
+    ]
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children",
+     "child rows with NULL FK false"
+    ],
+    "columns": [
+     "Customers.customer_id",
+     "Products.product_id",
+     "Order_Items.product_id",
+     "Customer_Orders.customer_id",
+     "Order_Items.order_id"
+    ]
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ],
+    "columns": [
+     "Order_Items.order_quantity"
+    ]
+   },
+   {
+    "pattern": "null_rows",
+    "targets": [
+     "none (NOT NULL column)"
+    ],
+    "columns": [
+     "Customer_Address_History.customer_id"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Contacts",
+    "child_column": "customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Customer_Address_History",
+    "child_column": "customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Customer_Address_History",
+    "child_column": "address_id",
+    "parent_table": "Addresses",
+    "parent_column": "address_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Customer_Orders",
+    "child_column": "customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Order_Items",
+    "child_column": "order_id",
+    "parent_table": "Customer_Orders",
+    "parent_column": "order_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Order_Items",
+    "child_column": "product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Addresses",
+    "column": "country",
+    "formula": "country IN ('USA', 'usa')",
+    "evidence": "All shown rows have country 'USA'"
+   },
+   {
+    "table": "Customer_Orders",
+    "column": "order_status_code",
+    "formula": "order_status_code IN ('Completed', 'Part', 'completed', 'part')",
+    "evidence": "Shown rows have 'Completed' and 'Part'"
+   },
+   {
+    "table": "Customers",
+    "column": "payment_method_code",
+    "formula": "payment_method_code IN ('Credit Card', 'Direct Debit')",
+    "evidence": "Shown rows have 'Credit Card' and 'Direct Debit'"
+   },
+   {
+    "table": "Products",
+    "column": "product_type_code",
+    "formula": "product_type_code IN ('Hardware', 'Clothes')",
+    "evidence": "Shown rows have 'Hardware' and 'Clothes'"
+   },
+   {
+    "table": "Contacts",
+    "column": "gender",
+    "formula": "gender IN ('male', 'female')",
+    "evidence": "Shown rows have 'male' and 'female'"
+   },
+   {
+    "table": "Products",
+    "column": "product_price",
+    "formula": "product_price >= 0",
+    "evidence": "All shown prices are positive"
+   },
+   {
+    "table": "Order_Items",
+    "column": "order_quantity",
+    "formula": "CAST(order_quantity AS INTEGER) > 0",
+    "condition": "order_quantity GLOB '[0-9]*'",
+    "evidence": "Shown numeric quantities are positive; one row has 'male'"
+   },
+   {
+    "table": "Customer_Address_History",
+    "column": "date_to",
+    "formula": "date_to >= date_from",
+    "evidence": "All shown date_to values are after date_from"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 15,
+   "Contacts": 15,
+   "Customer_Address_History": 20,
+   "Customer_Orders": 15,
+   "Customers": 15,
+   "Order_Items": 15,
+   "Products": 15
+  },
+  "null_targets": [
+   "Addresses.line_1_number_building",
+   "Addresses.city",
+   "Addresses.zip_postcode",
+   "Addresses.state_province_county",
+   "Addresses.country",
+   "Contacts.gender",
+   "Contacts.first_name",
+   "Contacts.last_name",
+   "Contacts.contact_phone",
+   "Customer_Address_History.date_to",
+   "Customer_Orders.order_status_code",
+   "Customers.payment_method_code",
+   "Customers.customer_number",
+   "Customers.customer_name",
+   "Customers.customer_address",
+   "Customers.customer_phone",
+   "Customers.customer_email",
+   "Order_Items.order_quantity",
+   "Products.product_type_code",
+   "Products.product_name",
+   "Products.product_price"
+  ],
+  "supporting_evidence": {
+   "Addresses.country": "Rows 1-8 all have country 'USA'",
+   "Customer_Orders.order_status_code": "Rows 1-8 have 'Completed' or 'Part'",
+   "Customers.payment_method_code": "Rows 1-8 have 'Credit Card' or 'Direct Debit'",
+   "Products.product_type_code": "Rows 1-8 have 'Hardware' or 'Clothes'",
+   "Contacts.gender": "Rows 1-8 have 'male' or 'female'",
+   "Products.product_price": "Rows 1-8 all positive",
+   "Order_Items.order_quantity": "Rows 1-3,5-8 numeric positive; row 4 'male'",
+   "Customer_Address_History.date_to": "Rows 1-8 date_to after date_from"
+  },
+  "uncertainty": "Order_Items.order_quantity is VARCHAR but mostly numeric; one non-numeric value 'male' observed. Gender column is VARCHAR(1) but values 'male'/'female' exceed length 1, suggesting truncation or data anomaly. Product prices are extremely large (up to 54 million), unusual for retail. Customer_Address_History has 20 rows but only 15 customers and 15 addresses, implying multiple history entries per customer."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification uncertainty notes Contacts.gender is VARCHAR(1) but enum values 'male'/'female' exceed length 1. The program (spec.ENUMS) uses 'male'/'female' as required by the semantic rule, and execution shows 0 integrity violations, so SQLite's non-enforcement of VARCHAR length masks the mismatch. This is a schema/data anomaly, not a generation error.",
+     "requested_revision": "No blocking change. Optionally document that gender values are stored despite the declared VARCHAR(1) length, consistent with the observed compact data."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py `_apply_unmatched_parents` is a no-op (returns immediately); unmatched-parent coverage relies entirely on the FK sampler drawing with replacement from a pool larger than n. Execution shows 0 FK violations and construction_pairs separated 18/50, so the pattern is partially realized but not explicitly guaranteed.",
+     "requested_revision": "No blocking change. Optionally make unmatched-parent coverage explicit (e.g., ensure at least one parent key is never referenced) rather than relying on sampling chance."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "`_apply_ties` forces vals[1]=vals[0] on the raw column, but for Customers.customer_id the PK is overwritten with sequential integers after sampling and ties are not re-applied to the aggregate ORDER(SUM(order_quantity)) target; ties on the actual ORDER expressions (aggregate sums) are not directly constructed. Execution still shows 18/50 construction pairs separated, so variation remains possible.",
+     "requested_revision": "No blocking change. Optionally note that ties are approximated at the column level rather than on the aggregate ORDER target."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "`_apply_group_sizes` and `_apply_duplicate_share` operate on generated rows only; compact rows are preserved (writer copies orig then appends). Group-size/duplicate-share targets are therefore realized on the appended portion, which is acceptable given the 'copy compact + append' design.",
+     "requested_revision": "No change required; behavior is consistent with the round-1 append design."
+    }
+   ],
+   "unresolved_checks": [
+    "Semantic rules (country IN ('USA','usa'), status IN ('Completed','Part',...), payment_method IN ('Credit Card','Direct Debit'), product_type IN ('Hardware','Clothes'), gender IN ('male','female'), product_price >= 0, order_quantity numeric > 0 with one 'male', date_to >= date_from) are supported by the compact data evidence and implemented by construction via spec.ENUMS / NONNEGATIVE_COLUMNS / QUANTITY_COLUMN / DATE_ORDER. The 'male' quantity anomaly is explicitly modeled (QUANTITY_NONNUMERIC).",
+    "NULL rule: all listed nullable columns show generated NULLs (>=1 per column) and non-NULL values; NOT NULL/PK columns (e.g., Customer_Address_History.customer_id) never get NULL. NULL shares follow compact shares via `_apply_null_rule`. Consistent with the interface rule.",
+    "Dependencies: FK columns draw from parent compact+generated key pools (`fill_foreign_keys_consistently`); execution reports 0 FK violations, 0 NOT NULL violations, 0 PK duplicates across 20 instances.",
+    "Reproducibility: seeded RNG (seed_base*100003+i) and reproducible=true in feedback.",
+    "Value variation: 18/50 construction pairs separated; missing separation alone does not indicate a generation error."
+   ]
+  }
+ ]
 }

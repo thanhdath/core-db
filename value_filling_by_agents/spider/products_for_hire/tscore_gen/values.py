@@ -6,6 +6,27 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_DT_FMT = '%Y-%m-%d %H:%M:%S'
+
+
+def parse_dt(v):
+    """Parse a compact DATETIME value (str or epoch int); None on failure."""
+    if v is None:
+        return None
+    if isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, (int, float)):
+        try:
+            return dt.datetime.utcfromtimestamp(float(v))
+        except (ValueError, OSError, OverflowError):
+            return None
+    s = str(v).strip()
+    for t in _TEMPLATES:
+        try:
+            return dt.datetime.strptime(s, t)
+        except ValueError:
+            pass
+    return None
 
 
 class ColumnSampler:
@@ -39,11 +60,18 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 forced_lo=None, forced_hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if forced_lo is not None:
+            self.min = max(self.min, forced_lo)
+        if forced_hi is not None:
+            self.max = min(self.max, forced_hi)
+        if self.min > self.max:
+            self.min = self.max
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -73,7 +101,7 @@ class NumberSampler(ColumnSampler):
 class StringSampler(ColumnSampler):
     """fuzz/string.py (allow_none dropped)."""
 
-    def __init__(self, elements, p, max_l0, rng, length=20):
+    def __init__(self, elements, p, max_l0, rng, length=20, alphabet=None):
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
         for e in els:
@@ -82,9 +110,10 @@ class StringSampler(ColumnSampler):
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
+        self.alphabet = alphabet or CHARSET
 
     def _rand(self, k):
-        return ''.join(self.rng.choice(CHARSET) for _ in range(k))
+        return ''.join(self.rng.choice(self.alphabet) for _ in range(k))
 
     def sample(self):
         r = self.rng
@@ -104,6 +133,20 @@ class StringSampler(ColumnSampler):
                 v = v[:-1]
             else:
                 v = v[1:]
+        return v
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform choice from a fixed enum list (varchar_short_enum); near-case variants permitted."""
+
+    def __init__(self, values: list, rng, case_variants=False):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.case_variants = case_variants
+
+    def sample(self):
+        v = self.rng.choice(self.elements)
+        if self.case_variants and self.rng.random() < 0.1:
+            v = v.upper() if self.rng.random() < 0.5 else v.lower()
         return v
 
 
@@ -152,6 +195,33 @@ class DateSampler(ColumnSampler):
         return self._fresh_or_reuse(self._draw)
 
 
+class DatetimeSampler(ColumnSampler):
+    """Uniform datetime in [lo, hi], formatted '%Y-%m-%d %H:%M:%S'; a value pool is honoured with prob p."""
+
+    def __init__(self, elements, p, max_l0, rng, lo=None, hi=None, fmt=_DT_FMT):
+        super().__init__(elements, p, max_l0, rng)
+        self.fmt = fmt
+        self.lo = lo or dt.datetime(2015, 1, 1)
+        self.hi = hi or dt.datetime(2018, 12, 31, 23, 59, 59)
+        if self.lo > self.hi:
+            self.lo, self.hi = self.hi, self.lo
+        self.as_int = bool(self.elements) and all(isinstance(e, int) for e in self.elements)
+
+    def _draw(self):
+        r = self.rng
+        span = int((self.hi - self.lo).total_seconds())
+        d = self.lo + dt.timedelta(seconds=r.randint(0, span) if span > 0 else 0)
+        return int(d.timestamp()) if self.as_int else d.strftime(self.fmt)
+
+    def sample(self):
+        if self.elements and self.rng.random() < self.p:
+            v = self.rng.choice(self.elements)
+            if isinstance(v, dt.datetime):
+                return v.strftime(self.fmt)
+            return v
+        return self._fresh_or_reuse(self._draw)
+
+
 class TimeSampler(ColumnSampler):
     """fuzz/time.py."""
 
@@ -174,7 +244,7 @@ class BoolSampler(ColumnSampler):
 
     def __init__(self, elements, p, max_l0, rng, bit=False):
         super().__init__(elements, p, max_l0, rng)
-        self.vals = (1, 0) if bit else (True, False)
+        self.vals = ('1', '0') if bit else (True, False)
 
     def sample(self):
         if not self.elements or self.rng.random() < self.p:
@@ -182,7 +252,12 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def base_type(t: str) -> str:
+    """Lowercased declared type without length/precision arguments."""
+    return (re.search(r'^([^(]*)', (t or '').strip().lower()) or [None, ''])[1].strip()
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, *, lo=None, hi=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
@@ -195,7 +270,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
             return NumberSampler(els, p, max_l0, rng, scale=4)
-        return DateSampler(els, p, max_l0, rng)
+        return DatetimeSampler(els, p, max_l0, rng, lo=lo, hi=hi)
     if 'bool' in t:
         return BoolSampler(els, p, max_l0, rng)
     if 'bit' in t:
@@ -208,7 +283,10 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        flo = None if lo is None else lo
+        fhi = None if hi is None else hi
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, forced_lo=flo, forced_hi=fhi)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)

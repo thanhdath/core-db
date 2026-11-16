@@ -12,7 +12,6 @@ _COL = r'((?:[`"]?[\w -]+?[`"]?\.)*[`"]?[\w-]+[`"]?)'
 _IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
 _BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
 _CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
-# a bare qualifier token: identifier possibly quoted, no spaces
 _QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
 
 
@@ -108,7 +107,6 @@ def _clean_qualifier(q: str) -> str:
     q = q.strip().replace('"', '').replace('`', '').lower()
     if not q:
         return ''
-    # take the last whitespace-separated token (drops 'and', 'where', 'on', ...)
     tok = q.split()[-1] if q.split() else ''
     if not _QUAL.match(tok):
         return ''
@@ -129,8 +127,7 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)

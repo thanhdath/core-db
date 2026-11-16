@@ -1,63 +1,586 @@
 {
  "db": "yelp",
- "operator_io_quirks": [
-  "All 7 tables report rows=0 and every column null_rate/distinct/storage/samples is null/empty: the facts carry NO data profile, so original_values are empty and literal pool must come entirely from TRAIN SQL.",
-  "Table name \"user\" is a SQL keyword; must be double-quoted everywhere (DDL already quotes it).",
-  "DDL uses backtick-quoted parent refs (`business`) inside FOREIGN KEY clauses; sqlite_master text must be replayed verbatim.",
-  "tip DDL is malformed-ish: missing comma between 'primary key(\"tip_id\")' and 'foreign key(...)' \u2014 sqlite accepted it, but line-based unique/check scanning and any re-parse must tolerate it.",
-  "FKs point to business.business_id and user.user_id, which are NOT primary keys and NOT declared unique (only bid/uid are PK). Parent columns are non-unique; FK fill draws with replacement from parent values, so duplicates are expected.",
-  "business_id / user_id are TEXT but semantically opaque IDs; latitude/longitude are TEXT though numeric-looking; is_open INT is a 0/1 flag; rating REAL in [1,5] semantically.",
-  "review.year and tip.year are INT (Number fuzzer, not Date); month is TEXT (String fuzzer) \u2014 no date fuzzer dispatches here at all.",
-  "No NOT NULL, no CHECK, no UNIQUE constraints anywhere; only PKs. So write_instance_sqlite will rarely skip rows for constraint failures except PK duplicates (already filtered) and the FK-less inserts.",
-  "Self-references: none. Cycles: none (business/user are roots; category/checkin/neighbourhood/review/tip are children).",
-  "review and tip each have TWO FKs (business_id, user_id) \u2014 column order must place both parents before the child.",
-  "All PKs are single-column INT (bid, id, uid, cid, id, rid, tip_id) \u2014 Number fuzzer with max_l0=inf, so PKs are always fresh draws.",
-  "No views, triggers, or indexes in the DDL; empty clone is just the 7 CREATE TABLEs."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on every INT/REAL column: uniform in [-10^scale, 10^scale] (scale=0 for INT, 4 for REAL), then +-1/+-2 (int) or +-0.01/+-0.02 (float) perturbation \u2014 yields implausible bid/uid/rid, negative review_count, rating outside [1,5], is_open not in {0,1}.",
-  "String fuzzer on business_id/user_id/name/city/state/latitude/longitude/month/text: random a-zA-Z0-9() strings length 0..20, plus 50% contaminate (prefix/suffix/drop char) \u2014 business_id and user_id become garbage, so FK joins between review/tip and business/user still 'work' (drawn from parent) but the IDs are meaningless.",
-  "latitude/longitude declared TEXT -> String fuzzer, so no numeric coordinate semantics; queries comparing them numerically will see random strings.",
-  "month TEXT -> String fuzzer, not a month name; year INT -> Number fuzzer, not a plausible year. Any 'month = \"January\"' or 'year = 2015' literal from TRAIN pool is the only source of plausible values (p=0.2 element reuse).",
-  "is_open INT -> Number fuzzer, so values like -3 or 7 appear; queries 'WHERE is_open = 1' will match ~randomly.",
-  "rating REAL -> Number fuzzer scale=4, range [-10000,10000] +-0.01 \u2014 almost never in [1,5]; 'rating > 4' selects ~half the rows by chance.",
-  "FK fill: category/checkin/neighbourhood.business_id drawn from business.business_id (final, after PK/unique filter); review/tip.business_id and .user_id likewise. Since business_id is non-unique in the parent, child rows can share parents \u2014 good for joins, but parent business_id values are random strings so no real correlation.",
-  "Empty original_values (rows=0) means elements = only literal-pool values; if pool is empty for a column, sampler is pure-fresh (p effectively 1).",
-  "Known FN driver: implausible values (negative counts, rating out of range, garbage IDs) make gold predicates like 'rating BETWEEN 1 AND 5' or 'is_open = 1' select wrong cardinalities, so gold and neighbour may agree by accident.",
-  "Known FP driver: no ties/duplicates in PKs (filtered) and non-unique FK parents mean GROUP BY / DISTINCT / COUNT(DISTINCT) queries can differ from real data distribution; missing duplicate business_id in business means 'businesses with >1 category' style queries behave differently.",
-  "No date fuzzer fires (no date/timestamp declared type), so date-format quirks of TS are not exercised on yelp."
- ],
- "challenger_refs": [
-  "G1",
-  "G2",
-  "G3",
-  "g0d0588a5",
-  "g0d0588a5",
-  "g0d0588a5",
-  "g284c11e4",
-  "g284c11e4",
-  "g284c11e4",
-  "g284c11e4",
-  "g284c11e4",
-  "g284c11e4",
-  "ge2d43975",
-  "ge2d43975",
-  "ge2d43975",
-  "g3a0f99b3",
-  "g3a0f99b3",
-  "g3a0f99b3",
-  "g3a0f99b3",
-  "g3a0f99b3",
-  "g44e1d336",
-  "g44e1d336",
-  "g0e83dc8b",
-  "g3ee1af1a"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a small pool of realistic short strings; 5% near-variants (case flip, trailing ' x', one-char typo) of pool values; 2% NULL when nullable.",
+   "text_long": "Sample from a pool of 8-12 realistic sentences; 20-50% duplicate share on DISTINCT-targeted columns; 2% NULL when nullable.",
+   "int_pk": "Sequential 1..N, never NULL.",
+   "int_quantity": "Uniform integer in [0, 200]; 1% NULL when nullable.",
+   "int_flag": "Uniform in {0,1}; 1% NULL when nullable.",
+   "real_rating": "Uniform real in [1.0, 5.0] rounded to 1 decimal; 1% NULL when nullable.",
+   "text_id": "Format '<prefix>_<8 hex>'; 20-50% duplicate share on DISTINCT-targeted columns; 2% NULL when nullable.",
+   "text_month": "Uniform in {January..December}; 2% NULL when nullable.",
+   "int_year": "Uniform in [2005, 2018]; 1% NULL when nullable.",
+   "text_lat_lon": "Numeric string with 6 decimals, e.g. '32.776664'; 2% NULL when nullable.",
+   "text_address": "Street number + street + city + state + zip; 2% NULL when nullable.",
+   "boundary_numeric": "For each listed literal L and step s: include L-s, L, L+s.",
+   "boundary_text": "For each listed literal L: include L, lower(L), upper(L), and one-char-typo variant.",
+   "like_variant": "For each listed LIKE literal '%X%': include X, X+' x', one-char-typo of X, lower(X).",
+   "null_share": "Every nullable column: at least one NULL row per instance; share ~2% (5% for join FK columns).",
+   "join_fk": "5% of child rows get NULL FK; 5% of parent rows have no child rows.",
+   "tie_order": "For ORDER/LIMIT-targeted columns, plant at least 3 rows sharing the max value."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "business.name": [
+      "Panda Express",
+      "panda express",
+      "Target",
+      "target",
+      "Texas de Brazil",
+      "texas de brazil"
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "business.name": [
+      "%Starbucks%",
+      "Starbucks",
+      "Starbuckt",
+      "Starbucks x",
+      "starbucks",
+      "%Panda Express%",
+      "Panda Exprest",
+      "Panda Express x",
+      "panda express"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "business.name": "20-50 %"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "business.business_id": [
+      "category.business_id",
+      "review.business_id",
+      "neighbourhood.business_id"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "business.business_id": "20-50 %"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "business.business_id": [
+      "Cafe Zinho",
+      "cafe zinho"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "category.category_name": [
+      "restaurant",
+      "RESTAURANT",
+      "Irish Pub",
+      "irish pub",
+      "escape games",
+      "ESCAPE GAMES"
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "category.category_name": [
+      "Egyptian",
+      "%Egyptian%",
+      "%egyptian%",
+      "Bar%",
+      "Bars",
+      "Egyptiao",
+      "Egyptian x",
+      "egyptian",
+      "egyptiao",
+      "egyptian x",
+      "EGYPTIAN"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "business.city": [
+      "Dallas",
+      "dallas",
+      "Madison",
+      "madison",
+      "Pittsburgh",
+      "pittsburgh"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "user.name": [
+      "Michelle",
+      "michelle",
+      "Niloofar",
+      "niloofar",
+      "Adrienne",
+      "adrienne"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "user.name": "20-50 %"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "category.business_id": [
+      "business.business_id",
+      "review.business_id"
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "user.user_id": [
+      "review.user_id",
+      "tip.user_id"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "user.user_id": [
+      "Michelle",
+      "michelle"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "business.state": [
+      "Texas",
+      "texas",
+      "Dallas",
+      "dallas",
+      "TX",
+      "tx"
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "review.user_id": [
+      "user.user_id"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "review.user_id": "20-50 %"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "review.business_id": [
+      "category.business_id",
+      "business.business_id",
+      "tip.business_id"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "review.text": "20-50 %"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "neighbourhood.neighbourhood_name": [
+      "South Summerlin",
+      "south summerlin",
+      "Hazelwood",
+      "hazelwood",
+      "Stone Meadows",
+      "stone meadows"
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "neighbourhood.neighbourhood_name": [
+      "Hazelwood",
+      "%Hazelwood%",
+      "%Houston%",
+      "Hazelwooe",
+      "Hazelwood x",
+      "hazelwood",
+      "Houston",
+      "Houstoo",
+      "Houston x",
+      "houston"
+     ]
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "tip.text": "20-50 %"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "neighbourhood.business_id": [
+      "business.business_id",
+      "category.business_id",
+      "business.bid"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "neighbourhood.business_id": [
+      "restaurant",
+      "RESTAURANT",
+      "Madison",
+      "madison"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "review.year": [
+      2009,
+      2010,
+      2011,
+      2013,
+      2014,
+      2015
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "review.month": [
+      "March",
+      "march"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "tip.year": [
+      2009,
+      2010,
+      2011,
+      2014,
+      2015,
+      2016
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "tip.month": [
+      "April",
+      "april",
+      "ril",
+      "RIL",
+      "4-APR",
+      "4-apr"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "business.rating": [
+      3.49,
+      3.5,
+      3.51,
+      4.49,
+      4.5,
+      4.51
+     ]
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "business.full_address": [
+      "%Panda Express%",
+      "%Sushi Too%",
+      "Panda Express",
+      "Panda Exprest",
+      "Panda Express x",
+      "panda express",
+      "Sushi Too",
+      "Sushi Top",
+      "Sushi Too x",
+      "sushi too"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "category.business_id",
+    "parent": "business.business_id",
+    "copied": []
+   },
+   {
+    "child": "checkin.business_id",
+    "parent": "business.business_id",
+    "copied": []
+   },
+   {
+    "child": "neighbourhood.business_id",
+    "parent": "business.business_id",
+    "copied": []
+   },
+   {
+    "child": "review.business_id",
+    "parent": "business.business_id",
+    "copied": []
+   },
+   {
+    "child": "review.user_id",
+    "parent": "user.user_id",
+    "copied": []
+   },
+   {
+    "child": "tip.business_id",
+    "parent": "business.business_id",
+    "copied": []
+   },
+   {
+    "child": "tip.user_id",
+    "parent": "user.user_id",
+    "copied": []
+   },
+   {
+    "unique": "business.business_id"
+   },
+   {
+    "unique": "user.user_id"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "business",
+    "column": "bid",
+    "formula": "bid > 0"
+   },
+   {
+    "table": "business",
+    "column": "is_open",
+    "formula": "is_open IN (0, 1)"
+   },
+   {
+    "table": "business",
+    "column": "rating",
+    "formula": "rating BETWEEN 1.0 AND 5.0"
+   },
+   {
+    "table": "business",
+    "column": "review_count",
+    "formula": "review_count >= 0"
+   },
+   {
+    "table": "category",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "checkin",
+    "column": "cid",
+    "formula": "cid > 0"
+   },
+   {
+    "table": "checkin",
+    "column": "count",
+    "formula": "count >= 0"
+   },
+   {
+    "table": "neighbourhood",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "review",
+    "column": "rid",
+    "formula": "rid > 0"
+   },
+   {
+    "table": "review",
+    "column": "rating",
+    "formula": "rating BETWEEN 1.0 AND 5.0"
+   },
+   {
+    "table": "review",
+    "column": "year",
+    "formula": "year BETWEEN 2005 AND 2018"
+   },
+   {
+    "table": "review",
+    "column": "month",
+    "formula": "month IN ('January','February','March','April','May','June','July','August','September','October','November','December')"
+   },
+   {
+    "table": "tip",
+    "column": "tip_id",
+    "formula": "tip_id > 0"
+   },
+   {
+    "table": "tip",
+    "column": "likes",
+    "formula": "likes >= 0"
+   },
+   {
+    "table": "tip",
+    "column": "year",
+    "formula": "year BETWEEN 2005 AND 2018"
+   },
+   {
+    "table": "tip",
+    "column": "month",
+    "formula": "month IN ('January','February','March','April','May','June','July','August','September','October','November','December')"
+   },
+   {
+    "table": "user",
+    "column": "uid",
+    "formula": "uid > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "business": 200,
+   "user": 120,
+   "category": 400,
+   "checkin": 300,
+   "neighbourhood": 250,
+   "review": 500,
+   "tip": 300
+  },
+  "null_targets": [
+   "business.business_id",
+   "business.name",
+   "business.full_address",
+   "business.city",
+   "business.latitude",
+   "business.longitude",
+   "business.review_count",
+   "business.is_open",
+   "business.rating",
+   "business.state",
+   "category.business_id",
+   "category.category_name",
+   "checkin.business_id",
+   "checkin.count",
+   "checkin.day",
+   "neighbourhood.business_id",
+   "neighbourhood.neighbourhood_name",
+   "review.business_id",
+   "review.user_id",
+   "review.rating",
+   "review.text",
+   "review.year",
+   "review.month",
+   "tip.business_id",
+   "tip.text",
+   "tip.user_id",
+   "tip.likes",
+   "tip.year",
+   "tip.month",
+   "user.user_id",
+   "user.name"
+  ],
+  "supporting_evidence": {
+   "no_formulas": "No calculated/dependent column formulas are supported: the provided sample rows are empty (all column value lists are []), so no formula can be verified against three shown rows. Only range/enum rules derived from declared types and the atomic-operation boundary targets are stated.",
+   "ranges": "business.rating boundary targets 3.49/3.5/3.51/4.49/4.5/4.51 imply a 1-5 rating scale; review.rating same. review.year/tip.year boundary targets 2009-2016 imply a year range around 2005-2018. business.is_open targets 0/1/2 imply a 0/1 flag. business.review_count targets -1/0/1 imply >= 0.",
+   "months": "review.month and tip.month boundary targets are month names (March, April) with case variants, implying a 12-month enum."
+  },
+  "uncertainty": {
+   "empty_sample": "All original column value lists are empty, so no formula, offset, rate or order rule can be computed from aligned sample rows; only type- and target-derived rules are stated.",
+   "duplicate_shares": "Duplicate shares are given as ranges (20-50%) and are applied as a target share, not an exact count.",
+   "join_null_rates": "NULL FK share and parent-without-child share are not given numerically; 5% each is chosen to guarantee occurrence within the stated table sizes.",
+   "text_pools": "Text pools are synthetic because no observed values are available; near-variants are generated from the listed literals only."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "supporting_evidence.no_formulas states the original sample rows are empty (all column value lists []), so no formula/offset/rate/order rule could be verified against three shown rows. Only type- and target-derived rules (ranges, enums, months) are stated. This is honestly disclosed and consistent with the 'fast mode' input.",
+     "requested_revision": "None required for pass; if a future round supplies non-empty sample rows, add verified formula/offset rules. The current range/enum rules (rating 1-5, year 2005-2018, is_open 0/1, review_count>=0, month enum) are adequately supported by the boundary targets and declared types."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Duplicate shares are given only as ranges (20-50%) and join NULL/parent-without-child rates are not numerically specified; the spec explicitly chooses 5% each. These are stated as uncertainty, not fabricated precision.",
+     "requested_revision": "None blocking. Optionally pin exact duplicate share and join-null rates in a later round for tighter control."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Execution feedback shows every nullable column has NULL rows in generated data (e.g. business.name NULL 31/1217, category.business_id NULL 127/1429, review.user_id NULL 170/1760), matching the ~2% / ~5% FK rule in _plant_nulls (instance.py). No column reads 'NULL 0 / n', so the interface NULL rule is satisfied.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Integrity feedback: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0; 20/20 valid instances; reproducible=true; rows_skipped all 0. Writer copies the compact DB then appends (writer.py), and _fresh_against_compact / sample_fresh_primary_keys / drop_unique_duplicates guard PK/UNIQUE collisions, consistent with the zero-violation result.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "construction_pairs: eligible 301, separated 224, unknown_executions 0. 77 pairs are not separated. This is expected: the spec deliberately plants boundary values (L, lower, upper, typo) and LIKE variants (X, X+' x', typo, lower) that are near-duplicates by design, and duplicate-share planting reuses values. Non-separation alone does not prove a generation error (per instruction 4). Value variation remains possible because spec pools are combined with fresh draws (values.py _init_sampler merges original values + literal pool + spec pools) and samplers still emit random variants.",
+     "requested_revision": "None blocking. If higher separation is desired, the designer could reduce the near-variant overlap in boundary/LIKE pools, but this is a tuning choice, not an error."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Spec value domains are implemented by construction: schema.load_specification routes comparison_boundary/like_near_variant targets into spec_pools, semantic_rules into spec_ranges/spec_enums, table_sizes_per_instance into spec_sizes, null_targets into spec_null, duplicates_for_distinct into spec_dup. instance.build_random_instance applies _plant_duplicates and _plant_nulls and fills FKs from parent values (fill_foreign_keys_consistently). Dependencies (category/checkin/neighbourhood/review/tip -> business, review/tip -> user) are honored, consistent with 0 FK violations.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Exact duplicate share and join-null rates are not numerically specified; only ranges/5% defaults are used, so precise conformance cannot be verified.",
+    "No non-empty original sample rows were available, so formula/offset/order rules could not be verified; only type- and target-derived rules are asserted.",
+    "77/301 construction pairs remain unseparated; this is consistent with intentional near-variant planting but cannot be independently confirmed as intended without held-out labels (not used per instructions)."
+   ]
+  }
+ ]
 }

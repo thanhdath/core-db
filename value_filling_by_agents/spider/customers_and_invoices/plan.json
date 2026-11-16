@@ -1,50 +1,723 @@
 {
  "db": "customers_and_invoices",
- "operator_io_quirks": [
-  "All table/column names are backtick-quoted in DDL; mixed case (Customers, Order_Items, Financial_Transactions) \u2014 must preserve original spelling and double-quote in generated SQL.",
-  "Tiny DB: every table has exactly 15 rows (Product_Categories 4); original_values sampling of 5 with replacement is a large fraction of the table.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional seconds); declared DATETIME dispatches to Date|Number(int elements) \u2014 first element is not int so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "Financial_Transactions and Invoice_Line_Items have NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there, and drop_unique_duplicates has no unique columns to act on.",
-  "Products.parent_product_id is an INTEGER that looks like a self-reference to Products.product_id but is NOT declared as an FK \u2014 TS will treat it as a plain Number column, not a consistent FK.",
-  "Financial_Transactions.transaction_id is INTEGER NOT NULL but not PK and not unique-declared; distinct=15 so effectively unique in original but TS may duplicate.",
-  "VARCHAR columns holding numeric-looking strings: product_quantity ('6','7','4'), account_name ('900','520'), gender ('1','0'), customer_middle_initial single letters \u2014 String fuzzer will produce arbitrary charset strings, not these shapes.",
-  "DECIMAL(19,4) columns store REAL (float) storage class; derived_product_cost/derived_total_cost mix real and integer storage \u2014 Number fuzzer with scale=19, precision=4 gives huge ranges.",
-  "Several VARCHAR(255) columns are 100% NULL (order_details, transaction_comment, other_transaction_details, other_order_item_details, derived_vat_payable) \u2014 distinct=0, samples empty; String sampler with no elements sets p=1 (always fresh).",
-  "product_title has distinct=1, value 'prod_name' \u2014 a placeholder string, not a real title; TS will treat it as a String with one element.",
-  "country has distinct=1 ('USA'); state_county_province distinct=14; town_city distinct=15 \u2014 low-cardinality String columns where TS fresh draws will destroy the near-constant distribution.",
-  "FK chain depth: Customers -> Orders -> Invoices -> Financial_Transactions and Customers -> Accounts -> Financial_Transactions; Products -> Product_Categories; Order_Items -> Orders, Products; Invoice_Line_Items -> Order_Items, Invoices, Products. All parents exist and are unique on their PK."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on date_order_placed/invoice_date/date_account_opened/transaction_date: template %Y-%m-%d %H:%M:%S, range from min/max of 5 sampled originals (e.g. 2012..2018), so fresh dates cluster in that window \u2014 plausible but narrow; misses queries filtering outside the sampled window.",
-  "Number fuzzer on INTEGER PKs: scale=0, range [-1,1] plus perturbation +-1/+-2 \u2014 PKs will be tiny ints (0,1,2,-1) and collide heavily; sample_fresh_primary_keys drops duplicates so tables shrink below requested size.",
-  "Number fuzzer on DECIMAL(19,4): scale=19, precision=4, range [-10^19, 10^19] \u2014 unit_price, transaction_amount, product_price, vat_rating get astronomically large floats, implausible for money; drives FN on range predicates like unit_price < 1000.",
-  "String fuzzer on VARCHAR(50)/(255): charset a-zA-Z 0-9() with length up to declared length (or 20 default) \u2014 names, emails, phone numbers, login_password all become random gibberish; LIKE '%@example.com' or phone-pattern queries get FN.",
-  "String fuzzer on VARCHAR(1) (gender, customer_middle_initial): length range [0,2) so mostly 1-char random strings, not '0'/'1' or 'A'-'Z' \u2014 gender='1' predicates get FN.",
-  "String fuzzer on product_quantity VARCHAR(50) holding '6','7': int-like strings get str(i+1), str(i-1) added, so '5','6','7','8' appear \u2014 some plausibility preserved; but fresh draws are random.",
-  "FK columns (customer_id, order_id, product_id, invoice_number, account_id, order_item_id, production_type_code) draw from parent's FINAL filtered values with replacement \u2014 ties/duplicates created, so COUNT(DISTINCT) and join-cardinality queries see different multiplicities than original (FP on exact-count queries).",
-  "Financial_Transactions and Invoice_Line_Items have no PK: no dedup, so duplicate rows accumulate; COUNT(*) queries get inflated counts (FP).",
-  "Product_Categories has only 4 rows and production_type_code is its PK (String): TS may generate 1-30 rows with random strings, breaking the 4-category enum; queries like production_type_code='Books' get FN.",
-  "Products.parent_product_id is not an FK: TS generates random Numbers, so self-join Products p1 JOIN Products p2 ON p1.parent_product_id=p2.product_id rarely matches \u2014 FN on hierarchy queries.",
-  "Low-cardinality String columns (country='USA', transaction_type in {Payment,Refund}, product_color in {Red,Yellow,Black}, product_size in {Small,Medium,Large}, other_account_details in {Regular,VIP}) get random fresh strings \u2014 equality predicates on these enums get FN.",
-  "NOT NULL columns (customer_id, order_id, date_order_placed, production_type_code, transaction_type, transaction_id, account_id, invoice_number, product_id, order_item_id) may receive NULL from String/Number samplers; insert fails and row is skipped, shrinking tables further."
- ],
- "challenger_refs": [
-  "G7",
-  "G8",
-  "G9",
-  "G3",
-  "G2",
-  "G11",
-  "G1",
-  "G6",
-  "G10",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1; unique; never NULL; exactly the target row count; draw from a set disjoint from compact PKs and already-drawn values, resampling until unique; never drop rows.",
+   "integer_fk": "Uniform over the parent table's finalized PK values in the same instance; never NULL where NOT NULL; where the column is NULL-targeted, 5-30% NULL and the rest reference valid parents; never plant NULL into a NOT NULL FK; draw only after parent PKs are finalized.",
+   "varchar_short": "Random token of 3-12 alphanumeric chars; 20-50% duplicate share for DISTINCT-targeted columns; near-variants (one char changed) around listed equality literals.",
+   "varchar_name": "Random capitalized word 4-10 chars; 20-50% duplicate share where DISTINCT-targeted.",
+   "varchar_email": "lower(name) + '@example.' + {com,org,net}; unique per row.",
+   "varchar_phone": "Random US-style pattern '(NNN)NNN-NNNN' or 'NNN.NNN.NNNNxNNNN'; 20-50% duplicate share where DISTINCT-targeted.",
+   "varchar_password": "20 lowercase hex chars.",
+   "varchar_quantity": "String of an integer 1-9.",
+   "varchar_nullable_comment": "NULL for all rows (null_rate 1.0 in stats).",
+   "datetime": "Uniform between 2009-01-01 and 2018-12-31, format '%Y-%m-%d %H:%M:%S'; 20-50% duplicate share where DISTINCT-targeted.",
+   "decimal_money": "Uniform 0.00-2000.00, 2 decimals; 5-30% NULL where nullable and NULL-targeted.",
+   "decimal_rate": "Uniform 0.00-20.00, 2 decimals.",
+   "varchar_enum_small": "Uniform over listed enum values.",
+   "boundary_numeric": "For each listed literal L, include L-1, L, L+1 (or L-0.01, L, L+0.01 for decimals).",
+   "boundary_text": "For each listed equality literal S, include S and one-char variants of S; emit exactly the listed literals plus one-char variants; do not overwrite with group mix.",
+   "tie_order_limit": "Ensure at least two rows share the top rank value of the ORDER column so LIMIT 1 is ambiguous.",
+   "group_size_mix": "For GROUP-targeted non-key columns ensure groups of size 1, 2 and >=3 exist on the final written rows (apply after NULL planting); never apply to PK or NOT NULL unique columns.",
+   "null_share": "Derive NULL eligibility and per-column share from the compact database: 0% stays 0%, non-zero share is preserved, every nullable column gets at least one NULL row per instance; never NULL in NOT NULL or PK columns; apply NULL planting before group/duplicate mix so targets hold on persisted rows.",
+   "parent_without_children": "Explicitly reserve some parent PKs that no child row references (parent rows without children); child FK draws exclude reserved PKs; reservation must survive parent dict rebuild."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Accounts.account_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "336",
+      "337",
+      "338"
+     ]
+    }
+   },
+   {
+    "column": "Accounts.account_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Accounts.account_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Financial_Transactions.account_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Accounts.account_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Accounts.customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Accounts.customer_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Financial_Transactions.account_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Financial_Transactions.account_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Accounts.account_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Financial_Transactions.transaction_amount",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "Financial_Transactions.transaction_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Invoices.invoice_number",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Invoices.invoice_number",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(invoices.invoice_number)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Invoices.order_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Order_Items.order_id",
+      "Invoices.order_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Orders.order_details",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Orders.order_details",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Order_Items.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Orders.order_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Order_Items.order_item_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Order_Items.product_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Order_Items.product_quantity",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Products.product_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Accounts.date_account_opened",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Accounts.other_account_details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.customer_last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.phone_number",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Orders.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Invoices.order_id",
+    "parent_table": "Orders",
+    "parent_column": "order_id",
+    "copied": []
+   },
+   {
+    "child": "Accounts.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "Products.production_type_code",
+    "parent_table": "Product_Categories",
+    "parent_column": "production_type_code",
+    "copied": []
+   },
+   {
+    "child": "Financial_Transactions.account_id",
+    "parent_table": "Accounts",
+    "parent_column": "account_id",
+    "copied": []
+   },
+   {
+    "child": "Financial_Transactions.invoice_number",
+    "parent_table": "Invoices",
+    "parent_column": "invoice_number",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.order_id",
+    "parent_table": "Orders",
+    "parent_column": "order_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Items.product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Line_Items.order_item_id",
+    "parent_table": "Order_Items",
+    "parent_column": "order_item_id",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Line_Items.invoice_number",
+    "parent_table": "Invoices",
+    "parent_column": "invoice_number",
+    "copied": []
+   },
+   {
+    "child": "Invoice_Line_Items.product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied": [
+     "product_name"
+    ]
+   },
+   {
+    "child": "Invoice_Line_Items.product_title",
+    "parent_table": "Products",
+    "parent_column": "product_name",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customers",
+    "column": "gender",
+    "formula": "gender IN ('0','1')"
+   },
+   {
+    "table": "Customers",
+    "column": "country",
+    "formula": "country = 'USA'"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_middle_initial",
+    "formula": "length(customer_middle_initial) = 1"
+   },
+   {
+    "table": "Product_Categories",
+    "column": "vat_rating",
+    "formula": "vat_rating BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Products",
+    "column": "unit_price",
+    "formula": "unit_price >= 0"
+   },
+   {
+    "table": "Products",
+    "column": "product_color",
+    "formula": "product_color IN ('Red','Yellow','Black')"
+   },
+   {
+    "table": "Products",
+    "column": "product_size",
+    "formula": "product_size IN ('Small','Medium','Large')"
+   },
+   {
+    "table": "Orders",
+    "column": "date_order_placed",
+    "formula": "date_order_placed >= '2009-01-01 00:00:00' AND date_order_placed <= '2018-12-31 23:59:59'"
+   },
+   {
+    "table": "Invoices",
+    "column": "invoice_date",
+    "formula": "invoice_date >= '2009-01-01 00:00:00' AND invoice_date <= '2018-12-31 23:59:59'"
+   },
+   {
+    "table": "Invoices",
+    "column": "invoice_date",
+    "formula": "invoice_date >= (SELECT date_order_placed FROM Orders WHERE Orders.order_id = Invoices.order_id)",
+    "condition": "order_id IS NOT NULL AND invoice_date IS NOT NULL",
+    "evidence": "invoice 1 (2018-03-01) order 9 (2012-06-27); invoice 2 (2018-03-20) order 3 (2017-11-05); invoice 3 (2018-03-05) order 13"
+   },
+   {
+    "table": "Accounts",
+    "column": "date_account_opened",
+    "formula": "date_account_opened >= '2009-01-01 00:00:00' AND date_account_opened <= '2018-12-31 23:59:59'"
+   },
+   {
+    "table": "Accounts",
+    "column": "other_account_details",
+    "formula": "other_account_details IN ('Regular','VIP')"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_type",
+    "formula": "transaction_type IN ('Payment','Refund')"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_amount",
+    "formula": "transaction_amount >= 0"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_date",
+    "formula": "transaction_date >= '2009-01-01 00:00:00' AND transaction_date <= '2018-12-31 23:59:59'"
+   },
+   {
+    "table": "Order_Items",
+    "column": "product_quantity",
+    "formula": "CAST(product_quantity AS INTEGER) > 0"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "product_quantity",
+    "formula": "CAST(product_quantity AS INTEGER) > 0"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "product_price",
+    "formula": "product_price >= 0"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "derived_product_cost",
+    "formula": "derived_product_cost >= 0"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "derived_total_cost",
+    "formula": "derived_total_cost >= 0"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "derived_vat_payable",
+    "formula": "derived_vat_payable >= 0",
+    "condition": "derived_vat_payable IS NOT NULL"
+   },
+   {
+    "table": "Invoice_Line_Items",
+    "column": "product_title",
+    "formula": "Invoice_Line_Items.product_title = Products.product_name VIA Invoice_Line_Items.product_id",
+    "condition": "product_id IS NOT NULL AND product_title IS NOT NULL",
+    "evidence": "product_title constant 'prod_name' in sample; copied from Products.product_name"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 20,
+   "Product_Categories": 4,
+   "Products": 20,
+   "Orders": 24,
+   "Accounts": 20,
+   "Invoices": 24,
+   "Order_Items": 30,
+   "Invoice_Line_Items": 30,
+   "Financial_Transactions": 24
+  },
+  "null_targets": [
+   "Financial_Transactions.transaction_amount",
+   "Financial_Transactions.invoice_number",
+   "Invoice_Line_Items.derived_vat_payable",
+   "Invoices.invoice_date",
+   "Accounts.date_account_opened",
+   "Accounts.other_account_details",
+   "Products.parent_product_id",
+   "Products.unit_price",
+   "Products.product_color",
+   "Products.product_size",
+   "Orders.order_details",
+   "Order_Items.other_order_item_details",
+   "Order_Items.product_quantity",
+   "Invoice_Line_Items.product_title",
+   "Invoice_Line_Items.product_quantity",
+   "Invoice_Line_Items.product_price",
+   "Invoice_Line_Items.derived_product_cost",
+   "Invoice_Line_Items.derived_total_cost",
+   "Customers.customer_middle_initial",
+   "Customers.gender",
+   "Customers.email_address",
+   "Customers.login_name",
+   "Customers.login_password",
+   "Customers.phone_number",
+   "Customers.town_city",
+   "Customers.state_county_province",
+   "Customers.country",
+   "Product_Categories.product_type_description",
+   "Product_Categories.vat_rating",
+   "Financial_Transactions.transaction_date",
+   "Financial_Transactions.transaction_comment",
+   "Financial_Transactions.other_transaction_details"
+  ],
+  "supporting_evidence": {
+   "Invoices.invoice_date >= Orders.date_order_placed": [
+    "invoice 1 (2018-03-01) order 9 (2012-06-27)",
+    "invoice 2 (2018-03-20) order 3 (2017-11-05)",
+    "invoice 3 (2018-03-05) order 13"
+   ],
+   "Invoice_Line_Items.product_title = Products.product_name": [
+    "sample product_title constant 'prod_name' across all 8 shown rows; copied from parent product"
+   ],
+   "Financial_Transactions.transaction_type enum": [
+    "Payment",
+    "Refund"
+   ],
+   "Accounts.other_account_details enum": [
+    "Regular",
+    "VIP"
+   ],
+   "Products.product_color enum": [
+    "Red",
+    "Yellow",
+    "Black"
+   ],
+   "Products.product_size enum": [
+    "Small",
+    "Medium",
+    "Large"
+   ],
+   "Customers.gender enum": [
+    "0",
+    "1"
+   ],
+   "Customers.country constant": [
+    "USA"
+   ]
+  },
+  "uncertainty": [
+   "derived_vat_payable is 100% NULL in the sample; treated as nullable with no formula.",
+   "derived_product_cost and derived_total_cost show no consistent arithmetic relation to product_price or quantity in the shown rows; only non-negativity is asserted.",
+   "parent_product_id has no FK declared; sampled freely over existing product_id values or NULL.",
+   "Financial_Transactions.transaction_id is declared NOT NULL but not PRIMARY KEY; duplicates allowed per stats.",
+   "Invoice_Line_Items has no declared PK; order_item_id+invoice_number+product_id treated as the effective unique tuple.",
+   "Invoices.invoice_date >= Orders.date_order_placed is supported by only 3 evidence rows; kept as a conditional order rule.",
+   "Invoice_Line_Items.product_title = Products.product_name is supported by a single constant 'prod_name' in 8 rows; kept as a conditional copied-value rule."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Foreign-key violations in every generated instance (1151 FK violations, 20/20 invalid)",
+     "evidence": "Execution feedback: integrity.fk_violations = 1151, validity.invalid = 20 with reason 'new_integrity_failures'. The writer disables FK enforcement (writer.py: 'pragma foreign_keys = OFF') and appends rows whose FK values are drawn from parent values that may themselves be NULL or from parents that were later dropped. In instance.py, fill_foreign_keys_consistently draws from instance[pt][pc] which can contain None (e.g. Financial_Transactions.invoice_number is NULL-targeted, and _plant_nulls runs after FK fill), and _apply_copied/_apply_invoice_date do not re-validate. Also _plant_nulls is applied to FK columns like Financial_Transactions.invoice_number and Products.parent_product_id, planting NULLs into FK columns that then reference nothing, and the 'unmatched_join_rows' rule is implemented only implicitly (no explicit parent-without-children construction), so the FK integrity is not guaranteed.",
+     "requested_revision": "Ensure every generated FK value is either NULL (only where the column is nullable) or a value that exists in the parent table in the same instance. Do not plant NULLs into FK columns unless the column is nullable AND the NULL rule targets it; when a FK column is NULL-targeted, keep the non-NULL share referencing valid parents. Re-enable FK checking (or validate in Python) before writing, and make the 'parent rows without children' rule explicit (e.g. reserve some parent PKs that no child references) rather than relying on random draws. Re-run and confirm fk_violations = 0 and validity.valid = n_instances."
+    },
+    {
+     "agent": "engineer",
+     "title": "Rows are silently dropped, so table sizes and group/duplicate targets are not met",
+     "evidence": "Execution feedback rows_skipped: Customers 190, Orders 140, Invoices 144, Accounts 145, Product_Categories 44, Products 142 (out of ~194-335 attempted). instance.py calls sample_fresh_primary_keys and drop_unique_duplicates after generating n rows, which removes rows; the spec's table_sizes_per_instance (Customers 20, Orders 24, ...) and the group_size_mix / duplicate_share targets are then computed on the reduced set. _apply_group_mix and _apply_duplicate_share run before _plant_nulls and before the final row count is known, and _plant_nulls can NULL out the very values that formed the size-1/2/>=3 groups, so the GROUP-targeted guarantee is not preserved.",
+     "requested_revision": "Generate exactly the specified number of rows per table (or regenerate until the target count is reached) instead of dropping rows; if a PK/unique collision occurs, resample that row rather than discard it. Apply _plant_nulls before _apply_group_mix/_apply_duplicate_share (or re-apply the group/duplicate mix after NULL planting) so the size-1/2/>=3 and 20-50% duplicate targets hold on the final written rows. Re-run and confirm rows_skipped is 0 and the group/duplicate targets are satisfied on the persisted data."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule applied to NOT NULL / PK-adjacent columns and to columns the spec does not target",
+     "evidence": "Execution feedback nullable_columns shows NULLs in Customers.customer_first_name (17/231), Customers.customer_last_name (9/231), Customers.country (51/231), Accounts.account_name (14/290), Products.product_name (13/291) \u2014 none of these are in spec.NULL_TARGETED, and the spec's null_targets list does not include them. Conversely spec.NULL_TARGETED includes ('Customers','country') and ('Customers','gender') etc., but the generic_sampling_rules say 'Every nullable column gets at least one NULL row; share follows compact DB stats (0% where stats show 0)'. The program's _plant_nulls uses share=0.0 for non-targeted columns but still plants max(1, round(0*n))=1 NULL, so every nullable column gets a NULL even where the compact DB share is 0. This contradicts the stated rule and the spec's null_targets.",
+     "requested_revision": "Make _plant_nulls respect the compact-DB NULL share: plant 0 NULLs where the compact share is 0 (and the column is not in null_targets), and only plant NULLs for columns in spec.NULL_TARGETED with a 5-30% share. Do not plant NULLs in columns that are NOT NULL or PK. Re-run and confirm the nullable_columns report matches the spec's null_targets and compact shares."
+    },
+    {
+     "agent": "designer",
+     "title": "Semantic rules with weak or no evidence",
+     "evidence": "The specification's 'uncertainty' section itself flags: derived_vat_payable is 100% NULL in the sample (treated as nullable with no formula); derived_product_cost and derived_total_cost show no consistent arithmetic relation to product_price or quantity (only non-negativity asserted); parent_product_id has no FK declared (sampled freely); Financial_Transactions.transaction_id is NOT NULL but not PRIMARY KEY (duplicates allowed). The 'Invoices.invoice_date >= Orders.date_order_placed' rule is supported by only 3 evidence rows, and 'Invoice_Line_Items.product_title = Products.product_name' by a single constant 'prod_name' in 8 rows. These are plausible but not strongly evidenced.",
+     "requested_revision": "Either (a) keep these as non-negativity / nullable-only constraints and mark them explicitly as uncertain in the spec (as already done in 'uncertainty'), or (b) provide more evidence (more sample rows, or a stated arithmetic formula) before asserting them as hard rules. Do not add new hard rules (e.g. a VAT formula) without evidence. This is a documentation/evidence issue, not a blocking generation error, but it should be resolved so the spec and program agree on which rules are enforced."
+    },
+    {
+     "agent": "engineer",
+     "title": "Dependent-value consistency (invoice_date, product_title) not verified after NULL planting",
+     "evidence": "instance.py applies _apply_invoice_date and _apply_copied before _plant_nulls. _plant_nulls can NULL out Invoices.invoice_date (targeted) and Invoice_Line_Items.product_title (targeted), which is fine under three-valued logic, but it can also NULL out Orders.date_order_placed? No \u2014 that is NOT NULL. However, _apply_invoice_date reads Orders.date_order_placed from the in-memory dict before NULL planting, and _plant_nulls does not touch Orders.date_order_placed, so the ordering is safe for that rule. The real gap is that _apply_copied looks up product_name from Products.product_name, which is NULL-targeted; if a product_name is NULL, product_title becomes NULL even for non-NULL product_id, which is allowed by the rule's condition but means the copied-value rule is only satisfied for non-NULL operands. This is consistent with the NULL rule but should be confirmed by execution.",
+     "requested_revision": "Add an execution check that for every generated Invoice_Line_Items row with non-NULL product_id and non-NULL product_title, product_title equals the parent Products.product_name; and for every Invoices row with non-NULL invoice_date and non-NULL order_id, invoice_date >= the parent Orders.date_order_placed. Report the counts in the execution feedback so the reviewer can confirm the dependent-value rules hold on the persisted data."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 25/112 separated construction pairs are due to genuine value variation or to the FK/NULL defects above; this cannot be resolved without re-running after the fixes.",
+    "Whether the compact rows are preserved exactly (the writer copies the original file and appends, which should preserve them, but the FK violations suggest appended rows may reference compact parents incorrectly; a row-by-row diff of compact rows before/after was not provided).",
+    "Whether the 'parent rows without children' rule is actually satisfied (no explicit construction; only implicit via random FK draws)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Foreign-key integrity is broken: 1093 FK violations across all 20 instances",
+     "evidence": "Execution feedback reports integrity.fk_violations = 1093 and validity.invalid = 20 with reason 'new_integrity_failures'. The writer copies the compact DB and appends generated rows with 'pragma foreign_keys = OFF' (writer.py), so nothing enforces FK validity at write time. The instance builder fills FKs from parent PK values, but the parent PKs are then *overwritten* by fresh sequential PKs in build_random_instance: `_fill_foreign_keys` runs before `_sample_primary_keys` replaces `cols[tm.primary_key[0]]` with `range(start, start+n)`. Child rows therefore reference the compact parent PKs (or the pre-overwrite generated values), while the persisted parent rows carry different PKs. This is a construction bug, not a query-pair issue.",
+     "requested_revision": "Reorder construction so parent PKs are finalized before any child FK is drawn, or re-map child FKs after PK assignment. Additionally, do not disable FK enforcement silently: either keep `pragma foreign_keys = ON` and fail loudly on violation, or add a post-write validation pass that asserts zero FK violations before `os.replace`. The generation must produce 0 FK violations."
+    },
+    {
+     "agent": "engineer",
+     "title": "Rows are dropped, violating the 'exactly the target row count / never drop rows' rule",
+     "evidence": "Execution feedback rows_added vs rows_skipped: Customers 214 added / 186 skipped, Orders 336/144, Invoices 331/149, Accounts 261/139, Product_Categories 43/37, Products 258/142. The spec's generic_sampling_rules.integer_pk states 'exactly the target row count (resample on collision, never drop rows)'. The writer's per-row fallback (`con.execute(sql, r)` inside the except branch) silently counts failures as `bad[t]` instead of resampling. The PK-collision resample loop in build_random_instance only handles single-column PKs and only increments; it does not cover the multi-column / non-integer cases and does not guarantee uniqueness against the compact rows for non-integer PKs (e.g. Product_Categories.production_type_code).",
+     "requested_revision": "Make PK generation collision-free by construction (draw from a set disjoint from compact PKs and from already-drawn values, resampling until unique), and remove the silent per-row drop path in writer.py \u2014 a failed insert must raise, not be counted as skipped. Target row counts must be met exactly."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule not applied per the interface: many nullable columns get 0 NULLs, and several get NULLs where the compact share is 0",
+     "evidence": "Interface rule 7 requires every nullable column to contain at least one NULL row per instance with a share following the compact share. Feedback shows 'generated rows: NULL 0 / n' for Accounts.account_name, Customers.customer_first_name, Customers.customer_last_name, Products.product_name \u2014 these are nullable in the schema but absent from spec.NULL_TARGETED, so `_choose_nulls` plants 0 NULLs. Conversely, columns with 0 NULLs in the compact DB (e.g. Customers.country, Customers.gender, Customers.email_address, Customers.login_name, Customers.login_password, Customers.town_city, Customers.state_county_province, Products.product_color, Products.product_size, Products.unit_price, Product_Categories.vat_rating, Invoices.invoice_date, Financial_Transactions.transaction_date) are in NULL_TARGETED and receive 5-30% NULLs, contradicting 'NULL share following the compact database's share'. Also `_choose_nulls` uses `rng.uniform(0.05, 0.30)` per column per instance, so the share is not tied to the compact share at all.",
+     "requested_revision": "Derive NULL_TARGETED and the per-column NULL share from the compact database's actual NULL share (read in schema.read_schema / original_values), not from a hard-coded list. Ensure every nullable column gets at least one NULL row per instance and a share matching the compact share; ensure columns with 0 NULLs in the compact get 0 NULLs. Note the 'NULL 0 / n' lines for the engineer as required by rule 7."
+    },
+    {
+     "agent": "engineer",
+     "title": "Dependent-value rules are applied before NULL planting and can be overwritten",
+     "evidence": "In build_random_instance, `_apply_copied` and `_apply_invoice_date` run before `_choose_nulls`. `_choose_nulls` then sets `Invoice_Line_Items.product_title` and `Invoices.invoice_date` to NULL for a random subset, which is fine for NULLs, but `_apply_copied` also runs before `_apply_quantity_positive`? No \u2014 order is quantity, copied, invoice_date, then nulls, then finalize. The real problem: `_apply_copied` builds `lookup` from `inst[pt][pc]` zipped with `inst[pt][fk[1]]`, but `_fill_foreign_keys` for Invoice_Line_Items.product_id draws from Products.product_id *before* Products PKs are finalized (same ordering bug as issue 1), so the lookup keys do not match the persisted Products.product_id. The copied product_title therefore does not equal Products.product_name for the persisted rows. Similarly `_apply_invoice_date` looks up `odates` by Orders.order_id, which is overwritten after `_fill_foreign_keys` for Invoices.order_id.",
+     "requested_revision": "Apply copied-value and invoice-date rules after all parent PKs are finalized and after FK remapping, and re-verify the conditional rules (product_title = Products.product_name via product_id; invoice_date >= Orders.date_order_placed) on the final persisted rows. Add an assertion in the writer or a post-write check that these hold for all non-NULL operands."
+    },
+    {
+     "agent": "designer",
+     "title": "Specification NULL targets contradict the compact database and the interface NULL rule",
+     "evidence": "The specification's null_targets list includes columns that are 0% NULL in the compact DB (Customers.country, gender, email_address, login_name, login_password, town_city, state_county_province, phone_number; Products.product_color, product_size, unit_price; Product_Categories.vat_rating; Invoices.invoice_date; Financial_Transactions.transaction_date) and omits nullable columns that should get NULLs (Accounts.account_name, Customers.customer_first_name, Customers.customer_last_name, Products.product_name). The generic_sampling_rules.null_share says 'plant NULLs only in columns listed in null_targets, at 5-30% share', which conflicts with interface rule 7 ('NULL share following the compact database's share for that column').",
+     "requested_revision": "Replace the hard-coded null_targets with a rule that derives NULL eligibility and share from the compact database per column (0% stays 0%, non-zero share is preserved, every nullable column gets at least one NULL). Remove the 5-30% blanket share. Keep NOT NULL / PK columns excluded."
+    },
+    {
+     "agent": "designer",
+     "title": "Uncertain semantic rules are asserted as hard constraints without sufficient evidence",
+     "evidence": "The specification's uncertainty section itself flags: 'Invoices.invoice_date >= Orders.date_order_placed is supported by only 3 evidence rows' and 'Invoice_Line_Items.product_title = Products.product_name is supported by a single constant prod_name in 8 rows'. These are promoted to semantic_rules_and_formulas with conditions and are implemented as hard construction rules (_apply_invoice_date, _apply_copied). The derived_vat_payable formula is listed as '>= 0' with condition 'IS NOT NULL' but the column is 100% NULL in the compact DB and in ALL_NULL, so the rule is vacuous; derived_product_cost / derived_total_cost have no arithmetic relation asserted, only non-negativity.",
+     "requested_revision": "Downgrade the two weakly-evidenced rules to 'uncertain' and either (a) keep them as soft/optional constraints that do not block generation, or (b) gather more evidence before promoting them. For derived_vat_payable, either drop the vacuous rule or state explicitly that it is unconstrained. Document that derived_product_cost / derived_total_cost are only non-negative."
+    },
+    {
+     "agent": "engineer",
+     "title": "Group-size and duplicate-share targets are applied to columns that are NOT NULL / PK and can be violated by NULL planting",
+     "evidence": "spec.GROUP_TARGETED includes ('Accounts','account_id'), ('Customers','customer_id'), ('Invoices','invoice_number'), ('Orders','order_id'), ('Products','product_id') \u2014 all PKs. `_apply_group_mix` overwrites vals[0..5] with random existing values, which for a PK column creates duplicate PKs. The PK-collision resample in build_random_instance runs *before* `_finalize_instances`, so the group mix can reintroduce PK duplicates. Feedback reports pk_duplicates = 0, but that is because the writer's per-row fallback drops the duplicate rows (see issue 2), masking the bug. Similarly `_apply_duplicate_share` on ('Customers','customer_id') and ('Financial_Transactions','transaction_id') can create duplicate PKs.",
+     "requested_revision": "Exclude PK / NOT NULL columns from GROUP_TARGETED and DUP_TARGETED, or apply the group/duplicate mix only to non-key columns and re-validate uniqueness after finalization. The group-size target for a PK column is meaningless (each PK value is unique by definition); the spec should not list PKs under group_sizes."
+    },
+    {
+     "agent": "engineer",
+     "title": "Boundary-text sampler does not produce the specified literal variants",
+     "evidence": "spec.BOUNDARY_TEXT for Accounts.account_name is ['336','337','338'] and the spec's comparison_boundary targets include both integer and string forms (336, 337, 338, '337', '338'). BoundaryTextSampler appends `s[:-1] + chr((ord(s[-1])+1)%128)` and `s + 'x'`, producing '337' -> '338' and '337x', but never the integer forms 336/337/338 as integers, and never the one-char-changed variant '336' -> '337' (it changes the last char, which for '336' gives '337' \u2014 actually that works). However the sampler is a StringSampler subclass returning strings only; the spec's boundary_numeric rule ('include L-1, L, L+1') is not applied to Accounts.account_name because it is a VARCHAR column. The comparison_boundary targets list integer values 336/337/338 for a VARCHAR column, which is a spec inconsistency.",
+     "requested_revision": "Clarify whether Accounts.account_name boundary literals are strings or integers; if strings, drop the integer targets from the spec. If integers, the column type is wrong. Ensure the boundary sampler emits exactly the listed literals plus one-char variants, and that the group-size mix does not overwrite them (currently `_apply_group_mix` runs after and can clobber the boundary values)."
+    },
+    {
+     "agent": "engineer",
+     "title": "Reproducibility and preservation of compact rows not verified",
+     "evidence": "Feedback reports reproducible = true and the writer copies the compact DB via shutil.copyfile, so compact rows are preserved by construction. However, the writer disables foreign_keys and uses a per-row fallback that can drop generated rows; combined with the PK overwrite bug, the persisted instance is not a faithful copy-plus-append of the intended generated rows. The 'reproducible' flag only checks that re-running produces the same output, not that the output matches the specification.",
+     "requested_revision": "Add a post-write validation step that (a) asserts compact row counts are unchanged, (b) asserts generated row counts equal the target sizes, (c) asserts zero FK violations, (d) asserts the conditional dependent-value rules hold on non-NULL operands, and (e) asserts PK uniqueness. Report these in the execution feedback so the reviewer can confirm."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL shares were read and used (schema.read_schema stores original_values but the NULL share is not computed or used by _choose_nulls).",
+    "Whether the 25/112 separated construction pairs are due to the FK/PK ordering bug or to genuine query-pair differences; the feedback does not break down construction_pairs_by_group.",
+    "Whether Product_Categories.production_type_code (VARCHAR PK) collisions are handled \u2014 the PK resample loop only increments integers and appends '_' for strings, which can still collide.",
+    "Whether the 'parent_without_children' reservation is effective given that _reserve_parents stores indices in instance[table]['_reserved__'] but _fill_foreign_keys reads it from the parent table's dict, and the parent dict is rebuilt as `{c: cols[c] for c in [cm.name for cm in tm.columns]}` which drops the '_reserved__' key."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py ALL_NULL includes ('Orders','order_details') and ('Invoice_Line_Items','derived_vat_payable'), and the execution feedback shows these columns are 100% NULL (480/480, 600/600). However, the specification's null_targets list and the compact statistics do not establish these as 100%-NULL columns; the specification only lists them as nullable. More importantly, the specification's per_column_exceptions require Orders.order_details to satisfy group_sizes '1, 2 and >= 3' and aggregate_boundary COUNT(*) values [1,2,3]. With order_details 100% NULL, GROUP BY order_details yields a single group of size 24, so the group_sizes and aggregate_boundary targets for Orders.order_details cannot hold on persisted rows. The program's _apply_group_mix skips columns whose non-NULL source is empty (src empty -> continue), so the target is silently unmet.",
+     "requested_revision": "Remove ('Orders','order_details') from ALL_NULL (and from any 100%-NULL treatment) so order_details receives non-NULL values, allowing the group_sizes and aggregate_boundary targets to be satisfied. Alternatively, if the compact data truly has order_details 100% NULL, drop the group_sizes/aggregate_boundary exceptions for Orders.order_details from the specification. The two must be made consistent; the current combination is contradictory."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions require group_sizes '1, 2 and >= 3' for Accounts.account_name, Accounts.customer_id, Financial_Transactions.account_id, Invoices.order_id, Order_Items.order_id, Order_Items.product_id, and Products.product_id, plus aggregate_boundary for Accounts.customer_id, Invoices.invoice_number, Orders.order_id, Orders.order_details. The program's _apply_group_mix only forces groups of size 1, 2, and 3 by overwriting the first six values with three chosen source values (vals[0]=a, vals[1]=b, vals[2]=b, vals[3..5]=d). This does not guarantee a group of size >= 3 distinct from the size-2 group when a==b or b==d or a==d, and it does not guarantee the aggregate COUNT(*) values [1,2,3] for the aggregate_boundary columns. There is no verification that the targets hold on the persisted rows; the writer's _validate only checks row counts, PK uniqueness, and FKs.",
+     "requested_revision": "Strengthen _apply_group_mix to deterministically construct at least one group of size 1, one of size 2, and one of size >= 3 using three distinct values (resampling if collisions), and add a post-write validation in writer._validate that checks the group_sizes and aggregate_boundary targets for the targeted columns. Also ensure the aggregate_boundary COUNT(*) values [1,2,3] are achievable given the table sizes (e.g., Orders has 24 rows, so counts 1,2,3 are feasible)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions require duplicates_for_distinct 20-50% for Customers.customer_id and Financial_Transactions.transaction_id. But Customers.customer_id is the PRIMARY KEY (INTEGER PRIMARY KEY) and Financial_Transactions.transaction_id is declared NOT NULL (and treated as a key-like column). The program's _sample_primary_keys assigns sequential unique PKs starting after the compact max, so Customers.customer_id has 0% duplicates. The generic_sampling_rules state integer_pk is 'unique; never NULL', which contradicts the duplicates_for_distinct target for Customers.customer_id. For Financial_Transactions.transaction_id, the program does not apply _apply_duplicate_share because it is not in DUP_TARGETED, so the 20-50% duplicate target is unmet.",
+     "requested_revision": "Resolve the contradiction: either remove the duplicates_for_distinct exception for Customers.customer_id (since it is a PK and must be unique), or change the schema/spec so customer_id is not a PK. For Financial_Transactions.transaction_id, add it to DUP_TARGETED and ensure the sampler produces 20-50% duplicate values (it is NOT NULL but not a PK, so duplicates are allowed)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions require comparison_boundary for Accounts.account_name with values ['336','337','338'] and group_sizes '1, 2 and >= 3'. The program uses BoundaryTextSampler for Accounts.account_name, which emits exactly the listed literals plus one-char variants. However, the execution feedback shows Accounts.account_name has NULL 0/400, and the group_sizes target is applied by _apply_group_mix which overwrites the first six values with random source values, potentially destroying the boundary literals. There is no guarantee that the boundary literals 336, 337, 338 survive in the final rows, and no validation that they do. The boundary_text rule says 'emit exactly the listed literals plus one-char variants; do not overwrite with group mix', but _apply_group_mix runs after and overwrites vals[0..5].",
+     "requested_revision": "Ensure _apply_group_mix does not overwrite the boundary literals for Accounts.account_name, or apply the group mix to positions that do not contain the required boundary values. Add a post-write validation that the boundary literals 336, 337, 338 are present in the persisted rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets include many columns (e.g., Customers.gender, Customers.country, Customers.email_address, Products.product_color, Products.product_size, Invoices.invoice_date, Accounts.date_account_opened, Financial_Transactions.transaction_amount, etc.). The execution feedback shows all these columns have 'NULL 0 / n' in generated rows. The program's _choose_nulls uses schema.null_share, which is computed from the compact database. If the compact database has 0% NULL for these columns, the program plants 0 NULLs, contradicting the null_targets list which explicitly includes them. The specification's null_share rule says 'non-zero share is preserved, every nullable column gets at least one NULL row per instance', but the program only plants NULLs when share > 0.0. The null_targets list and the compact null_share are inconsistent.",
+     "requested_revision": "Reconcile the null_targets list with the compact null_share. If the compact database has 0% NULL for a column, either remove it from null_targets or change the program to plant at least one NULL per nullable column regardless of compact share (per the stated null_share rule 'every nullable column gets at least one NULL row per instance'). The current behavior (0 NULLs for all listed null_targets columns) violates the stated rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'Invoice_Line_Items.product_title = Products.product_name VIA Invoice_Line_Items.product_id' with condition 'product_id IS NOT NULL AND product_title IS NOT NULL'. The program's _apply_copied implements this, but the execution feedback shows Invoice_Line_Items.product_title has NULL 0/600, and the copied rule is applied. However, the specification's uncertainty notes say 'Invoice_Line_Items.product_title = Products.product_name is supported by a single constant prod_name in 8 rows; kept as a conditional copied-value rule.' The program implements it as a soft rule, which is consistent. No issue here, but the reviewer notes the evidence is weak (single constant). This is a supported-but-uncertain rule; the program's soft implementation is acceptable.",
+     "requested_revision": "No change required; note that the copied product_title rule is weakly evidenced (single constant 'prod_name') and the program correctly treats it as a soft rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'Invoices.invoice_date >= Orders.date_order_placed' with evidence from 3 rows. The program's _apply_invoice_date implements this as a soft rule. The execution feedback shows Invoices.invoice_date has NULL 0/480, and the rule is applied. This is consistent. However, the specification's uncertainty notes say the rule is 'supported by only 3 evidence rows; kept as a conditional order rule.' The program's soft implementation is acceptable.",
+     "requested_revision": "No change required; note that the invoice_date >= order_date rule is weakly evidenced (3 rows) and the program correctly treats it as a soft rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions require unmatched_join_rows with parent_rows_without_children for Accounts.account_id, Financial_Transactions.account_id, Orders.order_id, Order_Items.order_id, Invoices.order_id. The program's _reserve_parents reserves k = max(1, len(vals)//8) parent PKs, and _fill_foreign_keys excludes reserved PKs from the child FK pool. However, _reserve_parents is called for each table after its own FKs are filled, and the reserved dict is passed to _fill_foreign_keys for child tables. The execution feedback shows fk_violations: 0, which is good, but there is no validation that parent rows without children actually exist in the persisted data. The reservation logic may be defeated if the child FK pool is empty after exclusion (falls back to pvals), or if the reserved PKs are not actually childless because the child FK draws from the full pool including reserved values in some path.",
+     "requested_revision": "Add a post-write validation in writer._validate that for each unmatched_join_rows target, at least one parent PK has no referencing child row. Also verify that _reserve_parents is called before the child table's FK fill (it is, since tables are processed in FK order), and that the reserved set is not overwritten."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows eligible: 112, separated: 10, unknown_executions: 0, but construction_pairs_by_group is empty. It is unclear which pairs were separated and whether the 10 separated pairs correspond to the intended value variation. This does not block a pass per the instructions, but the engineer should report which pairs were separated.",
+    "The execution feedback shows all nullable columns have 'NULL 0 / n' except the ALL_NULL columns. This suggests the compact database has 0% NULL for most columns, which contradicts the null_targets list. The engineer should confirm the compact null_share values and reconcile with the specification.",
+    "The specification's table_sizes_per_instance sets Product_Categories to 4, but the execution feedback shows 80 rows added (20 instances * 4 = 80), which is consistent. No issue.",
+    "The specification's uncertainty notes mention 'Financial_Transactions.transaction_id is declared NOT NULL but not PRIMARY KEY; duplicates allowed per stats.' The program does not apply duplicates to transaction_id, so the 20-50% duplicate target is unmet. This is flagged as an issue above."
+   ]
+  }
+ ]
 }

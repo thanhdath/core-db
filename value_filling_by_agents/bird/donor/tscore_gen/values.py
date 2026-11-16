@@ -37,7 +37,7 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
+    """fuzz/number.py; keeps the list_max overwrite quirk but guards the range (review fix)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
@@ -45,7 +45,7 @@ class NumberSampler(ColumnSampler):
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
         self.list_min = min(self.elements) if self.elements else self.min
-        self.list_max = min(self.max, _MAX)
+        self.list_max = max(self.list_min, min(self.max, _MAX))
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
@@ -55,6 +55,8 @@ class NumberSampler(ColumnSampler):
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
+            if int(lo) > int(hi):
+                lo, hi = self.min, self.max
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)

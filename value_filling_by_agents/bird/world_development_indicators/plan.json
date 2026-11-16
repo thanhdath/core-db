@@ -1,50 +1,772 @@
 {
  "db": "world_development_indicators",
- "operator_io_quirks": [
-  "Mixed-case table names (Country, Series, CountryNotes, Footnotes, Indicators, SeriesNotes) and mixed-case columns (CountryCode vs Countrycode, SeriesCode vs Seriescode) \u2014 case-insensitive column lookup required; FK child col 'Countrycode' -> parent 'CountryCode' differs only in case.",
-  "Indicators has 5,656,458 rows (> max_rows_per_table 300000): read_schema must sample by rowid % k = 0; original_sizes must still be full count(*).",
-  "Footnotes 532,415 rows also exceeds cap; Year stored as TEXT 'YR1990' style (not a date) \u2014 String fuzzer, not Date.",
-  "Indicators.Year is INTEGER with values 1961..2016 (year-like ints) but declared INTEGER -> Number fuzzer, not Year/Date; queries comparing Year to 2000 will get perturbed ints.",
-  "CountryNotes/Footnotes/Indicators/SeriesNotes have composite PKs (2-3 cols) -> composite-PK member max_l0=30 path; PK dedup must use full tuple.",
-  "FK child columns are NOT NULL (Countrycode, Seriescode, CountryCode) but upstream draws NULL when parent empty; those rows fail insert and are skipped \u2014 expected, keep.",
-  "Series.OtherNotes, OtherWebLinks, RelatedIndicators are INTEGER with 100% NULL (distinct=0): Number sampler gets empty element list -> p:=1, pure fresh draws; original_values all None dropped.",
-  "Country has 30 columns, many TEXT with empty-string values ('' appears as a real value, e.g. SpecialNotes, IncomeGroup) \u2014 String sampler must treat '' as an element, not NULL.",
-  "AlternativeConversionFactor contains non-ASCII bytes ('1991\\x96\\x96') \u2014 String fuzzer must not choke; sqlite text storage.",
-  "Country.Alpha2Code distinct=245 < 247 rows (duplicate 2-char codes) \u2014 not declared unique, so no dedup; ties exist in original.",
-  "Indicators.CountryCode distinct=13 (only 13 countries present) while Country has 247 \u2014 FK parent has many unused values; child draws from parent's generated values, not original.",
-  "No views/triggers in DDL; all FKs resolve (parent_exists true) \u2014 no dangling-FK drop path exercised here, but self-FK/cycle code still must be safe."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns -> String fuzzer: random a-zA-Z0-9() strings length 0..20, plus 5 sampled originals, plus 50% contaminate (prefix/suffix/drop char). Country names, Series codes, descriptions all become gibberish.",
-  "Indicators.Year / Value, Country.Latest*Data -> Number fuzzer (int): uniform in [-10^scale,10^scale] with scale from type args (none -> default), then +-1/+-2 perturbation; Year values like 1961 become arbitrary ints, breaking year-range predicates.",
-  "Series.OtherNotes/OtherWebLinks/RelatedIndicators (all-NULL INTEGER) -> Number with no elements -> p=1, always fresh random ints; original had only NULL so any non-NULL is a new value (fine, not a violation).",
-  "Footnotes.Year and SeriesNotes.Year are TEXT 'YR####' -> String fuzzer; queries filtering Year='YR2000' will mostly miss because fresh strings dominate (p=0.2 element reuse).",
-  "Composite PKs (CountryNotes, Footnotes, Indicators, SeriesNotes) get max_l0=30 cap on fresh draws -> heavy reuse of a small fresh pool, producing many duplicate PK tuples that get dropped by sample_fresh_primary_keys, shrinking tables.",
-  "FK consistency: CountryNotes/Footnotes/Indicators/SeriesNotes child FK values drawn from parent's FINAL filtered column with replacement -> many-to-one, ties created; but parent (Country 247, Series 1345) may be smaller than child size -> heavy duplication.",
-  "Indicators size likely capped at 2500 (level-based) or ~230 (rand_lin) \u2014 far below 5.6M original; joins Country x Indicators produce tiny results, so COUNT/aggregate gold queries may return 0 or small numbers -> FN risk from implausible emptiness.",
-  "String contaminate + fresh strings mean LIKE '%...%' predicates rarely match original substrings -> gold queries with LIKE on names/descriptions likely return empty in TS instance (FN).",
-  "Number perturbation (+-1/+-2) on Year means equality Year=2000 rarely holds; range predicates (Year BETWEEN 1990 AND 2000) survive better -> mixed FN.",
-  "Empty-string values in many Country TEXT columns are real elements; String sampler keeps them, so IS NULL vs ='' distinction preserved somewhat, but fresh strings add non-empty values -> FP risk for '= ''' predicates.",
-  "No Date/Time/Bool/Bit columns in this DB \u2014 Date/Time fuzzers unexercised; all dispatch is String or Number.",
-  "Duplicate Alpha2Code (245 distinct/247 rows) and duplicate ShortName possible -> queries relying on uniqueness of non-PK columns may see ties in TS (FP) or miss ties (FN) depending on draw."
- ],
- "challenger_refs": [
-  "G12",
-  "G9",
-  "G13",
-  "G1",
-  "G7",
-  "G6",
-  "G16",
-  "G22",
-  "G19",
-  "G21"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": null,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Pool of realistic short strings; 5% near-variants (case change, trailing char, truncation); 2% NULL if nullable.",
+   "text_long": "Pool of realistic long descriptions; 5% near-variants (case change, truncation, appended char); 2% NULL if nullable.",
+   "text_code": "Pool of realistic code-like strings (uppercase letters, digits, dots, underscores); 5% near-variants (case change, one char changed); 2% NULL if nullable.",
+   "integer_small": "Uniform integer in [0,100]; 5% boundary values (min-1,min,max,max+1) clamped to declared range; 2% NULL if nullable.",
+   "integer_year": "Uniform integer in [1960,2015]; 5% boundary values (1959,1960,2015,2016) clamped to [1960,2015]; 2% NULL if nullable.",
+   "integer_large": "Uniform integer in [0,1000000]; 5% boundary values; clamp to >=0; 2% NULL if nullable.",
+   "text_enum": "Uniform over enumerated values; no case variants for columns carrying a semantic enum rule; 2% NULL if nullable.",
+   "text_empty_or_value": "50% empty string, 50% realistic value; 5% near-variants; 2% NULL if nullable.",
+   "primary_key_text": "Unique values by prefixing counter to a base code; never NULL; never duplicate; respect any declared length rule (regenerate rather than append suffix when a length rule exists).",
+   "primary_key_composite": "Unique tuples by combining independently generated component values; never NULL; never duplicate tuple.",
+   "foreign_key": "Copy an existing parent key from the FINAL post-dedup parent key pool; never generate dangling keys and never NULL unless the column is nullable. Parent rows without children are achieved by leaving some parent keys unreferenced.",
+   "duplicate_distinct": "For columns flagged duplicates_for_distinct, repeat 20-50% of values across non-key rows; apply after NULL planting and after final PK dedup so the guarantee survives.",
+   "tie_order": "For columns flagged ties_for_order_limit, include at least two rows sharing the value at the listed LIMIT rank positions; apply after NULL planting and after final PK dedup so the guarantee survives; never collapse a value that a group-variety rule requires to stay distinct.",
+   "null_share": "For nullable non-copied columns, generate NULL in at least one row and follow the compact database's null rate; NOT NULL columns never get NULL; copied dependent columns are exempt from NULL planting beyond the compact share. NULL planting runs before duplicate/tie application."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "columns": [
+      "Country.CountryCode",
+      "Indicators.CountryCode",
+      "Indicators.IndicatorCode",
+      "Series.SeriesCode",
+      "CountryNotes.Seriescode",
+      "CountryNotes.Countrycode",
+      "Footnotes.Seriescode",
+      "Footnotes.Countrycode"
+     ],
+     "rule": "FOREIGN KEY constraints must hold. Every child FK value must exist in the FINAL post-dedup parent key set. 'parent_rows_without_children' is realized by leaving some generated parent keys unreferenced; no child row may carry a non-existent parent key; no NULL FK (all FK columns are NOT NULL). Freeze each parent table's final key set (after all dedup/NULL/duplicate/tie processing) before any child table draws FK values; do not re-dedup a parent after its children are generated. Verify foreign_keys is enabled at insert and check FK integrity before commit. Insert tables in topological order (parents before children)."
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "columns": [
+      "Country.ShortName",
+      "Country.TableName",
+      "Country.LongName",
+      "Footnotes.Year"
+     ],
+     "rule": "Repeat 20-50% of non-key values across rows. Never apply to primary-key or UNIQUE columns (Country.CountryCode, Series.SeriesCode, Indicators composite PK, CountryNotes composite PK, Footnotes composite PK, SeriesNotes composite PK). Apply after NULL planting and after final PK dedup."
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "columns": [
+      "Country.ShortName",
+      "Country.TableName",
+      "Country.LongName",
+      "Country.CurrencyUnit",
+      "Indicators.CountryName",
+      "Indicators.IndicatorName",
+      "Indicators.IndicatorCode",
+      "Indicators.Year",
+      "Series.SeriesCode",
+      "CountryNotes.Seriescode",
+      "Footnotes.Year"
+     ],
+     "rule": "Include each listed literal, a case-variant, and one near-variant (one char changed or appended). For Indicators.Year include 1979,1980,1981,1982. For Footnotes.Year include 'YR2','YR2001','YR2002' and lower/upper case variants; guarantee these literals appear at least once per instance by seeding the first rows. Seed boundary literals into PK columns only in a way that survives the final dedup (seed after dedup or reserve distinct PK slots)."
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "columns": [
+      "Indicators.IndicatorName"
+     ],
+     "rule": "For each LIKE/equality literal include the literal, a case-variant, a truncated variant (drop a substring), and a variant with one char changed (e.g. 'Agricultural land (% of land area)', 'GDP growth (annual %)', 'Land under cereal production')."
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "columns": [
+      "Country.ShortName",
+      "Indicators.IndicatorCode",
+      "Indicators.Value",
+      "Indicators.Year"
+     ],
+     "rule": "Include at least two rows sharing the same value at the listed LIMIT rank positions. Apply after NULL planting and after final PK dedup; ensure _ensure_group_variety does not overwrite tied values, and _apply_ties must skip Indicators.Year/Value when it would break a group's distinctness."
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "columns": [
+      "Indicators.Value"
+     ],
+     "rule": "For every (CountryCode, IndicatorCode) group with at least two rows generate at least two rows with distinct Year and distinct Value; enforce AFTER the final PK dedup and AFTER ties/duplicates. Groups with a single row are exempt (qualifying_rows: >= 2 per group). Add an assertion that every qualifying group has >=2 distinct Year and >=2 distinct Value after all post-processing."
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "columns": [
+      "Country.CountryCode"
+     ],
+     "rule": "NOT NULL primary key; never generate NULL; never duplicate."
+    }
+   },
+   {
+    "pattern": "copy_parent_value",
+    "targets": {
+     "columns": [
+      "Indicators.CountryName",
+      "Indicators.IndicatorName"
+     ],
+     "rule": "Always resolve the copied value from the matched parent row (Country.ShortName via CountryCode; Series.IndicatorName via IndicatorCode). Do not plant NULLs in these copied columns. Parent ShortName/IndicatorName are themselves nullable, so a copied NULL follows the parent's NULL."
+    }
+   },
+   {
+    "pattern": "fixed_length_code",
+    "targets": {
+     "columns": [
+      "Country.CountryCode"
+     ],
+     "rule": "Generate exactly 3-character codes; on collision regenerate a fresh 3-char code rather than appending a suffix."
+    }
+   },
+   {
+    "pattern": "year_code_format",
+    "targets": {
+     "columns": [
+      "Footnotes.Year",
+      "SeriesNotes.Year"
+     ],
+     "rule": "Construct as 'YR' + digits explicitly; include boundary literals 'YR2','YR2001','YR2002' and case variants at least once per instance."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "CountryNotes",
+    "child_column": "Countrycode",
+    "parent_table": "Country",
+    "parent_column": "CountryCode",
+    "copied_columns": []
+   },
+   {
+    "child_table": "CountryNotes",
+    "child_column": "Seriescode",
+    "parent_table": "Series",
+    "parent_column": "SeriesCode",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Footnotes",
+    "child_column": "Countrycode",
+    "parent_table": "Country",
+    "parent_column": "CountryCode",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Footnotes",
+    "child_column": "Seriescode",
+    "parent_table": "Series",
+    "parent_column": "SeriesCode",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Indicators",
+    "child_column": "CountryCode",
+    "parent_table": "Country",
+    "parent_column": "CountryCode",
+    "copied_columns": [
+     "CountryName"
+    ]
+   },
+   {
+    "child_table": "Indicators",
+    "child_column": "IndicatorCode",
+    "parent_table": "Series",
+    "parent_column": "SeriesCode",
+    "copied_columns": [
+     "IndicatorName"
+    ]
+   },
+   {
+    "child_table": "SeriesNotes",
+    "child_column": "Seriescode",
+    "parent_table": "Series",
+    "parent_column": "SeriesCode",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Country",
+    "column": "CountryCode",
+    "formula": "CountryCode IS NOT NULL AND length(CountryCode) = 3",
+    "evidence": "Primary key; all observed codes are 3 letters."
+   },
+   {
+    "table": "Country",
+    "column": "LatestIndustrialData",
+    "formula": "LatestIndustrialData IS NULL OR LatestIndustrialData BETWEEN 1960 AND 2015",
+    "evidence": "Observed 2002-2011; clamp after perturbation."
+   },
+   {
+    "table": "Country",
+    "column": "LatestTradeData",
+    "formula": "LatestTradeData IS NULL OR LatestTradeData BETWEEN 1960 AND 2015",
+    "evidence": "Observed 1995-2013."
+   },
+   {
+    "table": "Country",
+    "column": "LatestWaterWithdrawalData",
+    "formula": "LatestWaterWithdrawalData IS NULL OR LatestWaterWithdrawalData BETWEEN 1960 AND 2015",
+    "evidence": "Observed 2000-2012."
+   },
+   {
+    "table": "Country",
+    "column": "Region",
+    "formula": "Region IN ('South Asia','Europe & Central Asia','Middle East & North Africa','East Asia & Pacific','Sub-Saharan Africa','Latin America & Caribbean','North America','')",
+    "evidence": "8 distinct values observed."
+   },
+   {
+    "table": "Country",
+    "column": "IncomeGroup",
+    "formula": "IncomeGroup IN ('Low income','Upper middle income','High income: nonOECD','Lower middle income','High income: OECD','')",
+    "evidence": "6 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "LendingCategory",
+    "formula": "LendingCategory IN ('IDA','IBRD','Blend','')",
+    "evidence": "4 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "OtherGroups",
+    "formula": "OtherGroups IN ('HIPC','Euro area','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "SystemOfNationalAccounts",
+    "formula": "SystemOfNationalAccounts IN ('Country uses the 1993 System of National Accounts methodology.','Country uses the 1968 System of National Accounts methodology.','Country uses the 2008 System of National Accounts methodology.','')",
+    "evidence": "4 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "PppSurveyYear",
+    "formula": "PppSurveyYear IN ('','Rolling','2011','2011 (household consumption only).')",
+    "evidence": "4 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "BalanceOfPaymentsManualInUse",
+    "formula": "BalanceOfPaymentsManualInUse IN ('','IMF Balance of Payments Manual, 6th edition.')",
+    "evidence": "2 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "ExternalDebtReportingStatus",
+    "formula": "ExternalDebtReportingStatus IN ('Actual','Preliminary','Estimate','')",
+    "evidence": "4 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "SystemOfTrade",
+    "formula": "SystemOfTrade IN ('General trade system','Special trade system','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "GovernmentAccountingConcept",
+    "formula": "GovernmentAccountingConcept IN ('Consolidated central government','Budgetary central government','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "ImfDataDisseminationStandard",
+    "formula": "ImfDataDisseminationStandard IN ('General Data Dissemination System (GDDS)','Special Data Dissemination Standard (SDDS)','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "VitalRegistrationComplete",
+    "formula": "VitalRegistrationComplete IN ('Yes','Yes. Vital registration for Guernsey and Jersey.','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "SnaPriceValuation",
+    "formula": "SnaPriceValuation IN ('Value added at basic prices (VAB)','Value added at producer prices (VAP)','')",
+    "evidence": "3 distinct values."
+   },
+   {
+    "table": "Country",
+    "column": "CurrencyUnit",
+    "formula": "CurrencyUnit IS NULL OR CurrencyUnit = '' OR length(trim(CurrencyUnit)) > 0",
+    "evidence": "Empty and named currencies observed; rule only forbids non-empty whitespace (comparison boundary includes '' vs 'Euro')."
+   },
+   {
+    "table": "Series",
+    "column": "SeriesCode",
+    "formula": "SeriesCode IS NOT NULL AND length(SeriesCode) > 0",
+    "evidence": "Primary key."
+   },
+   {
+    "table": "Series",
+    "column": "Periodicity",
+    "formula": "Periodicity IS NULL OR Periodicity = 'Annual'",
+    "evidence": "Only 'Annual' observed."
+   },
+   {
+    "table": "Series",
+    "column": "UnitOfMeasure",
+    "formula": "UnitOfMeasure IN ('','`','%','2005 PPP $','2011 PPP $')",
+    "evidence": "5 distinct values."
+   },
+   {
+    "table": "Series",
+    "column": "AggregationMethod",
+    "formula": "AggregationMethod IN ('','Weighted average','Sum','Gap-filled total','Median','Linear mixed-effect model estimates','Unweighted average')",
+    "evidence": "7 distinct values."
+   },
+   {
+    "table": "Series",
+    "column": "LicenseType",
+    "formula": "LicenseType IN ('Open','Restricted')",
+    "evidence": "2 distinct values."
+   },
+   {
+    "table": "Series",
+    "column": "OtherNotes",
+    "formula": "OtherNotes IS NULL",
+    "evidence": "100% NULL."
+   },
+   {
+    "table": "Series",
+    "column": "OtherWebLinks",
+    "formula": "OtherWebLinks IS NULL",
+    "evidence": "100% NULL."
+   },
+   {
+    "table": "Series",
+    "column": "RelatedIndicators",
+    "formula": "RelatedIndicators IS NULL",
+    "evidence": "100% NULL."
+   },
+   {
+    "table": "Indicators",
+    "column": "Year",
+    "formula": "Year BETWEEN 1960 AND 2015",
+    "evidence": "56 distinct years; boundary 1979-1982; clamp after perturbation."
+   },
+   {
+    "table": "Indicators",
+    "column": "Value",
+    "formula": "Value IS NULL OR Value >= 0",
+    "evidence": "Observed values include 0 and large positives; clamp after perturbation."
+   },
+   {
+    "table": "Indicators",
+    "column": "CountryName",
+    "formula": "Indicators.CountryName = Country.ShortName",
+    "condition": "Indicators.CountryCode IS NOT NULL",
+    "evidence": "Copied from parent via CountryCode; every matched row resolves."
+   },
+   {
+    "table": "Indicators",
+    "column": "IndicatorName",
+    "formula": "Indicators.IndicatorName = Series.IndicatorName",
+    "condition": "Indicators.IndicatorCode IS NOT NULL",
+    "evidence": "Copied from parent via IndicatorCode; every matched row resolves."
+   },
+   {
+    "table": "Footnotes",
+    "column": "Year",
+    "formula": "Year LIKE 'YR%'",
+    "evidence": "All observed values start with 'YR'."
+   },
+   {
+    "table": "SeriesNotes",
+    "column": "Year",
+    "formula": "Year LIKE 'YR%'",
+    "evidence": "All observed values start with 'YR'."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Country": 40,
+   "Series": 40,
+   "CountryNotes": 80,
+   "Footnotes": 200,
+   "Indicators": 400,
+   "SeriesNotes": 40
+  },
+  "null_targets": [
+   "Country.ShortName",
+   "Country.TableName",
+   "Country.LongName",
+   "Country.Alpha2Code",
+   "Country.CurrencyUnit",
+   "Country.SpecialNotes",
+   "Country.Region",
+   "Country.IncomeGroup",
+   "Country.Wb2Code",
+   "Country.NationalAccountsBaseYear",
+   "Country.NationalAccountsReferenceYear",
+   "Country.SnaPriceValuation",
+   "Country.LendingCategory",
+   "Country.OtherGroups",
+   "Country.SystemOfNationalAccounts",
+   "Country.AlternativeConversionFactor",
+   "Country.PppSurveyYear",
+   "Country.BalanceOfPaymentsManualInUse",
+   "Country.ExternalDebtReportingStatus",
+   "Country.SystemOfTrade",
+   "Country.GovernmentAccountingConcept",
+   "Country.ImfDataDisseminationStandard",
+   "Country.LatestPopulationCensus",
+   "Country.LatestHouseholdSurvey",
+   "Country.SourceOfMostRecentIncomeAndExpenditureData",
+   "Country.VitalRegistrationComplete",
+   "Country.LatestAgriculturalCensus",
+   "Country.LatestIndustrialData",
+   "Country.LatestTradeData",
+   "Country.LatestWaterWithdrawalData",
+   "Series.Topic",
+   "Series.IndicatorName",
+   "Series.ShortDefinition",
+   "Series.LongDefinition",
+   "Series.UnitOfMeasure",
+   "Series.Periodicity",
+   "Series.BasePeriod",
+   "Series.OtherNotes",
+   "Series.AggregationMethod",
+   "Series.LimitationsAndExceptions",
+   "Series.NotesFromOriginalSource",
+   "Series.GeneralComments",
+   "Series.Source",
+   "Series.StatisticalConceptAndMethodology",
+   "Series.DevelopmentRelevance",
+   "Series.RelatedSourceLinks",
+   "Series.OtherWebLinks",
+   "Series.RelatedIndicators",
+   "Series.LicenseType",
+   "CountryNotes.Description",
+   "Footnotes.Description",
+   "SeriesNotes.Description",
+   "Indicators.Value"
+  ],
+  "supporting_evidence": {
+   "Country.CountryCode": "Primary key, 247 distinct, all 3-letter codes; no duplicates allowed.",
+   "Country.LatestIndustrialData": "Observed 2002-2011, 54.3% NULL.",
+   "Country.LatestTradeData": "Observed 1995-2013, 24.7% NULL.",
+   "Country.LatestWaterWithdrawalData": "Observed 2000-2012, 27.1% NULL.",
+   "Country enums": "Region 8, IncomeGroup 6, LendingCategory 4, OtherGroups 3, SystemOfNationalAccounts 4, PppSurveyYear 4, BalanceOfPaymentsManualInUse 2, ExternalDebtReportingStatus 4, SystemOfTrade 3, GovernmentAccountingConcept 3, ImfDataDisseminationStandard 3, VitalRegistrationComplete 3, SnaPriceValuation 3 distinct values observed with an empty member.",
+   "Series.Periodicity": "Only 'Annual' observed.",
+   "Series.UnitOfMeasure": "5 values incl empty.",
+   "Series.AggregationMethod": "7 values incl empty.",
+   "Series.LicenseType": "Open/Restricted.",
+   "Series.OtherNotes/OtherWebLinks/RelatedIndicators": "100% NULL.",
+   "Indicators.Year": "56 distinct years; atomic boundary 1979-1982.",
+   "Indicators.Value": "Observed including 0 and large positives; no negatives. Compact NULL share not provided by atomic report; _plant_nulls forces at least one NULL per nullable column, which is the intended behavior.",
+   "Indicators.CountryName/IndicatorName": "Copied via FK; every matched parent resolves (ShortName/IndicatorName observed non-empty).",
+   "Footnotes.Year/SeriesNotes.Year": "All observed start with 'YR'.",
+   "FK integrity": "All six FK columns are NOT NULL; original join data has parents without children but no dangling child keys; disconnected FK generation is prohibited by schema constraints. Parent key pool must be frozen after final dedup before child FK sampling."
+  },
+  "uncertainty": {
+   "Indicators.Value": "Negative values not shown; range rule only applies to non-NULL values; clamp after perturbation. Compact NULL share unknown; at least one NULL planted per instance.",
+   "Country.Latest*Data": "Year ranges inferred from observed values; clamp to 1960-2015.",
+   "Footnotes.Year/SeriesNotes.Year": "'YR%' format inferred; generator must construct 'YR'+digits explicitly.",
+   "Copied columns NULL": "If parent ShortName/IndicatorName is NULL the copied child is NULL; otherwise copied column mirrors parent.",
+   "Enum case variants": "Semantic enum rules take precedence over the generic text_enum case-variant rule; enum columns emit exact enumerated values only.",
+   "Group variety": "rows_with_different_values applies only to (CountryCode, IndicatorCode) groups with at least two rows; single-row groups are exempt. Must be enforced after final PK dedup and after ties/duplicates.",
+   "CurrencyUnit boundary literals": "Atomic report lists '', 'x', 'euro', 'EURO', 'Euro'; spec requires at least '' and 'Euro' plus case variants 'euro'/'EURO' and value 'x' as near-variants."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances is invalid with 'new_integrity_failures'; 518 FK violations across Indicators.CountryCode, Footnotes.Seriescode, Footnotes.Countrycode, CountryNotes.Seriescode, CountryNotes.Countrycode. The program writes instances with `pragma foreign_keys = OFF` (writer.py) and inserts rows whose FK values are deliberately unmatched ('__UNMATCHED__%d' in instance.py) or NULL, so the resulting databases violate the declared FOREIGN KEY constraints. The specification's 'unmatched_join_rows' rule (5% child rows referencing a non-existent parent) directly conflicts with the schema's FOREIGN KEY constraints and with the validity criterion 'adds no integrity failure'.",
+     "requested_revision": "Reconcile the unmatched-join rule with the integrity requirement. Either (a) drop the '__UNMATCHED__' FK generation and instead achieve 'parent rows without children' by simply not generating children for some parents (which the schema allows), or (b) if unmatched FKs are truly required, the specification must state that FK constraints are intentionally violated and the validity checker must accept it. As written, the program cannot produce valid instances. Also stop disabling foreign_keys during insert (or verify FK integrity before commit) so violations are caught rather than silently written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable-column feedback shows Indicators.CountryName: NULL 2456 / 2456 and Indicators.IndicatorName: NULL 1987 / 2456. The specification requires Indicators.CountryName = Country.ShortName VIA CountryCode and Indicators.IndicatorName = Series.IndicatorName VIA IndicatorCode (copied columns). The program's `_copied_value` returns None whenever the FK is an unmatched '__UNMATCHED__' value or when the parent key is not found, and the copied column is then treated as nullable and NULL-planted. This breaks the dependent-value consistency rule: copied columns should equal the parent's value for matched keys, and should not be all-NULL.",
+     "requested_revision": "Ensure copied columns are populated from the parent for every matched FK (compact and generated parent rows), and do not plant NULLs in copied columns beyond the compact share. If unmatched FKs are removed (see issue 1), copied values will resolve; otherwise the copied-column rule must be defined for unmatched keys. The current all-NULL Indicators.CountryName is a clear dependent-value inconsistency."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's 'unmatched_join_rows' rule (5% of child rows reference a non-existent parent) is stated for Country.CountryCode, Indicators.CountryCode, Series.SeriesCode, CountryNotes.Seriescode, CountryNotes.Countrycode, Indicators.IndicatorCode. But the schema declares FOREIGN KEY constraints on all these columns. The atomic summary's 'unmatched_join_rows' pattern with 'parent_rows_without_children: true' describes the *original* data (parents with no children), not child rows with dangling FKs. The specification misinterprets this as generating dangling child FKs, which is unsupported by the schema and causes the integrity failures.",
+     "requested_revision": "Revise the specification so that 'parent_rows_without_children' is implemented by leaving some parent rows childless (no generated child referencing them), not by generating child rows with non-existent parent keys. Remove the 5% unmatched-FK generation rule, which contradicts the FOREIGN KEY constraints."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires Indicators.Value to satisfy 'Value IS NULL OR Value >= 0' and the atomic summary notes 'rows_with_different_values' per (CountryCode, IndicatorCode) group. The program's NumberSampler for Indicators.Value uses domain range (0, 1000000) but the sampler's `_fresh_or_reuse` and the \u00b11/\u00b12 perturbation (values.py NumberSampler.sample) can produce negative values (v -= d, v -= 2*d) when v is near 0, violating the non-negative rule. Also, the 'rows_with_different_values' rule (at least two rows per group with different Year and Value) is not implemented anywhere in instance.py.",
+     "requested_revision": "Clamp Indicators.Value to >= 0 after perturbation, and implement the per-group different-values rule (e.g., ensure at least two rows per (CountryCode, IndicatorCode) group with distinct Year and Value) in build_random_instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires Indicators.Year BETWEEN 1960 AND 2015 and the atomic summary shows boundary values 1979-1982. The program's NumberSampler for Year uses domain range (1960, 2015) but the \u00b11/\u00b12 perturbation can push values to 1959 or 2016, violating the range. Similarly Country.LatestIndustrialData/TradeData/WaterWithdrawalData ranges (1960-2015) can be violated by perturbation.",
+     "requested_revision": "Clamp numeric values to the specified range after perturbation, or disable perturbation for range-constrained columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires Footnotes.Year LIKE 'YR%' and SeriesNotes.Year LIKE 'YR%'. The program's StringSampler (used for TEXT columns without enum/like/boundary domain) generates random strings from CHARSET and applies near-variants (truncation, prefix/suffix), which will not reliably produce 'YR%' values. The spec's semantic rule for these columns is not enforced by construction.",
+     "requested_revision": "Add a domain/sampler for Footnotes.Year and SeriesNotes.Year that generates values matching 'YR%' (e.g., 'YR' + digits), and include the comparison-boundary literals ('YR2', 'YR2001', 'YR2002' and case variants) as required by the atomic summary."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires Country.CountryCode to be a 3-letter code (length = 3) and the primary key. The program's CodeSampler generates random codes of length 3-12 and near-variants, and the primary-key dedup keeps first occurrence. Generated CountryCode values may not be length 3, violating the semantic rule. Also, the 'duplicates_for_distinct' rule is applied to Country.CountryCode (a primary key) via _apply_duplicates, which would create duplicate primary keys \u2014 though sample_fresh_primary_keys runs before _apply_duplicates, the ordering in build_random_instance applies duplicates after PK dedup, potentially reintroducing duplicates. Execution shows 0 duplicate keys, but the logic is fragile.",
+     "requested_revision": "Enforce length-3 CountryCode generation and ensure duplicate/ties rules are never applied to primary-key columns (or re-run PK dedup after duplicate application)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets list includes many columns, and the NULL rule requires 'each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share'. The program's _plant_nulls uses spec['null_share'] which is populated from the compact database for nullable columns, but for columns with 0% NULL in the compact database (e.g., some enum columns), the share is 0 and _plant_nulls still forces k = max(1, ...) = 1 NULL, which may be acceptable per the interface rule. However, Indicators.CountryName and IndicatorName are copied columns that should not be NULL-planted (see issue 2). Also, the 'always_null' columns (Series.OtherNotes, OtherWebLinks, RelatedIndicators) are correctly all-NULL.",
+     "requested_revision": "Exclude copied columns (Indicators.CountryName, Indicators.IndicatorName) from NULL planting; they should reflect parent values. Verify null shares match compact database shares for all nullable columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic rules for Country.Region, IncomeGroup, LendingCategory, etc. are supported by the supporting_evidence (distinct value counts). However, the specification's 'unmatched_join_rows' rule and the 'duplicates_for_distinct' rule applied to Country.CountryCode (a primary key) are not supported by the schema. The 'duplicates_for_distinct' on Country.CountryCode contradicts the primary key constraint.",
+     "requested_revision": "Remove Country.CountryCode from the duplicates_for_distinct targets (it is a primary key and cannot have duplicates). Clarify that 'duplicates_for_distinct' applies only to non-key columns."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 'rows_with_different_values' rule for Indicators.Value is actually satisfied in generated instances (not verified by execution feedback).",
+    "Whether Footnotes.Year and SeriesNotes.Year values match 'YR%' in generated instances (not verified).",
+    "Whether Country.CountryCode values are length 3 in generated instances (not verified).",
+    "Whether Indicators.Value is non-negative in all generated rows (not verified; sampler perturbation may produce negatives).",
+    "Whether Indicators.Year stays within 1960-2015 after perturbation (not verified)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: TypeError('cannot unpack non-iterable NoneType object') at tscore_gen/spec.py:214: `ct, cc = key(ct_name, d['child_column'])`. The `key()` helper returns `None` when the table/column cannot be resolved (e.g. `d['child_column']` is 'Countrycode' but the schema column is 'CountryCode' \u2014 case-insensitive lookup should succeed, but the fallback dependency list iterates over every table name and calls `key(ct_name, d['child_column'])`; for tables that do not contain that column, `key` returns `None` and the unpack fails). The program crashed before writing any instance (0 of 20).",
+     "requested_revision": "Guard the unpack: `k = key(ct_name, d['child_column']); if k is None: continue; ct, cc = k`. Apply the same defensive pattern everywhere `key(...)` is unpacked (also the `dependencies` loop and `per_column_exceptions` loop). Re-run and confirm instances are produced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py `build_spec` fallback dependency loop iterates `for ct_name in schema.tables:` and calls `key(ct_name, d['child_column'])` for every table, but `d['child_column']` (e.g. 'Countrycode', 'Seriescode', 'CountryCode', 'IndicatorCode') only exists in specific child tables. For non-matching tables `key` returns `None`, causing the crash above. This is a logic error, not just a missing guard: the loop should only consider tables that actually have the child column.",
+     "requested_revision": "Restrict the loop to tables whose columns include `d['child_column']` (case-insensitive), or skip `None` results. Verify the resulting `deps` list contains exactly the six FK dependencies from the specification (CountryNotes.Countrycode/Seriescode, Footnotes.Countrycode/Seriescode, Indicators.CountryCode/IndicatorCode, SeriesNotes.Seriescode) with the correct copied columns (Indicators.CountryName, Indicators.IndicatorName)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py `build_spec` has a dead/incorrect line: `copied = {(d['child'][0], cc) for d in deps for cc in [d['copied']] for cc in [x for pair in cc for x in [pair[1]]]} if deps else set()` \u2014 the comprehension rebinds `cc` and produces a set of `(table, column_name)` tuples, but the result `copied` is never used (only `copied_cols` is returned). This is confusing and could mask a bug if later relied upon.",
+     "requested_revision": "Remove the unused `copied` variable or replace it with a correct construction of `copied_cols` (which is already built correctly below)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_ensure_group_variety` only enforces distinct Year/Value for groups with `len(idxs) >= 2`; groups with a single row are left alone. The specification's `rows_with_different_values` rule requires '>= 2 per group with different values', which is satisfied only if every (CountryCode, IndicatorCode) group has at least two rows. With random FK sampling over 40 countries \u00d7 40 series and 400 Indicators rows, many groups will have exactly one row, so the rule is not enforced for those groups.",
+     "requested_revision": "Either (a) ensure the Indicators generation produces at least two rows per (CountryCode, IndicatorCode) group (e.g. by constructing groups explicitly), or (b) document that the rule applies only to groups with \u22652 rows and confirm this matches the atomic report's intent ('qualifying_rows: >= 2 per group with different values'). If (b), the current code is acceptable but should be stated explicitly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_nulls` is applied to every nullable non-PK, non-copied column with `share = spec['null_share'].get(key, 0.02)`. For columns whose compact share is 0 (e.g. a column that is never NULL in the compact DB but is declared nullable), `_plant_nulls` still plants `max(1, round(0 * n)) = 1` NULL. This matches the interface rule ('at least one NULL row per nullable column'), so it is correct per the stated NULL rule. However, `spec['null_share']` is populated from the compact DB for every nullable column, so the default 0.02 is rarely used. No issue here, but note: `_plant_nulls` is called AFTER `_apply_duplicates`/`_apply_ties`, so a NULL planted into a column flagged `duplicates_for_distinct` or `ties_for_order_limit` could break the duplicate/tie guarantee (e.g. if the tie pair becomes NULL).",
+     "requested_revision": "Apply NULL planting before duplicate/tie application, or exclude NULLs from the duplicate/tie logic, so that the duplicate/tie guarantees survive NULL planting. Verify with a check that at least two rows share the tie value and that 20-50% of non-key values are duplicated after NULL planting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_duplicates` and `_apply_ties` are applied to `cols[cm.name]` for columns in `spec['duplicate']`/`spec['ties']`, but `spec['duplicate']` includes `('Footnotes', 'Year')` and `spec['ties']` includes `('Indicators', 'IndicatorCode')`, `('Indicators', 'Value')`, `('Indicators', 'Year')`. For `Indicators.IndicatorCode` (a FK to Series.SeriesCode), duplicating values is fine (FK still valid), but for `Indicators.Year` and `Indicators.Value` the tie/duplicate application happens BEFORE `_ensure_group_variety`, which may then overwrite the tied values. The order is: duplicates \u2192 ties \u2192 always_null \u2192 Value clamp \u2192 NULL planting \u2192 `_ensure_group_variety`. So `_ensure_group_variety` can destroy the tie guarantee for Indicators.Year/Value.",
+     "requested_revision": "Reorder so that `_ensure_group_variety` runs before tie/duplicate application, or make `_ensure_group_variety` preserve existing ties. Verify the tie guarantee holds in the final instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_fresh_pk` for composite PKs: `used = _compact_key_set(schema, t, c0) | set()` \u2014 the `| set()` is a no-op, and `used` is reset per column, so freshness is only per-column, not per-tuple. Then `sample_fresh_primary_keys` dedups tuples. This is acceptable (dedup handles collisions), but the `| set()` is dead code.",
+     "requested_revision": "Remove the dead `| set()` for clarity. No functional change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` calls `choose_table_sizes(spec, rng)` but the function signature is `choose_table_sizes(schema, spec, rng)` \u2014 the call passes `spec` as `schema` and `rng` as `spec`, missing `rng`. This would raise a TypeError at runtime once the earlier crash is fixed.",
+     "requested_revision": "Fix the call to `choose_table_sizes(schema, spec, rng)`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` uses `spec['sizes']` inside `choose_table_sizes`, but `choose_table_sizes` is defined as `def choose_table_sizes(schema, spec, rng)` and accesses `spec['sizes']` \u2014 consistent. However, the call site passes arguments in the wrong order (see previous issue). Also `_domain_for` reads `spec['ranges'].get(('__like__',) + key)` \u2014 this key is set in `build_spec` as `ranges[('__like__',) + k] = pref`, so the lookup is correct.",
+     "requested_revision": "Fix the call-site argument order (see previous issue)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Country.CountryCode IS NOT NULL AND length(CountryCode) = 3`. The program's `FixedLengthCodeSampler` (used for PK columns with `args[0] <= 4`) generates 3-char codes, but `_fresh_pk` may append a suffix (`base + '_' + str(k)`) when a collision occurs, producing codes longer than 3. Since `Country` has 40 rows and the compact DB has 247 codes, collisions are possible and the suffix would violate the length-3 rule.",
+     "requested_revision": "For `Country.CountryCode`, ensure `_fresh_pk` respects the length-3 constraint (e.g. by regenerating a fresh 3-char code rather than appending a suffix), or relax the rule to `length(CountryCode) >= 3`. Confirm the chosen behavior matches the compact DB evidence."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `comparison_boundary` rule for `Indicators.IndicatorName` lists literals like 'CO2 emissions FROM gaseous fuel consumption (kt)' and 'Agricultural land (% of land area)', and the `like_near_variant` rule requires truncated and one-char-changed variants. The program's `CodeSampler` (used for `Indicators.IndicatorName` via `domain['like']`/`domain['boundary']`) emits the literal with 5% case change and 5% one-char change, but does NOT emit truncated variants (e.g. 'Agricultural land ( of land area)'). The atomic report explicitly lists truncated variants as targets.",
+     "requested_revision": "Extend `CodeSampler` (or add a dedicated sampler for `Indicators.IndicatorName`) to emit truncated variants (drop a substring) in addition to case and one-char changes, matching the `like_near_variant` rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `comparison_boundary` rule for `Footnotes.Year` requires 'YR2', 'YR2001', 'YR2002' and lower/upper case variants. The program's `YearCodeSampler` emits 'YR' + digits and 10% near-variants (case change or one digit changed), but does not guarantee the specific literals 'YR2', 'YR2001', 'YR2002' appear. The `_BOUNDARY_LITERALS` dict includes them, and `make_column_sampler` passes `domain.get('boundary')` to `YearCodeSampler`, but `YearCodeSampler.sample` only uses `self.elements` (which includes the boundary literals) with 50% probability \u2014 so they may appear, but not guaranteed per instance.",
+     "requested_revision": "Guarantee that the listed boundary literals appear at least once per instance (e.g. by seeding the first few rows with them), or document that probabilistic inclusion is acceptable."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` includes `Indicators.CountryName` and `Indicators.IndicatorName`, but the `copy_parent_value` exception says 'Do not plant NULLs in these copied columns. Parent ShortName/IndicatorName are themselves nullable, so a copied NULL follows the parent's NULL.' The program's `build_random_instance` correctly skips NULL planting for `copied_cols`, and `_copied_value` returns the parent's value (which may be NULL). This is consistent. However, the specification's `null_targets` list is misleading \u2014 it lists copied columns as NULL targets while the exception forbids planting NULLs. This is a specification inconsistency, not a program bug.",
+     "requested_revision": "Remove `Indicators.CountryName` and `Indicators.IndicatorName` from `null_targets` (or annotate them as 'inherited from parent') to avoid confusion."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py `_insert_rows` inserts rows table-by-table in `schema.tables` order (dict order, which is insertion order from `read_schema` \u2014 the order of `sqlite_master`). FK integrity requires parents inserted before children. `read_schema` builds `tables` in `tnames` order (sqlite_master order), which may not be topological. The `table_order` (topological levels) is computed but not used in `_insert_rows`. If a child table appears before its parent in `sqlite_master`, the insert will fail FK checks (with `foreign_keys = ON`), and rows will be skipped.",
+     "requested_revision": "Insert rows in topological order using `schema.table_order` (flattened), not `schema.tables` order. Verify FK integrity passes for all instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py `_integrity_ok` runs `pragma foreign_key_check` and rolls back ALL generated rows if any violation is found, reporting them as skipped. This is safe but means a single bad row discards the entire instance's generated rows. Given the FK sampling draws only from existing parent keys, violations should not occur \u2014 but if they do (e.g. due to the insert-order issue above), the instance will have zero generated rows, defeating the purpose.",
+     "requested_revision": "Fix the insert order (previous issue) so FK violations do not occur. Optionally, on violation, retry with corrected order rather than discarding all rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_parent_pool` includes compact rows and generated rows, but for `Indicators.CountryCode` the parent pool is `Country.CountryCode` (compact + generated). Since `Country` is generated before `Indicators` (topological order), generated Country codes are available. However, `_fresh_pk` for `Country.CountryCode` may produce codes that collide with compact codes (handled) but the generated codes are added to `used` only within the `Country` table generation \u2014 `_parent_pool` for `Indicators` reads `instance['Country']['CountryCode']`, which includes the fresh codes. This is correct.",
+     "requested_revision": "No change required; confirm with a test that Indicators.CountryCode values all exist in Country.CountryCode (compact + generated)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_copied_value` looks up the parent value by scanning `schema.original_values` and `instance[pt]` linearly for each row \u2014 O(n) per row, O(n\u00b2) total. For 400 Indicators rows \u00d7 40 Country rows this is fine, but for larger sizes (up to 2500) it could be slow. Not a correctness issue.",
+     "requested_revision": "Optional: build a dict lookup for parent values to improve performance. Not blocking."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Series.Periodicity IS NULL OR Periodicity = 'Annual'`. The program's `_FALLBACK_ENUMS` sets `('Series', 'Periodicity'): []` (empty list), so `enums` does not include Periodicity, and the sampler falls back to `StringSampler` (since `Periodicity` is TEXT). `StringSampler` generates random strings, which would violate the rule (only 'Annual' or NULL allowed). The specification's `semantic_rules_and_formulas` for Periodicity is not parsed into an enum because the formula is `IS NULL OR = 'Annual'`, not an `IN (...)` list.",
+     "requested_revision": "Either (a) add `('Series', 'Periodicity'): ['Annual']` to `_FALLBACK_ENUMS`, or (b) extend `build_spec` to parse `Col IS NULL OR Col = 'value'` formulas into a single-value enum. Verify generated Periodicity values are only 'Annual' or NULL."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Country.CurrencyUnit IS NULL OR CurrencyUnit = '' OR length(trim(CurrencyUnit)) > 0`. The program's `_BOUNDARY_LITERALS` includes `('Country', 'CurrencyUnit'): ['', 'Euro']`, and `build_spec` adds these to `enums[('Country', 'CurrencyUnit')]`. So `CurrencyUnit` is sampled from `['', 'Euro']` via `EnumSampler`, which satisfies the rule. However, the rule also allows any non-whitespace string, and the enum restricts to only two values \u2014 this is a narrowing, not a violation. Acceptable.",
+     "requested_revision": "No change required; the enum is a valid subset of the allowed domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/values.py `EnumSampler.sample` applies a 5% case change (`v.upper()` or `v.lower()`). For enum columns like `Country.Region`, this produces values like 'south asia' that are NOT in the enumerated domain, violating the `Region IN (...)` rule. The specification's `text_enum` rule says '5% near-variants (case change)', so this is intentional per the generic sampling rule \u2014 but it conflicts with the semantic rule `Region IN ('South Asia', ...)`. The semantic rule should take precedence for enum columns.",
+     "requested_revision": "For columns with a semantic enum rule (Region, IncomeGroup, etc.), do not apply case variants \u2014 emit only the exact enumerated values. Alternatively, document that case variants are allowed and the semantic rule is interpreted case-insensitively. Confirm which interpretation matches the compact DB (which has exact-case values)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/values.py `CodeSampler.sample` applies case changes and one-char changes to code-like strings. For `Series.SeriesCode` (PK), `FixedLengthCodeSampler` is used (since `pk_pos > 0` and no length arg \u2192 falls through to `CodeSampler`? Actually `Series.SeriesCode` is TEXT with no length, so `args` is empty, `column.pk_pos > 0` but `args` is empty \u2192 condition `column.pk_pos > 0 and args and args[0] <= 4` is False \u2192 falls to `if domain.get('like') or domain.get('boundary')` \u2192 `CodeSampler`). `CodeSampler` may produce case-changed variants of `Series.SeriesCode`, but since it's a PK, `_fresh_pk` ensures uniqueness. However, case-changed variants of a PK are still valid PK values (just different strings). No violation.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` applies `_apply_duplicates` and `_apply_ties` to `cols[cm.name]` for columns in `spec['duplicate']`/`spec['ties']`, but these are applied AFTER `sample_fresh_primary_keys` and `drop_unique_duplicates`. For `Footnotes.Year` (in `spec['duplicate']`), duplicating values is fine (Year is part of composite PK with Countrycode, Seriescode \u2014 duplicating Year alone doesn't violate PK uniqueness as long as the tuple is unique). But `sample_fresh_primary_keys` is called again at the end of the table loop (`if tm.primary_key: inst[t] = sample_fresh_primary_keys(tm, inst[t])`), which may drop rows and undo the duplicate/tie guarantees. This is a correctness risk.",
+     "requested_revision": "Apply duplicate/tie rules AFTER the final PK dedup, or ensure dedup does not remove rows needed for duplicate/tie guarantees. Verify the guarantees hold in the final instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` calls `_ensure_group_variety(inst, schema, rng)` for Indicators, then `sample_fresh_primary_keys` again. `_ensure_group_variety` modifies Year/Value in place, which could create PK collisions (same CountryCode, IndicatorCode, Year) \u2014 the subsequent `sample_fresh_primary_keys` would drop one of the colliding rows, potentially breaking the group variety guarantee.",
+     "requested_revision": "Ensure `_ensure_group_variety` does not create PK collisions (e.g. by choosing a Year not already used in the group), or re-run `_ensure_group_variety` after dedup. Verify the group variety guarantee holds in the final instance."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the insert order in writer.py matches topological order (not verified due to crash).",
+    "Whether FK integrity passes for all instances (not verified due to crash).",
+    "Whether the duplicate/tie guarantees survive NULL planting and PK dedup (not verified due to crash).",
+    "Whether the group variety guarantee survives PK dedup (not verified due to crash).",
+    "Whether the boundary literals for Footnotes.Year appear per instance (probabilistic).",
+    "Whether the truncated variants for Indicators.IndicatorName are emitted (not implemented).",
+    "Whether Series.Periodicity is restricted to 'Annual'/NULL (not implemented).",
+    "Whether enum case variants violate semantic enum rules (design decision needed)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances reports rows_added = 0 for all tables and rows_skipped = {Country: 436, Series: 491, CountryNotes: 1389, Footnotes: 2113, Indicators: 2457, SeriesNotes: 957}; validity reasons = {\"no_rows_added\": 20}. The program reports n_ok=20, n_fail=0, errors={}, so the failure is silent at the CLI level. In writer.py `_insert_rows` inserts rows in `schema.table_order`; `_integrity_ok` runs `pragma foreign_key_check` and on any violation rolls back ALL generated rows and reclassifies them as skipped. Because every table's rows are skipped, the rollback path is being taken on every instance (or every insert fails), yet the CLI still counts the unit as ok.",
+     "requested_revision": "Diagnose why all inserts fail/roll back. Likely causes to check: (a) `_insert_rows` builds `rows` from `cols.get(c, [None]*n)` but `n` is derived from the first column only, so tables whose column lists have differing lengths (e.g. after `sample_fresh_primary_keys`/`drop_unique_duplicates` re-filtering some columns but not others) produce mismatched row widths and every executemany fails; (b) `build_random_instance` returns `{t: inst.get(t, {})}` and `_insert_rows` computes `n` from `names[0]` which may be absent from `cols`, yielding n=0 for some tables but not others; (c) FK integrity check failing because generated child rows reference parent keys that were later dropped by `sample_fresh_primary_keys`/`drop_unique_duplicates` on the parent (parent PK dedup runs after FK values were drawn from the pre-dedup pool). Ensure the parent key pool used for FK sampling is the FINAL post-dedup parent key set, and that all columns of a table have equal length before insert. Also make the CLI surface `rows_skipped` as a failure (n_fail) rather than reporting n_ok=20 when zero rows were added."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance`: FK values are drawn via `_parent_pool(inst, schema, pt, pc)` which reads `instance.get(pt, {}).get(pc, [])` \u2014 the parent's column list at the time the child is built. But after building each table, the code runs `sample_fresh_primary_keys` and `drop_unique_duplicates` again ('re-dedup PKs after duplicates/ties/nulls'), which can remove parent rows whose keys were already used as FK values in children. This produces dangling FKs, which `_integrity_ok` then detects and triggers the full rollback seen in the feedback.",
+     "requested_revision": "Freeze each parent table's final key set (after all dedup/NULL/duplicate/tie processing) before any child table draws FK values, and draw child FKs only from that frozen set. Do not re-dedup a parent table after its children have been generated. Verify with `pragma foreign_key_check` that no violations occur and that rows_added > 0 for every table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_ensure_group_variety` is called before the per-column duplicate/tie/NULL loop and before the final `sample_fresh_primary_keys` re-dedup. The spec's `rows_with_different_values` rule requires that for every (CountryCode, IndicatorCode) group with >=2 rows there are >=2 distinct Year and >=2 distinct Value. The final re-dedup (`sample_fresh_primary_keys`) can drop rows from a group, and `_apply_ties` on Indicators.Year/Value (both in `_FALLBACK_TIES`) can collapse the distinct values that `_ensure_group_variety` just established. The spec explicitly says ties must be applied 'after NULL planting and after final PK dedup' and that `_ensure_group_variety` must not be overwritten by ties.",
+     "requested_revision": "Reorder so that group variety is enforced AFTER the final PK dedup and AFTER ties/duplicates, or make `_apply_ties` skip Indicators.Year/Value when it would break a group's distinctness. Add an assertion that every qualifying group has >=2 distinct Year and >=2 distinct Value after all post-processing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_seed_boundary_literals` writes boundary literals into `cols[col][j]` for the first rows, but this runs AFTER `_plant_nulls` and AFTER `_apply_duplicates`/`_apply_ties`, and then the final `sample_fresh_primary_keys` re-dedup runs. For Footnotes.Year (a PK component) and Indicators.Year (PK component), seeding a boundary literal into a PK column can create a duplicate PK that the final dedup then drops, losing the seeded literal. Also `_seed_boundary_literals` only seeds `spec['enums'].get(key)` values, but for Indicators.Year the boundary values 1979/1980/1981/1982 are not in `enums` (they are in `ranges`), so the required Year boundary literals are never seeded.",
+     "requested_revision": "Seed boundary literals for Indicators.Year (1979,1980,1981,1982) explicitly, and seed boundary literals into PK columns only in a way that survives the final dedup (e.g. seed after dedup, or reserve distinct PK slots). Confirm the spec's requirement that 'these literals appear at least once per instance by seeding the first rows' is actually met for Indicators.Year and Footnotes.Year."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` for Country.CurrencyUnit states `CurrencyUnit IS NULL OR CurrencyUnit = '' OR length(trim(CurrencyUnit)) > 0`, and the atomic report shows comparison_boundary values ['', 'x', 'euro', 'EURO', 'Euro']. The spec's `_BOUNDARY_LITERALS` for CurrencyUnit is only ['', 'Euro'], and the generic text_short sampler will emit near-variants but the spec does not require the case variants 'euro'/'EURO' or the value 'x' that the atomic report lists. This is a minor gap but the spec should state which boundary literals are mandatory.",
+     "requested_revision": "Either add 'euro', 'EURO', 'x' to the CurrencyUnit boundary literal list in the spec, or explicitly state that only '' and 'Euro' are required. This is a low-severity clarification, not a blocker."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` lists Indicators.Value as nullable and the NULL rule requires at least one NULL per nullable column per instance. However `_ensure_group_variety` and the Value clamp run before `_plant_nulls`, and `_plant_nulls` is applied to Indicators.Value with `spec['null_share']` derived from the compact DB. The spec does not state the compact NULL share for Indicators.Value, and the atomic report does not provide it. If the compact share is 0, `_plant_nulls` still forces k=max(1,...) so at least one NULL is planted, which is correct per the interface rule, but the spec should record the intended share.",
+     "requested_revision": "Add the compact NULL share for Indicators.Value to the spec's supporting evidence so the engineer's `_plant_nulls` share is grounded. Low severity."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not confirm from the provided code alone why every insert fails; the rollback path in writer.py is the most likely cause but the exact failing constraint (FK vs. row-width mismatch) requires running the generator with the rollback disabled and inspecting the first sqlite3.Error.",
+    "Construction_pairs: 159 eligible, only 8 separated, 0 unknown. The low separation count is consistent with the zero-rows-added failure (no generated rows means no separation can be observed); it should be re-measured after the insert bug is fixed.",
+    "Dependent-value consistency (Indicators.CountryName = Country.ShortName, Indicators.IndicatorName = Series.IndicatorName) could not be verified because no Indicators rows were added."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "summary": "Every generated row is rejected; all 20 instances add zero rows (NoRowsAdded).",
+     "evidence": "Execution feedback: n_ok 0, n_fail 20, errors {\"NoRowsAdded\": 20}; rows_added all 0 while rows_skipped is large (Country 436, Series 491, CountryNotes 1389, Footnotes 2113, Indicators 2457, SeriesNotes 957). Integrity checks show 0 FK/not-null/PK violations, so the rows are being dropped for another reason (e.g. a per-row insert error such as a type/constraint mismatch, or the writer's fallback path zeroing ok counts). The program therefore produces no usable instances.",
+     "requested_revision": "Diagnose why _insert_rows rejects every row (log the actual sqlite3 error per table, e.g. NOT NULL on a column the generator leaves NULL, or a CHECK/type mismatch), fix the generator/writer so rows are inserted, and re-run until n_ok > 0 with rows_added > 0 for each table."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Writer's last-resort fallback silently converts all successful inserts into 'skipped', masking the real failure.",
+     "evidence": "writer.py: on FK-integrity failure it rolls back, retries, and if still failing does `bad[t] += ok[t]; ok[t] = 0` then commits. Combined with the per-row retry in _insert_rows, a systematic insert error yields exactly the observed pattern (all rows counted as skipped, none added) with no integrity violation reported.",
+     "requested_revision": "Do not zero out ok counts on fallback; surface the underlying sqlite3 error (raise or record it) so failures are diagnosable, and ensure the fallback path cannot turn a systematic error into a silent 'all skipped' result."
+    },
+    {
+     "agent": "engineer",
+     "summary": "NULL planting is applied to NOT NULL-adjacent / constrained columns that then fail insertion, and to columns whose compact share is 0.",
+     "evidence": "instance.py _finalize_table plants NULLs for every nullable non-PK, non-copied column using spec['null_share'] (default 0.02). spec.py sets null_share from compact data for all nullable columns, but for columns that are effectively always populated in the compact DB the share is 0 and _plant_nulls still forces k=max(1,...) = 1 NULL. If any such column participates in a constraint (e.g. a CHECK or a NOT NULL enforced elsewhere), every row fails. This is consistent with the uniform all-rows-rejected outcome.",
+     "requested_revision": "Verify which columns actually reject NULL at insert; restrict forced-NULL planting to genuinely nullable columns and confirm the interface NULL rule (at least one NULL per nullable column) does not conflict with any CHECK/constraint. Re-run and confirm rows are added."
+    },
+    {
+     "agent": "designer",
+     "summary": "Specification's 'unmatched_join_rows' pattern is described as producing parent rows without children, but the atomic report also lists child-side join targets; the spec text is ambiguous about whether any child rows may be unmatched.",
+     "evidence": "Atomic report: Country.CountryCode unmatched_join_rows targets joins_with Indicators/CountryNotes/Footnotes with parent_rows_without_children true; Indicators.CountryCode and CountryNotes.Countrycode also list unmatched_join_rows. The spec's per_column_exceptions rule correctly forbids dangling FKs, but the pattern name 'unmatched_join_rows' on child columns is not reconciled with the FK-integrity requirement.",
+     "requested_revision": "Clarify in the specification that 'unmatched_join_rows' on child FK columns is realized only as unreferenced parents (never dangling child keys), so the engineer's implementation and the spec agree."
+    },
+    {
+     "agent": "designer",
+     "summary": "Indicators.Value NULL share is unknown and the spec forces at least one NULL, but the compact data shows no negatives and the range rule is only for non-NULL; the interaction with rows_with_different_values (distinct Value per group) is under-specified.",
+     "evidence": "Spec uncertainty: 'Indicators.Value: Negative values not shown... Compact NULL share unknown; at least one NULL planted per instance.' rows_with_different_values requires >=2 distinct Value per qualifying group, but a planted NULL plus a single non-NULL value in a 2-row group would violate distinctness unless the group-variety pass runs after NULL planting (it does not: _ensure_group_variety runs before NULL planting in _finalize_table).",
+     "requested_revision": "Specify ordering: group-variety (distinct Year/Value) must be enforced after NULL planting, or exempt NULL from the distinctness count, and state the intended NULL share for Indicators.Value."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Group-variety is enforced before NULL planting, so a planted NULL can break the >=2 distinct Value guarantee.",
+     "evidence": "instance.py _finalize_table: `_ensure_group_variety` is called first, then duplicates/ties, then NULL planting. If a qualifying group's two distinct values are both overwritten to NULL by _plant_nulls (share>0), the group no longer has >=2 distinct Value, contradicting the rows_with_different_values rule the spec says must hold AFTER NULL planting.",
+     "requested_revision": "Move _ensure_group_variety after NULL planting (and after ties/duplicates), or exclude NULL-planted rows from the distinctness requirement, and add the assertion the spec requests."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Boundary seeding writes literals into the first rows of PK/unique columns and can be undone or collide, and for Indicators.Year it can break group distinctness.",
+     "evidence": "instance.py _seed_boundary_literals and _seed_year_boundaries overwrite cols[col][j] for the first rows unconditionally, including PK columns (e.g. Series.SeriesCode, Indicators.Year). For Indicators.Year this can set two rows of the same (CountryCode, IndicatorCode) group to the same year, and for PK columns it can create duplicates that the subsequent sample_fresh_primary_keys then drops, losing the seeded literal. The spec requires boundary literals to survive final dedup.",
+     "requested_revision": "Seed boundary literals into reserved distinct PK slots (as the spec says) and avoid overwriting Year values that would collapse a group's distinctness; verify each listed literal appears at least once after final dedup."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Copied columns are computed from the parent but the parent ShortName/IndicatorName may be NULL-planted, and the spec says copied NULL follows parent; however _copied_value returns None when the parent value is missing, which can produce NULL in a column the spec treats as copied (not NULL-planted) \u2014 acceptable, but the writer must not then reject the row.",
+     "evidence": "instance.py _copied_value returns None if key not found; spec copy_parent_value says copied NULL follows parent's NULL. If Indicators.CountryName/IndicatorName end up NULL and the column is NOT NULL in the schema, insertion fails. The schema shows Indicators.CountryName/IndicatorName are nullable (no NOT NULL), so this is likely fine, but combined with the all-rows-rejected outcome it should be verified.",
+     "requested_revision": "Confirm Indicators.CountryName/IndicatorName are nullable and that copied NULLs are permitted; if not, ensure copied values are never NULL."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Construction separation is very low (8 of 159 eligible pairs), indicating the generated data rarely exercises the intended value variation.",
+     "evidence": "construction_pairs: eligible 159, separated 8. While a missing separation alone does not prove an error, combined with zero rows added it means no variation is being produced at all.",
+     "requested_revision": "After fixing row insertion, re-run and confirm construction pairs separate meaningfully; ensure boundary/duplicate/tie/NULL rules actually materialize in generated rows."
+    }
+   ],
+   "unresolved_checks": [
+    "Root cause of the uniform per-row insert failure is not visible from the feedback (no sqlite3 error text); must be diagnosed by the engineer.",
+    "Whether Indicators.CountryName/IndicatorName are nullable in the actual compact DB (schema text shows no NOT NULL, but not confirmed against data).",
+    "Whether the compact NULL share for Indicators.Value is 0 (forcing a NULL that may conflict with distinctness)."
+   ]
+  }
+ ]
 }

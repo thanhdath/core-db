@@ -1,9 +1,4 @@
-"""Build the compact database D_c of one training database from its gold queries.
-
-``--golds`` is a JSON list of the gold SQL queries of the database.  The selected rows are copied byte for byte
-(ATTACH + INSERT ... SELECT) and a JSON report (row counts, selection rules, diagnostics) is written next to the
-output database.
-"""
+"""Build the compact database D_c of one training database from its gold queries."""
 import argparse
 import json
 import os

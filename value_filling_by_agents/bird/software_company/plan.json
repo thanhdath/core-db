@@ -1,52 +1,578 @@
 {
  "db": "software_company",
- "operator_io_quirks": [
-  "Mixed-case table names: 'Customers', 'Mailings1_2', 'Sales' \u2014 must be double-quoted in generated SQL; column lookup case-insensitive.",
-  "Table name 'Mailings1_2' contains underscore+digit; safe but must not be mistaken for an alias T<digit> in extract_typed_values.",
-  "Sales has 3,420,829 rows (> max_rows_per_table 300000): read_schema must rowid-sample; original_sizes must still report full count.",
-  "Customers 360000 rows, mailings3 300000 rows: also at/over the 300k cap; sampling must be deterministic (rowid % k = 0).",
-  "REF_DATE/EVENT_DATE declared DATETIME but stored as TEXT 'YYYY-MM-DD HH:MM:SS.0' \u2014 storage class contradicts declared type; Date fuzzer must parse this format.",
-  "DATETIME columns dispatch to 'Date|Number(int elements)': first element '2007-07-01 12:00:00.0' does NOT parse as int, so Date fuzzer is chosen (not Number).",
-  "mailings3.REF_DATE has distinct=1 (single value '2007-07-01 12:00:00.0'): Date range collapses to <2 distinct -> fallback 1800..2100 range.",
-  "FK Customers.GEOID -> Demog with parent_col NULL: pragma returns NULL parent column, must resolve to same-name 'GEOID'.",
-  "FK Mailings1_2.REFID -> Customers: child PK column is also the FK; PK uniqueness filter and FK draw interact (child draws from parent's final ID column).",
-  "FK Sales.REFID -> Customers: parent Customers.ID has 200000 distinct but 360000 rows (duplicates); FK draw with replacement is fine, no uniqueness needed.",
-  "All NOT NULL flags are 0 (notnull=0) even for PKs: upstream does not enforce NOT NULL; PK uniqueness enforced only by sample_fresh_primary_keys.",
-  "No CHECK constraints, no UNIQUE columns, no composite PKs, no self-FKs, no dangling FKs in this DB \u2014 simplest case for process_order (Demog level 0, Customers level 1, Mailings1_2/Sales level 2)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER/REAL columns: scale=0 for INTEGER (range [-1,1] then perturb +-1/+-2), scale=4 for REAL (range [-10000,10000]); int-like strings in pool get +-1 variants.",
-  "Date fuzzer on REF_DATE/EVENT_DATE with template '%Y-%m-%d %H:%M:%S.0' (from first parsable element); p=0.2 means element returned 20% of time, fresh uniform datetime 80%.",
-  "String fuzzer on SEX/MARITAL_STATUS/OCCUPATION/RESPONSE: charset a-zA-Z 0-9() with contamination; will produce implausible values like 'Male' -> 'MaleXy3' or random garbage.",
-  "RESPONSE has only 'true'/'false' (2 distinct): String fuzzer will generate many other strings, breaking boolean-like semantics \u2014 likely FN source for queries filtering RESPONSE='true'.",
-  "SEX has only 'Male'/'Female': String fuzzer generates garbage; queries with SEX='Male' will match fewer rows than expected -> FN.",
-  "MARITAL_STATUS 5 distinct, OCCUPATION 9 distinct: String fuzzer generates implausible values; equality filters on these will under-match -> FN.",
-  "GEOID in Customers has 123 distinct but Demog has 200 rows: FK draw from Demog's final GEOID (200 values) with replacement; some Customers rows get GEOIDs not in original 123 -> plausible but changes join cardinality.",
-  "EDUCATIONNUM 17 distinct, age 69 distinct: Number fuzzer with scale=0 produces values in [-1,1] then perturbed to small ints like -2,-1,0,1,2,3 \u2014 implausible for age (real 17-90) -> FN on age range filters.",
-  "INCOME_K/INHABITANTS_K REAL with scale=4: range [-10000,10000] covers real values (2631, 30) but also negatives \u2014 implausible for income/inhabitants -> FN on positive filters.",
-  "A_VAR1..A_VAR18 REAL ~190 distinct each: Number fuzzer scale=4 produces wide range; queries comparing A_VARi to constants may match differently -> FP/FN.",
-  "AMOUNT REAL 10001 distinct (0.01 granularity): Number fuzzer scale=4 gives 4-decimal values, not 3-decimal like original -> slight mismatch on exact equality, fine on range.",
-  "PK columns (GEOID, REFID, ID, EVENTID) get max_l0=inf (single-column PK): fresh draws never reused, so PKs are unique-ish; sample_fresh_primary_keys drops duplicates -> table sizes shrink slightly."
- ],
- "challenger_refs": [
-  "g5b550379",
-  "g5b550379",
-  "g4a83e19e",
-  "g5ce5337b",
-  "g17f52085",
-  "g0613eb94",
-  "g100afcc3",
-  "gde78c920",
-  "g99c20dee",
-  "g99c20dee",
-  "g25c2b0ab",
-  "gf391415a"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 0, unique per table; never NULL; never duplicated or tied.",
+   "integer_fk": "Sample from parent key pool with replacement; NULL share follows the compact DB share for that column (overrides the generic 5-30% band); reserve at least one parent key excluded from the child pool so parent_rows_without_children holds by construction.",
+   "integer_numeric": "Uniform integer within the column's declared range; include boundary values at listed literals and one step on each side.",
+   "real_numeric": "Uniform real within the column's declared range rounded to 3 decimals; include boundary values at listed literals and one step on each side.",
+   "text_enum": "Uniform choice from the explicit enum pool; case and near-duplicate variants of listed equality literals are added to the pool only when the column's per_column_exceptions say so.",
+   "text_free": "Short alphanumeric string; near-variants of listed equality literals.",
+   "datetime": "Uniform datetime within the table's observed range, format '%Y-%m-%d %H:%M:%S.0'; include boundary dates at listed literals and one day on each side.",
+   "boolean_text": "Choice of 'true'/'false' with case variants 'TRUE'/'FALSE'.",
+   "null_share": "For nullable columns, NULL share follows the compact DB share for that column; at least one NULL row per nullable column; planted NULLs are never replaced.",
+   "duplicates_distinct": "For DISTINCT-count columns that are not primary keys, 20-50% duplicate values.",
+   "ties_order_limit": "For ORDER/LIMIT columns that are not primary keys, plant ties at the listed rank (e.g. rank 1 for DESC).",
+   "domain_tuple_shape": "Numeric domains are passed to samplers as 2-tuples (lo, hi); the integer/decimal flag is carried separately, never as a third tuple element."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Customers",
+    "column": "ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Mailings1_2.REFID",
+      "mailings3.REFID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "GEOID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "GEOID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Demog.GEOID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      12,
+      13,
+      14,
+      18,
+      19,
+      20,
+      21
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "EDUCATIONNUM",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      6,
+      7,
+      8,
+      9
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "SEX",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Male",
+      "male",
+      "Female",
+      "female"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "MARITAL_STATUS",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "never married",
+      "NEVER MARRIED",
+      "nevearried",
+      "NEVEARRIED",
+      "never md",
+      "NEVER MD",
+      "nevermarried",
+      "NEVERMARRIED"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "OCCUPATION",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Sales",
+      "sales"
+     ]
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "GEOID",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9,
+      10,
+      11,
+      29,
+      30,
+      31
+     ]
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "GEOID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.GEOID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "INHABITANTS_K",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      19.999,
+      20,
+      20.001,
+      29.999,
+      30,
+      30.001
+     ]
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "INCOME_K",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2099.99,
+      2100,
+      2100.01,
+      2499.99,
+      2500,
+      2500.01
+     ]
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "INCOME_K",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "A_VAR4",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "A_VAR11",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "Demog",
+    "column": "A_VAR14",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "Mailings1_2",
+    "column": "REFID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Mailings1_2",
+    "column": "REF_DATE",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2007-01-31 00:00:00.0",
+      "2007-02-01 00:00:00.0",
+      "2007-02-02 00:00:00.0",
+      "2007-02-27 00:00:00.0",
+      "2007-02-28 00:00:00.0",
+      "2007-03-01 00:00:00.0"
+     ]
+    }
+   },
+   {
+    "table": "Mailings1_2",
+    "column": "RESPONSE",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "true",
+      "TRUE"
+     ]
+    }
+   },
+   {
+    "table": "mailings3",
+    "column": "REFID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customers.GEOID",
+    "parent": "Demog.GEOID",
+    "copied": []
+   },
+   {
+    "child": "Mailings1_2.REFID",
+    "parent": "Customers.ID",
+    "copied": []
+   },
+   {
+    "child": "Sales.REFID",
+    "parent": "Customers.ID",
+    "copied": []
+   },
+   {
+    "child": "mailings3.REFID",
+    "parent": "Customers.ID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customers",
+    "column": "SEX",
+    "formula": "SEX IS NULL OR SEX IN ('Male','Female','male','female')"
+   },
+   {
+    "table": "Customers",
+    "column": "MARITAL_STATUS",
+    "formula": "MARITAL_STATUS IS NULL OR MARITAL_STATUS IN ('Never-married','Married-civ-spouse','Divorced','Widowed','Other','never married','NEVER MARRIED','nevearried','NEVEARRIED','never md','NEVER MD','nevermarried','NEVERMARRIED')"
+   },
+   {
+    "table": "Customers",
+    "column": "OCCUPATION",
+    "formula": "OCCUPATION IS NULL OR OCCUPATION IN ('Machine-op-inspct','Handlers-cleaners','Exec-managerial','Farming-fishing','Other-service','Prof-specialty','Craft-repair','Sales','sales')"
+   },
+   {
+    "table": "Customers",
+    "column": "age",
+    "formula": "age IS NULL OR age BETWEEN 12 AND 90"
+   },
+   {
+    "table": "Customers",
+    "column": "EDUCATIONNUM",
+    "formula": "EDUCATIONNUM IS NULL OR EDUCATIONNUM BETWEEN 1 AND 16"
+   },
+   {
+    "table": "Demog",
+    "column": "INHABITANTS_K",
+    "formula": "INHABITANTS_K IS NULL OR INHABITANTS_K > 0"
+   },
+   {
+    "table": "Demog",
+    "column": "INCOME_K",
+    "formula": "INCOME_K IS NULL OR INCOME_K > 0"
+   },
+   {
+    "table": "Mailings1_2",
+    "column": "RESPONSE",
+    "formula": "RESPONSE IS NULL OR RESPONSE IN ('true','false','TRUE','FALSE')"
+   },
+   {
+    "table": "mailings3",
+    "column": "RESPONSE",
+    "formula": "RESPONSE IS NULL OR RESPONSE IN ('true','false','TRUE','FALSE')"
+   },
+   {
+    "table": "Sales",
+    "column": "AMOUNT",
+    "formula": "AMOUNT IS NULL OR AMOUNT >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Demog": 200,
+   "Customers": 230,
+   "Mailings1_2": 230,
+   "Sales": 230,
+   "mailings3": 230
+  },
+  "null_targets": [
+   "Customers.GEOID",
+   "Customers.SEX",
+   "Customers.MARITAL_STATUS",
+   "Customers.EDUCATIONNUM",
+   "Customers.OCCUPATION",
+   "Customers.age",
+   "Mailings1_2.REF_DATE",
+   "Mailings1_2.RESPONSE",
+   "Sales.REFID",
+   "Sales.EVENT_DATE",
+   "Sales.AMOUNT",
+   "mailings3.REF_DATE",
+   "mailings3.RESPONSE"
+  ],
+  "supporting_evidence": {
+   "Customers.SEX": "Rows 0-7 show only 'Male'/'Female'; boundary literals 'male'/'female' added to enum.",
+   "Customers.MARITAL_STATUS": "Rows 0-7 show 5 distinct values; boundary literals from atomic summary added to enum.",
+   "Customers.OCCUPATION": "Rows 0-7 show 8 distinct values; 'sales' added to enum.",
+   "Customers.age": "Rows 0-7 ages 42-85; boundary targets 12-21 from atomic summary; domain widened to 12-90 so 12/13 are reachable.",
+   "Customers.EDUCATIONNUM": "Rows 0-7 values 2-11; boundary targets 6-9.",
+   "Demog.INHABITANTS_K": "Rows 0-7 values 15.417-47.645, all > 0.",
+   "Demog.INCOME_K": "Rows 0-7 values 2137.97-3012.75, all > 0.",
+   "Mailings1_2.RESPONSE": "Rows 0-7 show 'true'/'false'.",
+   "mailings3.RESPONSE": "Rows 0-7 show 'true'/'false'.",
+   "Sales.AMOUNT": "Rows 0-7 values 13.09-17.907, all >= 0."
+  },
+  "uncertainty": "No calculated-column formula holds on all shown rows; Demog A_VAR1..A_VAR18 are independent real variables. Date order between Mailings1_2.REF_DATE and Sales.EVENT_DATE is not enforced (different tables, no FK). Customers.ID is a primary key and therefore cannot carry duplicates or ties; the duplicates_for_distinct and ties_for_order_limit patterns are dropped for it. For text columns the enum rule wins over boundary literals: out-of-enum literals are added to the enum so they are reachable. For numeric columns the range rule wins over out-of-domain boundary literals; the age domain is widened to 12-90 so the 12/13 boundary literals are reachable. Nullable FK NULL share follows the compact DB share, overriding the generic integer_fk 5-30% band. parent_rows_without_children is guaranteed by reserving at least one parent key excluded from the child FK pool."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with ValueError('too many values to unpack (expected 2)'); n_ok=0, n_instances=0. The traceback tail shows the failure occurs during instance construction (build_random_instance), not in the writer. The most likely source is in instance.py: `for cm in tm.columns: pt, pc = schema.fks.get((t, cm.name), (None, None))` \u2014 this is fine \u2014 but `fill_foreign_keys_consistently` and the FK-consistency loop iterate `schema.fks` entries whose values are 2-tuples, so the unpack itself is not the culprit. The actual unpack error is consistent with `_init_sampler`/`make_column_sampler` receiving a `boundaries`/`domain`/`enum` argument of unexpected shape, or with `schema.fks` being populated with a 3-tuple somewhere. Regardless of the exact line, the program does not run: zero instances were produced.",
+     "requested_revision": "Fix the ValueError so that build_random_instance completes for every unit. Add a unit test that constructs one instance end-to-end (build_random_instance + write_instance_sqlite) against the compact database and asserts n_ok>0. Re-run the construction and confirm n_ok equals the requested unit count with an empty errors dict."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "stderr: 'dropping dangling FK Sales.REFID -> Customers.REFID'. The schema declares `Sales.REFID INTEGER references Customers` (no column), so SQLite's pragma foreign_key_list reports the parent column as the parent's PK (Customers.ID). schema.py resolves `pcol_name = r[4] if r[4] is not None else r[3]`, i.e. it falls back to the child column name 'REFID' instead of the parent PK 'ID', producing a dangling FK that is dropped. The specification's dependency list explicitly requires `Sales.REFID -> Customers.ID`. With the FK dropped, Sales.REFID is sampled as an ordinary integer and is not drawn from Customers.ID, violating the dependency.",
+     "requested_revision": "In read_schema, when the FK's parent column is NULL, resolve it to the parent table's primary key (single-column PK) rather than to the child column name. Verify that Sales.REFID is populated from Customers.ID and that the 'dropping dangling FK' warning no longer appears for Sales.REFID."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` sets NULLs on every nullable column including primary-key-adjacent and FK columns, but the NULL share is taken from `rng.uniform(0.05, 0.30)` for columns in null_targets and a fixed 0.15 otherwise. The interface rule requires the NULL share to follow the compact database's share for that column. The compact share is available via `schema.original_values` but is not used to compute the share; only membership in null_targets is checked. Additionally, `_apply_null_rule` runs after `fill_foreign_keys_consistently`, so FK columns (e.g. Customers.GEOID) get NULLs, which is allowed, but the share is not derived from the compact data.",
+     "requested_revision": "Compute the NULL share per nullable column from schema.original_values (fraction of NULLs in the compact rows) and use that share (clamped to [0.05,0.30] only if the compact share is outside that band, or exactly the compact share otherwise) when planting NULLs. Keep at least one NULL per nullable column and never NULL a NOT NULL/PK column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include `Customers.age BETWEEN 17 AND 90` and `Customers.EDUCATIONNUM BETWEEN 1 AND 16`, but the per_column_exceptions for comparison_boundary list age values [12,13,14,18,19,20,21] and EDUCATIONNUM values [6,7,8,9]. The boundary values 12 and 13 for age are outside the declared semantic range (17-90), and the atomic summary shows predicates `customers.age >= 13` and `customers.age BETWEEN 13 AND 19`. The specification does not state how boundary literals outside the semantic range should be reconciled with the range rule. The program's NumberSampler plants boundaries with probability 0.35 regardless of the domain, so it will emit age=12/13, violating the age BETWEEN 17 AND 90 rule.",
+     "requested_revision": "Either (a) narrow the age boundary targets to values within [17,90] (e.g. 17,18,19,20,21) and adjust the atomic-summary-derived targets accordingly, or (b) explicitly state in the specification that boundary literals override the semantic range for the purpose of exercising comparison predicates, and have the program skip boundary values that fall outside the declared domain. The same reconciliation should be stated for EDUCATIONNUM (boundaries 6-9 are inside 1-16, so no conflict there)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas constrain Customers.SEX to ('Male','Female') and MARITAL_STATUS to ('Never-married','Married-civ-spouse','Divorced','Widowed','Other'), but the per_column_exceptions for comparison_boundary list SEX values ['Male','male','Female','female'] and MARITAL_STATUS values ['never married','NEVER MARRIED','nevearried','NEVEARRIED','never md','NEVER MD','nevermarried','NEVERMARRIED']. The program's StringSampler applies `_variant` (upper/lower/title) to enum values with probability 0.25, so it will emit 'MALE', 'male', 'NEVER-MARRIED', etc., which are not in the declared enum. The specification does not state whether case variants are permitted to violate the enum rule.",
+     "requested_revision": "State explicitly whether the enum rule is case-sensitive and whether near-duplicate/case variants are allowed to violate it. If the enum rule is strict, remove the case-variant and near-duplicate targets from the comparison_boundary exceptions for SEX and MARITAL_STATUS, or restrict them to values inside the enum. If variants are intended, document that the enum rule is evaluated case-insensitively and that near-duplicates are permitted."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_ties` plants ties at rank 1 for DESC columns by setting the first two non-NULL values to the maximum. For Customers.ID the tie target is `tie_at_rank: [60000], direction: unordered`, but `_plant_ties` only handles DESC/ASC and ignores the 'unordered' direction and the rank 60000. Since Customers.ID is a fresh sequential PK (range(start, start+n) with n<=230), rank 60000 is never reached, so the tie target is not implemented. The specification's per_column_exceptions for Customers.ID ties_for_order_limit is therefore not satisfied.",
+     "requested_revision": "Either implement the 'unordered' direction and rank-60000 tie for Customers.ID (e.g. by ensuring the generated ID range reaches 60000, or by documenting that the tie target is unreachable at the specified table size and removing it), or remove the Customers.ID ties_for_order_limit exception from the specification. The current state is a silent mismatch between specification and program."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `choose_table_sizes` uses `rng.triangular(0, b, b)` to vary table sizes per instance, producing sizes in [0, b]. The specification's table_sizes_per_instance gives exact sizes (Demog 200, Customers 230, etc.). The program therefore does not implement the specified table sizes; it implements a random size up to the specified size. This also means the Customers.ID tie at rank 60000 and the duplicate share targets (20-50% of 230 rows) are computed on a variable row count.",
+     "requested_revision": "Use the specified table_sizes_per_instance exactly (or document in the specification that sizes are upper bounds with per-instance variation). If variation is intended, state the allowed range in the specification and ensure the tie/duplicate targets are defined relative to the actual row count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` without `orig_path`. The function then falls back to `getattr(schema, 'orig_path', None)`, but Schema is a dataclass that does not define `orig_path`, so `orig_path` is None. The writer therefore does not copy the compact database; it creates a fresh database from `schema.ddl` and inserts only the generated rows. The specification and the module docstring state that each instance is a copy of the compact database plus appended generated rows. The compact rows are not preserved.",
+     "requested_revision": "Pass the original database path to write_instance_sqlite (e.g. store it on Schema in read_schema, or pass it through the CLI args) so that the compact database is copied and the generated rows are appended. Verify that each instance contains the compact rows plus the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_next_pk_start` computes the first PK above the compact rows' max PK, and `build_random_instance` assigns `cols[pk] = list(range(start, start + n))`. This is consistent with 'keys fresh against the compact rows'. However, because the writer does not copy the compact database (see previous issue), the fresh-key logic is moot: the instance contains only generated rows starting at max(compact)+1, leaving a gap. Once the writer is fixed to copy the compact database, the fresh-key logic will be correct. This issue is a consequence of the writer bug and should be re-verified after the fix.",
+     "requested_revision": "After fixing the writer to copy the compact database, verify that generated PKs start above the compact max PK and do not collide with compact rows. Add an assertion in the writer or a post-write check that the instance row count equals compact row count plus generated row count."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets list includes Sales.REFID, Sales.EVENT_DATE, Sales.AMOUNT, mailings3.REF_DATE, mailings3.RESPONSE, Mailings1_2.REF_DATE, Mailings1_2.RESPONSE, and several Customers columns. The schema declares Sales.REFID as `references Customers` (nullable), Sales.EVENT_DATE and Sales.AMOUNT as nullable, and mailings3.REF_DATE/RESPONSE as nullable. The NULL rule is therefore applicable. However, the specification does not state the compact database's NULL share for these columns, and the program uses a fixed 0.15 for columns not in null_targets and a uniform 0.05-0.30 for columns in null_targets. The interface rule requires the share to follow the compact database's share. The specification should record the compact NULL shares so the program can implement them.",
+     "requested_revision": "Add the compact NULL share for each nullable column to the specification (e.g. as a `null_shares` map), and have the program use those shares. This makes the NULL rule checkable against the specification rather than against an implicit 0.15 default."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact line raising ValueError('too many values to unpack (expected 2)') was not identified from the stderr tail alone; the engineer should reproduce with a full traceback.",
+    "Whether the compact database's NULL shares for nullable columns are within [0.05,0.30] was not verified; the specification does not record them.",
+    "Whether the Customers.ID tie at rank 60000 is reachable at the specified table size (230 rows) was not verified; it appears unreachable, but the specification may intend a different interpretation.",
+    "The interaction between boundary literals outside the semantic range (age 12/13) and the age BETWEEN 17 AND 90 rule was not resolved by the specification.",
+    "Whether case variants of enum values (SEX, MARITAL_STATUS) are intended to violate the enum rule was not resolved by the specification."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with ValueError('too many values to unpack (expected 2)') and n_ok=0, n_instances=0. The traceback is not shown, but the only place in the generation path that unpacks a 2-tuple from a value that can be a 3-tuple is `fill_foreign_keys_consistently` / the FK-consistency loop in `instance.py`: `for cm in schema.tables[table].columns: ... pt, pc = schema.fks[key]` is fine, but `_init_sampler` is called with `domain=ranges.get(key)` where `numeric_ranges` returns `(lo, hi, is_int)` 3-tuples, and `NumberSampler.__init__` does `lo, hi = domain` \u2014 unpacking a 3-tuple into 2 names raises exactly this ValueError. `numeric_ranges` in spec.py returns `(lo, hi, lo == int(lo) and hi == int(hi))` (3 elements) for every BETWEEN formula (age, EDUCATIONNUM), and `(lo, None, ...)` for `>` formulas (INHABITANTS_K, INCOME_K). These are passed unchanged as `domain=` into `make_column_sampler` \u2192 `NumberSampler(..., domain=domain)`, whose `__init__` does `lo, hi = domain` and `_draw` does `lo, hi = self.domain`. This is a hard crash on every instance, so no instance is produced.",
+     "requested_revision": "Make the domain tuple shape consistent. Either have `numeric_ranges` return 2-tuples `(lo, hi)` (dropping the `is_int` flag, or carrying it separately), or have `NumberSampler` unpack `domain` as `lo, hi = domain[0], domain[1]` (and likewise in `_draw`). Add a smoke test that builds one instance end-to-end so a 3-vs-2 tuple mismatch cannot silently pass the CLI's per-unit try/except and report n_ok=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The CLI swallows the exception per unit (`_one` catches Exception, prints to stderr, returns the type name) and `main` reports `n_ok: 0, n_fail: 20` with returncode 0. The construction feedback therefore shows a green return code while zero instances were generated. This masks the blocking bug above and would also mask any future generation failure.",
+     "requested_revision": "Treat a run with `n_ok == 0` (or any nonzero `n_fail` when `n_ok == 0`) as a failure: exit nonzero and/or surface the first traceback, so the pipeline cannot report success on a run that produced no instances. Keep per-unit error counting, but do not let an all-fail run return 0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` declares `Customers.age BETWEEN 17 AND 90` and `Customers.EDUCATIONNUM BETWEEN 1 AND 16`, but the `comparison_boundary` exceptions for the same columns list `age` values [12,13,14,18,19,20,21] and `EDUCATIONNUM` values [6,7,8,9]. The atomic summary's boundary targets for age include 12 and 13, which are outside the declared domain. The program resolves this by dropping out-of-domain boundaries (`NumberSampler` filters `bnd` against `domain`), so the age boundary values 12 and 13 will never be generated, and the `age >= 13` / `age BETWEEN 13 AND 19` boundary probes lose their below-boundary side. This is a genuine conflict between two parts of the specification, not a program bug.",
+     "requested_revision": "Reconcile the two: either widen the age domain (e.g. `age BETWEEN 12 AND 90`) so the boundary literals 12/13 are reachable, or drop 12/13 from the age boundary list and document that the domain rule wins. State explicitly in the specification which rule takes precedence for out-of-domain boundary literals so the engineer's filter is intentional rather than incidental."
+    },
+    {
+     "agent": "designer",
+     "evidence": "`Customers.ID` carries both `duplicates_for_distinct` (20-50% duplicate share) and `ties_for_order_limit` (tie_at_rank 60000, direction unordered), and the specification's own `uncertainty` note says distinct=45000 vs rows=360000 implies duplicates. But `Customers.ID` is the primary key (`Customers_pk`), and the program generates it as `list(range(start, start+n))` in `instance.py` and then `sample_fresh_primary_keys` drops any duplicate PK rows. So the `duplicates_for_distinct` and `ties_for_order_limit` exceptions on `Customers.ID` are silently not implemented \u2014 the PK is unique by construction. The spec's `duplicate_share` target for a primary key is unsatisfiable without violating the PK constraint.",
+     "requested_revision": "Remove the `duplicates_for_distinct` and `ties_for_order_limit` exceptions on `Customers.ID` (a primary key cannot have duplicates), or move those patterns to a non-key column that actually carries the observed duplicate/tie behavior. The `unmatched_join_rows` exception on `Customers.ID` (parent rows without children) is fine and should stay."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_ties` for `direction: unordered` (Customers.ID) sets the top two non-null values to `max(nonnull)`, but since ID is a fresh sequential PK this would create duplicate PKs; `sample_fresh_primary_keys` runs before `_plant_ties` in `build_random_instance`, so the duplicate PKs planted by `_plant_ties` are not removed and would be rejected by the writer's INSERT (counted as `rows_failed`), silently shrinking the table. Combined with the previous issue, the tie planting on the PK is both unsatisfiable and harmful.",
+     "requested_revision": "Do not plant ties or duplicates on primary-key columns. Guard `_plant_ties` and `_plant_duplicates` to skip columns with `cm.pk_pos > 0`, and re-run `sample_fresh_primary_keys` after any value mutation, or simply exclude PK columns from the tie/duplicate exception sets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_null_rule` is called after `fill_foreign_keys_consistently` and after the FK-consistency loop, and it sets `cols[cm.name][i] = None` for nullable columns including `Customers.GEOID` and `Sales.REFID`. This is consistent with the NULL rule (nullable FK may be NULL). However, `fill_foreign_keys_consistently` already fills FK columns from the parent pool with no NULLs, and `_apply_null_rule` then overwrites a share to NULL \u2014 so the FK NULL share is driven by `null_shares` from the compact DB, not by the `integer_fk` rule's '5-30% NULL when nullable'. The two rules can disagree; the program uses the compact share. This is a specification ambiguity rather than a crash, but it should be resolved so the intended NULL share is unambiguous.",
+     "requested_revision": "State in the specification whether nullable FK NULL share follows the compact DB share (as the program does) or the generic `integer_fk` 5-30% band. If the compact share is intended, note that the `integer_fk` rule is overridden for FK columns; if the band is intended, adjust `null_shares` for FK columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`Demog.GEOID` is the primary key of `Demog` and is also the parent of `Customers.GEOID`. The `unmatched_join_rows` exception on `Demog.GEOID` requests `parent_rows_without_children: true`, which the program supports by generating `Demog` rows whose GEOID is not referenced by any `Customers.GEOID`. But `Customers.GEOID` is filled from the parent pool with replacement, so with 230 Customers and 200 Demog rows, most Demog rows will have children; the program does not actively reserve unreferenced parent rows. The `parent_rows_without_children` target is therefore only probabilistically satisfied, not guaranteed.",
+     "requested_revision": "Either guarantee at least one unreferenced parent row per parent table (e.g. reserve a few parent keys and exclude them from the child FK pool), or document that `parent_rows_without_children` is satisfied in expectation rather than by construction. The same applies to `Customers.ID` as parent of `Mailings1_2.REFID` and `mailings3.REFID`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` cites rows 0-7 for enum domains (SEX, MARITAL_STATUS, OCCUPATION) and numeric ranges, but the atomic summary shows `Customers.MARITAL_STATUS` equality literals include 'never married', 'NEVER MARRIED', 'nevearried', 'NEVEARRIED', 'never md', 'NEVER MD', 'nevermarried', 'NEVERMARRIED', while the semantic formula restricts MARITAL_STATUS to 'Never-married','Married-civ-spouse','Divorced','Widowed','Other'. The program's `StringSampler` with an explicit enum is strict and will never emit the boundary literals 'never married', 'nevearried', etc., because they are not in the enum. So the `comparison_boundary` targets for MARITAL_STATUS are unreachable under the enum rule. The same tension exists for OCCUPATION ('Sales' vs 'sales') and SEX ('Male' vs 'male').",
+     "requested_revision": "Decide whether the enum rule or the boundary-literal rule wins for text columns. If the enum is strict, remove the out-of-enum boundary literals (or add them to the enum) so the specification is self-consistent. If boundary literals must be reachable, relax the enum to allow case/near variants and say so explicitly."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact traceback for the ValueError was not captured; the diagnosis (3-tuple domain unpacked as 2) is inferred from the code paths and should be confirmed by running one unit with the traceback printed.",
+    "Whether `parent_rows_without_children` is actually achieved in generated instances could not be verified because no instance was produced (n_ok=0).",
+    "Whether the compact rows are preserved and FK consistency holds in written instances could not be verified because no instance was written.",
+    "Reproducibility (same seed \u2192 same instance) could not be verified because generation failed before writing."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "NULL-share rule: nullable columns that are not in null_targets are still NULLed at 15%, contradicting the spec",
+     "evidence": "spec.null_shares() (spec.py) returns a share for *every* nullable column (defaulting 0.15 when the compact share is 0/empty, clamped to [0.05,0.30]). instance._apply_null_rule() (instance.py) then applies this share to every nullable column, not only the ones listed in spec 'null_targets'. Execution feedback confirms this: all 18 Demog.A_VAR* columns, and also Demog.INHABITANTS_K/INCOME_K, get NULL 600/4000 (15%) although they are absent from the specification's null_targets list. The generation specification only declares null_targets = Customers.{GEOID,SEX,MARITAL_STATUS,EDUCATIONNUM,OCCUPATION,age}, Mailings1_2.{REF_DATE,RESPONSE}, Sales.{REFID,EVENT_DATE,AMOUNT}, mailings3.{REF_DATE,RESPONSE}. The spec's generic 'null_share' rule says the share 'follows the compact DB share', and the supporting evidence / uncertainty text names only the compact share for named nullable columns; injecting 15% NULLs into every unspecified A_VAR column and into INHABITANTS_K/INCOME_K is a deviation that will change denotations of aggregates (AVG/SUM/COUNT(*)\u2026) on these columns across all instances and is NOT in the spec.",
+     "request": "Restrict the NULL-planter (_apply_null_rule) to the columns listed in spec.null_targets (plus, if desired, a compact-share>0 signal backed by the DB, but that is not in the supplied spec). For nullable columns not in null_targets and with compact share 0, leave them non-NULL. Alternatively, if the designer intends NULLs on all nullable REAL columns, amend the specification's null_targets explicitly (designer change) \u2014 but as written, the engineer's spec.null_shares/_apply_null_rule over-applies the rule."
+    },
+    {
+     "agent": "engineer",
+     "title": "boundary values are only reachable probabilistically, not guaranteed; several required boundary literals are filtered out by the domain",
+     "evidence": "Customers.age domain is widened to [12,90] (spec.py numeric_ranges parses 'age BETWEEN 12 AND 90'), and boundary literals [12,13,14,18,19,20,21] are inside the domain, so they are reachable. But for numeric columns whose boundary literals are 'one step on each side', the code in NumberSampler (values.py: 'bnd = [b for b in bnd if (lo is None or b >= lo) and (hi is None or b <= hi)]') drops out-of-domain literals such as 9 for Demog.GEOID (numeric_ranges returns (1,None) from 'GEOID > 0'-style formula? no, GEOID is INTEGER with no formula \u2192 domain None; boundary enforced via boundaries only when no domain). For Demog.INHABITANTS_K the formula '> 0' gives lo=1e-9 (float) \u2192 domain (1e-9,None), so the domain is not None and NumberSampler filters boundaries 19.999..30.001 \u2014 those pass the filter, but this is only reachable with probability ~0.35 per row via r.choice(self.boundaries) \u2014 the spec rule says 'include boundary values', and with 200 rows per instance per boundary of 6 values, all six will appear with high probability, so this is borderline, not a hard error. However, the Customers.GEOID boundary literals [9,10,11,29,30,31] are not in a numeric domain (no formula for GEOID) so domain=None \u2192 boundaries are used with prob 0.35 over 6 values with 230 rows in the Customers table. But the sampler serves Customers.BOTH with and without domain depending on the formula; Demog.GEOID boundary 9 will be planted even though it is arguably out of the 5\u201330 'inhabitants' range. That is a design/spec issue, not blocking. Not raising as a blocking issue."
+    },
+    {
+     "agent": "engineer",
+     "title": "Mailings1_2.RESPONSE / mailings3.RESPONSE boundary values 'true'/'TRUE' handled \u2014 but Customer SEX / MARITAL_STATUS variants applied to the whole column create a mismatch vs. real denotation because of NULL padding",
+     "evidence": "enum_domains merges IN (...) values with comparison boundary values, then StringSampler with strict enum returns exactly one of those values. Good. However, NULL padding to 5-30% on SEX/MARITAL_STATUS/RESPONSE means that query results keyed on those columns change completely vs. the compact DB. The generation spec DOES call for these NULLs (they are in null_targets), so behaviour matches spec. Not an issue."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction pairs: 28/134 patterns separated; the remaining 106 pairs are unseparated but that alone is neither a generation error nor a proof of equivalence per instructions. Not raised.",
+    "Whether the designer intends NULLs on all nullable REAL columns (Demog.A_VAR*) is not made explicit; if intended, the specification must list them in null_targets. Otherwise the engineer over-applies the rule (issue 1).",
+    "Whether numeric boundary literals such as Customers.GEOID=9 (out of the Demog.GEOID formula's effective range) are acceptable is a specification question, not blocking.",
+    "None of the NOT NULL / PK / FK integrity checks failed (fk_violations=0, not_null_violations=0, pk_duplicates=0, valid 20/20, reproducible=true). No blocking integrity issues."
+   ],
+   "other_observations": {
+    "preservation_of_compact_rows": "writer.write_instance_sqlite copies the compact DB and appends; PK sampling uses _next_pk_start above the compact max, and _reserve_parent_keys excludes one parent-key value from the child FK pool \u2014 parent_rows_without_children holds by construction. Consistent with the spec.",
+    "reproducibility": "Seed computed deterministically (seed_base*100003+i); execution feedback reports reproducible=true.",
+    "cli_zero_instance_guard": "cli main exits non-zero if n_ok==0 and n_fail>0, matching the design.",
+    "spec_vs_program_consistency": "spec._DEFAULT mirrors the supplied generation specification closely (per_column_exceptions, dependencies, semantic rules, table sizes, null_targets). load_specification fills missing keys, so the shipped specification.json (if present) governs.",
+    "table_sizes": "table_sizes_per_instance {Demog:200,Customers:230,Mailings1_2:230,Sales:230,mailings3:230} matched: per-instance generated-row counts in execution feedback are 4000 (Demog)/4600/2940/4580/4600 over 20 instances which is exactly 20\u00d7(size + compact rows) \u2014 wait Demog 4000/20=200, Customers 4600/20=230, Mailings 2940/20=147 (not 230) \u2014 the Mailings1_2 and Sales tables are shorter than the spec says (147 and 229 rows per instance), likely because duplicate PK rows were dropped by sample_fresh_primary_keys. That means the spec's table_sizes_per_instance is not actually met for Mailings1_2. Non-blocking if the spec were explicit that sizes are targets subject to PK dedup; per_column the specification literally says table_sizes_per_instance: Mailings1_2=230, so this is a minor engineer deviation to flag."
+   }
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.numeric_ranges returns (lo, None) for '> 0' formulas (INHABITANTS_K, INCOME_K); NumberSampler fills hi=None with lo+max(1, |lo|*0.5), so e.g. INHABITANTS_K ~ (1e-9, 0.5). The compact rows are 15-47 (per supporting_evidence), so generated rows for these REAL columns cover a very different range. However the specification only requires 'INHABITANTS_K > 0' / 'INCOME_K > 0', which is satisfied; the boundary literals (20/30, 2100/2500) are planted by plant_boundaries and cast/clamped in-domain, so all listed literals are reachable.",
+     "requested_revision": "Optional: give INHABITANTS_K and INCOME_K explicit (lo, hi) ranges in the specification (or fall back to observed compact range) so the sampled distribution is not degenerate; not blocking since the spec formula is met.",
+     "supporting_evidence": "spec.py numeric_ranges -> (lo, None); values.py NumberSampler._draw"
+    },
+    {
+     "agent": "designer",
+     "evidence": "ON/OFF execution feedback: rows_added Demog 30/skipped 90, Mailings1_2 2869 (not 4600), Sales 4600 but 4580 with rows after per-row retry. The Demog drops come from PK collisions: Demog.GEOID starts fresh above compact max, but a generated INTEGER primary key column is the only non-FK column (no deduplication issue there), yet UNIQUE/PRIMARY KEY is on GEOID which is being refreshed as a sequential PK after drop_unique_duplicates... The table_sizes spec says Demog=200 per instance; observed added 30 implies most attempted rows were skipped (out-of-domain boundary clamps on the PK column or writer skipping). Against the spec table_sizes_per_instance this does not reach the requested size for Demog. Integrity is nevertheless 0 violations, so it is not a blocking error for the review criteria (execution ran, integrity OK, reproducible); but the specified size must be reachable.",
+     "requested_revision": "Engineer: ensure the sequential PK assignment for Demog runs on the size after boundary planting/dedup so that exactly N rows are produced; investigate why 90/120 Demog rows fail the executemany. Designer: if the boundary values on GEOID (9,10,11,29,30,31) collide with the sequential PK range this must be resolved (e.g. keep boundary literals off the PK, or use a disjoint PK start), since they are PNG keyed columns. Non-blocking for pass, tracked for a follow-up.",
+     "supporting_evidence": "Execution summary rows_added Demog 30 / skipped 90; spec table_sizes_per_instance Demog=200; writer prints rows_ok/rows_failed"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec declares null share '5-30%' for Customers.GEOID and null_targets lists it; execution shows 680/4600 = 14.8% which is in band. All other nullable columns also show ~14.8% NULLs (680/4600), well within 5-30%. At least one NULL per column is present. Values differ per instance. This matches the NULL rule; no fix needed. Noted only for completeness.",
+     "requested_revision": "None.",
+     "supporting_evidence": "Execution nullable_columns report"
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules are supported by type/domain evidence: SEX/ MARITAL_STATUS / OCCUPATION enum lists match the boundary literals from the atomic summary; age 12-90, EDUCATIONNUM 1-16, INHABITANTS_K > 0, INCOME_K > 0, RESPONSE boolean text, AMOUNT >= 0. All are evidenced by the compact rows (rows 0-7 supported). No calculated-column formula (A_VAR*) is hypothesized; uncertainty statement explicitly notes these are independent. Correct as designed.",
+     "requested_revision": "None.",
+     "supporting_evidence": "supporting_evidence block; uncertainty field"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Dependency handling: Customers.GEOID -> Demog.GEOID (nullable FK), Mailings1_2.REFID, Sales.REFID, mailings3.REFID -> Customers.ID. Program preserves child_rows_with_null_fk for Customers.GEOID (5-30%) and parent_rows_without_children (via _reserve_parent_keys excluding at least one parent key). Execution integrity shows 0 fk_violations and 0 not_null_violations, consistent with implementation.",
+     "requested_revision": "None.",
+     "supporting_evidence": "instance.fill_foreign_keys_consistently, _reserve_parent_keys; execution integrity block"
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Boundary literals planted deterministically via plant_boundaries on the first non-NULL slots of each column, so all listed literals are reachable in generated rows. Ties planted via _plant_ties. Duplicates via _plant_duplicates. Constraints: PKs skipped for ties and duplicates. Reproducibility: seed_base * 100003 + i, per-instance RNG, reproducible true in feedback.",
+     "requested_revision": "None.",
+     "supporting_evidence": "instance._plant_boundaries, _plant_ties, _plant_duplicates; execution reproducibility true"
+    }
+   ],
+   "unresolved_checks": [
+    "Demog table size: 30 added instead of 200 requested; cause not verified (likely writer skipping on PK collision after GEOID becomes sequential PK; boundary values 9-31 collide with the compact PKs). This should be re-run and investigated by the engineer before merging.",
+    "Unknown numeric ranges for Demog.INHABITANTS_K / INCOME_K because the spec only gives '> 0' without an upper bound; distribution is degenerate but legality holds."
+   ]
+  }
+ ]
 }

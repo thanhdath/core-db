@@ -1,12 +1,4 @@
-"""Step 4: execute the construction pairs on every candidate instance and record the separations.
-
-A pair is *eligible* when the gold is informative on the original database and the neighbor returns the
-same result there (the original cannot tell them apart).  An instance *separates* an eligible pair when the
-gold is informative on the instance and the two results differ.  Execution errors and timeouts are
-``unknown`` and never count as a separation.  The compact database is always instance 0 of the pool.
-
-Output: <out>/separation.json
-"""
+"""Step 4: execute the construction pairs on every candidate instance and record the separations."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -34,9 +26,10 @@ def eligible_pairs(original, pairs):
                            has_top_level_order(p['gold_sql'])) == 'accept']
 
 
-def separate(original, units, pairs, workers):
-    """{unit: [separated pair ids]} plus the eligible pairs."""
-    eligible = eligible_pairs(original, pairs)
+def separate(original, units, pairs, workers, eligible=None):
+    """{unit: [separated pair ids]} plus the eligible pairs (``eligible``: precomputed eligible pairs, which skips
+    re-running every pair on the original database)."""
+    eligible = eligible_pairs(original, pairs) if eligible is None else eligible
     needed = sorted({p['gold_sql'] for p in eligible} | {p['neighbor_sql'] for p in eligible})
     with ProcessPoolExecutor(workers) as pool:
         matrix = dict(pool.map(unit_statuses, [(u, needed, eligible) for u in units], chunksize=4))
@@ -53,7 +46,8 @@ def main():
     args = parser.parse_args()
     out, start = Path(args.out), time.time()
     pairs = load_json(out / 'pairs.json')['pairs']
-    units = [str(Path(args.compact).resolve())] + load_json(out / 'generation.json')['units']
+    generation = load_json(out / 'generation.json')
+    units = [str(Path(args.compact).resolve())] + generation.get('valid_units', generation['units'])
     eligible, separated, unknown = separate(args.original, units, pairs, worker_count())
     separable = sorted(set().union(*separated.values())) if separated else []
     save_json(out / 'separation.json', {

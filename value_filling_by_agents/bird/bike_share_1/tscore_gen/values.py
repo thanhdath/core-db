@@ -58,6 +58,7 @@ class NumberSampler(ColumnSampler):
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
+        v = float(v)
         d = 1 if self.is_int else 0.01
         if r.random() < 1 / 6:
             v += d

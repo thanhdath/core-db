@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from .spec import parse_dt, fmt_dt
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -233,3 +235,76 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def _like_variants(literals):
+    """Expand LIKE literals into concrete strings that match / nearly match them."""
+    out = []
+    for lit in literals:
+        s = str(lit)
+        body = s.replace('%', '')
+        out.append(body)
+        if body:
+            out.append(body[:-1] if len(body) > 1 else body)
+            out.append(body[1:] if len(body) > 1 else body)
+            out.append(body.lower())
+            out.append(body.upper())
+            out.append(body + ' x')
+    return out
+
+
+def spec_pool_values(table, column, spec, type_str):
+    """Concrete values contributed by the specification for one column."""
+    cs = spec.exc(table, column) if spec is not None else None
+    if cs is None:
+        return [], []
+    t = (type_str or '').lower()
+    pat = cs.pattern
+    targets = list(cs.targets)
+    if pat == 'enum':
+        return [str(x) for x in targets], []
+    if pat == 'comparison_boundary':
+        if 'date' in t or 'timestamp' in t:
+            vals = [fmt_dt(parse_dt(x)) for x in targets if parse_dt(x) is not None]
+            return vals, vals
+        if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
+            vals = [float(x) for x in targets]
+            return vals, vals
+        return [str(x) for x in targets], [str(x) for x in targets]
+    if pat == 'aggregate_boundary':
+        vals = [float(x) for x in targets]
+        return vals, vals
+    if pat == 'like_near_variant':
+        vals = _like_variants(targets)
+        return vals, []
+    if pat == 'duplicates_for_distinct':
+        vals = [str(x) for x in targets if not re.search(r'\d+\s*-\s*\d+\s*%', str(x))]
+        return vals, []
+    return [], []
+
+
+def make_spec_sampler(column, spec, literal_pool, original_values, p, rng, n_pk):
+    """Build a sampler whose element pool is enriched with specification values."""
+    table, name = column.table, column.name
+    els, boundary = spec_pool_values(table, name, spec, column.type_str)
+    cs = spec.exc(table, name) if spec is not None else None
+    if cs is not None and cs.pattern == 'enum':
+        s = make_column_sampler(column, els, 0.0, 0, rng)
+        s.elements = list(els)
+        s.p = 0.0
+        s.max_l0 = 0
+        return s
+    ov = list(original_values)
+    base = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    pool = base + [str(v) for v in els]
+    if column.checked:
+        p = 0.0
+    max_l0 = float('inf')
+    if rng.random() < 0.5:
+        max_l0 = rng.random() * 30
+        if column.pk_pos > 0:
+            max_l0 = float('inf') if n_pk == 1 else 30
+    s = make_column_sampler(column, pool, p, max_l0, rng)
+    if boundary:
+        s.boundary = list(boundary)
+    return s

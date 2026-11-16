@@ -1,9 +1,11 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
 import os
 import random
+import shutil
+import sqlite3
 import sys
 import time
 
@@ -22,6 +24,19 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
+def _copy_compact(orig: str, path: str) -> None:
+    """Copy the compact database to `path` (atomic via .part)."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    part = path + '.part'
+    if os.path.exists(part):
+        os.remove(part)
+    shutil.copyfile(orig, part)
+    os.chmod(part, 0o644)
+    os.replace(part, path)
+
+
 def _one(i: int) -> str:
     """Build and write unit i; returns '' on success or the exception type name."""
     a = _G['args']
@@ -31,9 +46,10 @@ def _one(i: int) -> str:
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
+        _copy_compact(a['orig'], p)
+        write_instance_sqlite(_G['schema'], inst, p, append=True)
         return ''
-    except Exception as e:  # counted and reported, never silent
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
         return type(e).__name__
 
@@ -63,7 +79,8 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base,
+            'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -75,9 +92,25 @@ def main(argv=None) -> None:
     for r in res:
         if r:
             errs[r] = errs.get(r, 0) + 1
+    added: dict = {}
+    skipped_rows: dict = {}
+    for i in idx:
+        p = unit_path(a.root, a.ds, a.db, i, a.tag)
+        if not os.path.exists(p):
+            continue
+        try:
+            con = sqlite3.connect('file:%s?mode=ro' % p, uri=True)
+            for t in schema.tables:
+                n = con.execute('select count(*) from "%s"' % t.replace('"', '""')).fetchone()[0]
+                base = schema.original_sizes.get(t, 0)
+                added[t] = added.get(t, 0) + max(0, n - base)
+            con.close()
+        except sqlite3.Error:
+            pass
     print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows}))
 
 
 if __name__ == '__main__':

@@ -1,49 +1,478 @@
 {
  "db": "tracking_orders",
- "operator_io_quirks": [
-  "All 7 tables are tiny (15 rows each); no huge-table sampling needed, but read_schema must still handle max_rows_per_table path.",
-  "Table names are mixed-case with underscores (Customers, Order_Items, Shipment_Items); DDL uses backticks, not double quotes \u2014 writer must emit double-quoted identifiers and sqlite accepts both.",
-  "Shipment_Items has NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there and drop_unique_duplicates has no unique columns to dedupe.",
-  "Shipment_Items is a pure junction table with two FKs and no PK \u2014 duplicate (shipment_id, order_item_id) pairs are legal and present upstream.",
-  "All FKs point to existing parents with unique PKs; no dangling FKs, no self-references, no composite keys, no non-unique parents.",
-  "Declared DATETIME columns (invoice_date, date_order_placed, shipment_date) store TEXT in format 'YYYY-MM-DD HH:MM:SS' \u2014 Date fuzzer template must be '%Y-%m-%d %H:%M:%S' (not the 7 upstream templates' date-only forms); first element does not parse as int so Date branch is taken, not Number.",
-  "VARCHAR(10) status columns (order_status, order_item_status) hold short enum-like text ('Shipped','Packing','On Road','Finish','Payed','Cancel') \u2014 String fuzzer with length range [min,max+1] from elements.",
-  "shipment_tracking_number is VARCHAR(80) but stores digit-only strings ('3452','0114','478') \u2014 String fuzzer will treat as int-like and add str(i\u00b11) neighbours; storage class text contradicts numeric-looking content.",
-  "Four columns are 100% NULL in the original (order_details, product_details, order_item_details, other_shipment_details) with distinct=0 \u2014 original_values is all-None, so Base drops them and p:=1 (always fresh).",
-  "customer_id in Orders has distinct=10 < 15 rows: FK fan-in, not a uniqueness violation; Shipments.invoice_number distinct=7, Shipments.order_id distinct=12, Order_Items.product_id distinct=9, Order_Items.order_id distinct=9 \u2014 all FK fan-in.",
-  "All PKs are INTEGER single-column; Number fuzzer with scale=0 (no args) \u2192 range [-1,1] then perturb \u00b11/\u00b12, so fresh PKs collide often and sample_fresh_primary_keys will drop many rows.",
-  "NOT NULL columns: Orders.customer_id/order_status/date_order_placed, Order_Items.product_id/order_id/order_item_status, Shipments.order_id/invoice_number, Shipment_Items.shipment_id/order_item_id \u2014 upstream does not enforce NOT NULL in Python; NULL rows fail at insert and are skipped."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on the three DATETIME columns: template inferred from first parsable element = '%Y-%m-%d %H:%M:%S'; range = [min,max] of 5 sampled originals (e.g. 1971..2010), so fresh dates cluster in that window \u2014 plausible but narrow.",
-  "Number fuzzer on all INTEGER PKs: scale=0, range [-1,1], perturb \u00b11/\u00b12 \u2192 tiny integer space; with 15-row tables and PK dedupe, many rows dropped, final table sizes well below chosen size.",
-  "String fuzzer on VARCHAR(80/255) name/detail columns: length range from 5 sampled originals (e.g. [4,9] for customer_name), CHARSET a-zA-Z 0-9() \u2192 random gibberish names, plus 50% contaminate (prefix/suffix/drop) \u2014 implausible values drive FN on name-equality predicates.",
-  "String fuzzer on order_status/order_item_status (VARCHAR(10)): length range from 3 distinct short values, so fresh strings are 3-10 chars of gibberish \u2014 status='Shipped' predicates almost never match \u2192 FN.",
-  "String fuzzer on shipment_tracking_number: elements are digit strings, so int-like branch adds str(i\u00b11); fresh draws are alphanumeric gibberish \u2014 tracking-number equality predicates miss.",
-  "100%-NULL columns: Base drops all None elements \u2192 p:=1, always fresh String draws; original has zero non-null values so any predicate on these columns is trivially empty in original but TS fills them \u2192 FP risk on IS NULL / IS NOT NULL.",
-  "FK consistency: child columns draw from parent's FINAL filtered values with replacement; with tiny parent sizes after PK dedupe, FK fan-in is preserved but absolute counts shrink \u2014 join cardinalities differ from original.",
-  "Shipment_Items has no PK and no unique columns: no dedupe, so duplicate (shipment_id, order_item_id) pairs are generated freely \u2014 COUNT(*) on the junction table inflates vs original.",
-  "Number fuzzer quirk (list_max overwritten to full-range max) is irrelevant here since all INTEGER columns have no (a,b) args and scale=0.",
-  "p=0.2 default with 30% chance of p=0 for whole instance: when p=0, Date fuzzer returns fresh dates always (inverted p), String returns fresh always \u2014 more implausible values.",
-  "max_l0 cap (rng.random()*30) applies to non-PK columns; single-column PKs get inf, so PKs keep drawing fresh tiny ints and colliding \u2014 heavy PK dedupe.",
-  "Known misses: FN from gibberish strings/statuses and narrow date windows; FP from filling 100%-NULL columns and from junction-table duplicates; ties/duplicates in FK fan-in are preserved by with-replacement draw."
- ],
- "challenger_refs": [
-  "G3",
-  "G4",
-  "G10",
-  "G5",
-  "G6",
-  "G2",
-  "G8",
-  "G12",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "integer_fk": "Uniformly sample an existing parent key from the final surviving parent key set (compact + generated, after dedup); never NULL for NOT NULL FK columns; ~5% NULL only if the column is nullable; ensure at least one parent row has no children.",
+   "varchar_text": "Random string of length 4-12 drawn from lowercase letters plus space and digits; 20-50% duplicate share for DISTINCT-targeted columns; near-variants (case/whitespace/one-char edits) of listed equality literals; 0.3 of text values fresh, 0.7 drawn from observed pool.",
+   "varchar_short_enum": "Uniform choice from the table's enum list; case variants (lower/upper) allowed only where listed.",
+   "datetime": "Random timestamp between 1970-01-01 and 2015-12-31 23:59:59 in '%Y-%m-%d %H:%M:%S'; boundary values at each listed literal and one day on each side planted with probability 0.35 per instance.",
+   "nullable_columns": "Every nullable column receives NULL treatment: k = clamp(round(n*share), 1, n-1) so at least one NULL and at least one non-NULL generated row always exist; a compact share of 1.0 does not force all-NULL.",
+   "boundary_numbers": "For each numeric literal L in targets, include L-1, L, L+1 with probability 0.35 per instance.",
+   "boundary_dates": "For each date literal D, include D-1 day, D, D+1 day in the column format with probability 0.35 per instance.",
+   "tie_ranks": "For ORDER-targeted aggregate columns, plant at least two parent rows sharing the rank-1 aggregate value (tie_rank read from per_column_exceptions).",
+   "fresh_value_share": "0.3 of text values are fresh (not from the observed pool); 0.7 drawn from observed pool."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Customers.customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(orders.order_id)"
+     ]
+    }
+   },
+   {
+    "column": "Customers.customer_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.customer_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.customer_name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Customers.customer_details",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Shipments.order_id",
+      "Order_Items.order_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(orders.order_id)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Orders.order_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Orders.date_order_placed",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2008-12-31 00:00:00",
+      "2009-01-01 00:00:00",
+      "2009-01-02 00:00:00",
+      "2009-12-31 00:00:00",
+      "2010-01-01 00:00:00",
+      "2010-01-02 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "Orders.date_order_placed",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Orders.customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Orders.order_status",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "On Road",
+      "on road",
+      "Shipped",
+      "shipped"
+     ]
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Order_Items.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      10,
+      11,
+      12
+     ]
+    }
+   },
+   {
+    "column": "Products.product_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Order_Items.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Order_Items.product_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      10,
+      11,
+      12
+     ]
+    }
+   },
+   {
+    "column": "Order_Items.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Orders.order_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Order_Items.order_item_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Order_Items.order_item_status",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Finish",
+      "Payed",
+      "Cancel"
+     ]
+    }
+   },
+   {
+    "column": "Shipments.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Orders.order_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Shipments.shipment_date",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Shipments.shipment_tracking_number",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      3451,
+      3452,
+      3453,
+      "3452",
+      "3453"
+     ]
+    }
+   },
+   {
+    "column": "Invoices.invoice_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1989-09-02 00:00:00",
+      "1989-09-03 00:00:00",
+      "1989-09-04 00:00:00",
+      "2007-12-24 00:00:00",
+      "2007-12-25 00:00:00",
+      "2007-12-26 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "Shipments.invoice_number",
+    "pattern": "literal_pool",
+    "targets": {
+     "values": [
+      10
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Orders.customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Order_Items.order_id",
+    "parent_table": "Orders",
+    "parent_column": "order_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Order_Items.product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Shipments.order_id",
+    "parent_table": "Orders",
+    "parent_column": "order_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Shipments.invoice_number",
+    "parent_table": "Invoices",
+    "parent_column": "invoice_number",
+    "copied_columns": []
+   },
+   {
+    "child": "Shipment_Items.shipment_id",
+    "parent_table": "Shipments",
+    "parent_column": "shipment_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Shipment_Items.order_item_id",
+    "parent_table": "Order_Items",
+    "parent_column": "order_item_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Orders",
+    "column": "order_status",
+    "formula": "order_status IN ('Shipped','Packing','On Road')"
+   },
+   {
+    "table": "Order_Items",
+    "column": "order_item_status",
+    "formula": "order_item_status IN ('Finish','Payed','Cancel')"
+   },
+   {
+    "table": "Orders",
+    "column": "date_order_placed",
+    "formula": "date_order_placed BETWEEN '1970-01-01 00:00:00' AND '2015-12-31 23:59:59'"
+   },
+   {
+    "table": "Invoices",
+    "column": "invoice_date",
+    "formula": "invoice_date BETWEEN '1970-01-01 00:00:00' AND '2015-12-31 23:59:59'"
+   },
+   {
+    "table": "Shipments",
+    "column": "shipment_date",
+    "formula": "shipment_date BETWEEN '1970-01-01 00:00:00' AND '2015-12-31 23:59:59'"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 15,
+   "Invoices": 15,
+   "Products": 15,
+   "Orders": 15,
+   "Order_Items": 15,
+   "Shipments": 15,
+   "Shipment_Items": 15
+  },
+  "null_targets": [
+   "Customers.customer_name",
+   "Customers.customer_details",
+   "Invoices.invoice_date",
+   "Invoices.invoice_details",
+   "Orders.order_details",
+   "Products.product_name",
+   "Products.product_details",
+   "Shipments.shipment_tracking_number",
+   "Shipments.shipment_date",
+   "Shipments.other_shipment_details"
+  ],
+  "supporting_evidence": {
+   "Orders.order_status": "Observed values Shipped, Packing, On Road in Orders.order_status sample.",
+   "Order_Items.order_item_status": "Observed values Finish, Payed, Cancel in Order_Items.order_item_status sample.",
+   "date_bounds": "All observed dates in Orders, Invoices, Shipments fall within 1970-01-01..2015-12-31 (e.g. Orders 1974-06-24, Invoices 1971-02-12, Shipments 1977-11-10)."
+  },
+  "uncertainty": "The shipment_date >= order_date rule is contradicted by compact row shipment_id=1 (1983-08-13) vs order_id=5 (2010-06-08); it is dropped from semantic_rules_and_formulas and the program must not rewrite shipment_date to enforce it. No numeric quantity/price columns exist, so no range rules beyond date bounds. NULL shares observed as 0 for nullable columns but instruction 10 requires at least one NULL row per nullable column; the nullable_columns rule clamps k to [1, n-1] so all-NULL compact shares do not force all-NULL generated rows. Boundary planting is probabilistic (0.35 per instance) per the implemented samplers."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20 with reasons compact_rows_missing (20), no_rows_added (17), new_integrity_failures (20); integrity.fk_violations = 1184. writer.write_instance_sqlite is called from cli._one as write_instance_sqlite(_G['schema'], inst, p) with orig_path defaulting to None, so the compact database is never copied (the `_copy_compact` branch is skipped) and the instance is built from DDL only. The docstring/comment claims 'copy of the compact database plus appended rows' but the call site never passes orig_path.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. write_instance_sqlite(schema, inst, p, orig_path=_G['args']['orig'])) so compact rows are preserved, and re-run to confirm compact_rows_missing and no_rows_added disappear."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "integrity.fk_violations = 1184 across 20 instances. In instance.build_random_instance, foreign keys are filled by fill_foreign_keys_consistently from _parent_values, but afterwards sample_fresh_primary_keys and drop_unique_duplicates drop rows from parent tables (and from child tables) without re-validating the FK columns of already-generated child rows. Also, when the parent table has zero generated rows and the compact rows are absent (see issue 1), _parent_values returns [] and FK columns become all-NULL, but for NOT NULL FK columns (Orders.customer_id, Order_Items.order_id/product_id, Shipments.order_id/invoice_number) this yields NULLs that violate NOT NULL \u2014 yet not_null_violations reports 0, indicating the FK values are instead drawn from a pool that no longer matches surviving parent keys after dedup.",
+     "requested_revision": "After all PK/unique dedup and NULL application, re-derive FK columns from the final surviving parent key sets (compact + generated) and assert no FK references a dropped key; ensure NOT NULL FK columns never receive NULL. Add a post-build integrity self-check in the generator that fails the unit if any FK/ NOT NULL constraint is violated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback shows several nullable columns with 'NULL 0 / n' (Customers.customer_name: 0/41) and several with 100% NULL (Order_Items.order_item_details 36/36, Orders.order_details 115/115, Products.product_details 50/50, Shipments.other_shipment_details 105/105). The interface rule requires each instance to contain both NULL and non-NULL generated rows per nullable column. _apply_null_rule sets k = max(1, round(n*share)) and, when compact share is 0, uses 1/n \u2014 but for columns whose compact share is 1.0 (all-NULL in compact) it sets k = n, producing all-NULL generated rows; and for customer_name the sampler produced no NULL because the column is not in spec null_targets and the compact share path was bypassed.",
+     "requested_revision": "In _apply_null_rule, clamp k to [1, n-1] for nullable columns so at least one NULL and at least one non-NULL row always exist; do not let a compact share of 1.0 force all-NULL. Ensure every nullable column (including those not listed in null_targets) receives the NULL treatment."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification supporting_evidence for 'Shipments.shipment_date >= Orders.date_order_placed' explicitly states the rule is contradicted by sample row shipment_id=1 (1983-08-13) vs order_id=5 (2010-06-08) and is 'retained as a conditional soft rule only'. This is an uncertain pattern, not a supported semantic rule. The program implements it as a hard rewrite in _apply_soft_shipment_rule (shifts shipment_date forward), which changes generated values to satisfy an unsupported rule.",
+     "requested_revision": "Either drop the shipment_date >= order_date rule from semantic_rules_and_formulas (it is contradicted by the compact data), or keep it explicitly as a soft/uncertain pattern and have the program not rewrite values to enforce it. Document the decision in the specification's uncertainty field."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification generic_sampling_rules.varchar_text says 'Random lowercase pseudo-word of length 4-12', but values.StringSampler uses CHARSET = ascii_letters + ' ' + digits + '()' and length bounds derived from observed elements (lo, hi from min/max element length, default 0-20), not 4-12 lowercase. Similarly boundary_numbers rule 'include L-1, L, L+1' is implemented only via BoundaryNumberSampler at 35% probability, and boundary_dates via BoundaryDateSampler at 35% \u2014 not guaranteed per instance.",
+     "requested_revision": "Align the specification with the implemented samplers (or vice versa): either state the actual charset/length distribution and probabilistic boundary planting, or make the program enforce the stated 4-12 lowercase words and guaranteed boundary values. The current mismatch means the specification is not faithfully implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 86, separated 24, unknown_executions 0. The specification's per-column exceptions (e.g. Customers.customer_id ties_for_order_limit, aggregate_boundary values [0,1,2,3], group_sizes '1,2,>=3') are only partially realized: _apply_group_sizes plants groups but _apply_duplicate_share runs first and can collapse the value pool, and tie_rank is stored in spec_cols but never used in build_random_instance (no code reads sc['tie_rank']). So the tie-at-rank-1 requirement for COUNT(orders.order_id) DESC is not implemented.",
+     "requested_revision": "Implement tie_rank handling in build_random_instance (plant at least two customers sharing the rank-1 COUNT(orders.order_id) value) and ensure group_sizes and duplicate_share are applied in an order that preserves both targets. Add a construction self-check that verifies each per-column exception is satisfied before writing the unit."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 24/86 separated construction pairs are sufficient for value variation cannot be fully judged without inspecting the actual generated values; the low separation may be a consequence of the missing compact-row copy (issue 1) rather than a sampler defect.",
+    "The exact cause of fk_violations=1184 (dropped parent keys vs. NULL FK on NOT NULL columns) could not be isolated from the summary alone; both mechanisms are present in the code and both need fixing.",
+    "Reproducibility is reported true, but the seed derivation (seed_base*100003+i) and multiprocessing chunking were not independently re-executed here."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` field documents that the `shipment_date >= order_date` rule is contradicted by compact row shipment_id=1 (1983-08-13) vs order_id=5 (2010-06-08), and it is correctly dropped from `semantic_rules_and_formulas`. The remaining semantic rules (order_status IN ('Shipped','Packing','On Road'), order_item_status IN ('Finish','Payed','Cancel'), and the 1970-2015 date bounds) are supported by observed values cited in `supporting_evidence`.",
+     "requested_revision": "None required. The designer correctly separated supported rules from the contradicted one; the enum lists and date bounds are backed by observed data."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.py` `_EMBEDDED` mirrors the specification's enums, date ranges, boundary dates/numbers/strings, literal pool, group sizes, duplicate shares, tie ranks, unmatched-join targets, and null targets. `values.py` implements varchar_text (0.3 fresh / 0.7 pool, length 4-12, lowercase+space+digits), boundary planting at 0.35, and enum case variants. `instance.py` applies duplicate share, group sizes, NULL rule (clamped to [1,n-1]), and re-derives FKs from final surviving parent keys. `_apply_tie_rank` plants the rank-1 tie for Customers.customer_id.",
+     "requested_revision": "None blocking. Minor: `_apply_tie_rank` trims `kept[:n]` after appending `[a]*target + [b]*target`, which can drop the planted tie if `target` is large relative to n; consider guaranteeing the tie survives trimming. Not blocking since execution shows no integrity failures and tie planting is best-effort."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=20, n_fail=0, integrity fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, validity valid=20/invalid=0, reproducible=true. `writer.py` copies the compact DB via `_copy_compact` before appending, preserving compact rows (issue 1 fix). `check_instance_integrity` runs post-build.",
+     "requested_revision": "None. Integrity, compact-row preservation, and reproducibility are all confirmed by execution evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable-column feedback shows several columns with very high NULL shares (e.g. Order_Items.order_item_details 35/36, Orders.order_details 102/104, Shipments.other_shipment_details 109/112). This follows the compact share per the NULL rule, and each still has at least one non-NULL row, so the rule is satisfied. No column reads 'NULL 0 / n'.",
+     "requested_revision": "None blocking. Note for the engineer: the high NULL shares reduce value variation for those columns; if downstream query separation on these columns matters, consider capping the compact-derived share. Not a pass blocker per the NULL rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible=86, separated=19, unknown_executions=0. Separation is partial but non-zero, and per instructions a missing separation alone does not establish a generation error. Boundary planting is probabilistic (0.35) as specified, so some boundary pairs may not separate in a given run.",
+     "requested_revision": "None blocking. The 19/86 separation is consistent with probabilistic boundary planting; no evidence of a systematic value-domain error."
+    }
+   ],
+   "unresolved_checks": [
+    "Tie-rank planting for Customers.customer_id is best-effort; whether the rank-1 tie survives trimming in all instances was not directly verified from execution output.",
+    "Whether the high NULL shares on order_item_details/order_details/other_shipment_details materially reduce intended value variation for downstream queries was not quantified."
+   ]
+  }
+ ]
 }

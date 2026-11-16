@@ -1,52 +1,769 @@
 {
  "db": "legislator",
- "operator_io_quirks": [
-  "Table names with hyphens and spaces: 'current-terms', 'historical-terms', 'social-media' \u2014 must be double-quoted in generated SQL; column lookup case-insensitive.",
-  "Composite PKs: current(bioguide_id, cspan_id); current-terms(bioguide, end) \u2014 end is TEXT date-like, so PK uniqueness depends on date strings.",
-  "FK current-terms.bioguide -> current.bioguide_id: parent column is only PART of a composite PK, so it is NOT unique in the parent (541 distinct over 541 rows here, but schema does not declare it unique).",
-  "FK social-media.bioguide -> current.bioguide_id: same non-unique-parent situation; social-media.bioguide is itself PK (unique).",
-  "FK historical-terms.bioguide -> historical.bioguide_id: parent is single-column PK, unique \u2014 clean.",
-  "Self-references: none. Dangling FKs: none (all parent_exists true).",
-  "current.birthday_bio declared DATE but stored as TEXT 'YYYY-MM-DD'; historical.birthday_bio declared TEXT and also stores 'YYYY-MM-DD' \u2014 same format, different declared type, so TS dispatches Date fuzzer on current and String fuzzer on historical for the same semantic column.",
-  "current-terms.start/end, historical-terms.start/end declared TEXT but store 'YYYY-MM-DD' dates \u2014 TS will treat them as String (random charset), not Date.",
-  "current.cspan_id declared REAL, PK member, but 22% NULL \u2014 NULL PK members are allowed by sqlite here (no NOT NULL), so PK uniqueness is on (bioguide_id, cspan_id) with NULLs.",
-  "historical.thomas_id declared TEXT but stores zero-padded numeric strings '01308'; current.thomas_id declared INTEGER \u2014 same semantic column, different declared type and storage class.",
-  "historical.cspan_id, votesmart_id, maplight_id declared TEXT but store '12590.0' style float-as-text; current counterparts are REAL.",
-  "historical-terms.middle, name, relation are 100% NULL with distinct=0 \u2014 empty literal pool for those columns; TS String sampler will fall back to fresh random strings.",
-  "current.fec_id stores Python-list-repr strings \"['H2OH13033', 'S6OH00163']\" \u2014 not a real FK, just text; TS String sampler will contaminate these.",
-  "No NOT NULL constraints anywhere; no CHECK constraints; no UNIQUE indexes beyond PKs \u2014 TS insert failures will be rare (only PK collisions)."
- ],
- "operator_ts_expectations": [
-  "current.birthday_bio: Date fuzzer, template %Y-%m-%d (all samples match), range ~[1943,1960] from 5 sampled originals \u2014 fresh dates will be plausible but narrow; misses on queries filtering by decade/age.",
-  "current-terms.start/end, historical-terms.start/end: String fuzzer over charset a-zA-Z 0-9() \u2014 will produce garbage like 'aB3(x' instead of dates; any date comparison query will FP/FN heavily.",
-  "historical.birthday_bio: String fuzzer (declared TEXT) \u2014 same garbage-date problem, though values are dates.",
-  "current.cspan_id, govtrack_id, thomas_id, house_history_id, icpsr_id, maplight_id, votesmart_id: Number fuzzer, scale from REAL/INTEGER; range [-10^4,10^4] for REAL, [-10^4,10^4] for INTEGER \u2014 will produce negative and huge IDs unlike real 5-7 digit positive IDs; FN on range/join predicates.",
-  "current-terms.class, district, historical-terms.class, district: Number fuzzer over REAL \u2014 class will get values like -3.7 instead of {1,2,3}; district negative values; FN on 'class = 1' style filters.",
-  "social-media.facebook_id, instagram_id, twitter_id, youtube_id, govtrack: Number fuzzer over REAL \u2014 huge 15-16 digit IDs sampled from [-10^4,10^4] range, implausible; FN on equality/join.",
-  "gender_bio, party, state, type, chamber, state_rank, title, relation, religion_bio: String fuzzer with 5 sampled originals + pool \u2014 will mix real values with random charset strings; FN on 'party = Democrat' style filters, FP on LIKE.",
-  "bioguide_id / bioguide: String fuzzer, but PK \u2014 sample_fresh_primary_keys drops duplicates; FK children draw from parent's final values so joins work, but values are random charset not 'A000055' pattern; FN on 'bioguide_id LIKE A%'.",
-  "current-terms.end is PK member and TEXT date \u2014 String fuzzer produces random strings, so composite PK (bioguide, end) rarely collides; but date-range queries on end will be garbage.",
-  "Empty-pool columns (historical-terms.middle/name/relation, current-terms.last 100% NULL): String sampler with no elements -> p=1, always fresh random strings; any IS NULL query will FN.",
-  "fec_id, party_affiliations, bioguide_previous_id store list/dict reprs \u2014 String fuzzer will contaminate with random chars; queries doing LIKE '%H2%' will FP.",
-  "Number fuzzer's list_max quirk (overwrites with full-range max) means even with real elements, fresh draws span [-10^4,10^4] \u2014 implausible IDs drive FN on equality joins between current and historical on govtrack_id/thomas_id."
- ],
- "challenger_refs": [
-  "G26",
-  "G25",
-  "G17",
-  "G2",
-  "G16",
-  "G14",
-  "G4",
-  "G10",
-  "G29",
-  "G13"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a small pool of realistic tokens; 5% of values are near-variants (case change, trailing space, doubled letter) of a pool value; NULL share per column statistics.",
+   "text_id": "Sample an identifier-shaped string (letters+digits) unique within the column unless the column is a foreign key; 5% near-variants; NULL share per statistics.",
+   "text_url": "Sample 'http://' or 'https://' + host + path; 5% near-variants (http vs https, trailing slash); NULL share per statistics.",
+   "text_phone": "Sample 'NNN-NNN-NNNN'; NULL share per statistics.",
+   "text_date": "Sample a date string in %Y-%m-%d; NULL share per statistics.",
+   "text_json": "Sample a Python-dict-like string \"{'start': 'YYYY-MM-DD', 'end': 'YYYY-MM-DD', 'party': '<party>'}\"; NULL share per statistics.",
+   "integer_id": "Sample an integer in [1, 10^6]; 5% near-variants (value +/- 1); NULL share per statistics.",
+   "real_id": "Sample a real in [1, 10^6] with one decimal; 5% near-variants (value +/- 1); NULL share per statistics.",
+   "date_iso": "Sample a date in %Y-%m-%d between 1730-01-01 and 2020-12-31; 5% near-variants (one day before/after a pool value); NULL share per statistics.",
+   "enum_small": "Sample uniformly from the column's enum list; NULL share per statistics.",
+   "fresh_values": "For every column, 5% of non-NULL values are fresh (not in the observed pool) to exercise DISTINCT and GROUP BY.",
+   "boundary_reservation": "For every column listed in per_column_exceptions with pattern comparison_boundary, reserve at least one generated row per listed literal (exact value, no near-variant substitution); for numeric-typed columns accept non-numeric boundary literals as text values (declared type is loose).",
+   "null_share_reconciliation": "For columns whose compact NULL share exceeds 30% (e.g. current.ballotpedia_id 0.359, current.middle_name 0.601, historical.middle_name 0.299), use the compact share as the NULL share; the 5-30% target applies only to columns whose compact share lies in that band. Every nullable column gets at least one NULL row per instance.",
+   "append_only": "Each instance is the compact database copied unchanged plus appended generated rows; compact rows are never deleted or modified; generated rows per table must be > 0 for every table named in a formula."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "current.official_full_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Sherrod Brown",
+      "sherrod brown",
+      "Maria Cantwell",
+      "maria cantwell",
+      "Bob Corker",
+      "bob corker"
+     ]
+    }
+   },
+   {
+    "column": "current.official_full_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "current.official_full_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "current.official_full_name",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.first_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Sherrod",
+      "sherrod",
+      "Bob",
+      "bob",
+      "Amy",
+      "amy"
+     ]
+    }
+   },
+   {
+    "column": "current.first_name",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.last_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Brown",
+      "brown",
+      "Corker",
+      "corker",
+      "Klobuchar",
+      "klobuchar"
+     ]
+    }
+   },
+   {
+    "column": "current.bioguide_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "current-terms.bioguide",
+      "social-media.bioguide",
+      "current-terms.end"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "current.bioguide_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "current-terms.bioguide",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "current.bioguide_id",
+      "current.suffix_name",
+      "social-media.bioguide"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "social-media.bioguide",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "current.bioguide_id",
+      "current-terms.bioguide"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "historical.bioguide_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "current.birthday_bio",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1959-12-31",
+      "1960-01-01",
+      "1960-01-02",
+      "1960-12-31",
+      "1961-01-01",
+      "1961-01-02"
+     ]
+    }
+   },
+   {
+    "column": "current.birthday_bio",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.cspan_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "",
+      "x"
+     ]
+    }
+   },
+   {
+    "column": "current.cspan_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "current.lis_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.lis_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "historical.gender_bio",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "M",
+      "m",
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "current.opensecrets_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "",
+      "x",
+      "N00003689",
+      "n00003689"
+     ]
+    }
+   },
+   {
+    "column": "historical.wikipedia_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "current.ballotpedia_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "",
+      "x"
+     ]
+    }
+   },
+   {
+    "column": "current.ballotpedia_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.fec_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "",
+      "x"
+     ]
+    }
+   },
+   {
+    "column": "current.fec_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.gender_bio",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "current.nickname_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "",
+      "x"
+     ]
+    }
+   },
+   {
+    "column": "current.religion_bio",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Baptist",
+      "baptist"
+     ]
+    }
+   },
+   {
+    "column": "current.thomas_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "current.govtrack_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "current-terms.bioguide",
+    "parent": "current",
+    "parent_column": "bioguide_id",
+    "copied": []
+   },
+   {
+    "child": "social-media.bioguide",
+    "parent": "current",
+    "parent_column": "bioguide_id",
+    "copied": []
+   },
+   {
+    "child": "historical-terms.bioguide",
+    "parent": "historical",
+    "parent_column": "bioguide_id",
+    "copied": []
+   },
+   {
+    "table": "current",
+    "primary_key": [
+     "bioguide_id",
+     "cspan_id"
+    ],
+    "note": "composite PK; bioguide_id unique in practice, cspan_id may repeat"
+   },
+   {
+    "table": "current-terms",
+    "primary_key": [
+     "bioguide",
+     "end"
+    ]
+   },
+   {
+    "table": "historical",
+    "primary_key": [
+     "bioguide_id"
+    ]
+   },
+   {
+    "table": "historical-terms",
+    "primary_key": [
+     "bioguide"
+    ]
+   },
+   {
+    "table": "social-media",
+    "primary_key": [
+     "bioguide"
+    ]
+   },
+   {
+    "table": "current",
+    "unique": [
+     "bioguide_id"
+    ],
+    "note": "de-facto unique; required so SQLite can validate FKs from current-terms and social-media to current(bioguide_id); generator must use the same DDL as the compact database"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "current",
+    "column": "gender_bio",
+    "formula": "gender_bio IN ('M','F')"
+   },
+   {
+    "table": "current",
+    "column": "birthday_bio",
+    "formula": "birthday_bio BETWEEN '1730-01-01' AND '2020-12-31'"
+   },
+   {
+    "table": "current",
+    "column": "cspan_id",
+    "formula": "cspan_id >= 0"
+   },
+   {
+    "table": "current",
+    "column": "govtrack_id",
+    "formula": "govtrack_id > 0"
+   },
+   {
+    "table": "current",
+    "column": "thomas_id",
+    "formula": "thomas_id > 0"
+   },
+   {
+    "table": "current",
+    "column": "house_history_id",
+    "formula": "house_history_id >= 0"
+   },
+   {
+    "table": "current",
+    "column": "icpsr_id",
+    "formula": "icpsr_id >= 0"
+   },
+   {
+    "table": "current",
+    "column": "maplight_id",
+    "formula": "maplight_id >= 0"
+   },
+   {
+    "table": "current",
+    "column": "votesmart_id",
+    "formula": "votesmart_id >= 0"
+   },
+   {
+    "table": "current",
+    "column": "religion_bio",
+    "formula": "religion_bio IN ('Lutheran','Roman Catholic','Jewish','Presbyterian','Latter Day Saints','United Methodist','Southern Baptist','Baptist','Methodist','Episcopalian','Non-Denominational','United Church of Christ','Unknown')"
+   },
+   {
+    "table": "current",
+    "column": "suffix_name",
+    "formula": "suffix_name IN ('Jr.','Sr.','II','III','IV')"
+   },
+   {
+    "table": "current-terms",
+    "column": "chamber",
+    "formula": "chamber IN ('senate','house')"
+   },
+   {
+    "table": "current-terms",
+    "column": "party",
+    "formula": "party IN ('Democrat','Republican','Independent')"
+   },
+   {
+    "table": "current-terms",
+    "column": "type",
+    "formula": "type IN ('sen','rep')"
+   },
+   {
+    "table": "current-terms",
+    "column": "class",
+    "formula": "class IN (1,2,3)"
+   },
+   {
+    "table": "current-terms",
+    "column": "state_rank",
+    "formula": "state_rank IN ('senior','junior')"
+   },
+   {
+    "table": "current-terms",
+    "column": "title",
+    "formula": "title IN ('Minority Whip','Majority Whip','Minority Leader','Majority Leader','Speaker')"
+   },
+   {
+    "table": "current-terms",
+    "column": "district",
+    "formula": "district >= 0"
+   },
+   {
+    "table": "current-terms",
+    "column": "start",
+    "formula": "start <= end",
+    "evidence": "sample rows: start 1993-01-05 <= end 1999-01-03; 1995-01-04 <= 2001-01-03; 1997-01-07 <= 2003-01-03"
+   },
+   {
+    "table": "historical",
+    "column": "gender_bio",
+    "formula": "gender_bio IN ('M','F')"
+   },
+   {
+    "table": "historical",
+    "column": "govtrack_id",
+    "formula": "govtrack_id > 0"
+   },
+   {
+    "table": "historical",
+    "column": "house_history_id",
+    "formula": "house_history_id >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "icpsr_id",
+    "formula": "icpsr_id >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "suffix_name",
+    "formula": "suffix_name IN ('Jr.','Sr.','II','III','IV')"
+   },
+   {
+    "table": "historical-terms",
+    "column": "chamber",
+    "formula": "chamber IN ('senate','house')"
+   },
+   {
+    "table": "historical-terms",
+    "column": "type",
+    "formula": "type IN ('sen','rep')"
+   },
+   {
+    "table": "historical-terms",
+    "column": "class",
+    "formula": "class IN (1,2,3)"
+   },
+   {
+    "table": "historical-terms",
+    "column": "state_rank",
+    "formula": "state_rank IN ('senior','junior')"
+   },
+   {
+    "table": "historical-terms",
+    "column": "district",
+    "formula": "district >= -1"
+   },
+   {
+    "table": "historical-terms",
+    "column": "start",
+    "formula": "start <= end",
+    "evidence": "sample rows: 1789-03-04 <= 1793-03-03; 1790-01-01 <= 1791-03-03; 1791-10-24 <= 1795-03-03"
+   },
+   {
+    "table": "social-media",
+    "column": "facebook_id",
+    "formula": "facebook_id >= 0"
+   },
+   {
+    "table": "social-media",
+    "column": "instagram_id",
+    "formula": "instagram_id >= 0"
+   },
+   {
+    "table": "social-media",
+    "column": "twitter_id",
+    "formula": "twitter_id >= 0"
+   },
+   {
+    "table": "social-media",
+    "column": "govtrack",
+    "formula": "govtrack > 0"
+   },
+   {
+    "table": "social-media",
+    "column": "thomas",
+    "formula": "thomas > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "current": 40,
+   "current-terms": 120,
+   "historical": 40,
+   "historical-terms": 40,
+   "social-media": 35
+  },
+  "null_targets": [
+   "current.ballotpedia_id",
+   "current.birthday_bio",
+   "current.cspan_id",
+   "current.fec_id",
+   "current.first_name",
+   "current.gender_bio",
+   "current.google_entity_id_id",
+   "current.govtrack_id",
+   "current.house_history_id",
+   "current.icpsr_id",
+   "current.lis_id",
+   "current.maplight_id",
+   "current.middle_name",
+   "current.nickname_name",
+   "current.official_full_name",
+   "current.opensecrets_id",
+   "current.religion_bio",
+   "current.suffix_name",
+   "current.thomas_id",
+   "current.votesmart_id",
+   "current.wikidata_id",
+   "current.wikipedia_id",
+   "current-terms.address",
+   "current-terms.caucus",
+   "current-terms.chamber",
+   "current-terms.class",
+   "current-terms.contact_form",
+   "current-terms.district",
+   "current-terms.fax",
+   "current-terms.last",
+   "current-terms.name",
+   "current-terms.office",
+   "current-terms.party",
+   "current-terms.party_affiliations",
+   "current-terms.phone",
+   "current-terms.relation",
+   "current-terms.rss_url",
+   "current-terms.start",
+   "current-terms.state",
+   "current-terms.state_rank",
+   "current-terms.title",
+   "current-terms.type",
+   "current-terms.url",
+   "historical.ballotpedia_id",
+   "historical.bioguide_previous_id",
+   "historical.birthday_bio",
+   "historical.cspan_id",
+   "historical.fec_id",
+   "historical.google_entity_id_id",
+   "historical.house_history_alternate_id",
+   "historical.house_history_id",
+   "historical.icpsr_id",
+   "historical.lis_id",
+   "historical.maplight_id",
+   "historical.middle_name",
+   "historical.nickname_name",
+   "historical.official_full_name",
+   "historical.opensecrets_id",
+   "historical.religion_bio",
+   "historical.suffix_name",
+   "historical.thomas_id",
+   "historical.votesmart_id",
+   "historical-terms.address",
+   "historical-terms.chamber",
+   "historical-terms.class",
+   "historical-terms.contact_form",
+   "historical-terms.district",
+   "historical-terms.fax",
+   "historical-terms.last",
+   "historical-terms.middle",
+   "historical-terms.name",
+   "historical-terms.office",
+   "historical-terms.party",
+   "historical-terms.party_affiliations",
+   "historical-terms.phone",
+   "historical-terms.relation",
+   "historical-terms.rss_url",
+   "historical-terms.state",
+   "historical-terms.state_rank",
+   "historical-terms.title",
+   "historical-terms.type",
+   "historical-terms.url",
+   "social-media.facebook",
+   "social-media.facebook_id",
+   "social-media.govtrack",
+   "social-media.instagram",
+   "social-media.instagram_id",
+   "social-media.thomas",
+   "social-media.twitter",
+   "social-media.twitter_id",
+   "social-media.youtube",
+   "social-media.youtube_id"
+  ],
+  "supporting_evidence": [
+   "current-terms.start <= end: rows (1993-01-05,1999-01-03), (1995-01-04,2001-01-03), (1997-01-07,2003-01-03)",
+   "historical-terms.start <= end: rows (1789-03-04,1793-03-03), (1790-01-01,1791-03-03), (1791-10-24,1795-03-03)",
+   "current.gender_bio enum from statistics distinct=2 and sample values M/F",
+   "current-terms.chamber enum from statistics distinct=2 and sample values senate/house",
+   "current-terms.party enum from statistics distinct=3 and sample values Democrat/Republican/Independent",
+   "current-terms.type enum from statistics distinct=2 and sample values sen/rep",
+   "current-terms.class enum from statistics distinct=3 and sample values 1/2/3",
+   "current-terms.state_rank enum from statistics distinct=2 and sample values senior/junior",
+   "current-terms.title enum from statistics distinct=5 and sample values Minority Whip/Majority Whip/Minority Leader/Majority Leader/Speaker",
+   "current.religion_bio enum from statistics distinct=19 and sample values",
+   "current.suffix_name enum from statistics distinct=3 and sample values Jr./III/II",
+   "historical.suffix_name enum from statistics distinct=5 and sample values Jr./Sr./II/III/IV"
+  ],
+  "uncertainty": [
+   "current.cspan_id is declared NOT NULL in the schema but statistics show null_rate 0.22; treated as nullable in generation to match observed data.",
+   "current-terms.end is declared NOT NULL but statistics show null_rate 0.014; treated as nullable.",
+   "historical-terms.end and start are declared NOT NULL; start <= end order rule holds on all shown rows.",
+   "No formula relates current.bioguide_id to historical.bioguide_id; they are independent identifier spaces.",
+   "social-media.bioguide is a foreign key to current.bioguide_id but only 479 of 541 current rows have social-media children; parent rows without children are generated.",
+   "current-terms.bioguide is a foreign key to current.bioguide_id; parent rows without children are generated.",
+   "historical-terms.bioguide is a foreign key to historical.bioguide_id; one-to-one in the sample.",
+   "Enum domains for state_rank, class, title, religion_bio, gender_bio are inferred from observed data, not declared in DDL; treated as sampled-from-observed-with-fresh-values rather than hard constraints, except where a comparison_boundary exception pins specific literals.",
+   "SQLite FK validation requires current(bioguide_id) to be UNIQUE; the compact schema must declare it UNIQUE (or use composite FKs) and the generator must replay the same DDL so foreign_key_check passes.",
+   "The writer must copy the compact database (orig_path) and append generated rows; the call path must pass orig_path so compact rows are preserved unchanged."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "e692cf0696f154da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "issue": "Generated instances do not preserve the compact database rows; every instance is missing/changing compact rows (reported as dc_rows_missing_or_changed=890 per instance, with per-table counts current 173, current-terms 536, historical 75, historical-terms 58, social-media 48). Rows_added is also negative (-588..-750), meaning rows were lost rather than appended.",
+     "evidence": "Run report: 'compact_rows_missing': 20; per-instance 'dc_rows_missing_or_changed': 890; constraint_violations.dc_rows_missing_or_changed lists current-terms 10720/20, current 3460/20, historical 1500/20, historical-terms 1160/20, social-media 960/20. The validity check 'adds rows, keeps every D_c row unchanged' fails for all 20 instances. Writing does copy the original when orig_path is set (writer.py), but build_random_instance / write are invoked from cli._one with a fresh schema copy that reads from orig; the resulting DB evidently is NOT the compact DB plus appended rows. Several causes are visible in code: (a) writer.write_instance_sqlite is able to open a copy of orig only when orig_path is passed, but cli.py calls write_instance_sqlite(_G['schema'], inst, p) without orig_path, so the copy path is skipped and a fresh empty DB is built from schema.ddl (created=True). Then only generated rows are inserted, so compact rows are absent. This exactly explains rows_added negative / compact_rows_missing.",
+     "requested_revision": "Pass orig_path through to write_instance_sqlite in cli._one (e.g. write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])) OR change writer so the copy is always produced from the original DB path stored on the schema. The instance must contain the compact rows unchanged plus appended generated rows."
+    },
+    {
+     "agent": "designer/engineer",
+     "issue": "Foreign key enforcement cannot be checked: 'foreign_key_check not possible: foreign key mismatch - social-media referencing current'. This is a real runtime problem for the generated database.",
+     "evidence": "constraint_violations.foreign_keys: constraint \"foreign_key_check not possible: foreign key mismatch - 'social-media' referencing 'current'\", instances 20. The schema declares social-media.bioguide TEXT PRIMARY KEY FOREIGN KEY REFERENCES current(bioguide_id), but current's primary key is the composite (bioguide_id, cspan_id), and SQLite requires the referenced columns to be a UNIQUE or PRIMARY KEY pair; bioguide_id alone is not unique in the declared schema. 'current-terms' has the same pattern (fk to current(bioguide_id)).",
+     "requested_revision": "Either (i) declare bioguide_id UNIQUE (or use a composite FK to (bioguide_id, cspan_id)) in the compact schema, or (ii) in the generator, when the original schema is replayed (created=True path) still keep the original DDL so SQLite can validate. If the compact DB accepts these FKs in practice (e.g. because bioguide_id is de-facto unique), ensure the generator uses the SAME DDL; the mismatch arises from the reemitted schema. Please re-check the COPY path so foreign_key_check passes with 0 rows."
+    },
+    {
+     "agent": "engineer",
+     "issue": "NULL is a value must be generated for every nullable column; the specification and the code silently omit it for some nullable columns not in NOT_NULL.",
+     "evidence": "instance._apply_null_rule relies on null_share(table,column) and NOT_NULL. NOT_NULL includes ('current','cspan_id') and ('current-terms','end') and ('historical-terms','end'), ('historical-terms','start'). But the specification's null_targets/statistics include current.cspan_id (null_rate 0.22) and current-terms.end (null_rate 0.014); the reviewer instructions explicitly say NOT NULL / PK columns never get NULL, but these are BOTH in the schema's PRIMARY KEY (current.cspan_id is part of PK; current-terms.end is part of PK). PK columns should indeed never be NULL, so leaving them out is OK per the instruction. However, some nullable FK columns are not handled: historical-terms columns include bioguide (PK, fine), but the spec's null_targets lists historical-terms.end / start which are declared NOT NULL in the schema; they're in NOT_NULL \u2014 consistent. The real gap is the nullable FKs not in NOT_NULL, e.g. current.opensecrets_id (NULL 0.102) fine, current.ballotpedia_id 0.359 \u2014 but _apply_null_rule caps share to 5-30%? The spec requires 'NULL share following the compact database's share' while the per_column_exceptions restrict target columns to '5-30 %'. For ballotpedia_id NULL_SHARE=0.359, which is outside 5-30%; inconsistency between NULL_SHARE and the target. Same for middle_name 0.601, historical middle_name 0.299.",
+     "requested_revision": "Reconcile NULL_SHARE with the specified target ranges; for columns the specification lists with null_share 5-30 % ensure the compact share is clamped or documented. Do not silently mask NULL for FK columns not in NOT_NULL. Add a per-column report 'generated rows: NULL k / n' so nullability can be audited."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Fresh-primary-key generation and unique-dropping in instance builder apply AFTER FK fill and can collapse to zero rows for some tables; execution shows negative rows_added and 'compact_rows_missing', but even the compact copy aside, some tables may end up empty.",
+     "evidence": "In build_random_instance, after generating cols with samplers, 'cols.update(fill_foreign_keys_consistently(...))', then 'sample_fresh_primary_keys' (dedupe on PK), then 'drop_unique_duplicates'. Then the FK-consistency pass for self-fks, and _apply_null_rule. When a sampler draws 5% near-variants and p=0 with max_l0 large, dedup on a wide PK may drop many rows; combined with sharing a fresh/reuse pool built from 'fresh' list capped at max_l0, rows can become all-equal and all drop. This is part of why instances have negative rows_added / no append.",
+     "requested_revision": "Verify, for each instance and table, that appended rows > 0 for every table and that PK dedup does not just empty a table when the sampler has few distinct values. Add an assertion/log per table (rows_generated > 0) and a post-build row-count check."
+    },
+    {
+     "agent": "designer",
+     "issue": "Semantic rules are in many places supported only by evidence for a few and are stated as enum-like hard domains with weak evidence.",
+     "evidence": "supporting_evidence lists current-terms.state_rank IN ('senior','junior') and class IN (1,2,3) as 'from statistics distinct=2/3 and sample values'; these are not declared in the DDL, so they are guesses from data, not constraints. Similarly title IN (5 values) and religion_bio IN (13 values) are inferred, and current.gender_bio IN ('M','F') vs historical.gender_bio ('M','F') are asserted but only supported by sample values. Treating them as hard enum domains is speculative; and values.py enforces them via ENUMS, which will prevent valid variation for comparator queries that test other values.",
+     "requested_revision": "Downgrade the uncertain rules to 'sampled-from-observed-with-fresh-values' rather than hard enum, or restrict them to columns whose data truly shows those domains across the whole table (documented). At minimum document which enum values are observed vs required and allow fresh values outside the lists so comparison-boundary queries/negations can separate."
+    },
+    {
+     "agent": "designer",
+     "issue": "Some comparison-boundary boundary values require the sampler to reach them; with max_l0 and near-variant replacement, boundary literals may be diluted, and there's no guarantee the boundary values are ever produced.",
+     "evidence": "_init_sampler adds BOUNDARY literals to the elements, but if p>0 the sampler often draws fresh values, not elements; with 5% near-variant logic replacing boundary literals by case change/trailing space, the exact literals ('Sherrod Brown', '1961-01-01', '') may rarely appear. StringSampler can append random chars or empty strings; NumberSampler jitters values by +1/-1/2. For current.cspan_id ('', 'x') the NumberSampler (REAL) converts '' to None, and 'x' is not numeric \u2014 so these are dropped, never generating the boundary '', 'x' from the pool.",
+     "requested_revision": "Guarantee that boundary literals are emitted for their columns (e.g., reserve a small fraction of rows for the exact boundary values; do not drop non-numeric boundary values for a numeric-typed column, or accept the declared type is loose). Provide a test asserting at least one row equals each boundary value used by the query suite."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Reproducibility: build_random_instance uses _init_sampler with rng per column and choose_table_sizes with rng from seed_base*100003+i; but writing does not guarantee deterministic row order / complete determinism across Python runs if dict iteration or schema.original_values sampling changes.",
+     "evidence": "cli._one builds rng = random.Random(seed_base*100003+i) but instance building samples original_values with rng.choices which is deterministic; however table iteration in instance.rebuild is over schema.table order, and samplers mutate via 'f' list on fresh; also sorted({...}) stable. Execution says reproducible: true; this may be adequate, but with negative rows_added the test currently doesn't validate the output content. Recheck after fix #1.",
+     "requested_revision": "Keep deterministic; add an explicit row-count and content hash comparison across two runs of the same seed to confirm reproducibility. The current execution evidence (reproducible true) is from a run whose instances are all invalid due to #1, so reproducibility of valid instances is unconfirmed."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The 'compact + generated appended' promise in writer.py/instance.py docs is not implemented in the call path.",
+     "evidence": "writer.unit_path and writer docs say 'copy of compact database plus the generated rows appended', and writer code does copy when orig_path is given, but cli._one calls write_instance_sqlite(_G['schema'], inst, p) with no orig_path. So the copy branch never runs.",
+     "requested_revision": "Pass orig_path into the writer from cli. Also fix any table schema mismatch (the create branch builds from schema.ddl which is re-parsed DDL, not the original). Provide an integrity check that compact row count equals original row count after generation."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether affected generated instances have compact rows and append rows after fixes; currently they don't (all 20 instances invalid).",
+    "Whether foreign_key_check can be validated for social-media and current-terms; currently raises 'foreign key mismatch'.",
+    "Whether comparison-boundary literals (esp. non-numeric like '' / 'x' in numeric columns, and date literals) are actually materialized per column.",
+    "Whether NULL shares for columns the spec bounds to 5-30% (ballotpedia_id 0.359, middle_name 0.601) are reconciled or intentionally out-of-range.",
+    "Whether the enum domains treated as hard constraints (title, state_rank, religion) are truly table-wide domains or merely observed values, which would block legitimate value variation."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "issue": "FK validation is not actually exercised: the compact schema declares current(bioguide_id) only as part of a composite PK (bioguide_id, cspan_id), so SQLite reports 'foreign key mismatch' for social-media/current-terms referencing current(bioguide_id). The spec acknowledges this in dependencies/uncertainty ('SQLite FK validation requires current(bioguide_id) to be UNIQUE ... generator must use the same DDL as the compact database') but does not resolve it.",
+     "evidence": "constraint_violations.foreign_keys: 'foreign_key_check not possible: foreign key mismatch - \"social-media\" referencing \"current\"' in 20/20 instances. Schema DDL: current primary key (bioguide_id, cspan_id); social-media FK references current(bioguide_id).",
+     "requested_revision": "Designer should state explicitly that FK integrity is validated by construction (child FK values drawn from parent rows) rather than by SQLite foreign_key_check, or specify a UNIQUE index on current(bioguide_id) in the compact DDL. This is a documentation/validation-method gap, not a generation error: the program draws FK values from parent rows (fill_foreign_keys_consistently) and the checker reports 0 new FK violations."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Several nullable columns show 'generated rows: NULL 0 / n' in the execution feedback (e.g. current.last_name, historical.first_name, historical.gender_bio, historical.govtrack_id, historical.last_name, historical.wikidata_id, historical.wikipedia_id, historical-terms.end/start). Per the review instructions this is a note, not a blocker, but it means the NULL rule is not visibly exercised for those columns.",
+     "evidence": "nullable_columns list: 'current.last_name: generated rows: NULL 0 / 738', 'historical.first_name: NULL 0 / 661', 'historical.gender_bio: NULL 0 / 661', 'historical-terms.end: NULL 0 / 441', etc. Cause: NULL_SHARE has no entry for these columns (defaults to 0.0) and _NULLABLE_TABLES omits them.",
+     "requested_revision": "Engineer should add these columns to NULL_SHARE (using compact shares) and to _NULLABLE_TABLES so at least one NULL row per nullable column is generated. Non-blocking per instruction 7."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Row counts per table vary widely and many rows are skipped (rows_skipped: current-terms 390, historical 168, historical-terms 188, social-media 12). The spec's table_sizes_per_instance (current 40, current-terms 120, historical 40, historical-terms 40, social-media 35) is treated as a base with 0.5x-1.5x variation, and PK/unique dedup plus FK/NOT NULL failures drop rows. This is consistent with the spec's 'per-instance variation' but the skip volume is high.",
+     "evidence": "run summary rows_added {current 738, current-terms 2325, historical 551, historical-terms 282, social-media 436}, rows_skipped {current-terms 390, historical 168, historical-terms 188, social-media 12}; choose_table_sizes applies 0.5x-1.5x; sample_fresh_primary_keys/drop_unique_duplicates drop rows.",
+     "requested_revision": "Engineer should reduce skip volume (e.g. regenerate on PK/unique collision instead of dropping) so generated sizes stay closer to the spec. Non-blocking: all 20 instances are valid and add rows."
+    },
+    {
+     "agent": "designer",
+     "issue": "Some semantic rules rest on weak evidence. The enum domains for state_rank, class, title, religion_bio, gender_bio are inferred from observed distinct counts and sample values, not declared in DDL; the spec itself flags this in uncertainty. The start <= end rule is supported by only three sample rows per terms table.",
+     "evidence": "supporting_evidence lists 3 rows each for current-terms and historical-terms start<=end; uncertainty: 'Enum domains ... are inferred from observed data, not declared in DDL'.",
+     "requested_revision": "Designer should mark these as sampled-from-observed (soft) rather than hard constraints, which the spec partially does. The program implements them as ENUMS with 5% near-variants, consistent with a soft treatment. No change strictly required."
+    }
+   ],
+   "unresolved_checks": [
+    "SQLite foreign_key_check cannot run due to composite-PK FK mismatch; FK integrity is only verified by construction and by the checker's 'new_fk_violations: 0'.",
+    "NULL rule not visibly exercised for several nullable columns (NULL 0 / n); noted, non-blocking per instruction 7."
+   ],
+   "summary": "The program ran cleanly (20/20 instances, 0 errors, reproducible), preserved compact rows (dc_rows_missing_or_changed 0), added rows to every table, and reported 0 new FK/duplicate/NOT NULL violations. It implements the specified value domains (ENUMS), boundary literals (BOUNDARY planted exactly), NULL shares, start<=end enforcement, FK-by-construction, and append-only writing. Remaining issues are documentation/validation-method gaps (FK check not runnable) and non-blocking NULL-coverage notes, not generation errors."
+  }
+ ]
 }

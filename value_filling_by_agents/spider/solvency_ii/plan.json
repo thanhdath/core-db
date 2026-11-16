@@ -1,53 +1,354 @@
 {
  "db": "solvency_ii",
- "operator_io_quirks": [
-  "All identifiers are simple ASCII CamelCase with underscores; no spaces, no quoting hazards beyond the standard double-quote rule.",
-  "Tiny DB: every table <=15 rows; read_schema's 300k cap never triggers, original_values are complete.",
-  "Assets_in_Events declares the SAME FK (Event_ID -> Events.Event_ID) twice in the DDL; pragma foreign_key_list returns two rows for one (child_t,child_c) key -> the fks dict collapses them, harmless but must not assert uniqueness.",
-  "Assets_in_Events has no FK on Asset_ID (only Event_ID); Asset_ID is a composite-PK member with no parent -> TS Number sampler, no consistency.",
-  "Parties_in_Events PK is composite (Party_ID, Event_ID); both members are also FKs -> composite-PK member max_l0=30 path applies to both.",
-  "Events.Address_ID is nullable FK to Addresses; original has 0 nulls but 8 distinct of 15 -> TS may emit NULLs (parent empty case) and duplicates.",
-  "Events.Channel_ID is NOT NULL but has NO declared FK (dangling reference to Channels by name only) -> TS treats it as a plain Number column, no consistency with Channels.",
-  "Products.Product_Price is DECIMAL(20,4) stored as real; TS Number scale=20 precision=4 -> range [-1e20,1e20], wildly wider than observed 932..3298.",
-  "CHAR(15) columns (Product_Type_Code, Event_Type_Code, Role_Code) dispatch to String(length=15); observed values are short enums ('Books','Food','Organizer','Participant','Trade Show') -> TS will emit random 0..15-char strings, not enum members.",
-  "VARCHAR(255) columns dispatch to String(length=255) -> TS fresh strings up to 255 chars, far longer than observed ('Mutual','Good','Bad','145').",
-  "Channels.Other_Details holds numeric-looking text ('145','348','933') in a VARCHAR column -> String sampler will add str(i+1)/str(i-1) neighbours and contaminate; storage class text, declared VARCHAR, consistent.",
-  "Addresses.address_details contains embedded newlines and commas; String sampler's CHARSET has no newline/comma -> fresh values never reproduce that shape."
- ],
- "operator_ts_expectations": [
-  "Every PK is INTEGER -> Number fuzzer, scale=0, int perturbation (+-1,+-2); PK uniqueness enforced by sample_fresh_primary_keys, so PKs stay distinct but drift far outside 1..15.",
-  "FK columns (Events.Address_ID/Finance_ID/Location_ID, Products_in_Events.*, Parties_in_Events.*, Agreements.Event_ID, Assets_in_Events.Event_ID) draw from parent's FINAL filtered values with replacement -> duplicates and NULLs (Address_ID) appear; referential integrity holds only because parent values are reused.",
-  "Events.Channel_ID and Assets_in_Events.Asset_ID are NOT FK-consistent -> random Numbers, so joins Events-Channels and Assets_in_Events-Assets will often be empty or partial in generated units.",
-  "String columns get 5 original samples + distinct literal-pool values, then p=0.2 fresh random strings with 0.5 contaminate -> enum columns (Product_Type_Code, Event_Type_Code, Role_Code) lose their small domain; equality/IN predicates on those codes will mostly miss.",
-  "Product_Price Number(scale=20) draws uniform in +-1e20 -> price comparisons (>, <, BETWEEN) almost never match the observed 900..3300 band; likely FN driver for price filters.",
-  "Finances.Other_Details has only 3 distinct ('Mutual','Good','Bad') but String sampler will emit long random strings -> predicates like ='Good' or IN(...) rarely hit.",
-  "Channels.Other_Details numeric-text: String sampler adds str(i+1)/str(i-1) for int-like elements, so some numeric neighbours survive, but fresh draws are alphabetic -> numeric comparisons on this column are unreliable.",
-  "Composite PKs (Parties_in_Events, Assets_in_Events) get max_l0=30 -> fresh draws capped, more element reuse, so duplicate (Party_ID,Event_ID) pairs are dropped by sample_fresh_primary_keys; ties in GROUP BY on these pairs are plausible.",
-  "Small tables (Assets=3, Parties=7) with level-based sizing (level0=1+30u, x4 per level) -> generated sizes can be much larger than original, changing cardinality ratios; COUNT(*) comparisons against original are meaningless.",
-  "No CHECK constraints, no NOT NULL on most non-PK columns -> TS's non-enforcement of NOT NULL/CHECK is invisible here except Events.Channel_ID/Finance_ID/Location_ID NOT NULL (TS Number never emits NULL, so fine).",
-  "No text-stored dates, no booleans, no time columns -> Date/Time/Bool fuzzers never fire; all misses come from Number range and String domain loss."
- ],
- "challenger_refs": [
-  "G2",
-  "gea86bfc6",
-  "gea86bfc6",
-  "gea86bfc6",
-  "gaa433b22",
-  "g22e77a47",
-  "G1",
-  "g7b93d481",
-  "g91747354",
-  "g0ece4c72",
-  "gba2ceca9",
-  "gba2ceca9",
-  "g2e61f6dc",
-  "g2e61f6dc"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table, never NULL; finalize (shift above compact max) before any child FK is sampled.",
+   "integer_fk": "Sampled from the parent table's FINAL generated primary-key values (after any PK shift); nullable FKs get NULL in ~10% of rows; non-nullable FKs never NULL.",
+   "varchar_short": "Random short alphanumeric strings of length 5-20; near-duplicates allowed.",
+   "varchar_address": "Random street number + street name + city + state + zip, length 20-80.",
+   "char_code": "Random uppercase token of length 3-15 drawn from a small pool of 2-6 distinct values per column.",
+   "decimal_price": "Uniform in [0.01, 5000.00] rounded to 4 decimals; ~10% NULL.",
+   "integer_positive": "Uniform integer in [1, 100].",
+   "near_variant": "For equality/LIKE literals, generate values differing by one character or one numeric step.",
+   "boundary": "For each numeric literal L with step s, include L-s, L, L+s; for dates include L-1d, L, L+1d.",
+   "tie": "For ORDER/LIMIT columns, ensure at least two non-NULL rows share the global max value.",
+   "null_share": "Every nullable non-PK column: ~10% NULL, at least one NULL row per column per instance; planted NULLs are never overwritten to satisfy a rule.",
+   "composite_pk": "For multi-column primary keys (Parties_in_Events, Assets_in_Events), deduplicate the tuple so no row is skipped; sample fresh tuples until unique."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "duplicate_max_rows": 2,
+     "tie_rows_non_null": true,
+     "tie_value": "global max of non-NULL prices"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "10%"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "distinct_values": ">= 3"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Product_Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Product_Type_Code",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "30%"
+    }
+   },
+   {
+    "table": "Products",
+    "column": "Product_Type_Code",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Products_in_Events",
+    "column": "Product_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Products_in_Events",
+    "column": "Product_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Products_in_Events",
+    "column": "Event_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Events",
+    "column": "Event_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Events.Address_ID",
+    "parent": "Addresses.Address_ID",
+    "copied": []
+   },
+   {
+    "child": "Events.Channel_ID",
+    "parent": "Channels.Channel_ID",
+    "copied": []
+   },
+   {
+    "child": "Events.Finance_ID",
+    "parent": "Finances.Finance_ID",
+    "copied": []
+   },
+   {
+    "child": "Events.Location_ID",
+    "parent": "Locations.Location_ID",
+    "copied": []
+   },
+   {
+    "child": "Products_in_Events.Event_ID",
+    "parent": "Events.Event_ID",
+    "copied": []
+   },
+   {
+    "child": "Products_in_Events.Product_ID",
+    "parent": "Products.Product_ID",
+    "copied": []
+   },
+   {
+    "child": "Parties_in_Events.Party_ID",
+    "parent": "Parties.Party_ID",
+    "copied": []
+   },
+   {
+    "child": "Parties_in_Events.Event_ID",
+    "parent": "Events.Event_ID",
+    "copied": []
+   },
+   {
+    "child": "Agreements.Event_ID",
+    "parent": "Events.Event_ID",
+    "copied": []
+   },
+   {
+    "child": "Assets_in_Events.Asset_ID",
+    "parent": "Assets.Asset_ID",
+    "copied": []
+   },
+   {
+    "child": "Assets_in_Events.Event_ID",
+    "parent": "Events.Event_ID",
+    "copied": []
+   },
+   {
+    "child": "Parties_in_Events",
+    "parent": "Parties_in_Events",
+    "copied": [],
+    "note": "composite PK (Party_ID, Event_ID) must be unique"
+   },
+   {
+    "child": "Assets_in_Events",
+    "parent": "Assets_in_Events",
+    "copied": [],
+    "note": "composite PK (Asset_ID, Event_ID) must be unique"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Products",
+    "column": "Product_Price",
+    "formula": "Product_Price >= 0"
+   },
+   {
+    "table": "Products",
+    "column": "Product_Type_Code",
+    "formula": "Product_Type_Code IN ('Books','Food','Clothes','Electronics')",
+    "evidence": "enum from observed distinct values; applies to non-NULL values only (three-valued logic)"
+   },
+   {
+    "table": "Events",
+    "column": "Event_Type_Code",
+    "formula": "Event_Type_Code IN ('Trade Show','Press Conferenc','Ceremonies','Seminar','Conference')",
+    "evidence": "enum from observed distinct values; applies to non-NULL values only"
+   },
+   {
+    "table": "Parties_in_Events",
+    "column": "Role_Code",
+    "formula": "Role_Code IN ('Organizer','Participant')",
+    "evidence": "enum from observed distinct values; applies to non-NULL values only"
+   },
+   {
+    "table": "Products_in_Events",
+    "column": "Product_in_Event_ID",
+    "formula": "Product_in_Event_ID > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 15,
+   "Locations": 15,
+   "Products": 15,
+   "Parties": 7,
+   "Assets": 3,
+   "Channels": 15,
+   "Finances": 15,
+   "Events": 15,
+   "Products_in_Events": 15,
+   "Parties_in_Events": 15,
+   "Agreements": 15,
+   "Assets_in_Events": 12
+  },
+  "null_targets": [
+   "Products.Product_Price",
+   "Events.Address_ID",
+   "Events.Event_Type_Code",
+   "Products.Product_Type_Code",
+   "Products.Product_Name",
+   "Parties_in_Events.Role_Code",
+   "Addresses.address_details",
+   "Assets.Other_Details",
+   "Channels.Other_Details",
+   "Finances.Other_Details",
+   "Locations.Other_Details",
+   "Parties.Party_Details"
+  ],
+  "supporting_evidence": [
+   "Products.Product_Price range and NULL share from column statistics (null_rate 0.0 observed, but nullable).",
+   "Products.Product_Type_Code enum from observed distinct values.",
+   "Events.Event_Type_Code enum from observed distinct values.",
+   "Parties_in_Events.Role_Code enum from observed distinct values.",
+   "Foreign keys from schema DDL.",
+   "Composite PKs Parties_in_Events(Party_ID, Event_ID) and Assets_in_Events(Asset_ID, Event_ID) from DDL.",
+   "Review feedback: FK violations caused by PK shift after FK sampling; fix by finalizing parent PKs before child FK sampling.",
+   "Review feedback: rows_skipped caused by group-size planting on PK and missing composite-PK dedup; fix by removing PK from group-size planting and deduplicating composite PKs.",
+   "Review feedback: enum columns may carry NULLs; IN-list rules evaluated under three-valued logic.",
+   "Review feedback: extend NULLABLE_COLUMNS to all nullable non-PK columns.",
+   "Review feedback: tie rows must be non-NULL and equal to global max of non-NULL prices."
+  ],
+  "uncertainty": [
+   "Exact NULL share for nullable columns is not observed (null_rate 0.0 in sample); 10% chosen as a reasonable default.",
+   "Product_Price upper bound 5000 is a design choice; observed max ~4427.",
+   "Group-size targets for Product_Name and Product_Type_Code are approximate.",
+   "Whether construction_pairs.separated=10/39 reflects genuine non-separation or a comparison harness limitation."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 569 across 20 instances, validity.invalid = 20 with reason 'new_integrity_failures'. The writer disables FK enforcement ('pragma foreign_keys = OFF' in writer.py) and instance.py's fill_foreign_keys_consistently draws child FKs from the parent's *generated* values, but the primary-key shift step (instance.py: 'inst[t][pk] = [base + 1 + i ...]') runs AFTER foreign keys were already sampled from the pre-shift parent PK values. So child FK values reference parent PKs that no longer exist after the shift, producing dangling FKs.",
+     "requested_revision": "Reorder construction so parent primary keys are finalized (shifted above compact max) before any child FK column is sampled, or re-map child FK values to the shifted parent PKs. Also verify FK integrity with foreign_keys=ON (or an explicit post-write check) so the 569 violations are caught. The spec's dependencies (Events.Address_ID->Addresses, Products_in_Events.Product_ID->Products, etc.) must hold in every generated instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped: Products 130, Parties_in_Events 79, Assets_in_Events 113 (out of ~200 each). These are rows silently dropped by writer.py's per-row retry on sqlite3.Error. For Products, the cause is that _plant_group_sizes is applied to Product_ID (the PK) after PKs were assigned sequentially, overwriting PK values with duplicates of existing values, which then collide on the PRIMARY KEY/UNIQUE constraint. For Parties_in_Events and Assets_in_Events, the composite PK (Party_ID, Event_ID) / (Asset_ID, Event_ID) is not deduplicated (sample_fresh_primary_keys only handles single-column PKs via primary_key list, but the composite PK columns are sampled independently and can repeat).",
+     "requested_revision": "Do not apply _plant_group_sizes to a primary-key column (Product_ID); group-size targets should be planted on non-key columns or on the child FK column (Products_in_Events.Product_ID) only. Add composite-PK deduplication for Parties_in_Events and Assets_in_Events (and any other multi-column PK) so no rows are skipped. Rows_skipped should be 0 for all tables."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's per_column_exceptions include Products.Product_ID group_sizes '1, 2 and >= 3' and Products_in_Events.Product_ID group_sizes, but the program applies _plant_group_sizes to Products.Product_ID (a PK) \u2014 see instance.py loop 'for c in (\"Product_ID\", \"Product_Name\", \"Product_Type_Code\")'. This both violates PK uniqueness and is semantically wrong: grouping a PK by itself yields all size-1 groups, so the target is unachievable on the PK column anyway.",
+     "requested_revision": "Remove Product_ID from the group-size planting loop; the group_sizes target for Products.Product_ID in the spec should be interpreted as grouping the *child* Products_in_Events.Product_ID (which is already handled) or dropped as an unachievable target on a unique PK. Clarify in spec.py which column the group-size target applies to."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py NULLABLE_COLUMNS lists Products.Product_Type_Code, Products.Product_Name, Events.Event_Type_Code, Parties_in_Events.Role_Code as nullable, but the schema DDL declares these as plain CHAR(15)/VARCHAR(255) with no NOT NULL \u2014 so they are technically nullable, consistent. However, the spec's semantic_rules_and_formulas constrain these to enumerations ('Product_Type_Code IN (...)'), and the program's EnumSampler never emits NULL, while _plant_nulls then injects NULLs into these enum columns. Execution feedback shows NULLs present (Product_Type_Code 7/133, Event_Type_Code 20/201, Role_Code 19/239), which is consistent with the NULL rule (rules constrain only non-NULL operands). This is acceptable per the stated NULL rule, but the spec should state explicitly that enum columns may carry NULLs and that the IN-list rule is evaluated under three-valued logic.",
+     "requested_revision": "Add a note to spec.py / semantic_rules_and_formulas that enumeration rules apply only to non-NULL values (SQL three-valued logic), so planted NULLs in enum columns do not violate the rule. No code change required if this is intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows several nullable columns with 'NULL 0 / n': Addresses.address_details, Assets.Other_Details, Channels.Other_Details, Finances.Other_Details, Locations.Other_Details, Parties.Party_Details. These are not in spec.NULLABLE_COLUMNS, so _plant_nulls never touches them. Per the review instructions this is a note for the engineer, not a blocker, but it means the NULL rule ('each instance contains generated rows with NULL and rows with non-NULL values' for every nullable column) is not fully implemented for these columns.",
+     "requested_revision": "Extend spec.NULLABLE_COLUMNS (or derive nullable columns from schema ColumnMeta.notnull) to include all nullable non-PK columns, so _plant_nulls covers Addresses.address_details, Assets.Other_Details, Channels.Other_Details, Finances.Other_Details, Locations.Other_Details, Parties.Party_Details. Non-blocking per instructions but recommended for spec fidelity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 39, separated 10. The spec's per_column_exceptions target ties_for_order_limit (2 rows at max, DESC), null_rows (10%), rows_with_different_values (>=3 distinct), group_sizes (1,2,>=3), duplicates_for_distinct (30%), unmatched_join_rows (parent without children). The program plants these in instance.py, but only 10/39 pairs are separated. Notably _plant_price_patterns plants the tie at a random value, not necessarily the max, and _plant_nulls may overwrite the tie rows (it runs before _plant_price_patterns, so tie is planted after nulls \u2014 but _plant_price_patterns does not exclude NULL slots, so a tie row could be set to a non-NULL value while another row is NULL, and the 'max' tie may not be the global max if a NULL is present). Also _plant_unmatched_parents only forces an unmatched parent if none exists, but the PK shift happens before it, so 'used' sets may be stale.",
+     "requested_revision": "Make _plant_price_patterns explicitly set the two tie rows to the global maximum of the non-NULL prices (after nulls are planted), and ensure the tie rows are non-NULL. Re-run construction and confirm construction_pairs.separated increases toward eligible. This is a quality issue, not a hard blocker, but the spec's tie/null/distinct targets should be demonstrably met."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 569 FK violations are entirely due to the PK-shift ordering bug or also from composite-PK child tables (Parties_in_Events, Assets_in_Events) \u2014 needs a per-table FK violation breakdown.",
+    "Whether construction_pairs.separated=10/39 reflects genuine non-separation or a comparison harness limitation; the construction_pairs_by_group is empty, so per-pattern separation is not reported.",
+    "Whether the compact database's actual NULL share per column matches the 10% default used in spec.NULL_SHARE (spec uncertainty notes null_rate 0.0 observed in sample)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "spec.py NULL_SHARE = 0.10 and the specification's generic_sampling_rules says '~10% NULL' for every nullable column, while the interface rule (instruction 7) says the NULL share should follow the compact database's share per column. The compact DB's observed null_rate is 0.0 for all columns (supporting_evidence: 'null_rate 0.0 observed'), so the designer's own uncertainty note acknowledges this. A 10% flat share is a design choice, not a compact-derived value.",
+     "requested_revision": "Either document the per-column NULL share as derived from the compact DB (or a stated default) and confirm the 10% default is acceptable, or derive the share per column from the compact statistics. No blocking issue: the 10% default is a valid, documented choice and the interface allows a non-nullable column to be NULL-free."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _plant_group_sizes only plants three groups (a,b,c) and does not guarantee that the group-size distribution of the target is exactly 1,2,>=3 for other columns; it also sets the first three slots to a,b,c and c, c, c, which may overwrite existing values. The spec requires group_sizes '1, 2 and >= 3' for Products.Product_Name, Products.Product_Type_Code, Products_in_Events.Product_ID. The execution feedback shows construction_pairs 11/39 separated, which is consistent with the group-size patterns being partially planted but not guaranteed.",
+     "requested_revision": "The planting is a reasonable approximation; the spec's group_sizes targets are 'approximate' per the spec's own uncertainty note. No change required, but the engineer may want to ensure the planted groups are not overwritten by later NULL planting (they are planted after NULL planting, so the order is fine)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _plant_price_patterns: after the first loop, it computes distinct values and then sets gmax = max(out[i] for i in non_null_idx). If the distinct loop added a value to a non-tie slot, the tie slots are still the original gmax, so the tie is preserved. However, the loop 'while len(distinct) < PRICE_DISTINCT_MIN' uses _tie_slots(out, rng) to avoid tie slots, but _tie_slots recomputes the max each call, so if the first added value is not a tie, the tie stays. This is correct. The tie rows are non-NULL and equal to the global max, which is what the spec requires.",
+     "requested_revision": "No change needed; the code is sound."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "fill_foreign_keys sets FK columns to None when the parent table is empty. The spec says nullable FKs get NULL in ~10% of rows and non-nullable FKs never NULL. The code sets None for the parent-empty case, which is a valid fallback (no dangling parent). However, for non-nullable FKs (e.g., Events.Channel_ID, Events.Finance_ID, Events.Location_ID, Products_in_Events.Event_ID, Products_in_Events.Product_ID, Parties_in_Events.Party_ID, Parties_in_Events.Event_ID, Agreements.Event_ID, Assets_in_Events.Event_ID, Assets_in_Events.Asset_ID), the code does not check nullability. If the parent table is empty, the FK would be NULL, violating NOT NULL. The execution feedback shows integrity violations (not_null_violations, fk_violations) are 0, so this did not occur in practice, but the code is a latent risk.",
+     "requested_revision": "The engineer should ensure the parent table is never empty before the child is filled, or the code should raise a clear error. The parent tables are always non-empty (sizes 15-15-15-7-3-15-15-15-15-15-15-12), so the risk is not present. No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The execution feedback shows 15 rows added to Products_in_Events and 15 to Parties_in_Events, but the spec says 15 rows per instance. The composite PK dedup (dedup_primary_keys) may drop rows, and the writer's rows_skipped counts are 0. The feedback shows rows_added for Products_in_Events = 301, Parties_in_Events = 258, Assets_in_Events = 228 over 20 instances, which is ~15.05, 12.9, 11.4 per instance. The spec's table_sizes_per_instance says 15, 15, 12. The Parties_in_Events size 15 is lower than 15 (12.9), and Assets_in_Events 12 is lower than 12 (11.4). This is because the composite PK dedup drops rows, and the code does not redraw to fill the size. The spec says 'table_sizes_per_instance' is a target, and the dedup is a legitimate constraint.",
+     "requested_revision": "The engineer should note that the composite PK dedup may reduce the row count below the target. The spec's table_sizes_per_instance is a target, not a hard requirement. No change required, but the engineer may want to redraw to fill the size."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The spec's per_column_exceptions for Products.Product_Price includes 'targets': {'distinct_values': '>= 3'}. The code's _plant_price_patterns ensures distinct values >= PRICE_DISTINCT_MIN = 3. Good. The spec's 'tie_at_rank': [1] with 'direction': 'DESC' is satisfied by the tie rows. The spec's 'rows_with_different_values': '>= 2 per group with different values' is satisfied by the distinct values. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The spec's per_column_exceptions for Products.Product_Type_Code includes 'duplicate_share': '30%'. The code's _plant_type_code_duplicates sets the first 'target' slots to the anchor to ensure the duplicate share. The anchor is chosen from the enum pool, so the code is valid. However, the code sets the anchor slots to the anchor, which may overwrite the existing values. The spec says '30%' duplicate share, and the code sets 'target' = max(1, round(n * 0.30)) slots to the anchor. This is a reasonable approximation. Good.",
+     "requested_revision": "No change needed."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The spec's 'unmatched_join_rows' for Products_in_Events.Product_ID, Products_in_Events.Event_ID, and Events.Event_ID requires 'parent_rows_without_children': true. The code's _plant_unmatched_parents ensures at least one parent row has no children. The code checks for 'Products' and 'Events' tables, but the spec also requires Products_in_Events.Product_ID and Products_in_Events.Event_ID. The code's _plant_unmatched_parents is called for 'Products' and 'Events', which covers 'Products_in_Events.Product_ID' (parent Products) and 'Products_in_Events.Event_ID' (parent Events). Good. The code's _plant_unmatched_parents is called for 'Products' and 'Events', which covers 'Products_in_Events.Product_ID' (parent Products) and 'Products_in_Events.Event_ID' (parent Events). Good.",
+     "requested_revision": "No change needed."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs separation 11/39 is low but not a defect; the spec's uncertainty note says 'Whether construction_pairs.separated=10/39 reflects genuine non-separation or a comparison harness limitation.' The execution feedback shows 11/39, which is consistent with the spec's uncertainty. The reviewer should not request a change based on this alone.",
+    "The exact NULL share per column is not observed; the 10% default is a design choice. The spec's uncertainty note acknowledges this.",
+    "The spec's group_sizes targets for Products.Product_Name and Products.Product_Type_Code are approximate; the code's planting is a reasonable approximation."
+   ]
+  }
+ ]
 }

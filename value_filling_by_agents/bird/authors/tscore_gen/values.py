@@ -107,16 +107,6 @@ class StringSampler(ColumnSampler):
         return v
 
 
-def _parse_date(s: str):
-    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
-    for t in _TEMPLATES:
-        try:
-            return t, dt.datetime.strptime(s, t)
-        except ValueError:
-            pass
-    return None, None
-
-
 class DateSampler(ColumnSampler):
     """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
 
@@ -150,6 +140,16 @@ class DateSampler(ColumnSampler):
         if self.elements and self.rng.random() < self.p:
             return self.rng.choice(self.elements)
         return self._fresh_or_reuse(self._draw)
+
+
+def _parse_date(s: str):
+    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
+    for t in _TEMPLATES:
+        try:
+            return t, dt.datetime.strptime(s, t)
+        except ValueError:
+            pass
+    return None, None
 
 
 class TimeSampler(ColumnSampler):

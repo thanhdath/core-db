@@ -11,5 +11,6 @@ if [ ! -f "$suite/evaluation.py" ]; then
   git clone -q https://github.com/taoyds/test-suite-sql-eval.git "$suite"
   git -C "$suite" checkout -q e97acc546ecbee8fa27fa8dbf025ef61493a876c
 fi
+python -c "import nltk; nltk.data.find('tokenizers/punkt_tab/english/')" 2>/dev/null || python -m nltk.downloader -q punkt_tab
 python "$here/evaluation/spider_persample.py" "$suite" "$out" "$gold" "$pred" "$db"
 python -c "import json, sys; d = json.load(open(sys.argv[1])); print('EX %d/%d' % (d['correct'], d['n']))" "$out"

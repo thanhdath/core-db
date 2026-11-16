@@ -1,49 +1,759 @@
 {
  "db": "professional_basketball",
- "operator_io_quirks": [
-  "Mixed-case table names quoted in DDL: \"awards_coaches\", \"players_teams\", \"series_post\"; unquoted tables lowercase. Identifier quoting must preserve original case.",
-  "teams has a backtick-quoted column `rank` (SQL reserved word) and commented-out columns (-- o_fga etc.) inside CREATE TABLE; line-based unique/check scan must not trip on comments.",
-  "teams PK is (year, tmID) but FKs from coaches/draft/players_teams/series_post reference teams(tmID) and teams(year) SEPARATELY (single-column FKs to a composite PK) -> parent column is non-unique; FK fill draws from parent values with replacement, so many-to-one is expected.",
-  "players_teams.playerID FK has parent_col=null -> same-name resolution to players.playerID (upstream dbinfo.py:87-88).",
-  "series_post has TWO FKs to teams (tmIDWinner, tmIDLoser) plus year twice; both child cols must draw from teams.tmID and teams.year independently.",
-  "awards_coaches.id and players_teams.id and series_post.id are INTEGER PRIMARY KEY AUTOINCREMENT -> sqlite rowid alias; TS Number fuzzer will generate fresh ints, PK dedup keeps first.",
-  "players.birthDate/deathDate declared DATE but stored as TEXT 'YYYY-MM-DD'; deathDate has '0000-00-00' sentinel (not NULL) and null_rate 0.0.",
-  "players.height declared REAL, storage real (e.g. 82.0); weight INTEGER. Number fuzzer scale differs (REAL -> scale 0 default, int perturbation +-1).",
-  "players.firstseason/lastseason have only 2 distinct values (0, 1951) -> Number list-range quirk (min..max+1 then overwritten to full range) will produce wild ints.",
-  "awards_players.note, awards_coaches.note, players_teams.note, draft.suffixName, players.nameGiven/nameSuffix have null_rate ~1.0 or single distinct value -> String sampler with 5 original draws will mostly reproduce the one value.",
-  "teams has 1536 rows, players 5062, players_teams 23751, draft 8621 -> all well under 300000 cap; no rowid sampling needed.",
-  "draft.id INTEGER default 0 not null primary key (not autoincrement) -> TS Number fresh ints may collide with default; PK dedup handles."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for playerID/coachID/tmID/lgID/award/pos/name/college etc.: random a-zA-Z0-9() strings length 0-20 with 50% contaminate -> implausible IDs like 'aB3()x' that break joins/equality with literal pool values -> likely FN on queries filtering playerID='abdulka01'.",
-  "Number fuzzer for year/season_id/draftYear: full range [-10^0,10^0]=[-1,1] for INTEGER scale 0, then +-1/+-2 perturbation -> years become -1,0,1,2 instead of 1969.. -> FN on year BETWEEN 1990 AND 2000 style filters.",
-  "Date fuzzer for birthDate/deathDate: template from first parsable element (%Y-%m-%d), range from min/max of 5 sampled originals -> dates stay plausible-ish but '0000-00-00' sentinel in deathDate may parse oddly; leading-zero strip if no element starts with 0.",
-  "FK fill: coaches.tmID drawn from teams.tmID (161 distinct) with replacement, coaches.year from teams.year (75 distinct) INDEPENDENTLY -> (tmID,year) pairs mostly not in teams -> join coaches-teams on both cols yields few/no rows -> FN on multi-col FK joins.",
-  "Composite PK dedup (awards_players playerID,year,award; coaches coachID,year,tmID,stint) keeps first occurrence -> small tables shrink; child FK draws from FINAL filtered parent -> some children get NULL when parent empty.",
-  "String fuzzer on pos ('C','F','G','F/G','F/C') and conference ('East','West','Weset','Allstars','Denver') -> random strings break GROUP BY pos / WHERE conference='East' -> FN.",
-  "Number fuzzer on won/lost/games/points: full range [-1,1] for INTEGER -> wins/losses become -1,0,1 -> aggregates (SUM(won), AVG(points)) wildly off -> FN on HAVING/ORDER BY numeric thresholds.",
-  "teams.rank/confRank INTEGER: rank distinct 10 (1..10), confRank 0..15 -> Number fuzzer produces -1..1 -> ORDER BY rank / WHERE rank=1 misses.",
-  "players.height REAL: Number scale 0 (no args) -> range [-1,1] floats, perturb +-0.01 -> height ~0.5 instead of 82.0 -> FN on height > 80.",
-  "String fuzzer on award ('All-NBA First Team' etc.) -> random strings -> WHERE award='Finals MVP' returns nothing -> FN.",
-  "Null rate 0 columns (lgID, year, tmID) get NULLs from String/Number sampler only if p=1 (no elements) or checked; otherwise fresh values -> NOT NULL constraint failures at insert are skipped (writedb.py) -> rows_failed > 0, table shrinks."
- ],
- "challenger_refs": [
-  "G3",
-  "G5",
-  "G6",
-  "G12",
-  "G15",
-  "G13",
-  "G10",
-  "G11",
-  "G4",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a small pool of realistic tokens; 5% near-variants (case flip, one-char typo) of pool values; NULL share per column stats.",
+   "text_name": "Sample from a pool of realistic names; 3% near-variants; NULL share per column stats.",
+   "text_id": "Sample from a pool of 3-8 char uppercase/lowercase alphanumeric IDs; 2% near-variants; NULL share per column stats.",
+   "integer_count": "Uniform integer in [0, 200]; 5% boundary values at 0 and 200; NULL share per column stats.",
+   "integer_year": "Uniform integer in [1930, 2015]; 5% boundary values at 1930, 2015; NULL share per column stats.",
+   "integer_rank": "Uniform integer in [1, 16]; NULL share per column stats.",
+   "real_measure": "Uniform real rounded to 1 decimal in [0, 100]; NULL share per column stats.",
+   "date_iso": "Uniform date in [1930-01-01, 2015-12-31] formatted %Y-%m-%d; 5% boundary dates; NULL share per column stats.",
+   "enum_small": "Uniform choice from the column's enum list; NULL share per column stats.",
+   "primary_key_auto": "Sequential integer starting at 1.",
+   "fresh_values_share": "0.15 of text columns are fresh values not seen in the parent pool."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "players.playerID": "parent rows without children; 20-50% duplicate share",
+     "teams.year": "parent rows without children; child NULL FK allowed",
+     "teams.tmID": "parent rows without children; child NULL FK allowed",
+     "awards_players.playerID": "parent rows without children",
+     "players_teams.playerID": "parent rows without children",
+     "players_teams.year": "parent rows without children; child NULL FK allowed",
+     "coaches.year": "parent rows without children",
+     "player_allstar.playerID": "parent rows without children"
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "players.playerID": [
+      "abdulka01",
+      "ABDULKA01"
+     ],
+     "teams.year": [
+      1979,
+      1980,
+      1981,
+      2010,
+      2011,
+      2012
+     ],
+     "teams.tmID": [
+      "BOS",
+      "bos",
+      "LAL",
+      "lal",
+      "AFS",
+      "afs"
+     ],
+     "players_teams.playerID": [
+      "abdulka01",
+      "ABDULKA01"
+     ],
+     "players_teams.year": [
+      1936,
+      1937,
+      1938,
+      1979,
+      1980,
+      1981
+     ],
+     "awards_players.award": [
+      "Most Valuable Player",
+      "most valuable player",
+      "All-Defensive Second Team",
+      "all-defensive second team",
+      "Most Valuable Plar",
+      "most valuable plar"
+     ],
+     "players.college": [
+      "UCLA",
+      "ucla",
+      "Illinois",
+      "illinois",
+      "ILLINOIS"
+     ],
+     "coaches.year": [
+      1044,
+      1045,
+      1046,
+      1979,
+      1980,
+      1981
+     ],
+     "players.firstName": [
+      "George",
+      "george",
+      "Alexis",
+      "alexis"
+     ],
+     "players.lastName": [
+      "Mikan",
+      "mikan",
+      "Ajinca",
+      "ajinca"
+     ]
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "players.playerID": "tie at rank 1 on COUNT(*) DESC",
+     "awards_players.playerID": "tie at rank 1 on COUNT(awards_players.award) DESC",
+     "players.birthDate": "tie at rank 1 on COUNT(awards_players.award) DESC",
+     "teams.tmID": "tie at rank 1",
+     "teams.name": "tie at rank 1",
+     "players.firstName": "tie at rank 1",
+     "players.lastName": "tie at rank 1"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "players.playerID": "20-50% duplicate share",
+     "players.college": "duplicates present",
+     "coaches.coachID": "duplicates present",
+     "players.firstName": "duplicates present",
+     "players.lastName": "duplicates present",
+     "player_allstar.playerID": "duplicates present",
+     "players_teams.playerID": "duplicates present",
+     "awards_players.playerID": "duplicates present"
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "teams.name": "group sizes 1, 2 and >= 3",
+     "coaches.coachID": "group sizes 1, 2 and >= 3",
+     "players.playerID": "group sizes up to 4",
+     "awards_players.playerID": "group sizes up to 5",
+     "players_teams.playerID": "group sizes up to 2",
+     "players.firstName": "group sizes up to 2",
+     "players.birthDate": "group sizes up to 4"
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "awards_players.playerID": "NULL share in COUNT column"
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "awards_players.award": "near-variants of 'Most Valuable Player'",
+     "players.college": "near-variants of 'UCLA'"
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "player_allstar.playerID": "aggregate boundary"
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "coaches.year": "rows with different values"
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "players_teams.playerID": "at least one NULL row",
+     "coaches.coachID": "at least one NULL row"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "awards_players.playerID",
+    "parent": "players.playerID",
+    "copied": []
+   },
+   {
+    "child": "coaches.tmID, coaches.year",
+    "parent": "teams.tmID, teams.year",
+    "copied": []
+   },
+   {
+    "child": "draft.tmID, draft.draftYear",
+    "parent": "teams.tmID, teams.year",
+    "copied": []
+   },
+   {
+    "child": "player_allstar.playerID",
+    "parent": "players.playerID",
+    "copied": []
+   },
+   {
+    "child": "awards_coaches.coachID, awards_coaches.year",
+    "parent": "coaches.coachID, coaches.year",
+    "copied": []
+   },
+   {
+    "child": "players_teams.playerID",
+    "parent": "players.playerID",
+    "copied": []
+   },
+   {
+    "child": "players_teams.tmID, players_teams.year",
+    "parent": "teams.tmID, teams.year",
+    "copied": []
+   },
+   {
+    "child": "series_post.tmIDWinner, series_post.year",
+    "parent": "teams.tmID, teams.year",
+    "copied": []
+   },
+   {
+    "child": "series_post.tmIDLoser, series_post.year",
+    "parent": "teams.tmID, teams.year",
+    "copied": []
+   },
+   {
+    "primary_key": "awards_players(playerID, year, award)"
+   },
+   {
+    "primary_key": "coaches(coachID, year, tmID, stint)"
+   },
+   {
+    "primary_key": "draft(id)"
+   },
+   {
+    "primary_key": "player_allstar(playerID, season_id)"
+   },
+   {
+    "primary_key": "players(playerID)"
+   },
+   {
+    "primary_key": "teams(year, tmID)"
+   },
+   {
+    "primary_key": "awards_coaches(id)"
+   },
+   {
+    "primary_key": "players_teams(id)"
+   },
+   {
+    "primary_key": "series_post(id)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "players",
+    "column": "height",
+    "formula": "height = 0 OR height BETWEEN 60 AND 100"
+   },
+   {
+    "table": "players",
+    "column": "weight",
+    "formula": "weight = 0 OR weight BETWEEN 100 AND 400"
+   },
+   {
+    "table": "players",
+    "column": "firstseason",
+    "formula": "firstseason = 0 OR firstseason BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "players",
+    "column": "lastseason",
+    "formula": "lastseason = 0 OR lastseason BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "players",
+    "column": "birthDate",
+    "formula": "birthDate <= deathDate OR deathDate IS NULL"
+   },
+   {
+    "table": "players",
+    "column": "pos",
+    "formula": "pos IN ('C','F','G','F-C','C-F','G-F','F-G','C-F-G','F-C-G','G-C','G-F-C','F-G-C','C-G','C-G-F')"
+   },
+   {
+    "table": "players",
+    "column": "race",
+    "formula": "race IN ('B','W','O','1','r')"
+   },
+   {
+    "table": "teams",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "teams",
+    "column": "rank",
+    "formula": "rank BETWEEN 1 AND 16"
+   },
+   {
+    "table": "teams",
+    "column": "confRank",
+    "formula": "confRank BETWEEN 0 AND 16"
+   },
+   {
+    "table": "teams",
+    "column": "won",
+    "formula": "won >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "lost",
+    "formula": "lost >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "games",
+    "formula": "games = won + lost"
+   },
+   {
+    "table": "teams",
+    "column": "o_pts",
+    "formula": "o_pts >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "d_pts",
+    "formula": "d_pts >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "homeWon",
+    "formula": "homeWon >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "homeLost",
+    "formula": "homeLost >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "awayWon",
+    "formula": "awayWon >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "awayLost",
+    "formula": "awayLost >= 0"
+   },
+   {
+    "table": "teams",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','ABA','NBL','ABL1','PBLA','NPBL')"
+   },
+   {
+    "table": "coaches",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "coaches",
+    "column": "stint",
+    "formula": "stint BETWEEN 0 AND 5"
+   },
+   {
+    "table": "coaches",
+    "column": "won",
+    "formula": "won >= 0"
+   },
+   {
+    "table": "coaches",
+    "column": "lost",
+    "formula": "lost >= 0"
+   },
+   {
+    "table": "coaches",
+    "column": "post_wins",
+    "formula": "post_wins >= 0"
+   },
+   {
+    "table": "coaches",
+    "column": "post_losses",
+    "formula": "post_losses >= 0"
+   },
+   {
+    "table": "coaches",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','ABA','ABL1','PBLA','NPBL')"
+   },
+   {
+    "table": "awards_players",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "awards_players",
+    "column": "award",
+    "formula": "award IN ('All-Defensive Second Team','All-NBA Second Team','Rookie of the Year','All-NBA First Team','Finals MVP','Most Valuable Player','All-Defensive First Team','Most Improved Player')"
+   },
+   {
+    "table": "awards_players",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','ABA','NBL','ABL1')"
+   },
+   {
+    "table": "awards_players",
+    "column": "pos",
+    "formula": "pos IN ('C','F','G','F/G','F/C')"
+   },
+   {
+    "table": "awards_coaches",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "awards_coaches",
+    "column": "award",
+    "formula": "award IN ('NBA Coach of the Year','ABA Coach of the Year')"
+   },
+   {
+    "table": "awards_coaches",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','ABA')"
+   },
+   {
+    "table": "draft",
+    "column": "draftYear",
+    "formula": "draftYear BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "draft",
+    "column": "draftRound",
+    "formula": "draftRound BETWEEN 0 AND 22"
+   },
+   {
+    "table": "draft",
+    "column": "draftSelection",
+    "formula": "draftSelection BETWEEN 0 AND 30"
+   },
+   {
+    "table": "draft",
+    "column": "draftOverall",
+    "formula": "draftOverall BETWEEN 0 AND 240"
+   },
+   {
+    "table": "draft",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','ABA')"
+   },
+   {
+    "table": "player_allstar",
+    "column": "season_id",
+    "formula": "season_id BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "player_allstar",
+    "column": "conference",
+    "formula": "conference IN ('East','West','Weset','Allstars','Denver')"
+   },
+   {
+    "table": "player_allstar",
+    "column": "league_id",
+    "formula": "league_id IN ('NBA','ABA')"
+   },
+   {
+    "table": "player_allstar",
+    "column": "games_played",
+    "formula": "games_played = 1"
+   },
+   {
+    "table": "player_allstar",
+    "column": "minutes",
+    "formula": "minutes >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "rebounds",
+    "formula": "rebounds >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "assists",
+    "formula": "assists >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "fg_attempted",
+    "formula": "fg_attempted >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "fg_made",
+    "formula": "fg_made >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "ft_attempted",
+    "formula": "ft_attempted >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "ft_made",
+    "formula": "ft_made >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "three_attempted",
+    "formula": "three_attempted >= 0"
+   },
+   {
+    "table": "player_allstar",
+    "column": "three_made",
+    "formula": "three_made >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "players_teams",
+    "column": "stint",
+    "formula": "stint BETWEEN 0 AND 5"
+   },
+   {
+    "table": "players_teams",
+    "column": "GP",
+    "formula": "GP >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "GS",
+    "formula": "GS >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "minutes",
+    "formula": "minutes >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "points",
+    "formula": "points >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "rebounds",
+    "formula": "rebounds >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "assists",
+    "formula": "assists >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "steals",
+    "formula": "steals >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "blocks",
+    "formula": "blocks >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "turnovers",
+    "formula": "turnovers >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "PF",
+    "formula": "PF >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "fgAttempted",
+    "formula": "fgAttempted >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "fgMade",
+    "formula": "fgMade >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "ftAttempted",
+    "formula": "ftAttempted >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "ftMade",
+    "formula": "ftMade >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "threeAttempted",
+    "formula": "threeAttempted >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "threeMade",
+    "formula": "threeMade >= 0"
+   },
+   {
+    "table": "players_teams",
+    "column": "lgID",
+    "formula": "lgID IN ('NBA','NBL','ABA','ABL1','NPBL','PBLA')"
+   },
+   {
+    "table": "series_post",
+    "column": "year",
+    "formula": "year BETWEEN 1930 AND 2015"
+   },
+   {
+    "table": "series_post",
+    "column": "round",
+    "formula": "round IN ('F','QF','SF','DT','DF','DSF','RR','CF')"
+   },
+   {
+    "table": "series_post",
+    "column": "series",
+    "formula": "series IN ('O','M','N','A','K','J','I','L')"
+   },
+   {
+    "table": "series_post",
+    "column": "lgIDWinner",
+    "formula": "lgIDWinner IN ('NBA','ABA')"
+   },
+   {
+    "table": "series_post",
+    "column": "lgIDLoser",
+    "formula": "lgIDLoser IN ('NBA','ABA')"
+   },
+   {
+    "table": "series_post",
+    "column": "W",
+    "formula": "W BETWEEN 0 AND 4"
+   },
+   {
+    "table": "series_post",
+    "column": "L",
+    "formula": "L BETWEEN 0 AND 4"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "players": 230,
+   "teams": 230,
+   "coaches": 230,
+   "awards_players": 230,
+   "awards_coaches": 61,
+   "draft": 230,
+   "player_allstar": 230,
+   "players_teams": 230,
+   "series_post": 230
+  },
+  "null_targets": [
+   "awards_players.playerID",
+   "awards_players.note",
+   "awards_players.pos",
+   "coaches.won",
+   "coaches.lost",
+   "coaches.post_wins",
+   "coaches.post_losses",
+   "draft.playerID",
+   "draft.suffixName",
+   "player_allstar.points",
+   "player_allstar.o_rebounds",
+   "player_allstar.d_rebounds",
+   "player_allstar.rebounds",
+   "player_allstar.assists",
+   "player_allstar.steals",
+   "player_allstar.blocks",
+   "player_allstar.turnovers",
+   "player_allstar.personal_fouls",
+   "player_allstar.fg_attempted",
+   "player_allstar.fg_made",
+   "player_allstar.ft_attempted",
+   "player_allstar.ft_made",
+   "player_allstar.three_attempted",
+   "player_allstar.three_made",
+   "players.useFirst",
+   "players.middleName",
+   "players.nameGiven",
+   "players.fullGivenName",
+   "players.nameSuffix",
+   "players.nameNick",
+   "players.collegeOther",
+   "players.birthCity",
+   "players.birthState",
+   "players.birthCountry",
+   "players.highSchool",
+   "players.hsCity",
+   "players.hsState",
+   "players.hsCountry",
+   "players.deathDate",
+   "players.race",
+   "players_teams.note",
+   "series_post.tmIDLoser"
+  ],
+  "supporting_evidence": {
+   "teams.games = won + lost": "Sample rows: AFS 1937 won=14 lost=4 games=18; AGW 1938 won=13 lost=5 games=9 (contradicts); BFB 1939 won=3 lost=6 games=10 (contradicts). Formula dropped due to contradiction.",
+   "players.birthDate <= deathDate": "Sample rows: abdulka01 birth 1947-04-16 death 2011-11-18; abdulma01 birth 1942-04-15 death 2000-06-09; abdulma02 birth 1969-03-09 death 2011-07-09. Holds on all shown rows.",
+   "player_allstar.games_played = 1": "All shown rows have games_played=1; statistics show distinct=1."
+  },
+  "uncertainty": "The formula teams.games = won + lost is contradicted by sample rows (AGW 1938: 13+5=18 but games=9; BFB 1939: 3+6=9 but games=10), so it is not stated. The relationship between player_allstar.rebounds and o_rebounds + d_rebounds is inconsistent in sample rows (e.g., abdulka01: 1+2=3 but rebounds=11), so no formula is stated. The relationship between players_teams.rebounds and oRebounds + dRebounds is inconsistent (e.g., abdelal01: 27+62=89 matches, but abdulka01: 81+179=260 matches, abdulma01: 12+25=37 matches, abdulma02: 114+186=300 matches, abdulta01: 34+34=68 but rebounds=46), so no formula is stated. The relationship between players_teams.points and fgMade*2 + ftMade is inconsistent in sample rows, so no formula is stated."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's semantic_rules_and_formulas lists teams.games = won + lost, but supporting_evidence explicitly states it is contradicted by sample rows (AGW 1938: 13+5=18 vs games=9; BFB 1939: 3+6=9 vs games=10) and 'Formula dropped due to contradiction.' The rule is therefore not stated in the spec, which is consistent with the evidence. No action needed, but noted for transparency.",
+     "requested_revision": "None required; the designer correctly omitted the contradicted formula. Optionally document the omission in the spec's uncertainty field (already present)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows many nullable columns with 'generated rows: NULL 0 / n' (e.g., teams.won, teams.lost, teams.games, series_post.year, player_allstar.games_played, awards_coaches.year). Per instruction 7, this is a note for the engineer, not a blocking issue. The program's _null_plan only plants NULLs for columns in _is_null_target or with observed NULLs; columns like teams.won have no observed NULLs in the compact DB and are not in null_targets, so 0 NULLs is consistent with the compact share.",
+     "requested_revision": "Optional: if the compact DB has non-zero NULL share for these columns, extend _is_null_target or rely on observed NULLs. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _fix_check is a no-op (returns values unchanged), so CHECK constraints on enum columns (e.g., players.pos, players.race, teams.lgID) are not enforced by the generator. However, sample_scalar uses spec enums for these columns (enums from semantic_rules_and_formulas), so generated values are in-domain. Execution feedback shows 0 not_null_violations and 0 fk_violations, and validity=20/20, so no integrity failure occurred.",
+     "requested_revision": "None required for pass; consider implementing _fix_check to enforce CHECK constraints defensively if enum sampling is ever bypassed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions require 'parent rows without children' for unmatched_join_rows (e.g., players.playerID, teams.year, teams.tmID). The program's _fk_lookup and build_random_instance draw FK values from parent rows, but do not explicitly guarantee that some parent rows remain childless. Execution feedback shows construction_pairs separated=78/211, indicating some separation exists, but the unmatched_join_rows pattern is not explicitly enforced. This is a soft pattern; the spec's generic_sampling_rules and per_column_exceptions are probabilistic.",
+     "requested_revision": "Optional: add explicit logic to leave a fraction of parent rows without children to strengthen unmatched_join_rows. Not blocking since execution shows separation and no integrity failures."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's comparison_boundary targets (e.g., players.playerID values 'abdulka01'/'ABDULKA01', teams.year 1979/1980/1981, awards_players.award 'Most Valuable Player' variants) are listed in per_column_exceptions, but the program's sample_scalar only uses spec['boundary_values'] and spec['enums']; it does not explicitly inject the comparison_boundary literals. The literal pool from queries (seed_literal_pool_from_queries) may supply some, but not guaranteed. Execution feedback shows construction_pairs separated=78, so some boundary variation exists.",
+     "requested_revision": "Optional: ensure comparison_boundary literals are included in boundary_values or enums in the compiled spec so they are sampled. Not blocking given observed separation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _apply_ordering enforces players.birthDate <= deathDate by overwriting birthDate with deathDate when violated. This is consistent with the spec's ordering rule (three-valued: NULL operands pass). Execution feedback shows 0 integrity violations. However, the spec's semantic_rules_and_formulas also lists many '>= 0' and range rules (e.g., teams.won >= 0, players.height BETWEEN 60 AND 100) that are not explicitly enforced in code; sample_scalar uses ranges from spec['ranges'] and nonneg_columns, which should cover them. Execution shows validity=20/20.",
+     "requested_revision": "None required; ranges/nonneg are applied via spec. Verify spec['ranges'] and spec['nonneg_columns'] are populated for all such columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's writer uses 'INSERT INTO %s VALUES (...)' with positional columns matching schema order. For tables with autoincrement PKs (awards_coaches.id, players_teams.id, series_post.id, draft.id), the program's _assign_keys only handles single PK if not FK; for autoincrement id columns, cols may not include 'id' (since it's not in schema.fks and is PK). The writer inserts all columns including id, which could conflict with autoincrement. Execution feedback shows rows_skipped for draft (315), awards_coaches (166), players_teams (377), series_post (157), likely due to PK/FK conflicts, but 0 pk_duplicates and 0 fk_violations reported, so integrity holds.",
+     "requested_revision": "None required; skipped rows are acceptable per spec (rows_skipped reported). Consider excluding autoincrement id from INSERT to reduce skips."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program's _null_plan sets share = nulls/len(ov) if ov else 0.05, and forces k>=1 for null_targets or observed nulls. For columns with observed NULLs but not in null_targets (e.g., teams.playoff, teams.confID), NULLs are planted. Execution feedback shows NULLs for these. For columns in null_targets with 0 observed NULLs (e.g., awards_players.playerID), share is max(share, 0.02) and k>=1, so at least one NULL. Execution shows awards_players.playerID NULL 0/1226 \u2014 this contradicts the spec's null_targets requirement of at least one NULL row per nullable column. However, instruction 7 says 'generated rows: NULL 0 / n' may be noted, not blocking.",
+     "requested_revision": "Optional: investigate why awards_players.playerID got 0 NULLs despite being in null_targets (possibly FK overwrite after null plan). Not blocking per instruction 7."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether comparison_boundary literals are reliably sampled (observed separation=78/211 suggests partial coverage).",
+    "Whether unmatched_join_rows 'parent rows without children' is explicitly guaranteed (observed separation exists but not enforced).",
+    "Why awards_players.playerID shows 0 NULLs despite being in null_targets (FK assignment may overwrite planted NULLs)."
+   ]
+  }
+ ]
 }

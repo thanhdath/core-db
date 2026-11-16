@@ -1,10 +1,4 @@
-"""Sample LLM-written neighbor queries for training questions with a text-to-SQL model (vLLM).
-
-Input: a HF ``datasets`` folder (``save_to_disk``) with columns ``messages``, ``dataset_name``, ``db_id``
-and ``groundtruth_sqls``.  For every question the model samples ``--n`` candidates at ``--temperature``;
-the SQL after the last ``</think>`` tag is kept.  Output: JSON lines {"ds", "db", "gold", "pred", "model"},
-read by ``build_pairs.py --llm-neighbors``.  The paper samples SQL-R1 7B and FINER-SQL 0.5B / 3B (N = 30, T = 1.0).
-"""
+"""Sample LLM-written neighbor queries for training questions with a text-to-SQL model (vLLM)."""
 import argparse
 import json
 

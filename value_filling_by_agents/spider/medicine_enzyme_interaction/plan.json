@@ -1,49 +1,516 @@
 {
  "db": "medicine_enzyme_interaction",
- "operator_io_quirks": [
-  "Mixed-case column names: Trade_Name, FDA_approved, Location, Product, Chromosome, OMIM, Porphyria \u2014 must be double-quoted with original spelling; lookup case-insensitive.",
-  "DDL uses backtick-quoted parent refs (`enzyme`(\"id\")) \u2014 sqlparse/sqlite_master text must be copied verbatim into the clone.",
-  "All columns notnull=0 even for PKs (id, enzyme_id, medicine_id) \u2014 sqlite PK on INTEGER is rowid alias; composite PK on medicine_enzyme_interaction is NOT rowid, so NULL PK members would be allowed by DDL but rejected by PK uniqueness only.",
-  "Chromosome is TEXT but stores '3p21.1','10q25.2-q26.3' \u2014 cytoband strings, not numbers; String fuzzer will produce garbage but no crash.",
-  "OMIM is INT with 6-digit values (125290..606938) \u2014 Number fuzzer range [-10^scale,10^scale] with scale from type args (none) => default scale; values will be tiny vs 6-digit originals.",
-  "Product contains non-ASCII '\u03b4-Aminolevulinic acid' \u2014 String CHARSET a-zA-Z0-9() will never reproduce; UTF-8 write path must survive.",
-  "FDA_approved / interaction_type / Location are 2-value enums stored as text ('Yes'/'No', 'inhibitor'/'activitor' (sic), 'Mitochondrion'/'Cytosol').",
-  "Tiny tables (21/8/19 rows) \u2014 original_values sampling k=min(5,len) is fine; no max_rows_per_table concern.",
-  "medicine_enzyme_interaction has composite PK (enzyme_id, medicine_id) and two FKs to small parents \u2014 FK fill draws from parent's FINAL filtered column; parent PKs are single-col so no composite-parent issue.",
-  "No self-FK, no dangling FK, no unique/check constraints, no views/triggers/indexes in DDL.",
-  "enzyme_id distinct=6 < 8 enzymes, medicine_id distinct=13 < 21 medicines \u2014 original interaction table is sparse; TS will densify."
- ],
- "operator_ts_expectations": [
-  "medicine.id, enzyme.id, enzyme.OMIM, medicine_enzyme_interaction.enzyme_id/medicine_id -> Number fuzzer: uniform in [-10^scale,10^scale] (scale default 0 => [-1,1]) then +-1/+-2 perturbation; PK columns get max_l0=inf so fresh draws never reused.",
-  "Number fuzzer on OMIM will emit values ~[-1,1] vs original 6-digit \u2014 implausible, drives FN on range predicates like OMIM > 100000.",
-  "name/Trade_Name/Product/Chromosome/Porphyria/Location/FDA_approved/interaction_type -> String fuzzer: random a-zA-Z0-9() strings length [0,20] with 0.5 contaminate; will not match 'Yes'/'No'/'inhibitor'/'activitor' unless literal pool supplies them.",
-  "String fuzzer on 2-value enums (FDA_approved, interaction_type, Location) will produce many distinct values \u2014 FP on GROUP BY / DISTINCT-count queries, FN on = 'Yes' style filters unless pool seeds them.",
-  "Date/Time/Bool/Bit fuzzers unused (no such declared types).",
-  "FK fill: medicine_enzyme_interaction.enzyme_id drawn with replacement from enzyme.id final values (post PK-dedup), medicine_id from medicine.id \u2014 referential integrity preserved, but composite PK dedup (sample_fresh_primary_keys) drops duplicate (enzyme_id,medicine_id) pairs, so interaction table shrinks vs requested size.",
-  "choose_table_sizes: level 0 = medicine, enzyme (no deps); level 1 = medicine_enzyme_interaction; sizes 1+30u and x4 capped 2500 \u2014 interaction table may be much larger than 19, densifying the join.",
-  "PK dedup on medicine.id / enzyme.id: Number fuzzer with max_l0=inf gives near-unique ints, so few drops; but small range [-1,1] means many collisions -> heavy PK dedup -> tiny tables -> FN on COUNT(*) queries.",
-  "String PK not present; all PKs numeric.",
-  "Literal pool from train SQL will seed 'Yes','No','inhibitor','activitor','Mitochondrion','Cytosol' if train queries filter on them \u2014 critical for enum equality predicates.",
-  "Known TS misses likely: FN from Number range mismatch on OMIM/id; FP from String fuzzer inventing enum values; FP from densified interaction table changing COUNT/join cardinalities."
- ],
- "challenger_refs": [
-  "G5",
-  "g24ee6da7",
-  "G6",
-  "G2",
-  "G3",
-  "G7",
-  "G4",
-  "gf58f9921",
-  "gf58f9921",
-  "gfe6237a2",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential integers starting at 1, unique per table, never NULL; generated ids are offset past the compact max so they never collide with compact rows.",
+   "integer_foreign_key": "Sample from the final (post-offset) parent primary-key values; never NULL (all FK columns are NOT NULL here).",
+   "text_short": "Sample from the observed value pool for the column; with probability 0.15 emit a near-variant (case change, trailing space, or one-character edit) of a pool value; never NULL unless the column is nullable.",
+   "text_nullable": "With probability equal to the compact database's null share (0.0 here, so at least one NULL row per nullable column is still planted per instruction 10), emit NULL; otherwise sample from the observed pool with 0.15 near-variant probability.",
+   "integer_measure": "Sample integers within the observed min/max of the column; include boundary values (min, min+1, max-1, max) at least once. Coerce any near-variant string via int(float(str(v).strip())) with try/except fallback to a random positive integer; never raise.",
+   "enum_text": "Sample uniformly from the observed distinct values of the column.",
+   "fresh_value_share": 0.15
+  },
+  "per_column_exceptions": [
+   {
+    "table": "enzyme",
+    "column": "name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "ALA%",
+      "%ALA%"
+     ],
+     "variants": [
+      "ALA",
+      "ALB",
+      "ALA x",
+      "ala"
+     ],
+     "note": "At least one enzyme.name starts with 'ALA' (e.g. 'ALA synthase') and at least one contains 'ALA' not at the start, so both LIKE patterns match distinct rows."
+    }
+   },
+   {
+    "table": "enzyme",
+    "column": "id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "medicine_enzyme_interaction.enzyme_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "note": "At least one enzyme row whose id never appears in medicine_enzyme_interaction.enzyme_id."
+    }
+   },
+   {
+    "table": "enzyme",
+    "column": "id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT enzyme.id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ],
+     "note": "At least one enzyme id appears in >=2 interaction rows and at least one in exactly 1, so COUNT(DISTINCT) > 1 and = 1 both occur."
+    }
+   },
+   {
+    "table": "enzyme",
+    "column": "id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "note": "enzyme.id is a primary key so it is unique; the duplicate share applies to the join column medicine_enzyme_interaction.enzyme_id, which must repeat some enzyme ids so COUNT(DISTINCT enzyme.id) < COUNT(*)."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "medicine_enzyme_interaction.medicine_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "note": "At least one medicine row whose id never appears in medicine_enzyme_interaction.medicine_id."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ],
+     "note": "Relaxed from [1,2,3,4] to [1,2,3] per review: with 19 interaction rows and 8 enzymes, a medicine group of size exactly 4 is not guaranteed. Ensure medicine ids appear in interaction groups of size 1, 2, and >=3 so HAVING COUNT(*) >= 2 and >= 3 both select and reject rows."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "note": "Grouping medicine.id by interaction count must yield groups of size 1, 2, and >=3."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "note": "medicine.name is unique per row, so grouping by name yields only size-1 groups; the size-2 and >=3 groups are produced by grouping medicine.name after joining to interactions (a medicine with multiple interactions)."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ],
+     "note": "After joining to interactions, at least one medicine.name group has COUNT(*) >= 2 and at least one has COUNT(*) = 1."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC",
+     "note": "medicine.name values must be distinct enough that ORDER BY name ASC is deterministic; no ties required since no LIMIT is used."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "Trade_Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "note": "Trade_Name is unique per row; size-2 and >=3 groups arise only after joining to interactions. Ensure at least one trade name maps to a medicine with >=3 interactions and one with exactly 2."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "Trade_Name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ],
+     "note": "After joining, at least one Trade_Name group has COUNT(*) >= 3."
+    }
+   },
+   {
+    "table": "medicine",
+    "column": "FDA_approved",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "No",
+      "Yes"
+     ]
+    }
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "enzyme_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(medicine_enzyme_interaction.enzyme_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ],
+     "note": "Ensure enzyme_id groups with COUNT = 1, 2, and >=3 so HAVING COUNT(enzyme_id) > 1 and >= 3 both select and reject."
+    }
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "enzyme_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "enzyme.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "note": "At least one enzyme has no interaction rows (see enzyme.id exception)."
+    }
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "medicine_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "medicine.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "note": "At least one medicine has no interaction rows (see medicine.id exception)."
+    }
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "interaction_type",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "activitor",
+      "ACTIVITOR",
+      "inhibitor",
+      "INHIBITOR"
+     ],
+     "note": "Store canonical lowercase 'activitor' and 'inhibitor' so IN ('activitor','inhibitor') matches; both values must occur so COUNT(DISTINCT interaction_type) = 2 and each SUM(CASE ...) > 0. NULL planting must never remove the last non-NULL occurrence of either value."
+    }
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "interaction_type",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT medicine_enzyme_interaction.interaction_type)",
+      "SUM(CASE WHEN interaction_type = 'activitor' THEN 1 ELSE 0 END)",
+      "SUM(CASE WHEN interaction_type = 'inhibitor' THEN 1 ELSE 0 END)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "note": "Both interaction types must appear at least once so COUNT(DISTINCT) = 2 and both conditional sums are > 0. NULL planting is rule-aware: plant NULL only on a row whose type is duplicated, never on the last occurrence of a required enum value."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "medicine_enzyme_interaction",
+    "child_column": "enzyme_id",
+    "parent_table": "enzyme",
+    "parent_column": "id",
+    "copied_columns": [],
+    "note": "FK; child enzyme_id must reference an existing enzyme.id. Parent rows without children are allowed (see exceptions). Plan interactions against the final post-offset parent ids."
+   },
+   {
+    "child_table": "medicine_enzyme_interaction",
+    "child_column": "medicine_id",
+    "parent_table": "medicine",
+    "parent_column": "id",
+    "copied_columns": [],
+    "note": "FK; child medicine_id must reference an existing medicine.id. Parent rows without children are allowed (see exceptions). Plan interactions against the final post-offset parent ids."
+   },
+   {
+    "table": "enzyme",
+    "unique_tuples": [
+     [
+      "id"
+     ]
+    ],
+    "note": "Primary key id unique."
+   },
+   {
+    "table": "medicine",
+    "unique_tuples": [
+     [
+      "id"
+     ]
+    ],
+    "note": "Primary key id unique."
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "unique_tuples": [
+     [
+      "enzyme_id",
+      "medicine_id"
+     ]
+    ],
+    "note": "Composite primary key; no duplicate (enzyme_id, medicine_id) pairs."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "medicine",
+    "column": "FDA_approved",
+    "formula": "FDA_approved IN ('No', 'Yes')",
+    "evidence": "Observed distinct values No, Yes."
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "interaction_type",
+    "formula": "interaction_type IN ('activitor', 'inhibitor')",
+    "evidence": "Observed distinct values inhibitor, activitor."
+   },
+   {
+    "table": "enzyme",
+    "column": "Location",
+    "formula": "Location IN ('Mitochondrion', 'Cytosol')",
+    "evidence": "Observed distinct values Mitochondrion, Cytosol."
+   },
+   {
+    "table": "enzyme",
+    "column": "OMIM",
+    "formula": "OMIM > 0",
+    "evidence": "All observed OMIM values are positive integers (125290, 125270, 176000, 606938, 176100, 121300, 600923, 177000)."
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "enzyme_id",
+    "formula": "enzyme_id IN (SELECT id FROM enzyme)",
+    "evidence": "FK constraint."
+   },
+   {
+    "table": "medicine_enzyme_interaction",
+    "column": "medicine_id",
+    "formula": "medicine_id IN (SELECT id FROM medicine)",
+    "evidence": "FK constraint."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "enzyme": 8,
+   "medicine": 21,
+   "medicine_enzyme_interaction": 19
+  },
+  "null_targets": [
+   "enzyme.name",
+   "enzyme.Location",
+   "enzyme.Product",
+   "enzyme.Chromosome",
+   "enzyme.OMIM",
+   "enzyme.Porphyria",
+   "medicine.name",
+   "medicine.Trade_Name",
+   "medicine.FDA_approved",
+   "medicine_enzyme_interaction.interaction_type"
+  ],
+  "supporting_evidence": {
+   "enzyme.name_like": "enzyme.name row 1 'ALA synthase' matches 'ALA%' and '%ALA%'; a second row containing 'ALA' not at start is needed for the '%ALA%' variant to differ.",
+   "enzyme.id_unmatched": "enzyme has 8 rows but medicine_enzyme_interaction.enzyme_id has only 6 distinct values, so at least 2 enzymes have no children.",
+   "medicine.id_unmatched": "medicine has 21 rows but medicine_enzyme_interaction.medicine_id has only 13 distinct values, so at least 8 medicines have no children.",
+   "interaction_type_enum": "Observed values 'inhibitor' and 'activitor' (note the misspelling 'activitor' is canonical).",
+   "FDA_approved_enum": "Observed values 'No' and 'Yes'.",
+   "enzyme.Location_enum": "Observed values 'Mitochondrion' and 'Cytosol'.",
+   "OMIM_positive": "All 8 observed OMIM values are positive integers."
+  },
+  "uncertainty": [
+   "The duplicate_share 20-50% for enzyme.id cannot apply to the primary key itself; it is interpreted as applying to the join column medicine_enzyme_interaction.enzyme_id, which must repeat enzyme ids.",
+   "Group-size targets for medicine.name and medicine.Trade_Name (size 2 and >=3) are only achievable after joining to interactions, since both columns are unique per medicine row.",
+   "The 'activitor' spelling is preserved as canonical per the observed data; near-variants 'ACTIVITOR'/'INHIBITOR' are listed as comparison-boundary targets but the stored values should remain the canonical lowercase forms so IN predicates match.",
+   "Null shares are 0.0 in the compact database, but instruction 10 requires at least one NULL row per nullable column; this conflicts with the observed 0.0 share and is resolved in favor of instruction 10.",
+   "medicine.id aggregate_boundary relaxed from [1,2,3,4] to [1,2,3] per review: with 19 interaction rows and 8 enzymes, a medicine group of size exactly 4 is not guaranteed by the planner.",
+   "OMIM sampling must coerce near-variant strings via int(float(str(v).strip())) with try/except fallback to a random positive integer, so the POSITIVE rule never raises ValueError.",
+   "NULL planting for interaction_type must be rule-aware: plant NULL only on a row whose type is duplicated, never on the last non-NULL occurrence of 'activitor' or 'inhibitor'.",
+   "table_sizes_per_instance refers to the number of generated (appended) rows per instance, not the total instance size; the program appends these to the compact database, so the final instance has compact rows plus generated rows. All aggregate-boundary, group-size, unmatched-join and duplicate-share targets must be evaluated against the final compact+generated tables, and the program must plan interactions against the final post-offset parent ids and enable foreign-key enforcement (or run a post-insert FK check) so FK violations are caught rather than silently written.",
+   "The program must not silently skip interaction rows that are required to satisfy the specification; after writing, it must assert that the planned group sizes (enzyme_id groups 1/2/>=3, medicine_id groups 1/2/>=3), both interaction types, the unmatched-join targets and the duplicate share in [0.2,0.5] hold in the final instance, and report the achieved values."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 11 of 20 units failed with ValueError(\"invalid literal for int() with base 10: '176100.0 '\") etc. The failing column is enzyme.OMIM (declared INT, in POSITIVE set). In specgen._sample_column, the POSITIVE branch does `abs(int(v)) if _isnum(v) and int(v) != 0 else rng.randint(...)`. When v is a string like '176100.0 ' (a near-variant produced by _near_variant adding a trailing space, or a float-formatted string from the sampler), `_isnum(v)` is True (float('176100.0 ') parses) but `int(v)` raises ValueError because int() does not accept a trailing space or a decimal string. The `int(v) != 0` guard is evaluated before the conversion is safe.",
+     "requested_revision": "In specgen._sample_column, coerce via float first and strip whitespace before int(), e.g. `iv = int(float(str(v).strip()))` guarded by try/except, and fall back to rng.randint(1, 10**6) on failure. Ensure the POSITIVE rule never raises for near-variant strings. Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `reproducible: false`. The CLI seeds `random.Random(a['seed_base'] * 100003 + i)` per unit, which is deterministic, but `_init_sampler`/`make_column_sampler` call `rng.random()` and `rng.choices` during sampler construction, and `build_spec`/`seed_literal_pool_from_queries` iterate over sets (`sorted({...})` is fine, but `pool.setdefault` order and `_routing_items` depend on dict insertion order which is stable). The non-reproducibility more likely stems from the ValueError failures producing partial/absent instances, so the same seed yields different success sets across runs, or from multiprocessing ordering. Regardless, the feedback explicitly reports reproducible=false.",
+     "requested_revision": "After fixing the ValueError, verify determinism by generating the same unit index twice with the same seed and diffing the resulting SQLite files. If still non-reproducible, audit any use of unordered iteration (sets, dict from set comprehensions) in specgen/values that feeds rng draws, and make the draw order deterministic."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `table_sizes_per_instance` fixes enzyme=8, medicine=21, medicine_enzyme_interaction=19, and the per-column exceptions require enzyme_id groups of size 1, 2, and >=3 AND medicine_id groups of size 1, 2, and >=3, plus at least one unmatched enzyme and one unmatched medicine, plus both interaction types, all within 19 interaction rows and 8/21 parent rows. `_plan_interactions` hardcodes `target = 19` and `e_sizes=[3,2,1,1]`, `m_sizes=[3,2,1,1]`, which consumes 7+7=14 planned pairs before random fill; with only 8 enzymes and 21 medicines this is tight but feasible. However the spec's `duplicates_for_distinct` target for enzyme.id requires duplicate_share 20-50% on the join column, and the aggregate_boundary for medicine.id requires COUNT(*) values 1,2,3,4 \u2014 the fixed size 19 with the current planner does not guarantee a medicine group of size exactly 4 (only 3,2,1,1). The spec lists values [1,2,3,4] for medicine.id aggregate_boundary.",
+     "requested_revision": "Either relax the medicine.id aggregate_boundary target to [1,2,3] (consistent with the medicine.name exception which uses [1,2,3]) or extend `_plan_interactions` to include a medicine group of size 4. Also confirm the duplicate_share 20-50% on medicine_enzyme_interaction.enzyme_id is achievable with 19 rows and 8 enzymes given the planned group sizes; if not, adjust the spec's duplicate_share target or the table size."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `construction_pairs: eligible 48, separated 4`. Only 4 of 48 eligible construction pairs were separated, and `construction_pairs_by_group` is empty. This indicates the generated instances do not exercise the intended value variation for most patterns (e.g., LIKE near-variants, aggregate boundaries, group sizes). While a missing separation alone does not prove an error, the very low separation rate combined with the 11 ValueError failures (which removed over half the instances) means the surviving 9 instances were not validated against most targets.",
+     "requested_revision": "After fixing the ValueError and re-running with all 20 units succeeding, re-check construction_pairs separation. If separation remains low for specific groups (e.g., like_near_variant, aggregate_boundary), verify that `_sample_column`'s LIKE_ANCHORS planting and `_plan_interactions` group sizes actually produce the required distinct rows, and adjust the planner/sampler accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows `medicine_enzyme_interaction.interaction_type: generated rows: NULL 9 / 154`. The spec's comparison_boundary and aggregate_boundary exceptions require both 'activitor' and 'inhibitor' to occur so COUNT(DISTINCT interaction_type)=2 and both SUM(CASE...) > 0. `_plant_nulls` sets one value to NULL per nullable column, and `_plan_interactions` assigns types by `types[i % 2] if i < 2 else rng.choice(types)`. With 9 NULLs out of 154 (across 9 instances, ~1 per instance), the NULL planting may overwrite the only 'activitor' or 'inhibitor' row in a small instance, breaking the COUNT(DISTINCT)=2 target. The spec's uncertainty note says planted NULLs must not replace values needed to satisfy a rule.",
+     "requested_revision": "In `_plant_nulls`, for interaction_type, ensure at least one 'activitor' and one 'inhibitor' remain non-NULL after planting (e.g., plant NULL only on a row whose type is duplicated, or skip planting if it would remove the last occurrence of a required enum value). More generally, make `_plant_nulls` rule-aware for enum columns that are constrained by aggregate/comparison boundaries."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducibility could not be confirmed because 11/20 units failed; must be re-verified after the ValueError fix.",
+    "Whether the fixed table size 19 can simultaneously satisfy all group-size and aggregate-boundary targets (especially medicine.id COUNT(*)=4 and enzyme_id duplicate_share 20-50%) is unverified; construction_pairs separation was only 4/48.",
+    "Preservation of compact rows: writer.py copies the original DB and appends, which is correct by construction, but the feedback's `rows_added`/`rows_skipped` are empty dicts, so the actual append counts were not reported; should be populated for verification."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 136 across all 20 instances (validity: invalid 20/20, reason 'new_integrity_failures'). The writer appends generated rows with 'pragma foreign_keys = OFF' (writer.py) and never re-validates FK consistency after insert. The interaction planner (_plan_interactions in specgen.py) draws enzyme_id/medicine_id from parent_rows, but the writer's _offset_pk shifts generated PKs of enzyme/medicine past the compact max AFTER the interaction rows were planned against the un-offset ids. So interaction rows reference the pre-offset parent ids, which no longer exist in the written parent tables -> FK violations.",
+     "requested_revision": "Make the FK planning and the PK offset consistent: either (a) apply the PK offset to parent rows before planning interactions (so _plan_interactions sees the final ids), or (b) do not offset PKs and instead ensure generated PKs never collide with compact rows by construction. Also enable 'pragma foreign_keys = ON' (or run a post-insert FK check) so violations are caught rather than silently written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped: medicine_enzyme_interaction 139 of 241 attempted (58% skipped). The composite PK (enzyme_id, medicine_id) is deduped in _dedupe, but the writer's row-by-row fallback silently drops rows that still collide. Combined with the FK offset bug, many planned interaction rows are lost, so the by-construction group-size targets (enzyme_id groups 1/2/>=3, medicine_id groups 1/2/>=3, both interaction types present) are not guaranteed in the written instances.",
+     "requested_revision": "After fixing the FK/PK offset issue, verify that the written interaction table actually contains the planned group sizes and both interaction types. Add a post-write assertion (or report field) confirming the aggregate-boundary targets hold in the final instance, and do not silently skip rows that are required to satisfy the specification."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'table_sizes_per_instance' fixes enzyme=8, medicine=21, medicine_enzyme_interaction=19, but the program appends these counts to the compact database (writer copies orig then appends). The execution feedback shows rows_added medicine 420 (=21*20), enzyme 160 (=8*20), interaction 241 attempted. The specification's sizes are ambiguous: are they the total instance size or the appended count? The 'unmatched_join_rows' and 'duplicate_share 20-50%' targets were derived from the compact database (8 enzymes, 21 medicines, 19 interactions), so appending a full extra copy changes the intended statistics.",
+     "requested_revision": "Clarify whether table_sizes_per_instance refers to total rows in the instance or appended rows, and whether instances are 'copy of compact + appended' or 'freshly generated'. If the intent is to preserve the compact statistics (e.g. 6 of 8 enzymes referenced, 13 of 21 medicines referenced), state the target counts explicitly and have the program construct them against the final (compact+generated) tables."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists 'duplicates_for_distinct' for enzyme.id with duplicate_share 20-50% and notes it applies to medicine_enzyme_interaction.enzyme_id. With 8 enzymes and 19 interactions, the achievable duplicate share depends on how many distinct enzyme ids are referenced. The program's _plan_interactions uses only 4 enzyme ids (sizes 3,2,1,1) plus random fill, which may not yield a 20-50% duplicate share over the join column. No execution evidence confirms the duplicate share target is met.",
+     "requested_revision": "State the exact target (e.g. 'exactly K distinct enzyme ids referenced among N interaction rows, giving duplicate share in [0.2,0.5]') and have the program construct it deterministically; add a post-write check reporting the achieved duplicate share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires 'a NULL share following the compact database's share for that column'. The compact share is 0.0 (per specification uncertainty note), yet the program plants exactly one NULL per nullable column per instance (NULL_SHARE=0.0, k=max(1,round(0*n))=1). This is consistent with instruction 10's 'at least one NULL row per nullable column', but the program does not implement a share-based distribution for columns whose compact share is nonzero. For this database the compact share is 0.0, so the behavior is acceptable, but the code path is not general.",
+     "requested_revision": "No change required for this database (compact share 0.0). Note for the engineer: if a future database has a nonzero compact NULL share, _sample_column's k=max(1,round(share*n)) should be reviewed to ensure it matches the intended share rather than always planting exactly one."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the written instances actually satisfy the aggregate-boundary and group-size targets after the 139 skipped interaction rows (blocked by the FK offset bug).",
+    "Whether the duplicate_share 20-50% target for medicine_enzyme_interaction.enzyme_id is met in the written instances.",
+    "Whether the 'unmatched_join_rows' targets (>=1 enzyme and >=1 medicine without children) hold in the final compact+generated tables given the PK offset."
+   ]
+  },
+  {
+   "reviewer": "independent",
+   "recommendation": "revise",
+   "summary": "The program runs cleanly (20/20 instances, 0 FK/NOT NULL/PK violations, reproducible) and implements most of the specification by construction. However, the post-write check `dup_share` fails on all 20 instances (checks_failed: {dup_share: 20}), which the specification explicitly requires the program to assert and report. The duplicate-share target for the join column medicine_enzyme_interaction.enzyme_id (20-50%) is not achieved by the interaction planner, and the program's own assertion flags this. This is a blocking specification-vs-program inconsistency.",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "blocking",
+     "title": "duplicate_share target for medicine_enzyme_interaction.enzyme_id not achieved (checks_failed: dup_share 20/20)",
+     "evidence": "Execution feedback: `checks_failed: {\"dup_share\": 20}` across all 20 instances. The specification's uncertainty section states: 'the program must ... assert that ... the duplicate share in [0.2,0.5] hold in the final instance, and report the achieved values.' The program does assert it (writer._post_checks computes `share = 1 - n_dist/n_rows` and sets `checks['dup_share'] = 0.2 <= share <= 0.5`), and the assertion fails on every instance. In specgen._plan_interactions, the enzyme groups are built as sizes [3,2,1,1] over 4 distinct enzymes plus random fill; with 19 interaction rows and 8 enzymes, the number of distinct enzyme_ids used is high relative to 19 rows, so 1 - distinct/total falls below 0.2. The planner does not enforce the duplicate-share bound; it only hopes the random fill produces it.",
+     "requested_revision": "In specgen._plan_interactions, explicitly constrain the number of distinct enzyme_id values used so that 1 - distinct_enzyme_ids/N_INTERACTIONS lies in [0.2, 0.5] (e.g. with 19 rows, distinct enzyme ids must be between ~10 and ~15; currently the planner uses up to 8 distinct enzymes from the generated set plus compact enzymes, giving a share below 0.2). Either (a) reduce the number of distinct enzyme ids referenced by the planned interactions, or (b) adjust the planner to target a specific distinct count and verify it before returning. The post-write check must then pass on every instance."
+    },
+    {
+     "agent": "designer",
+     "severity": "non-blocking",
+     "title": "medicine.id aggregate_boundary values relaxed to [1,2,3] but specgen does not guarantee a size-4 group is absent/present as originally targeted",
+     "evidence": "Specification uncertainty: 'medicine.id aggregate_boundary relaxed from [1,2,3,4] to [1,2,3] per review'. specgen._plan_interactions builds medicine groups of sizes [3,2,1,1] which satisfies 1,2,>=3. The original target values [1,2,3,4] are not fully covered (no size-4 group is guaranteed), but the relaxed target [1,2,3] is met. This is consistent with the relaxed spec, so it is noted rather than blocking.",
+     "requested_revision": "No change required if the relaxed [1,2,3] target is accepted; otherwise the designer should confirm the relaxation is final."
+    },
+    {
+     "agent": "engineer",
+     "severity": "non-blocking",
+     "title": "enzyme.name LIKE anchors planted but near-variant sampling may overwrite them",
+     "evidence": "specgen._sample_column plants LIKE_ANCHORS at out[0] and out[1] for enzyme.name, but the generic sampler path (fresh_share / _near_variant) runs before the anchor assignment, and the anchor assignment happens after. The anchors are set last, so they are preserved. However, _plant_nulls may then NULL out one of the anchor rows if it is chosen (enzyme.name is nullable). The spec requires 'at least one enzyme.name starts with ALA and at least one contains ALA not at the start'. If _plant_nulls nulls out[0] or out[1], the anchor is lost. _plant_nulls for non-enum columns picks a uniformly random index, so there is a real chance of nulling an anchor.",
+     "requested_revision": "In _plant_nulls, exclude the LIKE-anchor indices (or re-plant anchors after NULL planting) so the ALA anchors survive NULL planting. Alternatively, plant the NULL on a non-anchor row for enzyme.name."
+    },
+    {
+     "agent": "engineer",
+     "severity": "non-blocking",
+     "title": "interaction_type NULL planting may remove a required enum value in edge cases",
+     "evidence": "specgen._plant_nulls is rule-aware for enum columns: it only plants NULL on an index whose value is duplicated. With 19 interaction rows and both 'activitor' and 'inhibitor' present, counts are typically >1 for each, so a safe index exists. This is correctly implemented. However, if the planner ever produced only one occurrence of a type (e.g. after truncation to target), the safe list could be empty and NULL planting would be skipped, leaving the column with no NULL row \u2014 violating the NULL rule ('at least one NULL row per nullable column'). The execution feedback shows interaction_type NULL 20/380, so in practice it works, but the guard is fragile.",
+     "requested_revision": "Ensure the planner always produces at least 2 occurrences of each interaction type before NULL planting, so a safe NULL index always exists. Add an assertion that interaction_type has at least one NULL after planting."
+    },
+    {
+     "agent": "engineer",
+     "severity": "non-blocking",
+     "title": "writer._offset_pk recomputes PKs independently of specgen.plan_offsets",
+     "evidence": "writer._offset_pk recomputes the base as (max(ov) if ov else 0) + 1 and assigns base+i, while specgen.plan_offsets uses the same formula. The two agree by construction, but the interaction planner in specgen uses plan_offsets ids, and writer._offset_pk re-derives them. If the two ever diverge (e.g. a future change to one), child rows would reference non-existent parents. The FK check would catch it, but the design is fragile.",
+     "requested_revision": "Have writer use the ids already produced by specgen.plan_offsets (pass them through) rather than recomputing, or assert equality between the two."
+    }
+   ],
+   "unresolved_checks": [
+    "The duplicate_share failure (checks_failed: dup_share 20/20) is the primary blocking issue; it must be fixed and re-verified.",
+    "The LIKE-anchor survival under NULL planting was not directly verified in the execution feedback; it should be asserted in _post_checks.",
+    "The interaction_type NULL-planting guard was not exercised in an edge case; an assertion should be added."
+   ],
+   "supported_rules": [
+    "FK integrity: 0 violations across 20 instances (foreign_keys=ON + PRAGMA foreign_key_check).",
+    "NOT NULL / PK: 0 violations; PKs offset past compact max.",
+    "Compact rows preserved: instances are byte copies of the compact DB plus appended rows.",
+    "Reproducible: reproducible=true, deterministic rng seeding.",
+    "Enum domains: FDA_approved in {No,Yes}, interaction_type in {activitor,inhibitor}, Location in {Mitochondrion,Cytosol} enforced by ENUMS.",
+    "OMIM positive: _to_positive_int coerces via int(float(...)) with try/except fallback.",
+    "Group sizes 1/2/>=3 for enzyme_id and medicine_id: planned by construction and asserted in _post_checks.",
+    "Both interaction types present: planned and asserted.",
+    "Unmatched joins: at least one enzyme and one medicine without children, asserted.",
+    "NULL rule: at least one NULL per nullable column (20/160, 20/420, 20/380 observed)."
+   ]
+  }
+ ]
 }

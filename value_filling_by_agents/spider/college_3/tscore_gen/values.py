@@ -182,6 +182,121 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform over a fixed enum domain; near-variants (case / trailing space) of literals."""
+
+    def __init__(self, domain: list, p: float, max_l0: float, rng, near_variants=()):
+        base = list(dict.fromkeys([str(x) for x in domain]))
+        super().__init__(base, p, max_l0, rng)
+        variants = []
+        for v in base:
+            if v.lower() != v:
+                variants.append(v.lower())
+            if v.upper() != v:
+                variants.append(v.upper())
+            if v and not v.endswith(' '):
+                variants.append(v + ' ')
+        for lit in near_variants:
+            variants.append(str(lit))
+        self.elements = list(dict.fromkeys(self.elements + variants))
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class RangeSampler(ColumnSampler):
+    """Uniform integer/float in [lo, hi]; boundary probes at listed literals and +-1."""
+
+    def __init__(self, lo, hi, p, max_l0, rng, is_int=True, boundary=()):
+        super().__init__([], p, max_l0, rng)
+        self.lo, self.hi, self.is_int = lo, hi, is_int
+        self.boundary = list(boundary)
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.35:
+            return r.choice(self.boundary)
+        if self.is_int:
+            return r.randint(int(self.lo), int(self.hi))
+        return round(r.uniform(self.lo, self.hi), 4)
+
+
+class CodeSampler(ColumnSampler):
+    """Uppercase alphanumeric code of fixed length; near-variants of listed literals."""
+
+    def __init__(self, length: int, p: float, max_l0: float, rng, literals=()):
+        super().__init__([str(x) for x in literals], p, max_l0, rng)
+        self.length = length
+        self.alpha = string.ascii_uppercase + string.digits
+
+    def _rand(self):
+        return ''.join(self.rng.choice(self.alpha) for _ in range(self.length))
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < 0.5:
+            v = r.choice(self.elements)
+            u = r.random()
+            if u < 0.25:
+                return v.lower()
+            if u < 0.5:
+                return v + ' '
+            if u < 0.75 and len(v) > 1:
+                i = r.randrange(len(v))
+                return v[:i] + r.choice(self.alpha) + v[i + 1:]
+            return v
+        return self._rand()
+
+
+class CIDSampler(ColumnSampler):
+    """Course.CID format 'NNN.NNN' (dot preserved); near-variants keep the digit pattern."""
+
+    def __init__(self, prefixes, p, max_l0, rng, literals=()):
+        super().__init__([str(x) for x in literals], p, max_l0, rng)
+        self.prefixes = [str(x) for x in prefixes] or ['050', '520', '550', '600']
+
+    def _rand(self):
+        r = self.rng
+        return '%s.%03d' % (r.choice(self.prefixes), r.randint(0, 999))
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < 0.5:
+            v = r.choice(self.elements)
+            u = r.random()
+            if u < 0.3 and '.' in v:
+                a, b = v.split('.', 1)
+                if b.isdigit():
+                    return '%s.%03d' % (a, (int(b) + r.choice([-1, 1])) % 1000)
+            if u < 0.6:
+                return v.lower()
+            return v
+        return self._rand()
+
+
+class NullWrapper:
+    """NULL rule: NULL is a value to generate."""
+
+    def __init__(self, sampler, nullable: bool, null_share: float, rng, force_null_at: int = 0):
+        self.sampler = sampler
+        self.nullable = nullable
+        self.null_share = null_share
+        self.rng = rng
+        self.force_null_at = force_null_at
+        self.i = 0
+
+    def sample(self):
+        i = self.i
+        self.i += 1
+        if not self.nullable:
+            return self.sampler.sample()
+        if i == self.force_null_at:
+            return None
+        if self.rng.random() < self.null_share:
+            return None
+        return self.sampler.sample()
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]

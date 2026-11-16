@@ -1,59 +1,561 @@
 {
  "db": "coinmarketcap",
- "operator_io_quirks": [
-  "Table 'historical' is a SQL keyword-ish name; must be double-quoted in generated SQL (DDL already quotes it).",
-  "historical has 4.44M rows, no PK, no rowid alias declared; read_schema must sample via rowid % k (max_rows_per_table) and count(*) for original_sizes.",
-  "No FKs at all in this DB (coins.platform_id and historical.coin_id are logical FKs to coins.id but undeclared) -> process_order is trivially flat; fill_foreign_keys_consistently never fires.",
-  "historical.date declared DATE but stored as TEXT 'YYYY-MM-DD'; ts_fuzzer dispatch = Date|Number(int elements) because first element parses as int? (samples are '2013-04-28' -> not int -> Date fuzzer, template %Y-%m-%d).",
-  "coins.date_added / date_launched declared TEXT but hold ISO 'YYYY-MM-DDTHH:MM:SS.sssZ' -> String fuzzer, not Date; TS will emit random charset strings, not dates.",
-  "historical.time_high / time_low declared TEXT holding 'HH:MM:SS' -> String fuzzer (not Time), so TS produces random strings, not times.",
-  "coins.id INTEGER PRIMARY KEY (rowid alias) -> single-column PK, max_l0 = inf, no fresh-draw cap; distinct=8927=rows so PK dedup rarely triggers.",
-  "historical.num_market_pairs is 100% NULL, distinct=0 -> Number sampler with empty elements -> p:=1, always fresh uniform in [-10^4,10^4] (scale=4 default for REAL? actually REAL has no args -> scale default).",
-  "historical has no PK and no unique columns -> sample_fresh_primary_keys / drop_unique_duplicates are no-ops; duplicate rows survive.",
-  "coins.category null_rate 0.006, status distinct=4, category distinct=2 -> low-cardinality ENUM-like columns; TS String fuzzer ignores the small domain.",
-  "coins.description/tags/tag_names/notice contain long text with newlines, markdown, commas -> String fuzzer length range [min,max+1] from 5 sampled originals, contaminate suffix/prefix likely.",
-  "coins.platform_id INTEGER with 21 distinct values, 36.5% NULL -> Number fuzzer; no FK so no consistency with coins.id."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on historical.date with template %Y-%m-%d (first parsable element '2013-04-28'); range = [min,max] of 5 sampled originals, so dates stay in 2013-2021 window -> plausible, low FN.",
-  "String fuzzer on coins.date_added/date_launched/time_high/time_low: random charset strings, not ISO/time -> any gold query filtering on date/time format will see implausible values -> FN risk on FORMAT/LIKE predicates.",
-  "Number fuzzer on historical.price/open/high/low/close: full range [-10^scale,10^scale] with scale from REAL (no args -> default), so values can be huge/negative -> implausible prices -> FN on range predicates (price > 0, high >= low).",
-  "Number fuzzer on percent_change_*: full range includes large magnitudes; original is roughly [-100,100] -> FN on BETWEEN -100 AND 100 style filters.",
-  "Number fuzzer on historical.cmc_rank: full range [-10^4,10^4] vs original 1..571 -> FN on cmc_rank <= 10 / rank predicates.",
-  "Number fuzzer on coins.id (PK, max_l0=inf): fresh uniform ints, no reuse -> PK values spread widely; joins on coins.id = historical.coin_id (no FK) will mostly miss -> FN on join queries.",
-  "historical.coin_id Number fuzzer independent of coins.id (no FK) -> join selectivity near zero -> many gold join queries return empty on TS instance -> FN.",
-  "String fuzzer on coins.status/category: random strings, not 'active'/'coin' -> FN on status='active' / category='token' predicates.",
-  "String fuzzer on coins.symbol/name/slug: random charset, not real tickers -> FN on symbol='BTC' style equality.",
-  "num_market_pairs 100% NULL original: TS Number sampler with empty elements -> p=1, always fresh -> non-NULL values where original is all NULL -> FP on IS NULL predicates.",
-  "No PK/unique on historical -> duplicate rows survive; TS may produce ties where original has none -> FP on DISTINCT/COUNT(DISTINCT) comparisons.",
-  "coins.id PK dedup + max_l0=inf: TS keeps ~n distinct ids; original distinct=rows so no ties -> low FP on id-based DISTINCT."
- ],
- "challenger_refs": [
-  "G4",
-  "g74cee59d",
-  "ga30bdd8d",
-  "G2",
-  "G3",
-  "G1",
-  "G5",
-  "G6",
-  "g6b41fe5f",
-  "g6b41fe5f",
-  "g6b41fe5f",
-  "g6b41fe5f",
-  "g07f1fd4e",
-  "g07f1fd4e",
-  "g07f1fd4e",
-  "g07f1fd4e",
-  "g07f1fd4e",
-  "g07f1fd4e",
-  "g07f1fd4e"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1; never NULL; unique per table.",
+   "text_short": "Random token of 3-12 lowercase letters; 5% chance of a near-variant (case flip, one-char typo) of an existing value; 2% NULL if nullable.",
+   "text_long": "Random sentence of 20-120 chars; 3% NULL if nullable.",
+   "real_positive": "Lognormal-ish positive value; 1% chance of boundary value near a listed literal; 1% NULL if nullable.",
+   "real_signed": "Normal around 0 with std 5; 1% chance of boundary value; 1% NULL if nullable.",
+   "date_iso": "Uniform date in 2013-01-01..2024-12-31 formatted %Y-%m-%d; 1% chance of boundary day near a listed literal; never NULL if NOT NULL.",
+   "datetime_iso": "Uniform datetime in 2013-01-01..2024-12-31 formatted %Y-%m-%dT%H:%M:%S.000Z; 3% NULL if nullable.",
+   "time_hms": "Uniform time formatted %H:%M:%S; 1% NULL if nullable.",
+   "enum_small": "Uniform over the listed enum values; 1% NULL if nullable.",
+   "fresh_value_share": "0.05 of text values are fresh (not copied from any parent or pool)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "coins.name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "coins.name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      5
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "coins.name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Bitcoin",
+      "bitcoin",
+      "Litecoin",
+      "litecoin",
+      "Bicoin",
+      "bicoin",
+      "Peercoin",
+      "peercoin"
+     ]
+    }
+   },
+   {
+    "column": "coins.name",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "0.01"
+    }
+   },
+   {
+    "column": "coins.slug",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "bitcoin",
+      "BITCOIN",
+      "peercoin",
+      "PEERCOIN"
+     ]
+    }
+   },
+   {
+    "column": "coins.symbol",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "BTC",
+      "btc"
+     ]
+    }
+   },
+   {
+    "column": "coins.subreddit",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "bitcoin",
+      "BITCOIN",
+      "litecoin",
+      "LITECOIN"
+     ]
+    }
+   },
+   {
+    "column": "coins.status",
+    "pattern": "enum_small",
+    "targets": {
+     "values": [
+      "active",
+      "untracked",
+      "inactive",
+      "extinct"
+     ]
+    }
+   },
+   {
+    "column": "coins.category",
+    "pattern": "enum_small",
+    "targets": {
+     "values": [
+      "coin",
+      "token"
+     ]
+    }
+   },
+   {
+    "column": "coins.date_added",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2013-12-31",
+      "2014-01-01",
+      "2014-12-31",
+      "2015-01-01"
+     ]
+    }
+   },
+   {
+    "column": "coins.date_added",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2014%"
+     ],
+     "variants": [
+      "2014",
+      "2015",
+      "2014 x"
+     ]
+    }
+   },
+   {
+    "column": "coins.tag_names",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "0.05-0.30"
+    }
+   },
+   {
+    "column": "coins.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "historical.coin_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "historical.date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2013-%",
+      "2013-05-29%",
+      "2013-05-29",
+      "2013%",
+      "2016-10-11"
+     ],
+     "variants": [
+      "2013-",
+      "2014-",
+      "2013- x",
+      "2013-05-28",
+      "2013-05-30"
+     ]
+    }
+   },
+   {
+    "column": "historical.date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "historical.date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2012-12-31",
+      "2013-01-01",
+      "2013-05-02",
+      "2013-05-03",
+      "2013-05-04",
+      "2013-12-31",
+      "2014-01-01"
+     ]
+    }
+   },
+   {
+    "column": "historical.date",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "column": "historical.open",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "0.05-0.30"
+    }
+   },
+   {
+    "column": "historical.open",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -0.0001,
+      0,
+      0.0001
+     ]
+    }
+   },
+   {
+    "column": "historical.coin_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "coins.id"
+     ],
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "historical.volume_24h",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "historical.circulating_supply",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9999999.9999,
+      10000000,
+      10000000.0001
+     ]
+    }
+   },
+   {
+    "column": "historical.total_supply",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      9999999.9999,
+      10000000,
+      10000000.0001
+     ]
+    }
+   },
+   {
+    "column": "historical.high",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "historical.percent_change_24h",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "historical.price",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "historical.cmc_rank",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1,
+      5
+     ]
+    }
+   },
+   {
+    "column": "historical.percent_change_1h",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "historical.coin_id",
+    "parent_table": "coins",
+    "parent_column": "id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "coins",
+    "column": "id",
+    "formula": "id > 0"
+   },
+   {
+    "table": "coins",
+    "column": "status",
+    "formula": "status IN ('active','untracked','inactive','extinct')"
+   },
+   {
+    "table": "coins",
+    "column": "category",
+    "formula": "category IS NULL OR category IN ('coin','token')"
+   },
+   {
+    "table": "coins",
+    "column": "date_added",
+    "formula": "date_added IS NULL OR date_added LIKE '____-__-__T__:__:__.___Z'"
+   },
+   {
+    "table": "coins",
+    "column": "date_launched",
+    "formula": "date_launched IS NULL OR date_launched LIKE '____-__-__T__:__:__.___Z'"
+   },
+   {
+    "table": "coins",
+    "column": "date_launched",
+    "formula": "date_launched IS NULL OR date_launched >= date_added",
+    "condition": "date_launched IS NOT NULL AND date_added IS NOT NULL"
+   },
+   {
+    "table": "historical",
+    "column": "date",
+    "formula": "date IS NULL OR date LIKE '____-__-__'"
+   },
+   {
+    "table": "historical",
+    "column": "cmc_rank",
+    "formula": "cmc_rank IS NULL OR cmc_rank >= 1"
+   },
+   {
+    "table": "historical",
+    "column": "price",
+    "formula": "price IS NULL OR price >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "open",
+    "formula": "open IS NULL OR open >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "high",
+    "formula": "high IS NULL OR high >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "low",
+    "formula": "low IS NULL OR low >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "close",
+    "formula": "close IS NULL OR close >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "market_cap",
+    "formula": "market_cap IS NULL OR market_cap >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "volume_24h",
+    "formula": "volume_24h IS NULL OR volume_24h >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "circulating_supply",
+    "formula": "circulating_supply IS NULL OR circulating_supply >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "total_supply",
+    "formula": "total_supply IS NULL OR total_supply >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "max_supply",
+    "formula": "max_supply IS NULL OR max_supply >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "num_market_pairs",
+    "formula": "num_market_pairs IS NULL OR num_market_pairs >= 0"
+   },
+   {
+    "table": "historical",
+    "column": "high",
+    "formula": "high IS NULL OR low IS NULL OR high >= low"
+   },
+   {
+    "table": "historical",
+    "column": "high",
+    "formula": "high IS NULL OR open IS NULL OR high >= open"
+   },
+   {
+    "table": "historical",
+    "column": "high",
+    "formula": "high IS NULL OR close IS NULL OR high >= close"
+   },
+   {
+    "table": "historical",
+    "column": "low",
+    "formula": "low IS NULL OR open IS NULL OR low <= open"
+   },
+   {
+    "table": "historical",
+    "column": "low",
+    "formula": "low IS NULL OR close IS NULL OR low <= close"
+   },
+   {
+    "table": "historical",
+    "column": "time_high",
+    "formula": "time_high IS NULL OR time_high LIKE '__:__:__'"
+   },
+   {
+    "table": "historical",
+    "column": "time_low",
+    "formula": "time_low IS NULL OR time_low LIKE '__:__:__'"
+   },
+   {
+    "table": "historical",
+    "column": "percent_change_1h",
+    "formula": "percent_change_1h IS NULL OR percent_change_1h BETWEEN -100 AND 1000"
+   },
+   {
+    "table": "historical",
+    "column": "percent_change_24h",
+    "formula": "percent_change_24h IS NULL OR percent_change_24h BETWEEN -100 AND 1000"
+   },
+   {
+    "table": "historical",
+    "column": "percent_change_7d",
+    "formula": "percent_change_7d IS NULL OR percent_change_7d BETWEEN -100 AND 1000"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "coins": 40,
+   "historical": 200
+  },
+  "null_targets": [
+   "coins.name",
+   "coins.category",
+   "coins.description",
+   "coins.subreddit",
+   "coins.notice",
+   "coins.tags",
+   "coins.tag_names",
+   "coins.website",
+   "coins.platform_id",
+   "coins.date_launched",
+   "historical.date",
+   "historical.coin_id",
+   "historical.cmc_rank",
+   "historical.market_cap",
+   "historical.open",
+   "historical.high",
+   "historical.low",
+   "historical.close",
+   "historical.time_high",
+   "historical.time_low",
+   "historical.percent_change_1h",
+   "historical.percent_change_24h",
+   "historical.percent_change_7d",
+   "historical.circulating_supply",
+   "historical.total_supply",
+   "historical.max_supply",
+   "historical.num_market_pairs"
+  ],
+  "supporting_evidence": {
+   "high_ge_low": "historical rows 1-8: high >= low in every shown row (e.g. row1 high=147.488, low=134.0).",
+   "high_ge_open_close": "historical rows 1-8: high >= open and high >= close in every shown row.",
+   "low_le_open_close": "historical rows 1-8: low <= open and low <= close in every shown row.",
+   "date_launched_ge_date_added": "coins rows 1-8: date_launched (2015-2018) >= date_added (2013) in every shown row.",
+   "nonneg_prices": "historical rows 1-8: price, open, high, low, close, market_cap, volume_24h, supplies all >= 0."
+  },
+  "uncertainty": "No formula ties close to open/price or market_cap to price*supply on the shown rows (row1: price*supply=1.489e9 vs market_cap=1.4886e9 close but not exact; row8: price*supply=1.6037e9 vs market_cap=1.6038e9). No exact formula stated. percent_change bounds are loose heuristics. platform_id values in sample (1027, 1765, ...) look like coin ids, not platform ids; treated as free integer."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The spec lists nullable columns and the interface rule requires NULL for every nullable column (including nullable FKs), but `_apply_null_rule` skips `cm.notnull` and PK columns \u2014 correct \u2014 yet for historical it applies a default 0.05 share to nearly all columns; execution shows historical.open NULL 600/4000 (0.15 spec share applied) while every other historical column shows NULL 200/4000 (0.05 default). coins.name NULL 7/112 \u2248 0.06 vs spec 0.01, and coins.date_added NULL 4/112, coins.status NULL 4/112 even though no null_share is specified for these \u2014 acceptable default, but note that `coins.status` is an enum_small column and the spec's enum exception does not state a NULL policy; uniform enum sampler with no NULL injection plus default 0.05 produced a NULL share that happens to satisfy the interface rule.",
+     "request": "No blocking change required; optionally document that unspecified nullable columns fall back to null_share 0.05 (consistent with the interface rule requiring at least one NULL per nullable column). No fix to spec/program needed for a pass."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "`historical.date` has a declared_type DATE with date_format '%Y-%m-%d', and spec date_iso rule says format %Y-%m-%d and 'never NULL if NOT NULL'; but the column is nullable (null target) and the DATE_DDL has no NOT NULL, so NULL injection (200/4000) is permissible under SQL 3VL. However DateSampler, when initialized with boundary near-variants like '2013-' or '2014-' (stripping '%'), will use template fallback %Y-%m-%d \u2014 fine. The `date_iso` generic rule's 'if nullable' text is slightly ambiguous: it says 'never NULL if NOT NULL' which matches.",
+     "request": "No change required."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Spec's `semantic_rules_and_formulas` includes `coins.date_added IS NULL OR date_added LIKE '____-__-__T__:__:__.___Z'` \u2014 expecting an ISO DATETIME format (with T and .000Z), yet `coins.date_added` is declared TEXT and the comparison_boundary exception treats it as a date string like '2014-01-01' (via STRFTIME LIKE 2014%). The datetime_iso generic sampler produces 'YYYY-MM-DDTHH:MM:SS.000Z', while the comparison_boundary literals are plain 'YYYY-MM-DD' and the like_near_variant literals are '2014%' etc. The GENERIC rule `date_iso` says format %Y-%m-%d, but the semantic rule expects datetime. These two are inconsistent.",
+     "request": "Clarify whether coins.date_added/date_launched are date-only or full datetimes (the LIKE pattern enforces datetimes; the comparisons imply dates). Adjust spec rules or literals accordingly; current program's runtime DDL accepts either (TEXT column), so the mismatch does not break integrity but does weaken boundary separation intent for STRFTIME(%Y,...) predicates."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution: `construction_pairs` eligible=61, separated=11, unknown_executions=0. Only ~18% of designed pairs are separated. Per instruction 4, a missing separation alone does not establish a generation error. Note especially: `historical.price` DISTINCT 20-50% duplicate_share is 0.30 in spec but the NumberSampler with dup-cap max_l0=3.0 reuses only ~3 values \u2192 likely many duplicates; but construction_pairs separation is only measured per-pair, and many pairs require a true 'variation' row above thresholds that may or may not exist. `coins.name` ties_for_order_limit [1,5] requires 5 distinct names with same ORDER rank; duplicate_share 0.30 lets this happen. Cannot verify separation ratios for each pair without target labels; acceptable.",
+     "request": "No change needed; instruct the designer that if separation for DISTINCT/ORDER ties is important, target values may need tighter bounds. Program's behavior appears consistent with spec."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The `_fix_ohlc` function reorders/reassigns high and low values when consistency fails, which can overwrite an intended boundary sample for `historical.high` ties_for_order_limit DESC. Similarly, `BoundarySampler` returns exactly 1% of boundaries \u2014 with historical 200 rows, ties at rank 1 for ORDER DESC may or may not materialize (this is a soft tie rule). Not a blocker; ties can be absent.",
+     "request": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Dependency `historical.coin_id -> coins.id` is filled via `fill_foreign_keys_consistently`, then filtered by `sample_fresh_primary_keys` and `drop_unique_duplicates`. For nullable FK columns (`historical.coin_id` is in `null_targets`), `_apply_null_rule` injects NULL 0.05 share (200/4000 shown), satisfying 'child_rows_with_null_fk: true'. Compact coins.id never changes; PKs are checked against compact_ids. FK integrity verified by feedback: fk_violations=0.",
+     "request": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "`coins.status` has enum values only ['active','untracked','inactive','extinct'] but the literal_pool_other_columns lists only 'untracked' (count 1). EnumSampler ignores pools \u2192 uniform over 4 values. Good. But `coins.category` is nullable and includes only 'coin','token'; NULL share comes from default 0.05 \u2192 8/112 \u2248 7% NULL, which is fine. No conflict.",
+     "request": "No change required."
+    }
+   ]
+  }
+ ]
 }

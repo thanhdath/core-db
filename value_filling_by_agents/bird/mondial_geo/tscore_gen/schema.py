@@ -28,6 +28,7 @@ class TableMeta:
 class Schema:
     tables: dict
     fks: dict
+    composite_fks: dict
     ddl: list
     table_order: list
     column_order: list
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +74,21 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _resolve_parent_cols(tables: dict, pt: str, declared: list) -> list:
+    """Map declared referenced column names to real parent columns."""
+    pcols = {c.name.lower(): c.name for c in tables[pt].columns}
+    if declared and all(str(d).lower() in pcols for d in declared):
+        return [pcols[str(d).lower()] for d in declared]
+    pk = list(tables[pt].primary_key)
+    if pk and len(pk) == len(declared or [None]):
+        return pk
+    if pk and not declared:
+        return pk
+    if pk:
+        return pk[:max(1, len(declared or [1]))]
+    return []
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -108,18 +124,41 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             tables[t] = TableMeta(t, cols, pk)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
+        composite: dict = {}
         for t in tnames:
-            for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
-                pt = tlow.get(str(r[2]).lower())
-                child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
-                pc = None
-                if pt is not None:
-                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
-                if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
+            rows = con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall()
+            by_id: dict = {}
+            for r in rows:
+                by_id.setdefault(r[0], []).append(r)
+            for _fid, grp in sorted(by_id.items()):
+                grp = sorted(grp, key=lambda r: r[1])
+                pt = tlow.get(str(grp[0][2]).lower())
+                if pt is None:
+                    warnings.warn('dropping FK %s -> missing table %s' % (t, grp[0][2]))
                     continue
-                fks[(t, child)] = (pt, pc)
+                child_cols = []
+                declared = []
+                ok = True
+                for r in grp:
+                    child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
+                    if child is None:
+                        ok = False
+                        break
+                    child_cols.append(child)
+                    declared.append(r[4] if r[4] is not None else r[3])
+                if not ok:
+                    warnings.warn('dropping FK %s -> %s (unknown child column)' % (t, pt))
+                    continue
+                parent_cols = _resolve_parent_cols(tables, pt, declared)
+                if not parent_cols or len(parent_cols) != len(child_cols):
+                    warnings.warn('dropping FK %s.%s -> %s.%s (unresolvable parent key)'
+                                  % (t, child_cols, pt, declared))
+                    continue
+                if len(child_cols) == 1:
+                    fks[(t, child_cols[0])] = (pt, parent_cols[0])
+                else:
+                    composite[(t, tuple(child_cols))] = (pt, tuple(parent_cols))
+                    fks[(t, child_cols[0])] = (pt, parent_cols[0])
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
@@ -139,4 +178,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, composite, ddl, torder, corder, ov, sizes, from_index)

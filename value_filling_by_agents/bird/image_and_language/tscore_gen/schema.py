@@ -1,4 +1,5 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py), extended with key pools, compact row counts, and per-constraint
+composite-FK metadata (needed to draw shared IMG_ID across multiple FKs)."""
 import math
 import sqlite3
 import warnings
@@ -25,6 +26,15 @@ class TableMeta:
 
 
 @dataclass
+class CompositeFK:
+    """A multi-column foreign key: ordered child cols and matching parent cols (same parent table)."""
+    child_table: str
+    child_cols: list
+    parent_table: str
+    parent_cols: list
+
+
+@dataclass
 class Schema:
     tables: dict
     fks: dict
@@ -34,6 +44,10 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    composite_fks: list = field(default_factory=list)
+    single_fk_cols: dict = field(default_factory=dict)
+    composite_child_cols: dict = field(default_factory=dict)
+    unique_tuples: list = field(default_factory=list)
 
 
 def q(name: str) -> str:
@@ -48,7 +62,8 @@ def _levels(items: list, deps: dict) -> list:
     placed: set = set()
     out = []
     while remaining:
-        lvl = [x for x in remaining if all(d == x or d in placed or d not in known for d in sorted(deps.get(x, ())))]
+        lvl = [x for x in remaining
+               if all(d == x or d in placed or d not in known for d in sorted(deps.get(x, ())))]
         if not lvl:
             lvl = [remaining[0]]
         out.append(sorted(lvl))
@@ -57,8 +72,8 @@ def _levels(items: list, deps: dict) -> list:
     return out
 
 
-def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+def process_order(schema_fks: dict, all_columns: list, composite_fks: list = None) -> tuple:
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -66,6 +81,9 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
             cdeps.setdefault((ct, cc), set()).add((pt, pc))
         if ct != pt:
             tdeps.setdefault(ct, set()).add(pt)
+    for cf in composite_fks or []:
+        if cf.child_table != cf.parent_table:
+            tdeps.setdefault(cf.child_table, set()).add(cf.parent_table)
     tables = sorted({t for t, _ in all_columns})
     return _levels(list(all_columns), cdeps), _levels(tables, tdeps)
 
@@ -76,10 +94,11 @@ def _first_token(line: str) -> str:
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
+    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
-        master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
+        master = con.execute(
+            "select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
         ddl = [s for ty, n, s in master if not str(n).startswith('sqlite_')]
         tnames = [n for ty, n, s in master if ty == 'table' and not str(n).startswith('sqlite_')]
         create = {n: s for ty, n, s in master if ty == 'table'}
@@ -89,7 +108,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
             uniq, chk = set(), set()
-            for line in create[t].split('\n'):
+            for line in (create.get(t) or '').split('\n'):
                 ll = line.lower()
                 tok = _first_token(line).lower()
                 if 'unique' in ll and tok in low:
@@ -102,26 +121,53 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
                         uniq.add(cols[0][2].lower())
                         from_index.append((t, cols[0][2]))
-            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
+            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5],
+                               r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
+        single_fk_cols: dict = {}
+        by_constraint: dict = {}
         for t in tnames:
             for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
-                pt = tlow.get(str(r[2]).lower())
-                child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
+                by_constraint.setdefault((t, r[0]), []).append(r)
+        composite_fks: list = []
+        for (ct, _id), rows in sorted(by_constraint.items()):
+            rows = sorted(rows, key=lambda r: r[1])
+            pt_low = str(rows[0][2]).lower()
+            pt = tlow.get(pt_low)
+            if pt is None:
+                warnings.warn('dropping dangling composite FK on %s -> %s' % (ct, rows[0][2]))
+                continue
+            child_cols, parent_cols = [], []
+            ok = True
+            for r in rows:
+                child = next((c.name for c in tables[ct].columns
+                              if c.name.lower() == str(r[3]).lower()), None)
                 pcol_name = r[4] if r[4] is not None else r[3]
-                pc = None
-                if pt is not None:
-                    pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
-                if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
-                    continue
-                fks[(t, child)] = (pt, pc)
+                pc = next((c.name for c in tables[pt].columns
+                           if c.name.lower() == str(pcol_name).lower()), None)
+                if child is None or pc is None:
+                    ok = False
+                    break
+                child_cols.append(child)
+                parent_cols.append(pc)
+            if not ok:
+                warnings.warn('dropping incomplete FK constraint %s#%s' % (ct, _id))
+                continue
+            if len(child_cols) >= 2:
+                composite_fks.append(CompositeFK(ct, child_cols, pt, parent_cols))
+            else:
+                single_fk_cols[(ct, child_cols[0])] = (pt, parent_cols[0])
+        for (ct, cc), (pt, pc) in single_fk_cols.items():
+            fks[(ct, cc)] = (pt, pc)
+        for cf in composite_fks:
+            for cc, pc in zip(cf.child_cols, cf.parent_cols):
+                fks.setdefault((cf.child_table, cc), (cf.parent_table, pc))
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
-        corder, torder = process_order(fks, all_cols)
+        corder, torder = process_order(fks, all_cols, composite_fks)
         ov, sizes = {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
@@ -137,6 +183,31 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+        unique_tuples: list = []
+        for t in tnames:
+            pk = tables[t].primary_key
+            if pk:
+                unique_tuples.append((t, list(pk)))
+            for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
+                if idx[2]:
+                    cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                    ccols = [c[2] for c in cols if c[2]]
+                    if ccols:
+                        unique_tuples.append((t, ccols))
+            for cm in tables[t].columns:
+                if cm.unique:
+                    unique_tuples.append((t, [cm.name]))
+        seen_ut, ut2 = set(), []
+        for t, cols in unique_tuples:
+            k = (t, tuple(cols))
+            if k not in seen_ut:
+                seen_ut.add(k)
+                ut2.append((t, cols))
+        unique_tuples = ut2
+        comp_child_cols: dict = {}
+        for cf in composite_fks:
+            comp_child_cols.setdefault(cf.child_table, set()).update(cf.child_cols)
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index,
+                  composite_fks, single_fk_cols, comp_child_cols, unique_tuples)

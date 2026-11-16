@@ -1,11 +1,11 @@
 """Greedy test-suite distillation (paper section 3.2; no upstream code)."""
 
 
-def distill_instances(kills: dict, neighbors: dict, max_keep=None) -> list:
+def distill_instances(kills, neighbors, max_keep=None):
     """Greedy set cover: keep the unit killing most not-yet-killed neighbours, ties -> smallest id."""
     targets = {n for ids in neighbors.values() for n in ids}
-    killed: set = set()
-    kept: list = []
+    killed = set()
+    kept = []
     while max_keep is None or len(kept) < max_keep:
         best, gain = None, 0
         for u in sorted(kills):

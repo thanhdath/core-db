@@ -1,55 +1,532 @@
 {
  "db": "e_government",
- "operator_io_quirks": [
-  "Backtick-quoted DDL identifiers; table names mixed case (Addresses, Party_Forms); column names lowercase with typos (inidividual_phone, service_descriptio) - keep original spelling, quote with \" in generated SQL.",
-  "All tables tiny (5-15 rows); no huge-table sampling needed, but read_schema must still handle max_rows_per_table path.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional secs); ts_fuzzer dispatch = 'Date|Number(int elements)' - first element '2016-08-24 23:52:48' does NOT parse as int, so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "Party_Services has NO primary key (pk=[]) and no unique constraint; booking_id is NOT NULL but not PK - sample_fresh_primary_keys must no-op on empty PK.",
-  "Composite PKs: Organization_Contact_Individuals(individual_id,organization_id), Party_Addresses(party_id,address_id), Party_Forms(party_id,form_id) - composite-PK members get max_l0=30.",
-  "FK customer_id -> Parties.party_id (column name differs from parent PK name); FK mapping must use pragma foreign_key_list, not name matching.",
-  "All FKs resolve to existing parents (parent_exists=true); no dangling FKs, no self-references, no cycles - process_order is a clean DAG.",
-  "NOT NULL columns: service_type_code, form_type_code, payment_method_code, address_type_code, form_status_code, all composite-PK members, all *_from/*_started/service_datetime - TS does not enforce NOT NULL, so some rows will fail insert and be skipped.",
-  "Declared VARCHAR(n) but storage class text everywhere; INTEGER PKs store integer - affinity matches, no storage/declared contradiction.",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs - checked=False for all columns, so p=0-on-checked never triggers.",
-  "country has distinct=1 ('USA'), state_province_county distinct=13 of 15 - low-cardinality columns where TS String fuzzer will inject implausible fresh strings.",
-  "zip_postcode samples are 3-digit strings ('193','227') - int-like strings, so String fuzzer adds str(i+1)/str(i-1) neighbors."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on all DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max parsed originals (~2016-04 to 2018-03); fresh dates uniform in that range, so date_contact_to > date_contact_from ties are NOT guaranteed - likely FP source for temporal-ordering queries.",
-  "String fuzzer on names/emails/phones/addresses: 20% fresh random strings over a-zA-Z 0-9() plus 50% contaminate (suffix/prefix/drop char) - destroys email/phone/zip format, drives FN on LIKE '%@%' or regex-ish predicates.",
-  "String fuzzer on low-cardinality enums (service_type_code, payment_method_code, form_status_code, address_type_code): 5 original samples + pool values, but fresh random strings appear w.p. p - breaks equality/IN filters on these codes (FN).",
-  "Number fuzzer on INTEGER PKs: range [-10^4,10^4] (scale=4 default for bare INTEGER? actually int family scale from args, none -> scale=4), perturb +-1/+-2 - PKs become large/negative, so joins still work but range predicates on ids shift.",
-  "FK fill draws from parent's FINAL filtered values with replacement - child rows may repeat parent values, so 1:N joins produce duplicate-heavy results; missing ties (parent has fewer distinct than child rows) is a known TS miss.",
-  "Composite-PK tables: sample_fresh_primary_keys drops duplicate (individual_id,organization_id) tuples, then drop_unique_duplicates - but FK draws happen before filtering for self-FK only; here no self-FK, so child FK values drawn from filtered parents, may leave orphan-ish combos that still insert.",
-  "Party_Services has no PK: no dedup, so duplicate (customer_id,service_id,service_datetime) rows possible - COUNT(*) queries get inflated, COUNT(DISTINCT) stable.",
-  "NOT NULL violations (fresh strings never NULL, but Number/String samplers can emit None? base drops None; Date can emit None?) - rows failing NOT NULL are silently skipped, shrinking tables below chosen size, so join cardinalities drift.",
-  "country='USA' constant: TS String fuzzer will emit random strings, so WHERE country='USA' returns 0 rows in many instances - classic FN.",
-  "date_formed on Organizations (5 rows) gets fresh dates in 2016-2017 range; queries filtering date_formed by year will mostly match but boundary years may miss.",
-  "No CHECK/UNIQUE beyond PK: drop_unique_duplicates only acts on PKs, so no extra row loss from unique columns."
- ],
- "challenger_refs": [
-  "G6",
-  "ga6dea15a",
-  "ga6dea15a",
-  "ga6dea15a",
-  "ga6dea15a",
-  "ga6dea15a",
-  "ga6dea15a",
-  "g3654b5b4",
-  "g3654b5b4",
-  "G4",
-  "g9fc97908",
-  "G3",
-  "g7a962501",
-  "g29b2edd1",
-  "G2",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "integer_fk": "Sample uniformly from the parent table's generated primary-key values; nullable FKs get NULL in ~10% of rows.",
+   "varchar_short": "Random word-like token of 3-15 lowercase letters, capitalized first letter; length within declared limit.",
+   "varchar_name": "Random first/last name from a small built-in pool; duplicates allowed on DISTINCT-targeted columns.",
+   "varchar_email": "lowercase(first).lowercase(last) + random 2-digit number + '@example.com'.",
+   "varchar_phone": "Random US-style phone '###-###-####' or '(###)###-####x####'.",
+   "varchar_address_line": "Random number 1-99999 + space + capitalized word + ' ' + street suffix (St, Ave, Blvd, Rd, Lane, Way) + optional ' Suite ###'.",
+   "varchar_city": "Random capitalized word + optional suffix (town, berg, land, bury, ville).",
+   "varchar_zip": "3-digit zero-padded string '000'-'999'.",
+   "varchar_state": "Random US state name without spaces (e.g. NorthCarolina).",
+   "varchar_country": "Constant 'USA'.",
+   "varchar_description": "Short sentence derived from the row's name column.",
+   "datetime": "Random timestamp between 2016-01-01 and 2018-03-31, format '%Y-%m-%d %H:%M:%S'.",
+   "datetime_nullable": "Same as datetime; NULL in ~10% of rows.",
+   "enum_code": "Uniform choice from the column's enum list (see per_column_exceptions).",
+   "near_variant": "For LIKE/equality targets, generate the exact literal plus one-step variants (case change, trailing ' x', last-char change) and one row with the exact literal.",
+   "boundary_numeric": "For numeric boundary targets, generate values at the literal, literal-1 and literal+1.",
+   "tie_order": "Ensure at least two rows share the top aggregate value on the ORDER column.",
+   "null_share": "Every nullable column gets at least one NULL row per instance; share ~10% unless overridden."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Addresses.country",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "USA",
+      "usa"
+     ]
+    }
+   },
+   {
+    "column": "Addresses.line_1_number_building",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "6862 Kaitlyn Knolls Suite 309",
+      "%6862 Kaitlyn Knolls%"
+     ],
+     "variants": [
+      "6862 Kaitlyn Knolls",
+      "6862 Kaitlyn Knollt",
+      "6862 Kaitlyn Knolls x",
+      "6862 kaitlyn knolls"
+     ]
+    }
+   },
+   {
+    "column": "Addresses.state_province_county",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Colorado%",
+      "Colorado"
+     ],
+     "variants": [
+      "Coloradp",
+      "Colorado x",
+      "colorado"
+     ]
+    }
+   },
+   {
+    "column": "Addresses.town_city",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Individuals.individual_first_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Individuals.individual_middle_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Individuals.individual_last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Organizations.organization_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Organizations.organization_name",
+    "pattern": "null_rows",
+    "targets": {
+     "nullable": true
+    }
+   },
+   {
+    "column": "Organizations.organization_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Organizations.organization_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Organization_Contact_Individuals.organization_id",
+      "Parties.party_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Parties.party_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Parties.party_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "SUM(party_services.service_id)"
+     ]
+    }
+   },
+   {
+    "column": "Parties.party_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(parties.party_id)",
+      "COUNT(DISTINCT parties.party_id)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "Parties.party_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Organizations.organization_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Parties.party_email",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "SUM(party_services.service_id)"
+     ]
+    }
+   },
+   {
+    "column": "Parties.party_email",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Parties.payment_method_code",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "Organization_Contact_Individuals.organization_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Organizations.organization_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Organization_Contact_Individuals.date_contact_to",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Party_Forms.form_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Forms.form_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Forms.form_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Party_Services.customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Party_Services.service_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Parties.payment_method_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Cheque",
+      "Credit Card",
+      "Cash",
+      "Direct Debit"
+     ]
+    }
+   },
+   {
+    "column": "Party_Addresses.address_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Residence",
+      "Billing",
+      "Delivery"
+     ]
+    }
+   },
+   {
+    "column": "Party_Forms.form_status_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Completed",
+      "Partially Completed",
+      "Not Started",
+      "Work In Progress"
+     ]
+    }
+   },
+   {
+    "column": "Services.service_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Education",
+      "Welfare",
+      "Health"
+     ]
+    }
+   },
+   {
+    "column": "Forms.form_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Basic",
+      "Complex"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Forms.service_id",
+    "parent_table": "Services",
+    "parent_column": "service_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Organization_Contact_Individuals.organization_id",
+    "parent_table": "Organizations",
+    "parent_column": "organization_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Organization_Contact_Individuals.individual_id",
+    "parent_table": "Individuals",
+    "parent_column": "individual_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Addresses.address_id",
+    "parent_table": "Addresses",
+    "parent_column": "address_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Addresses.party_id",
+    "parent_table": "Parties",
+    "parent_column": "party_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Forms.party_id",
+    "parent_table": "Parties",
+    "parent_column": "party_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Forms.form_id",
+    "parent_table": "Forms",
+    "parent_column": "form_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Services.service_id",
+    "parent_table": "Services",
+    "parent_column": "service_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Party_Services.customer_id",
+    "parent_table": "Parties",
+    "parent_column": "party_id",
+    "copied_columns": []
+   },
+   {
+    "unique": "Organization_Contact_Individuals(individual_id, organization_id)"
+   },
+   {
+    "unique": "Party_Addresses(party_id, address_id)"
+   },
+   {
+    "unique": "Party_Forms(party_id, form_id)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Organization_Contact_Individuals",
+    "column": "date_contact_to",
+    "formula": "date_contact_to IS NULL OR date_contact_to >= date_contact_from"
+   },
+   {
+    "table": "Party_Addresses",
+    "column": "date_address_to",
+    "formula": "date_address_to IS NULL OR date_address_to >= date_address_from"
+   },
+   {
+    "table": "Party_Forms",
+    "column": "date_fully_completed",
+    "formula": "date_fully_completed IS NULL OR date_fully_completed >= date_completion_started"
+   },
+   {
+    "table": "Party_Services",
+    "column": "booking_made_date",
+    "formula": "booking_made_date IS NULL OR booking_made_date >= service_datetime"
+   },
+   {
+    "table": "Parties",
+    "column": "payment_method_code",
+    "formula": "payment_method_code IN ('Cheque','Credit Card','Cash','Direct Debit')"
+   },
+   {
+    "table": "Party_Addresses",
+    "column": "address_type_code",
+    "formula": "address_type_code IN ('Residence','Billing','Delivery')"
+   },
+   {
+    "table": "Party_Forms",
+    "column": "form_status_code",
+    "formula": "form_status_code IN ('Completed','Partially Completed','Not Started','Work In Progress')"
+   },
+   {
+    "table": "Services",
+    "column": "service_type_code",
+    "formula": "service_type_code IN ('Education','Welfare','Health')"
+   },
+   {
+    "table": "Forms",
+    "column": "form_type_code",
+    "formula": "form_type_code IN ('Basic','Complex')"
+   },
+   {
+    "table": "Addresses",
+    "column": "country",
+    "formula": "country = 'USA'"
+   },
+   {
+    "table": "Party_Services",
+    "column": "booking_id",
+    "formula": "booking_id > 0"
+   },
+   {
+    "table": "Party_Services",
+    "column": "service_id",
+    "formula": "service_id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 15,
+   "Services": 15,
+   "Forms": 6,
+   "Individuals": 15,
+   "Organizations": 5,
+   "Parties": 15,
+   "Organization_Contact_Individuals": 15,
+   "Party_Addresses": 15,
+   "Party_Forms": 13,
+   "Party_Services": 15
+  },
+  "null_targets": [
+   "Organizations.organization_name",
+   "Organization_Contact_Individuals.date_contact_to",
+   "Party_Addresses.date_address_to",
+   "Party_Forms.date_fully_completed",
+   "Party_Services.booking_made_date",
+   "Forms.service_id",
+   "Organizations.date_formed",
+   "Organizations.uk_vat_number",
+   "Services.service_name",
+   "Services.service_descriptio",
+   "Forms.form_number",
+   "Forms.form_name",
+   "Forms.form_description",
+   "Addresses.line_1_number_building",
+   "Addresses.town_city",
+   "Addresses.zip_postcode",
+   "Addresses.state_province_county",
+   "Addresses.country",
+   "Individuals.individual_first_name",
+   "Individuals.individual_middle_name",
+   "Individuals.inidividual_phone",
+   "Individuals.individual_email",
+   "Individuals.individual_address",
+   "Individuals.individual_last_name",
+   "Parties.party_phone",
+   "Parties.party_email"
+  ],
+  "supporting_evidence": {
+   "date_order_rules": "Organization_Contact_Individuals rows show date_contact_to (2018-03-25) > date_contact_from (2016-08-16); Party_Addresses date_address_to (2018-02-28) > date_address_from (2016-04-08); Party_Forms date_fully_completed (2018-02-11) > date_completion_started (2017-12-17); Party_Services booking_made_date (2018-03-23) > service_datetime (2018-03-10).",
+   "enums": "Parties.payment_method_code observed values Cheque, Credit Card, Cash, Direct Debit; Party_Addresses.address_type_code Residence, Billing, Delivery; Party_Forms.form_status_code Completed, Partially Completed, Not Started, Work In Progress; Services.service_type_code Education, Welfare, Health; Forms.form_type_code Basic, Complex.",
+   "country": "Addresses.country all 'USA' in sample.",
+   "positive_ids": "booking_id and service_id in Party_Services are positive integers in sample."
+  },
+  "uncertainty": "No calculated/derived numeric columns exist in the schema, so no arithmetic formulas are stated. Nullable FK Forms.service_id is nullable per schema but observed non-NULL; NULL rows are still generated per the NULL rule. Group-size and tie targets are approximated by controlling duplicate counts on the named columns."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `table_sizes_per_instance` gives exact sizes (e.g. Addresses: 15, Organizations: 5), but `choose_table_sizes` in instance.py applies \u00b140% jitter and a 30% chance of an empty table (`base = 0`). Execution feedback shows Addresses 268 rows over 20 instances (~13.4/instance) and Organizations 56 (~2.8/instance), not the specified 15 and 5. The spec text says 'table sizes per instance' without stating jitter is allowed.",
+     "requested_revision": "Either state explicitly in the specification that per-instance sizes are jittered around the listed base (and that empty tables are permitted), or remove the jitter/empty-table branch so generated sizes match the listed values. This is a documentation/consistency gap, not a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_group_sizes` in instance.py replaces a grouping column with `[v0, v1, v1, big, big, ...]`, which forces one singleton, one pair and one large group. This is applied to `Organizations.organization_id` and `Parties.party_id`, which are primary keys. Because PKs are also regenerated as sequential integers (`floor + i + 1`) *before* `_group_sizes` runs, the group-shaping overwrites the sequential PKs with duplicates; `sample_fresh_primary_keys` then drops the duplicate rows. Execution feedback shows Organizations 56 rows over 20 instances (~2.8/instance vs. spec 5) and Parties 48 (~2.4/instance vs. spec 15), with 40 Organization_Contact_Individuals and 41 Party_Services rows skipped \u2014 consistent with PK dedup collapsing the intended sizes.",
+     "requested_revision": "Do not apply `_group_sizes` to primary-key columns; group-size targets on PKs are not meaningful (a PK is unique by definition, so group sizes are always 1). Restrict GROUP_SIZES shaping to non-key grouping columns (e.g. organization_name, party_email, form_name) and let PKs stay sequential. This preserves the specified table sizes and avoids the row-skipping observed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` plants NULLs on `Addresses.country`, but the specification's semantic rule states `country = 'USA'` and the comparison_boundary target requires values 'USA' and 'usa'. Execution feedback shows `Addresses.country: generated rows: NULL 28 / 268`. Under SQL three-valued logic a NULL country does not violate `country = 'USA'` (it is UNKNOWN, not FALSE), so this is permitted by the NULL rule, but it weakens the boundary target (only ~89% of rows carry USA/usa).",
+     "requested_revision": "Optional: exclude `Addresses.country` from the blanket NULLABLE set (or reduce its NULL share) so the comparison_boundary target on 'USA'/'usa' is more strongly represented. Not blocking, since the NULL rule explicitly allows NULL on nullable columns and the rule holds under three-valued logic."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists `Parties.party_id` with `unmatched_join_rows` targeting `Organizations.organization_id` (parent_rows_without_children), and `Organizations.organization_id` with `unmatched_join_rows` targeting `Organization_Contact_Individuals.organization_id` and `Parties.party_id`. The program implements FK sampling from parent values (`fill_foreign_keys_consistently`) but does not explicitly guarantee parent rows without children; it relies on random sampling leaving some parents unmatched. Execution feedback shows 0 FK violations and 0 not-null violations, and construction_pairs separated 26/49, so the pattern is plausibly realized, but there is no explicit construction guaranteeing unmatched parents.",
+     "requested_revision": "Either add an explicit construction step ensuring at least one parent row per targeted join has no child (e.g. reserve a parent PK not drawn by any child FK), or note in the specification that unmatched-parent patterns are approximated by random FK sampling. Not blocking given the observed separation."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the \u00b140% size jitter and 30% empty-table chance are intended by the designer (spec lists fixed sizes).",
+    "Whether group-size targets on primary-key columns (Organizations.organization_id, Parties.party_id) are intended, given PK uniqueness makes them degenerate and the current implementation collapses table sizes.",
+    "Exact per-instance realization of unmatched-parent patterns for the two join targets; only aggregate separation (26/49) was observed, not per-instance guarantees."
+   ],
+   "summary": "The program runs cleanly (20/20 valid, 0 FK/not-null/PK violations, reproducible), implements the enum domains, near-variant banks, date-order formulas, positive-id rules, and the NULL rule. Two consistency issues are worth fixing but do not block a pass: (1) the specification lists fixed table sizes while the program jitters them and sometimes empties tables; (2) the program applies group-size shaping to primary-key columns, which collapses Organizations/Parties row counts and causes row skipping. Both are addressable by tightening the spec or restricting GROUP_SIZES to non-key columns. Semantic rules (date ordering, enums, country, positive ids) are supported by the sample evidence and constructed in code."
+  }
+ ]
 }

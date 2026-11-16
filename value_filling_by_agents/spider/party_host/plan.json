@@ -1,49 +1,447 @@
 {
  "db": "party_host",
- "operator_io_quirks": [
-  "All identifiers are mixed-case (Party_ID, Is_Main_in_Charge); must double-quote with original spelling.",
-  "DDL uses backtick-quoted FK parents (`host`, `party`) \u2014 sqlite_master text must be replayed verbatim; backticks are valid sqlite quoting.",
-  "First_year/Last_year/Age are declared TEXT but store 4-digit years / ages as text; TS dispatches them to String, not Date/Number.",
-  "Is_Main_in_Charge declared bool, storage class text with values 'T'/'F' (not 1/0) \u2014 Bool fuzzer emits True/False/1/0, contradicting storage.",
-  "party_host is a pure junction: composite PK (Party_ID,Host_ID), both columns also FKs to party/host; PK members are FK children.",
-  "All columns notnull=0, so TS may insert NULLs into PK/FK columns; sqlite PK on non-INTEGER columns allows NULLs, so PK dedup may not catch NULL rows.",
-  "Tiny tables (8/10/6 rows) \u2014 choose_table_sizes will massively over-generate vs original; FK child draws from small parent pools with replacement.",
-  "party_host.Party_ID distinct=5 < party rows=8 and Host_ID distinct=6 < host rows=10 \u2014 original junction is sparse, not a full cross product.",
-  "No unique/check constraints, no indexes, no views/triggers in DDL.",
-  "Location has trailing-space and comma-joined multi-value samples ('Hemkade 48 Zaandam, Heineken Music Hall ') \u2014 string contamination will look plausible.",
-  "Number_of_hosts values (5,23,4,6,31) exceed party_host row counts \u2014 no FK-like consistency between it and junction rows."
- ],
- "operator_ts_expectations": [
-  "Party_ID/Host_ID/Number_of_hosts -> Number fuzzer, scale 0, range [-1,1] full-range draws plus +-1/+-2 perturbations of sampled elements; fresh draws cluster near 0, far from original 1..10.",
-  "Party_Theme/Location/Name/Nationality -> String fuzzer, length range from samples, CHARSET a-zA-Z 0-9() with 50% contamination \u2014 produces implausible names/locations.",
-  "First_year/Last_year/Age -> String fuzzer (declared TEXT), so years become random strings, not 4-digit years; int-like elements get +-1 variants only.",
-  "Is_Main_in_Charge -> Bool fuzzer emits True/False (Python bools -> 1/0 in sqlite), contradicting original 'T'/'F' text storage.",
-  "party_host FK columns draw from party.Party_ID / host.Host_ID final filtered values with replacement; PK dedup then drops duplicate (Party_ID,Host_ID) pairs, shrinking junction below requested size.",
-  "Because PK members are also FK children, sample_fresh_primary_keys runs after FK fill; composite-PK member max_l0=30 caps fresh draws, so junction values are mostly reused parent keys.",
-  "Expected FN: gold queries filtering on 'T'/'F', on year strings like '2000', or on specific themes/locations will get no matching rows from contaminated strings.",
-  "Expected FP: gold queries with COUNT/aggregate or DISTINCT over tiny tables may coincidentally match because TS over-generates rows and aggregates saturate.",
-  "Expected FP: queries relying on junction sparsity (e.g. hosts per party) may match by luck since TS junction is near-dense over small parent pools.",
-  "Expected FN: queries on Number_of_hosts vs actual junction counts \u2014 TS never ties the two, so consistency queries fail both ways.",
-  "Expected FP: empty-result gold queries (e.g. impossible year) may return rows because String fuzzer emits arbitrary text that occasionally matches.",
-  "No Date/Time fuzzers fire here; no crash-fallback types; no dangling FKs; no self-references."
- ],
- "challenger_refs": [
-  "G3",
-  "gc2e36016",
-  "g2b7ddcf9",
-  "G4",
-  "g131fc1d2",
-  "gb9de1546",
-  "G1",
-  "G2",
-  "G5",
-  "g9c1236db"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_pk": "Sequential integers starting at 1, unique per table; never NULL; generated PKs are disjoint from compact PKs (start above max compact PK).",
+   "int_fk": "Sample from the union of compact parent PKs and generated parent PKs; the FK column is NOT NULL unless declared nullable; never plant NULL in a NOT NULL / primary-key FK column.",
+   "int_quantity": "Positive integers in a small range (1-50); never NULL when NOT NULL.",
+   "text_short": "Draw from a small pool of realistic short strings; allow case/spacing/punctuation near-variants; NULL only where the column is nullable.",
+   "text_name": "Draw from a pool of person-like names; enforce a 20-50% duplicate share across DISTINCT queries; NULL only where nullable.",
+   "text_nationality": "Draw from a small enum-like pool of country names; enforce a 20-50% duplicate share; NULL only where nullable.",
+   "text_year": "Four-digit year strings in 1990-2020; duplicates allowed; NULL only where nullable.",
+   "bool_flag": "Sample from {0,1} (or 'T'/'F' text form); occasional NULL only where nullable.",
+   "boundary_numeric": "For numeric columns with comparison targets, include every listed literal and one step on each side (e.g. 34,35,36,44,45,46 for age boundaries); these boundary literals are non-NULL and must survive NULL planting; if the target row count is smaller than the boundary set, raise the row count (never truncate the boundary set).",
+   "tie_order": "For ORDER/COUNT columns, ensure at least two rows share the top count value so rank-1 ties occur in both ASC and DESC directions; a tie at rank 'any (no LIMIT)' is satisfied trivially by returning all rows.",
+   "null_share": "For every nullable column, each instance contains at least one NULL row and a NULL share following the compact database's observed share; where the compact share is 0.0, use a uniform fallback NULL_SHARE = 0.10 (5-10% band) for all nullable columns; NOT NULL and primary-key columns never receive NULL; one planted NULL is never replaced to satisfy another rule.",
+   "composite_pk": "Draw composite primary-key tuples without replacement from the cross product of parent PK pools; if the cross product is smaller than the target child row count, raise the parent table sizes (or reduce the child count) so the cross product is large enough; assert len(set(pairs)) == n and the final child row count equals the target size before writing; no duplicate-producing fallback.",
+   "childless_parent_verify": "Operate on the union of compact+generated parent PKs and the union of compact+generated referenced PKs (compact party_host rows count as references). Reserve a parent PK that is not already referenced by any compact or generated child row; if no such PK exists, generate an extra parent row (raise table size) so a childless parent is guaranteed. Assert before writing that each referenced parent table has at least one unreferenced PK."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "host",
+    "column": "Age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      34,
+      35,
+      36,
+      44,
+      45,
+      46
+     ],
+     "note": "boundary literals must be present as non-NULL values; plant NULLs only on non-boundary positions; assert all six appear in final non-NULL Age values; choose_table_sizes must guarantee host size >= 6 (TABLE_SIZES['host'] - 2 >= len(AGE_BOUNDARY))"
+    }
+   },
+   {
+    "table": "host",
+    "column": "Nationality",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "host",
+    "column": "Nationality",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(party_host.host_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "host",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "party",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "party",
+    "column": "Party_Theme",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "party",
+    "column": "Party_Theme",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT) \u2014 trivially satisfied, all rows returned",
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "party",
+    "column": "Number_of_hosts",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": "per group, ensure at least 2 rows carry different non-NULL Number_of_hosts values; NULLs, where allowed, are excluded from this comparison"
+    }
+   },
+   {
+    "table": "party_host",
+    "column": "Party_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "party.Party_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "party_host",
+    "column": "Host_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "host.Host_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "host",
+    "column": "Host_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "party_host.Host_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "party",
+    "column": "Party_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "party_host.Party_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "party_host",
+    "child_column": "Host_ID",
+    "parent_table": "host",
+    "parent_column": "Host_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "party_host",
+    "child_column": "Party_ID",
+    "parent_table": "party",
+    "parent_column": "Party_ID",
+    "copied_columns": []
+   },
+   {
+    "kind": "primary_key_tuple",
+    "table": "party_host",
+    "columns": [
+     "Party_ID",
+     "Host_ID"
+    ],
+    "rule": "composite PK; each (Party_ID, Host_ID) pair unique; draw pairs without replacement from the cross product of the union of compact+generated parent PK pools so exactly n unique rows are produced; assert len(set(pairs)) == n and final row count == target before writing; if cross product < n, raise parent table sizes"
+   },
+   {
+    "kind": "parent_childless_guarantee",
+    "tables": [
+     "host",
+     "party"
+    ],
+    "rule": "reserve at least one parent PK (from the union of compact+generated PKs) that is not referenced by any compact or generated party_host row; if no such PK exists, generate an extra parent row (raise table size); verify after construction that host and party each contain a childless row; assert before writing"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "host",
+    "column": "Age",
+    "formula": "CAST(Age AS INTEGER) BETWEEN 18 AND 60",
+    "evidence": "observed ages 26-47"
+   },
+   {
+    "table": "party",
+    "column": "First_year",
+    "formula": "CAST(First_year AS INTEGER) BETWEEN 1990 AND 2020",
+    "evidence": "observed 1999-2004"
+   },
+   {
+    "table": "party",
+    "column": "Last_year",
+    "formula": "CAST(Last_year AS INTEGER) BETWEEN 1990 AND 2020",
+    "evidence": "observed 2001-2010"
+   },
+   {
+    "table": "party",
+    "column": "Last_year",
+    "formula": "Last_year IS NULL OR First_year IS NULL OR CAST(Last_year AS INTEGER) >= CAST(First_year AS INTEGER)",
+    "evidence": "all shown rows satisfy Last_year >= First_year; rule evaluated on non-NULL operands only (SQL three-valued logic)"
+   },
+   {
+    "table": "party",
+    "column": "Number_of_hosts",
+    "formula": "Number_of_hosts IS NULL OR Number_of_hosts > 0",
+    "evidence": "observed 4-31; NULL permitted by schema and excluded from comparison rules"
+   },
+   {
+    "table": "party_host",
+    "column": "Is_Main_in_Charge",
+    "formula": "Is_Main_in_Charge IS NULL OR Is_Main_in_Charge IN (0, 1)",
+    "evidence": "observed T/F"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "host": 10,
+   "party": 8,
+   "party_host": 6
+  },
+  "null_targets": [
+   "host.Name",
+   "host.Nationality",
+   "host.Age",
+   "party.Party_Theme",
+   "party.Location",
+   "party.First_year",
+   "party.Last_year",
+   "party.Number_of_hosts",
+   "party_host.Is_Main_in_Charge"
+  ],
+  "supporting_evidence": {
+   "host.Age": [
+    "43",
+    "37",
+    "31",
+    "26",
+    "45",
+    "47",
+    "30",
+    "40"
+   ],
+   "party.First_year": [
+    "2000",
+    "2002",
+    "2001",
+    "2004",
+    "1999"
+   ],
+   "party.Last_year": [
+    "2001",
+    "2002",
+    "2003",
+    "2004",
+    "2007",
+    "2010"
+   ],
+   "party.Number_of_hosts": [
+    5,
+    23,
+    4,
+    6,
+    31,
+    7,
+    18
+   ],
+   "party_host.Is_Main_in_Charge": [
+    "T",
+    "F"
+   ]
+  },
+  "uncertainty": "The compact database shows null_rate 0.0 for all columns, but the schema allows NULL on most text columns and on party_host.Is_Main_in_Charge. The uniform 10% NULL share is the fallback for all nullable columns because the compact share is 0.0; this is required by the interface rule (instruction 10), not by an observed atomic operation. party_host.Party_ID is NOT NULL by schema and by PRIMARY KEY so it is not listed in null_targets; the null_rows atomic operation for it (IS NULL) is unsatisfiable by generated data and is dropped. Number_of_hosts remains nullable per schema but its range rule excludes NULL from the >0 check and rows_with_different_values is evaluated on non-NULL operands only. Last_year >= First_year is evaluated only on non-NULL operands (a planted NULL yields UNKNOWN, not FALSE). No calculated column exists; Number_of_hosts is not derived from party_host counts in the shown data (party 1 has 5 hosts but only one party_host row), so no aggregate formula is stated. The ties_for_order_limit target at rank 'any (no LIMIT)' for party.Party_Theme is vacuous and recorded only for completeness. The childless-parent guarantee and the composite-PK row-count guarantee must be verified after construction; the boundary set for host.Age must not be truncated if the host row count is reduced below 6. The generator must be run on at least one instance and report rows_ok/rows_failed per table plus explicit assertions that (a) party_host has exactly TABLE_SIZES['party_host'] rows, (b) at least one host and one party PK is unreferenced, (c) all six host.Age boundary literals appear as non-NULL, and (d) every nullable column has at least one NULL and one non-NULL value."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/cli.py `_one()` calls `build_random_instance(_G['schema'], _G['pool'], None, rng)` and then `write_instance_sqlite(_G['schema'], inst, p)` \u2014 the `orig_path` argument is never passed, so `write_instance_sqlite` falls into the `orig_path is None` branch and creates an empty DDL clone instead of copying the compact database. The module docstring and writer docstring both claim 'Each instance is a byte copy of the compact database; generated rows are appended'. This contradicts the stated design and the 'preservation of compact rows' requirement.",
+     "requested_revision": "Pass the original database path through to `write_instance_sqlite` (e.g. store `orig` in `_G['args']` and call `write_instance_sqlite(schema, inst, p, orig_path=a['orig'])`), so instances are copies of the compact DB with appended rows as specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_spec` overwrites `host.Host_ID` and `party.Party_ID` with `_fresh_pk(...)` starting at `max(existing)+1`, and `party_host` FKs are drawn from `_parent_pool` = compact values + generated values. Because generated PKs are strictly greater than all compact PKs, generated `party_host` rows can only reference generated parents, never compact parents. Combined with the writer bug above (compact rows absent), the 'parent_rows_without_children' target for `host.Host_ID`/`party.Party_ID` (unmatched_join_rows) is not guaranteed: every generated parent may end up with a child, and no compact parent exists to be childless. The spec explicitly requires `parent_rows_without_children: true` for both.",
+     "requested_revision": "Ensure at least one parent row (compact or generated) has no matching `party_host` row in every instance, e.g. by reserving a parent PK that is excluded from the FK pool, or by verifying after construction that `party` and `host` each contain a childless row and regenerating/adjusting otherwise."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_spec` for `party_host` dedupes the composite PK `(Party_ID, Host_ID)` but does not enforce the `unmatched_join_rows` target for `party_host.Party_ID`/`Host_ID` (parent rows without children). More importantly, `_sample_number_of_hosts` only guarantees `>= 2 distinct values` across the whole column, not '>= 2 per group with different values' as the atomic operation `rows_with_different_values` for `party.Number_of_hosts` states. With `TABLE_SIZES['party'] = 8` and random draws from 1..50, distinctness is likely but not guaranteed per group; the spec target is not implemented by construction.",
+     "requested_revision": "Implement the `rows_with_different_values` target explicitly: for each group (e.g. per party theme or per party), ensure at least two rows carry different `Number_of_hosts` values, or document that the target is interpreted column-wide and adjust the spec accordingly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` lists only `party_host.Party_ID`, and the `uncertainty` note says the `null_rows` atomic operation (`PRED(party_host.party_id IS NULL)`) 'cannot be satisfied by generated data and is recorded only as a null_targets note'. However, the interface rule (instruction 7) requires NULL generation for every nullable column, and the schema declares `party_host.Party_ID` as part of the PRIMARY KEY (hence NOT NULL). The spec's `NOT_NULL_COLUMNS` correctly excludes it, but the `null_targets` field still names it, which is inconsistent and could mislead the engineer into planting NULLs in a NOT NULL column.",
+     "requested_revision": "Remove `party_host.Party_ID` from `null_targets` (it is NOT NULL) and instead list the actually nullable columns that should receive NULLs (e.g. `host.Name`, `host.Nationality`, `host.Age`, `party.Party_Theme`, `party.Location`, `party.First_year`, `party.Last_year`, `party.Number_of_hosts`, `party_host.Is_Main_in_Charge`), consistent with `NOT_NULL_COLUMNS`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_nulls` is applied to `party.Number_of_hosts` via `_null_share_for('party','Number_of_hosts')`, which returns `spec.NULL_SHARE` (0.10) because the column is not in `NOT_NULL_COLUMNS`. But `Number_of_hosts` is declared `int` in the schema and the semantic rule `Number_of_hosts > 0` is stated; planting NULLs there is allowed by SQL three-valued logic, yet the spec's `semantic_rules_and_formulas` does not mention NULL handling for this column, and the `rows_with_different_values` target (`>= 2 per group with different values`) is weakened when NULLs replace values. This is a spec/implementation mismatch rather than a hard error, but it should be reconciled.",
+     "requested_revision": "Either add `('party','Number_of_hosts')` to `NOT_NULL_COLUMNS` (if the intent is a positive integer column) or explicitly document in the spec that NULLs are permitted and that the `rows_with_different_values` target is evaluated on non-NULL operands only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_sample_age` builds `vals` from `spec.AGE_BOUNDARY` (6 values) then pads to `n`; with `TABLE_SIZES['host'] = 10` and jitter `-2..+2`, `n` can be as low as 8, so all six boundary values fit. However `_plant_nulls` is then applied with `NULL_SHARE = 0.10`, which can NULL out one of the boundary values (e.g. 34 or 46), breaking the `comparison_boundary` target `values: [34,35,36,44,45,46]`. The spec requires these literals to be present; the implementation does not protect them from NULL planting.",
+     "requested_revision": "Plant NULLs in `host.Age` only on non-boundary positions, or re-insert boundary values after NULL planting, so that all six boundary literals remain present as non-NULL values in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_sample_last_year` uses `first_years[i]` but `first` may contain NULLs (planted by `_plant_nulls`); the code handles `fy is None` by drawing an unconstrained year, which is correct under SQL three-valued logic. However `_plant_nulls` is then applied again to `Last_year`, which can NULL out a value that was chosen to satisfy `Last_year >= First_year`. This is acceptable under three-valued logic (NULL operand makes the comparison unknown, not FALSE), but the spec's `semantic_rules_and_formulas` states the rule as a hard constraint without noting the NULL exception. Minor documentation gap.",
+     "requested_revision": "Add a note to the spec that `Last_year >= First_year` is evaluated only on non-NULL operands (SQL three-valued logic), consistent with the interface rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows `n_instances: 0`, `run_seconds: 0.1`, and empty `construction_pairs_by_group`. No instances were actually generated, so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified from execution evidence. The `returncode: 0` with zero instances suggests the generation command was not exercised (e.g. empty `--pool-sqls` or `--i0 == --i1`).",
+     "requested_revision": "Run the generator with a non-empty instance range and a valid `--orig` path, and provide execution feedback showing `n_instances > 0`, per-table row counts, and confirmation that compact rows are preserved and FKs resolve."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether generated `party_host` rows ever reference compact parent rows (currently impossible given `_fresh_pk` starts above max compact PK).",
+    "Whether `parent_rows_without_children` holds for `host` and `party` in practice (no execution evidence).",
+    "Whether `rows_with_different_values` for `party.Number_of_hosts` holds per group (implementation only guarantees column-wide distinctness).",
+    "Whether the `ties_for_order_limit` target for `host.Nationality` (rank-1 tie on `COUNT(party_host.host_id)` and `COUNT(*)` in both ASC and DESC) is achievable given the small `party_host` size (6 rows) and the FK pool restriction to generated parents.",
+    "Whether `party.Party_Theme` `ties_for_order_limit` (ORDER BY party_theme ASC, no LIMIT) is trivially satisfied \u2014 it is, since no LIMIT means all rows are returned, but the spec's 'tie_at_rank: any (no LIMIT)' is vacuous and should be clarified.",
+    "Whether the `duplicates_for_distinct` 20-50% share is actually achieved by `_dup_pool` after `_plant_nulls` and PK deduplication (NULLs and dropped rows can shift the share)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_spec` for `party_host` calls `_reserve_childless(party_pool, rng)` and `_reserve_childless(host_pool, rng)`, then draws FK values with `rng.choice(party_pool)` / `rng.choice(host_pool)`. `_reserve_childless` only removes one element from the *pool used for sampling*; it does not guarantee that the reserved parent PK is actually absent from the generated `party_host` rows. Because the pool is built from `schema.original_values` (compact parents) plus generated parents, and the compact DB already contains `party_host` rows referencing compact parents, the 'childless parent' guarantee is not verified after construction. The spec's `parent_childless_guarantee` rule explicitly requires 'verify after construction that host and party each contain a childless row', which the code does not do.",
+     "requested_revision": "After building `party_host`, compute the set of referenced Party_ID/Host_ID values (compact + generated) and assert that at least one parent PK in `host` and one in `party` is unreferenced; if not, adjust the FK draws (e.g. exclude a reserved PK from all draws, not just from the sampling pool) and re-verify. Add this verification to `_apply_spec` or `build_random_instance`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_spec` dedupes the composite PK of `party_host` by keeping the first occurrence of each (Party_ID, Host_ID) pair, but the FK columns are drawn independently with replacement from the pools. With `TABLE_SIZES['party_host'] = 6` and small pools (compact + 8 generated parties, compact + 10 generated hosts), collisions are possible; the dedupe then *drops rows*, so the final `party_host` row count can be less than 6. The spec's `table_sizes_per_instance` states `party_host: 6`, and the writer's `rows_ok`/`rows_failed` accounting will not reflect the dropped rows (they are removed before writing). This silently violates the target size and can also remove the only row referencing a parent, weakening the childless guarantee.",
+     "requested_revision": "Draw FK pairs without replacement (or retry on collision) so that exactly `n` unique composite-PK rows are produced, and assert the final row count equals the target size before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_sample_age` builds `vals = list(spec.AGE_BOUNDARY)` then truncates with `vals = vals[:n]`. If `n < 6` (possible because `choose_table_sizes` applies jitter `rng.randint(-2, 2)` to `TABLE_SIZES['host'] = 10`, giving 8-12, so n>=8 here \u2014 but the truncation logic is fragile and would drop boundary literals for any smaller n). More importantly, `_plant_nulls` is called with `protect=age_protected`, but `age_protected` is computed *after* shuffling, so it correctly identifies boundary positions; however, `_plant_nulls` uses `rng.sample(candidates, k)` where `k = max(1, round(n*0.10))`. For n=10, k=1, so exactly one NULL is planted \u2014 fine. The real issue: `_sample_age` returns `[str(v) for v in vals]` but `spec.AGE_BOUNDARY` values are ints; the boundary check `v in spec.AGE_BOUNDARY` in the protected-set comprehension compares ints to ints (correct), but the returned values are strings. This is consistent with the TEXT column type, so not a bug per se. However, the spec's `boundary_numeric` rule says boundary literals 'must survive NULL planting' \u2014 this is satisfied only because `protect` is passed. No blocking error here, but the truncation `vals[:n]` should be guarded.",
+     "requested_revision": "Guard `_sample_age` so that if `n < len(spec.AGE_BOUNDARY)`, the boundary literals are still all present (e.g. by not truncating, or by documenting that n>=6 is guaranteed). Add an assertion that all six boundary literals appear in the final non-NULL Age values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` includes `host.Age`, `party.First_year`, `party.Last_year`, `party.Number_of_hosts`, and `party_host.Is_Main_in_Charge`, and the `null_share` rule says 'each instance contains at least one NULL row'. But `_plant_nulls` uses `k = max(1, int(round(n * share)))` with `share = 0.10`. For `party_host` with n=6, k=1 \u2014 OK. For `party` with n=8, k=1 \u2014 OK. For `host` with n=10, k=1 \u2014 OK. So the 'at least one NULL' rule is satisfied. However, the spec's `uncertainty` note says 'the compact database shows null_rate 0.0 for all columns' and the interface rule says 'NULL share following the compact database's share for that column'. The spec uses a fixed 10% share for all nullable columns, which does not follow the compact share (0.0). The interface rule allows 'a small nonzero share such as 5-10%' when the compact share is 0.0, so this is acceptable per the stated rule, but the spec should explicitly state that the 10% is the chosen fallback for the 0.0 compact share.",
+     "requested_revision": "Clarify in the spec that `NULL_SHARE = 0.10` is the fallback for columns whose compact share is 0.0, and that it applies uniformly. No code change required if the interface rule is interpreted as allowing this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `n_instances: 0` and `construction_pairs_by_group: []`, with `run_seconds: 0.1`. No instances were actually generated, so there is no execution evidence for integrity constraints, dependent-value consistency, preservation of compact rows, or reproducible generation. The `cli.py` `_one` function returns `''` on success and the exception type name on failure, but the feedback summary is empty, suggesting the generation run did not execute (or produced zero units). Without execution evidence, the review cannot confirm that the program runs and produces instances without errors.",
+     "requested_revision": "Run the generator (e.g. `python -m tscore_gen.cli generate --db ... --orig ... --ds ... --root ... --pool-sqls ... --i0 0 --i1 10`) and provide the execution feedback showing `n_ok > 0`, `n_fail = 0`, and the per-table `rows_ok`/`rows_failed` counts. Verify that compact rows are preserved (row counts in each instance >= compact counts) and that the childless-parent guarantee holds."
+    }
+   ],
+   "unresolved_checks": [
+    "No execution evidence: the generator was not run (n_instances=0), so integrity constraints, FK consistency, compact-row preservation, and reproducibility are unverified.",
+    "The childless-parent guarantee is not verified after construction; the code only removes one element from the sampling pool, which does not guarantee the reserved PK is unreferenced in the final party_host rows.",
+    "Composite PK dedupe in party_host can drop rows below the target size of 6; the final row count is not asserted.",
+    "The spec's `null_share` rule and the interface rule are consistent (10% fallback for 0.0 compact share), but the spec should state this explicitly.",
+    "The `_sample_age` truncation `vals[:n]` would drop boundary literals if n < 6; currently n>=8 due to jitter, but the code should guard against this."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_spec` overwrites `h['Host_ID']` and `p['Party_ID']` with `_fresh_pk(...)` AFTER `fill_foreign_keys_consistently` and `sample_fresh_primary_keys` have already run, and AFTER `party_host` FK pools were computed from the pre-overwrite `inst` in the same call. More importantly, `_apply_spec` is called once at the end of `build_random_instance`, but the `party_host` block reads `_parent_pool(inst, schema, 'party', 'Party_ID')` / `'host','Host_ID'` from `inst` \u2014 which at that point does contain the freshly overwritten PKs, so the FK pool is consistent. However, the writer appends these rows to a *copy of the compact DB*, and the compact DB already contains `party_host` rows referencing compact `party`/`host` PKs. The `_verify_childless` check unions compact referenced sets with generated ones, which is correct, but `_reserve_childless` only removes one element from the *generated* pool; if the compact `party_host` already references every compact `party`/`host` PK and the generated pool has exactly one element, `_reserve_childless` returns `reserved=None` and the assertion `all_party - ref_party` can still pass only by luck. The guarantee is not enforced when the pool has size 1.",
+     "requested_revision": "Make `_reserve_childless` operate on the union of compact+generated parent PKs and the union of compact+generated referenced PKs, reserving a PK that is not already referenced by compact `party_host` rows. If no such PK exists, generate an extra parent row (raise table size) so a childless parent is guaranteed. Assert this before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_draw_unique_pairs` falls back to `out.append((rng.choice(party_pool), rng.choice(host_pool)))` when the cross product is exhausted, which can produce duplicate composite PK tuples. The writer then inserts them into a table with `PRIMARY KEY (Party_ID, Host_ID)`; `executemany` will raise `sqlite3.IntegrityError`, the row-by-row fallback will skip the duplicate, and `rows_failed` will be non-zero. The spec's `composite_pk` rule requires 'the final child row count equals the target size' and 'assert the final row count before writing' \u2014 neither is done.",
+     "requested_revision": "Remove the duplicate-producing fallback. If `len(party_pool) * len(host_pool) < n`, raise the parent table sizes (or reduce `n`) so the cross product is large enough, and assert `len(set(pairs)) == n` before returning. Also assert the final `party_host` row count equals the target size in `_apply_spec`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_sample_age` returns `[str(v) for v in vals]` and `_plant_nulls` may NULL positions, but `_apply_spec` asserts `str(b) in non_null` for every boundary literal. `_sample_age` protects boundary positions via `age_protected`, but `_plant_nulls` computes `k = max(1, int(round(n * share)))` and samples `k` candidates from `candidates`; if `n - len(protected) < k`, `k` is clamped to `len(candidates)`, which is fine. However, `_sample_age` shuffles `vals` and then computes `protected = {i for i, v in enumerate(vals) if v in spec.AGE_BOUNDARY}` \u2014 this is correct. The real issue: `choose_table_sizes` raises `host` size to `len(spec.AGE_BOUNDARY)` = 6, but `TABLE_SIZES['host'] = 10` with jitter `[-2,2]` can yield 8, which is still >= 6, so the boundary set fits. No bug here, but the assertion is only in `_apply_spec`; if `n < 6` (e.g. jitter to 8 is fine, but a future change to `TABLE_SIZES` could break it), the assert fires. This is acceptable but fragile.",
+     "requested_revision": "Move the boundary-coverage assertion into `choose_table_sizes` (or a pre-check) so a too-small `host` size is caught before sampling, and document that `TABLE_SIZES['host'] - 2 >= len(AGE_BOUNDARY)` must hold."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` includes `host.Age`, `party.First_year`, `party.Last_year`, `party.Number_of_hosts`, and `party_host.Is_Main_in_Charge`, but the atomic operations list only shows a `null_rows` pattern for `party_host.Party_ID` (which is NOT NULL and unsatisfiable). The spec's `uncertainty` note says the `party_host.Party_ID` null_rows op is 'dropped', but the spec does not explicitly state that the other nullable columns' NULL planting is required by the interface rule (instruction 7) rather than by an observed atomic operation. This is a documentation gap, not a correctness bug, but it means the NULL rule is applied uniformly at 10% rather than following the compact share (which is 0.0 for all columns).",
+     "requested_revision": "Clarify in the spec that the uniform 10% NULL share is the fallback for all nullable columns because the compact share is 0.0, and that this is required by the interface rule, not by an observed pattern. No code change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_sample_last_year` uses `lo = max(spec.YEAR_MIN, int(fy))` and `rng.randint(lo, spec.YEAR_MAX)`. If `fy` is a string like '2020', `lo = 2020`, and `randint(2020, 2020)` returns 2020, so `Last_year >= First_year` holds. But `_plant_nulls` is applied to `Last_year` after `_sample_last_year`, and `_plant_nulls` may NULL a `Last_year` position where `First_year` is non-NULL \u2014 that's fine (3-valued logic). However, `_plant_nulls` is also applied to `First_year` *before* `_sample_last_year` is called, so `_sample_last_year` sees the NULLed `First_year` and generates an unconstrained `Last_year`. This is correct per the spec's 3-valued logic note. No bug.",
+     "requested_revision": "None; this is a confirmation, not an issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `n_instances: 0` and `construction_pairs_by_group: []`, meaning no instances were actually generated or verified. The `returncode: 0` with empty `summary` and `stderr_tail` suggests the CLI ran but produced no output, or the feedback harness did not exercise the generator. Without execution evidence, the integrity constraints (composite PK uniqueness, childless-parent guarantee, boundary-literal survival, NULL planting) are unverified.",
+     "requested_revision": "Run the generator on at least one instance and report `rows_ok`/`rows_failed` per table, plus explicit assertions that (a) `party_host` has exactly `TABLE_SIZES['party_host']` rows, (b) at least one `host` and one `party` PK is unreferenced, (c) all six `host.Age` boundary literals appear as non-NULL, and (d) every nullable column has at least one NULL and one non-NULL value. Re-submit with this evidence."
+    }
+   ],
+   "unresolved_checks": [
+    "No execution evidence: the generator was not run on any instance, so composite-PK uniqueness, childless-parent guarantee, boundary-literal survival, and NULL planting are unverified.",
+    "The `_reserve_childless` logic does not account for compact `party_host` rows already referencing compact parent PKs; the childless guarantee may fail when the generated pool has size 1.",
+    "The `_draw_unique_pairs` fallback can produce duplicate composite PKs, violating the spec's row-count guarantee.",
+    "The spec's NULL rule is applied uniformly at 10% rather than following the compact share (0.0); this is documented as a fallback but not explicitly tied to the interface rule."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 2 of 20 units failed with AssertionError('host row count must cover the age boundary set') (units 13 and 19). choose_table_sizes() applies jitter rng.randint(-2, 2) to the base host size 10, producing host sizes as low as 8, then only raises to max(size, len(AGE_BOUNDARY)) = 6. But _sample_age() asserts n >= len(boundary) where boundary has 6 elements \u2014 that passes for n=8. The real failure is that _apply_spec() calls _sample_age(n, rng) with n = len(h['Host_ID']) AFTER sample_fresh_primary_keys/drop_unique_duplicates may have shrunk the host table below 6 rows (e.g. duplicate PKs or unique-column drops), so n < 6 triggers the assert. The spec explicitly requires 'choose_table_sizes must guarantee host size >= 6 (TABLE_SIZES['host'] - 2 >= len(AGE_BOUNDARY))' and 'the boundary set for host.Age must not be truncated if the host row count is reduced below 6' \u2014 the program does not enforce this after dedup.",
+     "requested_revision": "In _apply_spec (or before it), after sample_fresh_primary_keys/drop_unique_duplicates, if the final host row count is below len(spec.AGE_BOUNDARY), either (a) top up the host table with additional fresh rows so n >= 6, or (b) raise the host size in choose_table_sizes to base + max_jitter + len(AGE_BOUNDARY) so post-dedup n is guaranteed >= 6. Also assert the final host row count >= 6 before calling _sample_age. Re-run generation and confirm 0 AssertionErrors and rows_ok for host on all units."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped = {'party_host': 22} across 18 units, i.e. ~1.2 party_host rows per instance are rejected by the writer. The spec requires 'assert len(set(pairs)) == n and the final child row count equals the target size before writing'. The writer's per-row fallback silently drops rows that violate constraints (likely composite-PK collisions with compact party_host rows, since _draw_unique_pairs only dedups against generated pairs, not against compact (Party_ID, Host_ID) tuples already present in the copied DB). This violates the composite_pk rule ('draw pairs without replacement from the cross product ... so exactly n unique rows are produced') and the spec's explicit assertion (a) 'party_host has exactly TABLE_SIZES['party_host'] rows'.",
+     "requested_revision": "In _draw_unique_pairs (or _apply_spec), seed the `seen` set with the compact party_host (Party_ID, Host_ID) tuples from schema.original_values so generated pairs never collide with existing rows. Then assert the final party_host row count equals the target and that rows_skipped['party_host'] == 0. Re-run and confirm rows_skipped is empty for party_host."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty section states: 'party_host.Party_ID is NOT NULL by schema and by PRIMARY KEY so it is not listed in null_targets; the null_rows atomic operation for it (IS NULL) is unsatisfiable by generated data and is dropped.' The atomic-operations extraction lists party_host.Party_ID null_rows with pairs=2 and target null_share 'none (NOT NULL column)'. This is consistent with the schema (PRIMARY KEY implies NOT NULL) and the interface NULL rule ('NOT NULL / primary-key columns never get NULL'), so dropping it is correct \u2014 but the spec should record this explicitly as a resolved/unsatisfiable pattern rather than leaving it ambiguous. No code change needed; the designer should confirm the drop is intentional and documented.",
+     "requested_revision": "Add an explicit note in the specification's uncertainty/atomic-operations section that party_host.Party_ID null_rows is unsatisfiable by construction (PK NOT NULL) and is intentionally excluded from null_targets, so reviewers do not treat it as a missing pattern."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: host.Age BETWEEN 18 AND 60 is supported by observed ages 26-47 (8 values) \u2014 reasonable. party.First_year/Last_year BETWEEN 1990 AND 2020 supported by observed 1999-2004 / 2001-2010 \u2014 reasonable. Last_year >= First_year supported by 'all shown rows satisfy' \u2014 but the supporting_evidence lists only 5 First_year and 6 Last_year values, and the spec admits 'all shown rows satisfy' without stating the row count. Number_of_hosts > 0 supported by observed 4-31. Is_Main_in_Charge IN (0,1) supported by observed T/F. These are adequately evidenced for a compact DB, but the Last_year >= First_year rule is only weakly evidenced (small sample) and should be flagged as uncertain rather than asserted as a hard formula.",
+     "requested_revision": "Mark Last_year >= First_year as 'supported by small sample (n=5-6), treat as soft/uncertain' in the specification, or provide the full row count backing the claim. No program change required since the sampler already enforces it on non-NULL operands."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: host.Age generated rows NULL 12/139 (~8.6%), host.Name 18/139 (~13%), party.* 18/116 (~15.5%), party_host.Is_Main_in_Charge 17/101 (~17%). The spec sets NULL_SHARE = 0.10 uniformly, but observed shares exceed 10% because _plant_nulls uses k = max(1, round(n*share)) per instance and the per-instance n is small (host ~8-12, party ~6-10), so rounding inflates the share. The interface rule says 'NULL share following the compact database's share for that column' \u2014 compact share is 0.0, so the fallback 5-10% band applies. Observed 13-17% exceeds the 5-10% band.",
+     "requested_revision": "In _plant_nulls, cap k so the realized share stays within the 5-10% band: k = min(max(1, round(n*share)), max(1, int(n*0.10))) and ensure k/n <= 0.10. Alternatively, compute k = max(1, min(int(round(n*share)), int(n*0.10))) and verify per-instance NULL share <= 0.10. Re-run and confirm nullable-column NULL shares are within 5-10%."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs: eligible=40, separated=9 \u2014 separation is low but the instructions state a missing separation alone does not establish a generation error; not blocking.",
+    "party_host.Party_ID null_rows atomic operation is unsatisfiable by schema (PK NOT NULL); documented as dropped in spec uncertainty \u2014 acceptable but should be explicitly recorded (see issue 3).",
+    "Ties for ORDER(COUNT(...)) at rank 1 in both ASC and DESC: spec claims tie_order rule ensures at least two rows share the top count; not directly verified in execution feedback (no per-instance tie check reported). Recommend the engineer add an assertion that at least two hosts share the max party_host count and at least two share the min, to confirm the tie_order rule is realized."
+   ]
+  }
+ ]
 }

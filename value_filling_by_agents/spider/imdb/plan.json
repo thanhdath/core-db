@@ -1,49 +1,790 @@
 {
  "db": "imdb",
- "operator_io_quirks": [
-  "All 16 tables report rows=0 and empty samples/storage: the frozen original is effectively empty (or unreadable), so original_values/original_sizes are all empty/0 and literal pool must come from TRAIN SQL only.",
-  "DDL uses backtick-quoted FK parents (`actor`(\"aid\")) while tables are double-quoted; sqlite_master DDL must be replayed verbatim for the empty clone.",
-  "FK targets are non-unique parents: cast.msid, classification.msid, directed_by.msid, made_by.msid, tags.msid, written_by.msid all reference copyright(msid), which is NOT the PK (PK is id) and has no unique index -> dangling/duplicate parent values are legal.",
-  "written_by has NO primary key (pk=[]); sample_fresh_primary_keys must no-op and drop_unique_duplicates has nothing to drop.",
-  "writer.name and writer.nationality are declared INT but semantically text (names/nationalities) -> Number fuzzer will emit integers for name/nationality; storage class contradiction.",
-  "movie.budget and tv_series.budget are declared TEXT (money) -> String fuzzer, not Number.",
-  "release_year / birth_year / num_of_episodes / num_of_seasons are INT -> Number fuzzer, not Date/Year; no date-typed column anywhere.",
-  "All columns notnull=0, no CHECK, no UNIQUE, no DEFAULT -> nothing enforced in Python; only PK/insert errors skip rows.",
-  "Table names are lowercase, no spaces, no mixed case; identifiers still must be double-quoted per spec.",
-  "copyright is a hub: 6 child tables FK to it; its msid is the join key but not unique, so FK consistency draws from a non-unique parent column.",
-  "cast.role is INT (role id), not text role name -> Number fuzzer.",
-  "No self-references, no composite PKs, no missing-parent FKs in this DB."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer (scale from INT -> scale 0, range [-1,1] then perturb +-1/+-2) for all *_id, birth_year, release_year, num_of_*, role, and for writer.name/nationality (declared INT).",
-  "String fuzzer (length 20, charset a-zA-Z 0-9()) for gender, name, nationality, birth_city, title, title_aka, budget, genre, keyword, country_code, company.name.",
-  "FK columns (cast.aid/msid, classification.gid/msid, directed_by.did/msid, made_by.pid/msid, tags.kid/msid, written_by.wid/msid) draw from parent's final column with replacement; copyright.msid non-unique so many children share few msids.",
-  "Empty original -> original_values empty -> samplers rely on literal pool + fresh draws; p=0.2 default, whole-instance p=0 w.p. 0.3.",
-  "PKs are single-column INT -> max_l0=inf for PK columns, so fresh PK draws never reuse -> PKs unique, no duplicate-row drops expected.",
-  "Likely FN driver: implausible values (writer.name as integer, budget as random string, gender as random charset) make gold predicates like name LIKE '%X%' or budget comparisons trivially empty/over-full.",
-  "Likely FP driver: copyright.msid non-unique means joins produce many-to-many blowups; TS does not model that ties exist, so COUNT/DISTINCT queries may match by accident.",
-  "No date columns -> Date fuzzer never used; no Bool/Bit/Time columns.",
-  "written_by has no PK -> no dedup, duplicate (msid,wid) rows possible, inflating join cardinalities.",
-  "release_year as Number in [-1,1]+perturb -> years like 0,1,-1,2, not 1990s; year-range predicates (release_year > 2000) return empty in TS but non-empty in real data -> FN.",
-  "budget TEXT random strings -> numeric budget comparisons (CAST) behave erratically."
- ],
- "challenger_refs": [
-  "gadd16ee2",
-  "gf83089aa",
-  "g8ec764e4",
-  "g6669ff68",
-  "g1f7a7ea2",
-  "gae721d21",
-  "g6bee928b",
-  "g2ceb6e9c",
-  "g52e676a8",
-  "g8dd9f0bf"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL.",
+   "int_foreign_key": "Sample from parent primary-key pool; 10% NULL when column is nullable; 15% of parent rows left without children.",
+   "int_range": "Uniform integer within the stated range; boundary values at each listed literal and one step on each side.",
+   "int_quantity": "Integer > 0.",
+   "int_year": "Integer in [1900, 2024]; boundary values at listed literals and one step on each side.",
+   "text_name": "Pick from a pool of 40 person names; 25% of rows reuse an existing name (duplicates on DISTINCT); include case variants (lowercase) of listed literals.",
+   "text_title": "Pick from a pool of 40 titles; 25% of rows reuse an existing title; include case variants and near-variants (append ' x', drop last char) of listed literals.",
+   "text_generic": "Pick from a pool of 30 short strings; 10% NULL when nullable; include near-variants of listed LIKE literals.",
+   "text_enum": "Uniform over the listed enum values; include case variants of listed literals.",
+   "text_budget": "String of form '<digits> million' or NULL.",
+   "text_country_code": "Two-letter uppercase code from a pool of 20.",
+   "text_nullable": "10% NULL; otherwise from the column pool.",
+   "fresh_value_share": "0.75 fresh, 0.25 reused from pool.",
+   "null_planting": "For every nullable column (including nullable foreign keys) plant NULLs at the column's NULL share (10% default) BEFORE applying any other sampler or semantic rule; ensure at least one NULL row per nullable column per instance; planted NULLs are never replaced to satisfy a rule.",
+   "duplicate_cap": "For columns with a duplicates_for_distinct target, lower the sampler's fresh-value cap BEFORE sampling so the realized duplicate share falls in the target band; verify after sampling."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "movie.title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie.title",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Saving Private Ryan",
+      "saving private ryan",
+      "Rush Hour 3",
+      "rush hour 3",
+      "Jim Jarmusch",
+      "jim jarmusch"
+     ]
+    }
+   },
+   {
+    "column": "movie.title",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Persians%",
+      "% Iraq%"
+     ],
+     "variants": [
+      "Persians",
+      "Persiant",
+      "Persians x",
+      "persians",
+      " Iraq",
+      " Irar",
+      " Iraq x",
+      " iraq"
+     ]
+    }
+   },
+   {
+    "column": "movie.mid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "cast.msid",
+      "directed_by.msid",
+      "tags.msid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "actor.name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "actor.name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Humphrey Bogart",
+      "humphrey bogart",
+      "Shahab Hosseini",
+      "shahab hosseini",
+      "Jennifer Aniston",
+      "jennifer aniston"
+     ]
+    }
+   },
+   {
+    "column": "director.name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Quentin Tarantino",
+      "quentin tarantino",
+      "Jim Jarmusch",
+      "jim jarmusch",
+      "Steven Spielberg",
+      "steven spielberg"
+     ]
+    }
+   },
+   {
+    "column": "movie.release_year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      2001,
+      2002,
+      2003,
+      2009,
+      2010,
+      2011
+     ]
+    }
+   },
+   {
+    "column": "directed_by.msid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.mid",
+      "made_by.msid",
+      "cast.msid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "cast.msid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.mid",
+      "directed_by.msid",
+      "director.did"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "actor.aid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "cast.aid",
+      "movie.mid",
+      "director.did"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "actor.birth_city",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "New York City",
+      "new york city",
+      "Los Angeles",
+      "los angeles",
+      " ",
+      " x"
+     ]
+    }
+   },
+   {
+    "column": "director.did",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "directed_by.did",
+      "movie.mid",
+      "actor.aid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "keyword.keyword",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Persians",
+      "persians",
+      "Iraq war",
+      "iraq war",
+      "",
+      "x"
+     ]
+    }
+   },
+   {
+    "column": "cast.aid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "actor.aid",
+      "actor.nationality",
+      "director.did"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "directed_by.did",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "director.did",
+      "director.gender"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "actor.nationality",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "China",
+      "china",
+      "Iran",
+      "iran",
+      "New York City",
+      "new york city"
+     ]
+    }
+   },
+   {
+    "column": "keyword.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "tags.kid",
+      "tags.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "tags.kid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "keyword.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "tags.msid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.mid",
+      "movie.title"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "made_by.pid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "producer.pid",
+      "movie.mid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "made_by.msid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.mid",
+      "directed_by.msid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "actor.birth_year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1979,
+      1980,
+      1981,
+      1999,
+      2000,
+      2001
+     ]
+    }
+   },
+   {
+    "column": "producer.pid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "made_by.pid",
+      "movie.mid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "movie.title_aka",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "%Iraq-war%",
+      "%Persians%",
+      "%Persian%"
+     ],
+     "variants": [
+      "Iraq-war",
+      "Iraq-was",
+      "Iraq-war x",
+      "iraq-war",
+      "Persians",
+      "Persiant",
+      "Persians x",
+      "persians"
+     ]
+    }
+   },
+   {
+    "column": "actor.gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "female",
+      "FEMALE",
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "copyright.msid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.mid",
+      "directed_by.msid",
+      "classification.msid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "director.nationality",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Iran",
+      "iran",
+      "China",
+      "china"
+     ]
+    }
+   },
+   {
+    "column": "writer.name",
+    "pattern": "type_override",
+    "targets": {
+     "declared_type": "INT",
+     "effective_type": "TEXT",
+     "reason": "schema anomaly; semantically a person name"
+    }
+   },
+   {
+    "column": "writer.nationality",
+    "pattern": "type_override",
+    "targets": {
+     "declared_type": "INT",
+     "effective_type": "TEXT",
+     "reason": "schema anomaly; semantically a country name"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "cast.aid",
+    "parent_table": "actor",
+    "parent_column": "aid",
+    "copied": []
+   },
+   {
+    "child": "cast.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "classification.gid",
+    "parent_table": "genre",
+    "parent_column": "gid",
+    "copied": []
+   },
+   {
+    "child": "classification.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "directed_by.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "directed_by.did",
+    "parent_table": "director",
+    "parent_column": "did",
+    "copied": []
+   },
+   {
+    "child": "made_by.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "made_by.pid",
+    "parent_table": "producer",
+    "parent_column": "pid",
+    "copied": []
+   },
+   {
+    "child": "tags.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "tags.kid",
+    "parent_table": "keyword",
+    "parent_column": "id",
+    "copied": [],
+    "note": "DDL declares references keyword(kid) which is dangling; spec overrides to keyword.id"
+   },
+   {
+    "child": "written_by.msid",
+    "parent_table": "copyright",
+    "parent_column": "msid",
+    "copied": []
+   },
+   {
+    "child": "written_by.wid",
+    "parent_table": "writer",
+    "parent_column": "wid",
+    "copied": []
+   },
+   {
+    "child": "copyright.msid",
+    "parent_table": "movie",
+    "parent_column": "mid",
+    "copied": [],
+    "note": "not declared in DDL; spec-driven FK"
+   },
+   {
+    "child": "copyright.cid",
+    "parent_table": "company",
+    "parent_column": "id",
+    "copied": [],
+    "note": "not declared in DDL; spec-driven FK"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "actor",
+    "column": "birth_year",
+    "formula": "birth_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "actor",
+    "column": "gender",
+    "formula": "gender IN ('male','female','M','F','m','f')"
+   },
+   {
+    "table": "director",
+    "column": "birth_year",
+    "formula": "birth_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "director",
+    "column": "gender",
+    "formula": "gender IN ('male','female','M','F','m','f')"
+   },
+   {
+    "table": "producer",
+    "column": "birth_year",
+    "formula": "birth_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "producer",
+    "column": "gender",
+    "formula": "gender IN ('male','female','M','F','m','f')"
+   },
+   {
+    "table": "writer",
+    "column": "birth_year",
+    "formula": "birth_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "writer",
+    "column": "gender",
+    "formula": "gender IN ('male','female','M','F','m','f')"
+   },
+   {
+    "table": "writer",
+    "column": "num_of_episodes",
+    "formula": "num_of_episodes >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "release_year",
+    "formula": "release_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "tv_series",
+    "column": "release_year",
+    "formula": "release_year BETWEEN 1900 AND 2024"
+   },
+   {
+    "table": "tv_series",
+    "column": "num_of_seasons",
+    "formula": "num_of_seasons > 0"
+   },
+   {
+    "table": "tv_series",
+    "column": "num_of_episodes",
+    "formula": "num_of_episodes > 0"
+   },
+   {
+    "table": "cast",
+    "column": "role",
+    "formula": "role >= 0"
+   },
+   {
+    "table": "company",
+    "column": "country_code",
+    "formula": "length(country_code) = 2"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "actor": 40,
+   "director": 30,
+   "producer": 25,
+   "writer": 25,
+   "company": 20,
+   "genre": 12,
+   "keyword": 20,
+   "movie": 60,
+   "tv_series": 20,
+   "copyright": 80,
+   "cast": 120,
+   "classification": 80,
+   "directed_by": 80,
+   "made_by": 80,
+   "tags": 80,
+   "written_by": 80
+  },
+  "null_targets": [
+   "actor.gender",
+   "actor.name",
+   "actor.nationality",
+   "actor.birth_city",
+   "actor.birth_year",
+   "director.gender",
+   "director.name",
+   "director.nationality",
+   "director.birth_city",
+   "director.birth_year",
+   "producer.gender",
+   "producer.name",
+   "producer.nationality",
+   "producer.birth_city",
+   "producer.birth_year",
+   "writer.gender",
+   "writer.name",
+   "writer.nationality",
+   "writer.num_of_episodes",
+   "writer.birth_city",
+   "writer.birth_year",
+   "movie.title",
+   "movie.release_year",
+   "movie.title_aka",
+   "movie.budget",
+   "tv_series.title",
+   "tv_series.release_year",
+   "tv_series.num_of_seasons",
+   "tv_series.num_of_episodes",
+   "tv_series.title_aka",
+   "tv_series.budget",
+   "cast.msid",
+   "cast.aid",
+   "cast.role",
+   "classification.msid",
+   "classification.gid",
+   "directed_by.msid",
+   "directed_by.did",
+   "made_by.msid",
+   "made_by.pid",
+   "tags.msid",
+   "tags.kid",
+   "written_by.msid",
+   "written_by.wid",
+   "copyright.msid",
+   "copyright.cid",
+   "company.name",
+   "company.country_code",
+   "genre.genre",
+   "keyword.keyword"
+  ],
+  "supporting_evidence": [
+   {
+    "rule": "movie.release_year BETWEEN 1900 AND 2024",
+    "evidence": "atomic summary lists boundary literals 2001,2002,2003,2009,2010,2011 for PRED(movie.release_year < 2010)"
+   },
+   {
+    "rule": "actor.birth_year BETWEEN 1900 AND 2024",
+    "evidence": "atomic summary lists boundary literals 1979,1980,1981,1999,2000,2001 for PRED(actor.birth_year > 1980)"
+   },
+   {
+    "rule": "actor.gender IN ('male','female','M','F','m','f')",
+    "evidence": "atomic summary lists values female,FEMALE,F,f for PRED(actor.gender = 'female')"
+   },
+   {
+    "rule": "tv_series.num_of_seasons > 0",
+    "evidence": "quantity column; no zero/negative seasons observed in schema semantics"
+   },
+   {
+    "rule": "tv_series.num_of_episodes > 0",
+    "evidence": "quantity column; no zero/negative episodes observed in schema semantics"
+   },
+   {
+    "rule": "tags.kid -> keyword.id",
+    "evidence": "spec dependencies entry; DDL FK references keyword(kid) which is dangling and dropped by schema reader"
+   },
+   {
+    "rule": "copyright.msid -> movie.mid and copyright.cid -> company.id",
+    "evidence": "spec dependencies; not declared in DDL, must be augmented into schema.fks"
+   }
+  ],
+  "uncertainty": [
+   "Original tables are empty; all ranges and enums are inferred from atomic-operation literals and schema semantics, not from observed rows.",
+   "writer.name and writer.nationality are declared INT in the schema but semantically text; per_column_exceptions type_override instructs the program to use text pools.",
+   "copyright.msid and copyright.cid are treated as foreign keys to movie.mid and company.id although no explicit FK is declared; the program must augment schema.fks from the dependencies list.",
+   "tags.kid is intended to reference keyword.id despite the DDL typo referencing keyword(kid); the program must apply the spec-driven FK override.",
+   "Exact NULL shares per column are unknown; a uniform 10% NULL share is used for nullable columns, with at least one NULL row per nullable column per instance.",
+   "movie.mid comparison_boundary literals ('Steven Spielberg', 'China', etc.) are mis-attributed from join predicates and are intentionally omitted from per_column_exceptions; they are not valid INT PK values."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` computes `share = DUP_SHARE.get((t, tm.columns[0].name if False else None))` \u2014 this always evaluates to `DUP_SHARE.get((t, None))` which is always None, so the variable is dead. More importantly, `_apply_dup_cap` is called AFTER `cols` has already been sampled (`cols = {cm.name: [samplers[...].sample() for _ in range(n)] ...}`), so lowering `sampler.max_l0` has no effect on the already-drawn values. The `duplicates_for_distinct` target (20-50% duplicate share for movie.title and actor.name) is therefore not enforced by construction, contradicting the docstring claim 'the fresh-value cap is lowered so 20-50 % of rows reuse a value'.",
+     "requested_revision": "Apply the duplicate cap to the sampler BEFORE sampling the column (move `_apply_dup_cap` before the `cols = {...}` comprehension, or re-sample after capping), and remove the dead `share = DUP_SHARE.get((t, tm.columns[0].name if False else None))` line. Verify the resulting duplicate share for movie.title and actor.name falls in 20-50%."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` returns `[rng.choice(pv) for _ in range(n)]` with no NULL injection, and `build_random_instance` never plants NULLs for nullable FK columns. The spec's generic rule states '10% NULL when column is nullable' and the `unmatched_join_rows` exceptions explicitly list `child_rows_with_null_fk: true` for cast.msid, cast.aid, directed_by.msid, directed_by.did, made_by.msid, made_by.pid, tags.msid, tags.kid, written_by.*, copyright.*. Execution feedback confirms this: every nullable FK column shows 'NULL 0 / n' (e.g. cast.msid NULL 0/2349, directed_by.msid NULL 0/2091, tags.kid NULL 0/1935). The program interface rule requires at least one NULL row per nullable column.",
+     "requested_revision": "In `fill_foreign_keys_consistently` (and for any nullable non-FK column), plant NULLs at the specified share (10% or the compact DB's share) for nullable columns, ensuring at least one NULL per nullable column per instance. Do not replace planted NULLs when applying semantic rules (the rules already pass None through)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` draws child FK values from the parent's generated values with replacement, but `build_random_instance` then calls `sample_fresh_primary_keys` and `drop_unique_duplicates` on the child table, which can drop rows and thus remove some FK values. More critically, the parent's `inst[pt]` is only populated for tables already processed in `order`; for `copyright.msid -> movie.mid` and `copyright.cid -> company.id` (declared in the spec's `dependencies` but NOT in the schema's `pragma foreign_key_list`), `schema.fks` will not contain these keys, so `fill_foreign_keys_consistently` will not populate them at all \u2014 they fall through to the sampler. The spec's `dependencies` list explicitly requires these two FK relationships, but the program relies solely on `schema.fks` (from `pragma foreign_key_list`), which does not include them (the schema DDL has no FK for copyright.msid/cid).",
+     "requested_revision": "Either add the copyright.msid -> movie.mid and copyright.cid -> company.id relationships to `schema.fks` (e.g. via a spec-driven augmentation in `read_schema` or `build_random_instance`), or document that these are not enforced. As written, the spec's dependency list is not implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_augment_pool` adds BOUNDARY literals for `('movie', 'mid')` = ['Steven Spielberg', 'steven spielberg', 'China', 'china'] \u2014 these are person/country names being injected into an INT primary-key column. The spec's `comparison_boundary` for movie.mid lists these values, but they are semantically nonsensical for an INT PK and will be coerced by `NumberSampler` (which filters non-numeric via `_num`), so they are silently dropped. The spec's `uncertainty` notes this is inferred from atomic ops, but the program does not flag or handle the type mismatch. Similarly `('actor', 'birth_city')` includes ' ' and ' x' which are fine, but the movie.mid case is a spec/program inconsistency.",
+     "requested_revision": "Either remove the nonsensical movie.mid boundary literals from the spec (they appear to be a mis-attribution from a join predicate), or have the program explicitly skip non-numeric boundary literals for INT columns and log the skip. Do not silently drop them."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `writer.name` and `writer.nationality` as INT in the schema but the spec's `uncertainty` says 'generation uses text pools and the declared type is noted as a schema anomaly'. However, the program's `make_column_sampler` routes by `column.type_str` \u2014 for `writer.name` (INT) it will use `NumberSampler`, not a text pool. The spec's intent (text pools) is not implemented. Execution feedback shows writer.name NULL 0/995 but does not reveal whether values are numeric or text.",
+     "requested_revision": "Either (a) update the spec to accept numeric generation for writer.name/nationality (matching the declared INT type), or (b) add a per-column type override in the spec and have the program honor it (e.g. a `type_override` field consumed by `make_column_sampler`). The current spec text and program behavior disagree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` \u2014 the `orig_path` parameter defaults to None, so the compact database is NOT copied and `schema.ddl` is used to create tables. The docstring says 'Copies the compact database to path' but the CLI never passes `orig_path`. This means compact rows are not preserved (there are none in this empty-DB case, but the contract is violated for non-empty compact DBs).",
+     "requested_revision": "Pass `orig_path` (the `--orig` argument) through to `write_instance_sqlite` in cli.py, or update the docstring/contract to state that compact rows are only preserved when `orig_path` is supplied. Given the spec's 'preservation of compact rows' check, the CLI should pass it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "schema.py emits `UserWarning: dropping dangling FK tags.kid -> keyword.kid` (stderr_tail). The schema DDL declares `foreign key(\"kid\") references keyword(\"kid\")` but keyword's PK is `id`, not `kid` \u2014 so the FK is genuinely dangling in the DDL. The program correctly drops it, but then `tags.kid` is treated as a non-FK column and sampled freely, so it will not reference `keyword.id`. The spec's `dependencies` lists `tags.kid -> keyword.id` (parent_column 'id'), which the program does NOT implement because the DDL FK points to the wrong column. This is a spec-vs-schema mismatch that the program silently resolves by dropping the FK.",
+     "requested_revision": "Add a spec-driven FK override for `tags.kid -> keyword.id` (matching the spec's `dependencies` entry) so the program enforces the intended relationship despite the DDL typo. Alternatively, document in the spec that tags.kid is intentionally unconstrained."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` lists many columns as nullable (e.g. movie.title, actor.name, cast.msid), but the schema DDL declares none of these as NOT NULL \u2014 so they are technically nullable. However, the spec's `generic_sampling_rules` says '10% NULL when nullable' and the program interface rule requires at least one NULL per nullable column. Execution feedback shows NULL 0 for ALL nullable columns (e.g. movie.title NULL 0/1855, actor.name NULL 0/1082). The spec does not specify per-column NULL shares, and the program does not implement any NULL planting for non-FK columns either (only `_init_sampler`'s `p` parameter, which controls fresh-vs-reuse, not NULL).",
+     "requested_revision": "Add explicit NULL-share guidance to the spec (per-column or a global rule) and implement NULL planting in the program for all nullable columns, not just FKs. The current spec's '10% NULL when nullable' is not implemented anywhere in the program."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 20-50% duplicate share for movie.title and actor.name is actually achieved after the (currently ineffective) dup-cap fix \u2014 needs re-execution.",
+    "Whether copyright.msid/cid FK consistency is required given the schema has no declared FK \u2014 spec says yes, program says no.",
+    "Whether writer.name/nationality should be text or numeric \u2014 spec text and program behavior disagree.",
+    "Whether the compact DB is non-empty in the target environment (here it is empty, so preservation is untested)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` list includes `written_by.id` and `written_by.msid`/`written_by.wid` as nullable, and the execution feedback shows `written_by.id: generated rows: NULL 208 / 2075`. However, `written_by.id` is the primary key of `written_by` (per DDL `primary key(\"id\")`), so it must never be NULL. The program's `_plant_nulls` is only applied to non-FK, non-PK columns (`cm.pk_pos == 0`), so the observed NULLs in `written_by.id` are surprising and likely come from the sampler's own NULL emission rather than the NULL rule. This is a minor inconsistency between the spec's null_targets and the DDL, but it does not block generation (integrity check reports 0 not_null violations, 0 pk_duplicates).",
+     "requested_revision": "Designer should remove `written_by.id` (and any other PK column) from `null_targets`, since primary keys are NOT NULL by DDL. Engineer should confirm the program never plants NULLs into PK columns (it currently guards with `cm.pk_pos == 0`, which is correct, but the observed NULLs in `written_by.id` should be traced to the sampler and suppressed for PK columns)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` section correctly notes that `movie.mid` comparison_boundary literals ('Steven Spielberg', 'China', etc.) are mis-attributed join literals and are intentionally omitted from per_column_exceptions. However, the program's `BOUNDARY` dict in `instance.py` still includes `('movie', 'mid'): ['Steven Spielberg', 'steven spielberg', 'China', 'china']`. The `_augment_pool` function skips non-numeric boundary literals for INT columns (`if is_int and not re.fullmatch(r'-?\\d+', str(v)): continue`), so these are correctly filtered out at runtime. This is a harmless redundancy but a latent inconsistency.",
+     "requested_revision": "Engineer should remove the `('movie', 'mid')` entry from `BOUNDARY` in `instance.py` to match the specification's stated intent, or add a comment explaining the defensive filter. No behavioral change is required since the filter already handles it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `generic_sampling_rules.int_foreign_key` states '15% of parent rows left without children'. The program's `fill_foreign_keys_consistently` draws child FK values with replacement from the parent pool, which does not guarantee that 15% of parent rows are childless \u2014 it only guarantees that some parent rows may be unreferenced by chance. The `unmatched_join_rows` pattern is listed for many columns (e.g., `movie.mid`, `actor.aid`, `director.did`), and the execution feedback shows `construction_pairs.separated: 128/128`, so the intended separation is achieved in practice. However, the 15% childless-parent rule is not explicitly enforced.",
+     "requested_revision": "Engineer should either (a) explicitly reserve 15% of parent PK values to be excluded from the child FK draw, or (b) document that the with-replacement draw statistically produces childless parents and that the `unmatched_join_rows` pattern is satisfied by the `parent_rows_without_children: true` flag combined with the NULL planting on nullable FKs. Given that all 128 construction pairs are separated, this is a documentation/clarity issue rather than a blocking error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `generic_sampling_rules.text_name` and `text_title` state '25% of rows reuse an existing name/title (duplicates on DISTINCT)'. The program's `DUP_SHARE` sets `('movie', 'title'): 0.35` and `('actor', 'name'): 0.35`, and `_apply_dup_cap` lowers `max_l0` to `(1 - share) * n` fresh values. This targets a 35% duplicate share, which is within the spec's `duplicate_share: '20-50 %'` band but not exactly 25%. The spec's `duplicate_cap` rule says 'lower the sampler's fresh-value cap BEFORE sampling so the realized duplicate share falls in the target band', which the program does. The 35% choice is a reasonable midpoint of the 20-50% band.",
+     "requested_revision": "No change required; the 35% target is within the specified 20-50% band. Engineer may add a comment noting the choice of 35% as the midpoint."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `dependencies` list includes `copyright.msid -> movie.mid` and `copyright.cid -> company.id` as 'not declared in DDL; spec-driven FK', and `tags.kid -> keyword.id` as a DDL typo override. The program's `schema.py` `SPEC_FKS` correctly implements all three, and the execution feedback shows the dangling FK warning for `tags.kid -> keyword.kid` is emitted and the override applied. The `copyright.msid` and `copyright.cid` FKs are augmented. This is correctly implemented.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `per_column_exceptions` includes `type_override` for `writer.name` and `writer.nationality` (declared INT, effective TEXT). The program's `values.py` `TYPE_OVERRIDE` and `instance.py` `TYPE_OVERRIDE` both implement this, routing these columns to `StringSampler`. The execution feedback shows `writer.name` and `writer.nationality` have NULLs planted (183/1808) and no integrity violations, confirming the override works.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `tv_series.num_of_seasons > 0` and `tv_series.num_of_episodes > 0`, and `writer.num_of_episodes >= 0`. The program's `RULES` dict maps these to `_rule_positive` and `_rule_nonneg`, which clamp values to the correct domain. The execution feedback shows no integrity violations, confirming the rules are enforced.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` includes many nullable columns, and the execution feedback shows NULLs planted in all of them (e.g., `actor.birth_city: NULL 147/1485`, `cast.msid: NULL 448/2396`). The program's `_plant_nulls` plants at least one NULL per nullable column per instance, and the `fill_foreign_keys_consistently` function plants NULLs in nullable FKs. The NULL share is 10% by default, which is consistent with the spec's '10% default'. The execution feedback shows NULL shares ranging from ~10% to ~19% (e.g., `cast.msid: 448/2396 \u2248 18.7%`), which is higher than 10% but still within reasonable bounds given the with-replacement draw and the `_plant_nulls` call. The spec says 'NULL share following the compact database's share for that column', but the compact database is empty (per the spec's uncertainty note), so 10% is a reasonable default.",
+     "requested_revision": "No change required; the NULL rule is correctly implemented. Engineer may note that the observed NULL shares exceed 10% for some FK columns due to the with-replacement draw combined with NULL planting, but this does not violate the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `integrity: {fk_violations: 0, not_null_violations: 0, pk_duplicates: 0, not_ok: 0}` and `validity: {valid: 20, invalid: 0}`. The program ran 20 instances with 0 failures, 0 errors, and reproducible generation (`reproducible: true`). The `construction_pairs` show 128/128 separated, confirming the intended value variation is achieved. The `rows_added` and `rows_skipped` are empty in the summary, but the `write_instance_sqlite` function returns `rows_ok` and `rows_failed` dicts; the CLI's summary does not surface these, which is a minor reporting gap.",
+     "requested_revision": "Engineer should surface `rows_ok` and `rows_failed` from `write_instance_sqlite` in the CLI summary (currently `rows_added: {}` and `rows_skipped: {}` are hardcoded empty). This is a reporting improvement, not a blocking error."
+    }
+   ],
+   "unresolved_checks": [
+    "The compact database is empty (per the spec's uncertainty note), so the 'NULL share following the compact database's share' rule cannot be verified against actual compact data; the 10% default is used instead.",
+    "The 15% childless-parent rule for `unmatched_join_rows` is not explicitly enforced in the program; it is satisfied statistically by the with-replacement FK draw. This should be confirmed by the engineer as intentional.",
+    "The observed NULLs in `written_by.id` (a PK column) are surprising and should be traced; the program's `_plant_nulls` guards against PK columns, so the source of these NULLs is unclear from the code alone."
+   ]
+  }
+ ]
 }

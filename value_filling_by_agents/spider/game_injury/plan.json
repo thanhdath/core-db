@@ -1,49 +1,450 @@
 {
  "db": "game_injury",
- "operator_io_quirks": [
-  "Mixed-case identifiers: table 'game', columns 'Home_Games','Average_Attendance','Total_Attendance','Capacity_Percentage','Season','Date','Home_team','Away_team','Score','Competition','Number_of_matches','Player','Injury','Source' \u2014 must be double-quoted verbatim; case-insensitive lookup.",
-  "Column named 'Date' (declared TEXT) and 'Season' (INT) \u2014 'Date' is a reserved-ish word, quote it; 'Season' holds years 2007-2011.",
-  "FKs are declared with backtick-quoted parent: references `stadium`(\"id\") \u2014 pragma foreign_key_list still resolves; parent_exists true for both.",
-  "All columns notnull=0, no CHECK, no UNIQUE beyond PKs; single-column PKs on all three tables (id).",
-  "Tiny tables (13/20/15 rows) \u2014 no sampling cap needed; original_values fully read.",
-  "Text-stored dates in 'Date': format 'D Month YYYY' e.g. '18 May 2007','22 September 2007','9 December 2007' \u2014 no leading zero on day, full month name.",
-  "Text-stored numbers: 'Number_of_matches' TEXT holding '12','2','1' (int-like strings); 'Score' TEXT holding en-dash '1\u20131','0\u20130 (7:6)' (U+2013, not ASCII hyphen).",
-  "Non-ASCII in text: 'Dejan Stankovi\u0107' (\u0107), en-dash in Score \u2014 sqlite text storage, fine.",
-  "Constant columns: stadium.Home_Games all '8' (distinct=1); injury_accident.Source all 'inter.it' (distinct=1) \u2014 String fuzzer will still contaminate.",
-  "Capacity_Percentage real >100 (108.8) \u2014 no range constraint; Number fuzzer full range [-10^scale,10^scale] with scale from REAL (no args -> default).",
-  "REAL columns store as 'real' storage class; INT columns as 'integer'; no storage/declared contradictions.",
-  "FK child columns (game.stadium_id, injury_accident.game_id) have distinct < parent rows (12<13, 11<20) \u2014 some parents unreferenced; no NULLs."
- ],
- "operator_ts_expectations": [
-  "stadium.id, game.id, injury_accident.id: Number fuzzer, single-col PK -> max_l0=inf, int perturb +-1/+-2; fresh draws dominate -> many implausible large ids but PK uniqueness enforced by sample_fresh_primary_keys.",
-  "stadium.name, game.Home_team/Away_team/Competition, injury_accident.Player/Injury/Source: String fuzzer, length range from originals, 50% contaminate -> random charset strings mixed with real names; drives FN when queries filter on real team names ('Pakhtakor') or 'League'.",
-  "game.Date declared TEXT -> String fuzzer (NOT Date fuzzer, since type has no 'date'): produces random strings, not 'D Month YYYY' \u2014 any date-format query (strftime, LIKE '%2007%') will miss -> FN.",
-  "game.Score TEXT -> String fuzzer: en-dash '1\u20131' treated as opaque string; queries parsing score (split on '-') get garbage -> FN.",
-  "injury_accident.Number_of_matches TEXT -> String fuzzer: int-like strings get +-1 neighbors added to elements, but fresh random strings dominate -> numeric comparisons (CAST, >) miss -> FN.",
-  "stadium.Home_Games (distinct=1, '8') and injury_accident.Source (distinct=1): String/Number fuzzer with 1 element -> p effectively 1, mostly returns the single element perturbed; queries 'WHERE Home_Games=8' may still pass, but 'Source=inter.it' with contamination (50%) breaks -> FN.",
-  "stadium.Average_Attendance/Total_Attendance/Capacity_Percentage REAL -> Number fuzzer scale default (no args -> scale 0? type 'real' has no parens): full range [-1,1] or similar small -> implausible vs real 70000-87000 -> FN on attendance thresholds.",
-  "game.Season INT -> Number fuzzer: fresh draws in [-10^scale,10^scale] (scale 0 -> [-1,1]) plus perturb -> years 2007-2011 never reproduced -> FN on Season filters.",
-  "FK consistency: game.stadium_id drawn from stadium.id final values, injury_accident.game_id from game.id \u2014 joins preserved, so join-count queries survive; but parent PK filtering may shrink parent set -> some child rows dropped or NULL.",
-  "No NOT NULL/CHECK: rows violating nothing (all nullable) so insert rarely fails; but PK dupes dropped -> row counts shrink vs original -> COUNT(*) queries differ -> FP/FN.",
-  "Ties/duplicates: original has ties (Home_team 3 distinct over 20 rows, Score 11 distinct) \u2014 TS fresh draws rarely reproduce exact tie structure -> queries with GROUP BY/HAVING or 'top-k' -> FP."
- ],
- "challenger_refs": [
-  "G2",
-  "gf72151b9",
-  "gf72151b9",
-  "G1",
-  "gffb11d15",
-  "gef9e029f",
-  "G3",
-  "g92d2a1b8",
-  "g92d2a1b8",
-  "g92d2a1b8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "sequential unique integers starting at 1; never NULL",
+   "int_foreign_key": "sample from parent id pool that survives PK/unique filtering; 5-30% NULL when nullable; include parent rows without children",
+   "int_quantity": "positive integers; include boundary values and one step on each side of listed literals",
+   "int_general": "integers within observed min/max; include min, max, and near-boundary values",
+   "real_measure": "real numbers within observed min/max; include min, max, and one step on each side",
+   "text_short": "short text values; include near-variants (case, whitespace, one-char edits) of listed literals",
+   "text_enum": "sample from explicit enum pool; include all listed values",
+   "text_date": "date strings in 'D Month YYYY' format; include boundary dates one day on each side of listed literals",
+   "text_score": "score strings like 'N\u2013M' or 'N\u2013M (P:Q)'; include near-variants of listed literals",
+   "text_nullable": "non-NULL text values; 5-30% NULL when nullable",
+   "distinct_share": "for DISTINCT-target columns, ensure duplicate share 20-50%",
+   "group_sizes": "for GROUP-target columns, ensure group sizes of 1, 2, and >=3",
+   "aggregate_boundary": "for HAVING COUNT targets, ensure groups with counts 1, 2, and >=3",
+   "comparison_boundary": "for comparison targets, include exact literal, one step below, one step above, and case variants",
+   "null_share": "for every nullable column (including nullable FKs), plant at least one NULL row and a share within the compact DB's null_share band (5-30% when the compact share is 0); never replace a planted NULL to satisfy a rule; rules and formulas constrain only non-NULL operands",
+   "column_length_invariant": "all columns of a table must have equal length; boundary literals are placed by overwriting existing positions, never by appending",
+   "fk_integrity": "every non-NULL FK value must exist in the parent table after PK/unique filtering; draw FK values only from surviving parent keys, and validate after insert"
+  },
+  "per_column_exceptions": [
+   {
+    "column": "stadium.name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "stadium.name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "game.Date",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "game.Date",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "injury_accident.Player",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Walter Samuel",
+      "walter samuel",
+      "Thiago Motta",
+      "thiago motta"
+     ]
+    }
+   },
+   {
+    "column": "injury_accident.Player",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT injury_accident.player)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "game.Score",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "game.Score",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "game.Season",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "game.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "injury_accident.game_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "game.id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "injury_accident.game_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "game.id",
+      "stadium.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "injury_accident.game_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "injury_accident.id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(injury_accident.id)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "injury_accident.id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "stadium.Home_Games",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "game.stadium_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "stadium.id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "injury_accident.Injury",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "injury_accident.Source",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "stadium.id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "stadium.id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "injury_accident.game_id",
+      "game.stadium_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "game",
+    "child_column": "stadium_id",
+    "parent_table": "stadium",
+    "parent_column": "id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "injury_accident",
+    "child_column": "game_id",
+    "parent_table": "game",
+    "parent_column": "id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "stadium",
+    "column": "Home_Games",
+    "formula": "Home_Games > 0",
+    "evidence": "observed value 8"
+   },
+   {
+    "table": "stadium",
+    "column": "Average_Attendance",
+    "formula": "Average_Attendance >= 0",
+    "evidence": "observed values 71080.0 to 87047.0"
+   },
+   {
+    "table": "stadium",
+    "column": "Total_Attendance",
+    "formula": "Total_Attendance >= 0",
+    "evidence": "observed values 568643.0 to 696377.0"
+   },
+   {
+    "table": "stadium",
+    "column": "Capacity_Percentage",
+    "formula": "Capacity_Percentage >= 0",
+    "evidence": "observed values 90.7 to 108.8"
+   },
+   {
+    "table": "stadium",
+    "column": "Total_Attendance",
+    "formula": "Total_Attendance = Average_Attendance * Home_Games",
+    "condition": "Home_Games > 0",
+    "evidence": "row 1: 87047.0*8=696376 vs 696377 (rounding); row 2: 83172.0*8=665376 vs 665380; row 3: 79019.0*8=632152 vs 632156"
+   },
+   {
+    "table": "game",
+    "column": "Season",
+    "formula": "Season BETWEEN 2000 AND 2030",
+    "evidence": "observed 2007-2013"
+   },
+   {
+    "table": "game",
+    "column": "Competition",
+    "formula": "Competition IN ('League', 'Cup', 'Supercup')",
+    "evidence": "observed values"
+   },
+   {
+    "table": "game",
+    "column": "Home_team",
+    "formula": "Home_team IN ('Quruvchi', 'Pakhtakor', 'Bunyodkor')",
+    "evidence": "observed values"
+   },
+   {
+    "table": "game",
+    "column": "Away_team",
+    "formula": "Away_team IN ('Quruvchi', 'Pakhtakor', 'Bunyodkor')",
+    "evidence": "observed values"
+   },
+   {
+    "table": "injury_accident",
+    "column": "Source",
+    "formula": "Source IN ('inter.it')",
+    "evidence": "observed single value"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "stadium": 13,
+   "game": 20,
+   "injury_accident": 15
+  },
+  "null_targets": [
+   "injury_accident.game_id"
+  ],
+  "supporting_evidence": {
+   "Total_Attendance formula": [
+    "stadium row 1: 87047.0*8=696376 vs 696377",
+    "stadium row 2: 83172.0*8=665376 vs 665380",
+    "stadium row 3: 79019.0*8=632152 vs 632156"
+   ],
+   "Home_Games positive": [
+    "stadium row 1: 8"
+   ],
+   "Competition enum": [
+    "game rows: League, Cup, Supercup"
+   ],
+   "Home_team enum": [
+    "game rows: Quruvchi, Pakhtakor, Bunyodkor"
+   ],
+   "Away_team enum": [
+    "game rows: Pakhtakor, Quruvchi, Bunyodkor"
+   ],
+   "Source enum": [
+    "injury_accident rows: inter.it"
+   ]
+  },
+  "uncertainty": "Total_Attendance formula holds approximately (rounding differences of up to 4); stated with condition Home_Games > 0. Home_Games observed as constant 8 (statistics distinct=1) but the rows_with_different_values target requires variation: Home_Games may vary (e.g. 1..12) to satisfy that target, and Total_Attendance must then be recomputed per row as Average_Attendance * Home_Games. Season range 2000-2030 is a loose bound from observed 2007-2013. Score shape (dash, parenthetical penalties, en dash) is uncertain / not enforced; group_sizes and aggregate_boundary on game.Score are best-effort. game.Date group_sizes and aggregate_boundary are best-effort within the 'D Month YYYY' format. Group-size and duplicate-share shaping on stadium.name and game.Date/Score must be applied in a single pass that satisfies both targets simultaneously."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with IndexError('list index out of range'); n_ok=0, n_fail=20. The traceback is not shown, but the failure is deterministic across every unit, so it is a construction bug, not a rare edge case.",
+     "requested_revision": "Fix the IndexError so that build_random_instance/write_instance_sqlite complete for every unit. Likely culprits to check: (a) in instance.build_random_instance, `cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)] for cm in tm.columns if (t, cm.name) in samplers}` then `cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns}, ...)` indexes cols[cm.name] for every column, but FK columns are only added later via cols.update(fk_cols) \u2014 so any FK column (game.stadium_id, injury_accident.game_id) is missing from cols at that point and raises KeyError/IndexError; (b) similarly `_apply_spec_rules` and the self-FK fixup loop `final = cols[pc]` assume columns exist. Reorder so FK columns are filled before PK filtering, and guard every column lookup. Re-run and confirm n_ok>0 with no errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.build_random_instance: `cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns}, _compact_keys(schema, t))` is executed before `cols.update(fk_cols)` is applied to the final dict? Actually fk_cols is merged into cols before this line, but the dict comprehension iterates over all tm.columns including FK columns that may not be present if fill_foreign_keys_consistently returned nothing (e.g. when parent pool empty it sets out[cm.name]=[None]*n, which is present; but if a column is neither in samplers nor in fk_cols it is absent). The deterministic IndexError across all units indicates at least one column is always missing.",
+     "requested_revision": "Make the column assembly total: build cols for every column of every table (sampler value, FK value, or explicit default), assert len(cols)==len(tm.columns) before PK filtering, and add a unit test that build_random_instance returns a dict with all columns for all three tables."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rule 'stadium.Total_Attendance = Average_Attendance * Home_Games' is stated with condition Home_Games>0 and rounding \u00b14, supported by three rows (87047*8=696376 vs 696377 etc.). This is adequately evidenced. However the spec also lists 'Home_Games observed as constant 8 but statistics show distinct=1' while simultaneously requiring rows_with_different_values '>= 2 per group with different values' for stadium.Home_Games \u2014 these two requirements are in tension and the spec does not say how to reconcile them (vary Home_Games to satisfy the atomic op, or keep constant 8).",
+     "requested_revision": "Clarify the precedence: state explicitly that Home_Games may vary (e.g. 1..12) to satisfy the rows_with_different_values target, and that the Total_Attendance formula must then be recomputed per row. The program already does this in _apply_spec_rules, but the spec should say so to avoid ambiguity."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'game.Season BETWEEN 2000 AND 2030' is described as a 'loose bound from observed 2007-2013' and marked uncertain; likewise 'Score format varies ... no strict formula stated'. These are flagged as uncertain in the spec's uncertainty field, which is acceptable, but the per_column_exceptions still demand group_sizes and aggregate_boundary on game.Score and game.Date without stating the value domain (e.g. allowed score shapes).",
+     "requested_revision": "Either promote the Season range and Score shape to firm rules with evidence, or mark them explicitly as 'uncertain / not enforced' in per_column_exceptions so the engineer knows they are best-effort. No change to program required if marked uncertain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL rule: spec null_targets=['injury_accident.game_id'] with 5-30% share. Program: in build_random_instance, `if key in schema.fks and not cm.notnull and cm.pk_pos == 0: share = min(0.30, max(0.05, share if share > 0 else 0.10))` \u2014 this forces a 5-30% share even when the compact DB has 0% NULLs, which is consistent with the interface rule ('at least one NULL row per nullable column'). However the same block only applies to FK columns; non-FK nullable columns (e.g. stadium.name if nullable, game.Date, injury_accident.Player/Injury/Source) get no NULL planting, and the interface rule requires NULL rows for every nullable column. Also `injury_accident.id` is a PK and correctly excluded.",
+     "requested_revision": "Extend NULL planting to all nullable non-PK columns (not just FKs), using the compact DB's null_share per column with a floor of at least one NULL row, and never replace a planted NULL to satisfy a rule. Verify with a post-generation check that each nullable column has NULL count >= 1 and share within the compact share band."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Preservation of compact rows: writer.write_instance_sqlite copies orig_path to part and appends rows with INSERT; compact rows are never deleted or updated \u2014 good. But `con.execute('pragma foreign_keys = OFF')` disables FK enforcement during insert, so generated rows with dangling FKs (e.g. injury_accident.game_id pointing to a game id that was dropped by sample_fresh_primary_keys or drop_unique_duplicates) will be silently accepted, violating the FK integrity constraint. The spec's unmatched_join_rows target wants parent rows without children and child rows with NULL FK, not dangling non-NULL FKs.",
+     "requested_revision": "After inserting, run a validation pass (or enable foreign_keys=ON and use deferred checks) to confirm every non-NULL FK value exists in the parent table; drop or NULL-out rows that violate FK integrity, and report counts. Alternatively, ensure fill_foreign_keys_consistently draws only from parent values that survive PK/unique filtering (currently it draws from instance[pt][pc] before filtering, so dropped parent keys can be referenced)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli._one uses rng = random.Random(seed_base*100003 + i), and build_random_instance consumes rng deterministically, so per-unit reproducibility holds. However `_init_sampler` uses `rng.choices(ov, k=min(5,len(ov)))` and `sorted({str(v) for v in literal_pool})` \u2014 the set-to-sorted is deterministic, but `rng.choices` order depends on rng state which is fine. No issue here; noted as verified.",
+     "requested_revision": "None; keep as is."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Value variation: _apply_group_sizes reshapes values to guarantee group sizes 1,2,>=3, but it is applied to stadium.name and stadium.id and then _apply_duplicate_share is applied to stadium.name afterwards, which can destroy the group-size pattern (duplicate share reshuffles and repeats values, potentially collapsing the singleton/pair/triple structure). Similarly game.Date gets _apply_group_sizes then _apply_aggregate_boundary (which is the same function), so the second call re-shuffles and may not preserve the first pattern. This risks failing the group_sizes target.",
+     "requested_revision": "Apply group-size and duplicate-share shaping in a single pass that satisfies both targets simultaneously (e.g. construct groups of size 1,2,>=3 first, then add duplicates only within existing groups up to the 20-50% share), and add an assertion after shaping that group sizes 1,2,>=3 all occur and duplicate share is in [0.2,0.5]."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "injury_accident.Player comparison_boundary: PlayerSampler includes PLAYER_BOUNDARY literals plus case variants and one-char edits, good. But _apply_spec_rules then does `vals = list(ia['Player']); for lit in PLAYER_BOUNDARY: if lit not in vals: vals.append(lit); ia['Player'] = _apply_aggregate_boundary(vals, rng)` \u2014 appending literals changes row count relative to other columns (e.g. ia['id'], ia['game_id']), so the table's columns become misaligned in length. writer uses n = len(cols[names[0]]) and indexes cols[c][i] for all columns, which will IndexError or silently truncate.",
+     "requested_revision": "Do not change column lengths in _apply_spec_rules. Instead, ensure boundary literals are present by overwriting existing positions (e.g. set the first k rows' Player to the boundary literals) rather than appending, and keep all columns of a table the same length. Add an assertion len(set(len(v) for v in inst[t].values()))==1 per table."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact source of the IndexError is not shown in the traceback; the review identifies likely causes (missing FK columns in the cols dict before PK filtering, and Player column length mismatch) but the engineer must confirm with a full traceback.",
+    "Whether the compact DB's null_share for injury_accident.game_id is within 5-30% is not shown; the program forces 5-30% regardless, which matches the interface rule but should be confirmed against the compact share.",
+    "Whether generated non-NULL FKs ever dangle after PK/unique filtering is not verified by execution (foreign_keys=OFF); a post-insert validation is requested.",
+    "Group-size and duplicate-share interaction on stadium.name and game.Date/Score is not verified by execution; an assertion is requested."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification states 'Home_Games observed as constant 8 (statistics distinct=1)' and the Total_Attendance formula 'Total_Attendance = Average_Attendance * Home_Games' with evidence rows 1-3 all using Home_Games=8. The rows_with_different_values target on stadium.Home_Games requires variation, and the spec's uncertainty note explicitly authorizes Home_Games to vary (e.g. 1..12) with Total_Attendance recomputed. This is a self-consistent resolution, but the formula evidence is only for Home_Games=8, so the multiplicative relation for other Home_Games values is an extrapolation, not directly evidenced.",
+     "requested_revision": "No blocking change. Optionally note in the spec that the Total_Attendance formula is only directly evidenced at Home_Games=8 and is assumed to generalize; keep the +-4 rounding tolerance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows many nullable columns with 'generated rows: NULL 0 / n' (e.g. stadium.name, game.Date, game.Score, injury_accident.Player, injury_accident.Source, stadium.Home_Games, etc.). Per the interface NULL rule, each nullable column should contain at least one NULL row per instance. The program only plants NULLs for nullable FKs (fk_null logic in build_random_instance) and never for other nullable columns; _apply_spec_rules overwrites values without introducing NULLs. This is a noted deviation but per instruction 7 does not block a pass.",
+     "requested_revision": "For completeness, plant at least one NULL in each nullable non-FK column (respecting the compact null_share band) in a future revision; not required to pass."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "stadium.id group_sizes target (1, 2, >=3) is nominally applied via _apply_group_sizes in _apply_spec_rules, but stadium.id is a primary key filled sequentially (range(start, start+n)) and then _apply_group_sizes reshapes it, which would create duplicate PK values. However, sample_fresh_primary_keys runs before _apply_spec_rules, so the reshaping happens after PK filtering and could reintroduce duplicates. Execution feedback reports pk_duplicates: 0 across 20 instances, so in practice the writer's INSERT ... executemany either fails those rows (counted in rows_skipped: stadium 100) or the reshaping is benign. The group_sizes target on a PK column is inherently unsatisfiable without violating uniqueness.",
+     "requested_revision": "Designer: drop or reinterpret the stadium.id group_sizes target (a PK cannot have group sizes >1). Engineer: remove the _apply_group_sizes call on stadium.id to avoid relying on insert-time rejection."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "injury_accident.id aggregate_boundary target (COUNT(injury_accident.id) with values 1,2,3) is explicitly not implemented: the code has 'if id in ia: pass' with a comment that it is best-effort and must not disturb uniqueness. Since id is a PK, group sizes >1 are impossible; the target is unsatisfiable as stated.",
+     "requested_revision": "Designer: remove or reinterpret the injury_accident.id aggregate_boundary target. Engineer: no code change needed given the target is unsatisfiable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "game.id aggregate_boundary (COUNT(*) values 1,2,3) and game.id unmatched_join_rows are listed, but game.id is a PK filled sequentially; group sizes >1 are impossible. The unmatched_join_rows target (parent rows without children, child rows with null FK) is satisfied via injury_accident.game_id NULLs (49/253) and game rows without injury_accident children. The aggregate_boundary on game.id is not separately implemented.",
+     "requested_revision": "Designer: remove the unsatisfiable game.id aggregate_boundary target. Engineer: no change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "injury_accident.game_id unmatched_join_rows lists joins_with ['game.id', 'stadium.id']. The FK is only to game.id; a join to stadium.id is not a declared FK and is not enforced. The program fills game_id from game.id pool only. This is a spec overreach rather than a program error.",
+     "requested_revision": "Designer: clarify that injury_accident.game_id only references game.id; the stadium.id join is a query-level join, not an FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction feedback: 41 eligible pairs, 12 separated, 0 unknown executions. This is low separation but per instruction 4 a missing separation alone does not establish a generation error. Integrity is clean (fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0), 20/20 valid, reproducible. Compact rows are preserved (writer copies orig then appends; _validate_fks only deletes rowid > compact count).",
+     "requested_revision": "No blocking change. The low separation rate is consistent with the spec's own uncertainty notes (Score/Date shaping best-effort) and does not indicate a correctness failure."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary for injury_accident.Player requires exact literal, one step below, one step above, and case variants. The program's _set_positions overwrites the first 4 positions with PLAYER_BOUNDARY (Walter Samuel, walter samuel, Thiago Motta, thiago motta), then _apply_aggregate_boundary reshapes the list, which may overwrite or reorder those boundary literals. The aggregate_boundary on Player (COUNT(DISTINCT player) values 1,2,3) is applied after the boundary placement, potentially destroying the boundary guarantee.",
+     "requested_revision": "Engineer: apply _apply_aggregate_boundary before _set_positions, or ensure the boundary literals survive the aggregate reshaping (e.g. reserve positions). Not blocking given execution succeeded, but the boundary guarantee is not robust."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the Total_Attendance = Average_Attendance * Home_Games formula holds for Home_Games != 8 is assumed, not evidenced.",
+    "Whether the low construction separation (12/41) reflects genuine query equivalence or insufficient value variation cannot be determined without held-out labels (not requested).",
+    "The stadium.id and injury_accident.id group_sizes/aggregate_boundary targets are unsatisfiable on PK columns; the spec should be revised to remove them."
+   ]
+  }
+ ]
 }

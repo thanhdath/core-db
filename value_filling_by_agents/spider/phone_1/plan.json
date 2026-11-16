@@ -1,54 +1,636 @@
 {
  "db": "phone_1",
- "operator_io_quirks": [
-  "Mixed-case identifiers everywhere: tables 'chip_model','screen_mode','phone'; columns 'Model_name','Launch_year','RAM_MiB','ROM_MiB','Slots','WiFi','Bluetooth','Graphics_mode','Char_cells','Pixels','Hardware_colours','used_kb','map','Type','Company_name','Hardware_Model_name','Accreditation_type','Accreditation_level','Date','chip_model','screen_mode' \u2014 must be double-quoted; column lookup case-insensitive.",
-  "Column named 'Date' is TEXT storing free text like 'Approved (awarded 15.11.12)' / 'Approved (valid until 14.09.13)' \u2014 declared type TEXT so dispatches to String, NOT Date fuzzer; no date parsing.",
-  "Column named 'Type' (TEXT) and 'map' (TEXT) are SQL-ish keywords; must be quoted in generated SQL.",
-  "FK child columns 'phone.chip_model' and 'phone.screen_mode' are TEXT while parent PKs 'chip_model.Model_name' (TEXT) and 'screen_mode.Graphics_mode' (REAL) \u2014 screen_mode FK is text-to-real affinity mismatch; sqlite will coerce on insert.",
-  "screen_mode.Graphics_mode is REAL PK with values 0.0..6.0; phone.screen_mode stores '1','3','4','5','6' as text \u2014 FK values are stringified reals.",
-  "chip_model.Model_name PK is TEXT with spaces ('X3 Advanced','X30 high-end'); phone.chip_model values ('X5','X51v','X3i') are NOT all present in parent (X5,X51v,X3i missing from chip_model samples) \u2014 FK integrity may be partial in original.",
-  "All columns notnull=0, no CHECK, no UNIQUE beyond PKs; small tables (14/7/8 rows) so original_values sampling k=min(5,len) is dense.",
-  "PKs are single-column TEXT/REAL; no composite keys, no self-FKs, no dangling FKs (both parents exist).",
-  "REAL columns hold integral floats (2002.0, 32.0) \u2014 Number fuzzer with scale from 'real' (no args) will produce wide-range floats, not these.",
-  "TEXT columns contain unicode '\u00d7' (Char_cells '80 \u00d7 32', Pixels '640 \u00d7 256') and en-dash '\u2013' (map '3000\u20137FFF') \u2014 String CHARSET a-zA-Z 0-9() will not reproduce these.",
-  "Tiny DB: read_schema max_rows_per_table irrelevant; original_sizes 14/7/8.",
-  "No views/triggers/indexes beyond PKs in DDL."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for Model_name, Company_name, Hardware_Model_name, Accreditation_*, Date, chip_model, screen_mode, Char_cells, Pixels, map, Type, Slots, WiFi, Bluetooth \u2014 random a-zA-Z0-9() strings with contamination; will not match 'Approved (awarded 15.11.12)' or '80 \u00d7 32' shapes.",
-  "Number fuzzer for Launch_year, RAM_MiB, ROM_MiB, Hardware_colours, used_kb, Graphics_mode \u2014 'real' with no (a,b) args gives scale=0 default, range [-1,1] plus perturbation; original values 2002, 32, 64, 0..6 are far outside \u2192 implausible values, likely FN on range predicates (Launch_year>2000, RAM_MiB>=64).",
-  "screen_mode.Graphics_mode is REAL PK: Number fuzzer with single-column PK \u2192 max_l0=inf, fresh draws dominate; values will be floats in [-1,1] not 0..6, so phone.screen_mode FK draws from these floats stringified \u2014 joins still work but predicates like screen_mode='1' fail.",
-  "phone.screen_mode FK draws from parent's FINAL Graphics_mode values (floats) with replacement \u2192 text '0.37...' etc.; original '1','3' not reproduced \u2192 FP risk on equality joins if gold expects specific modes.",
-  "chip_model.Model_name PK String with max_l0=inf \u2192 fresh random strings; phone.chip_model FK draws from these \u2192 join works but 'X3 Advanced' style values lost \u2192 FN on LIKE '%Advanced%' or equality to specific model.",
-  "String fuzzer adds str(i\u00b11) for int-like elements; '1','3','4' in phone.screen_mode may get '2','0','5' neighbors \u2014 partial tie preservation.",
-  "Number fuzzer list-range quirk (upper end overwritten to full range) means even with elements [2002..2005], fresh draws span [-1,1] \u2014 Launch_year predicates on 2002-2005 mostly miss.",
-  "No NOT NULL/CHECK enforcement in Python; all rows insert (no constraint failures expected) since notnull=0 everywhere.",
-  "PK dedup: single-column PKs with max_l0=inf \u2192 few duplicates; drop_unique_duplicates no-op (no unique non-PK columns).",
-  "Date column is TEXT \u2192 String fuzzer, no date template; gold SQL likely uses LIKE 'Approved%' or substr \u2014 random strings break these \u2192 FN.",
-  "Small tables (14/7/8) mean choose_table_sizes level-0 = 1+30*u \u2248 1..31 rows; parent tables may be smaller than child phone (8) \u2192 FK draws with replacement from few values, ties likely.",
-  "Bool/Bit/Time/Date fuzzers unused (no bool/bit/year/time/date/timestamp declared types)."
- ],
- "challenger_refs": [
-  "G2",
-  "ge1defddc",
-  "G8",
-  "g20e1f181",
-  "g3211f299",
-  "G4",
-  "G6",
-  "G7",
-  "g5357c987",
-  "g5357c987",
-  "g5357c987",
-  "g5357c987",
-  "g5357c987",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample a value from the column's observed pool, coercing every sampled value with str() before any case/near-variant transformation; with probability 0.15 emit a near-variant (case change, truncation, one-character substitution, or appended suffix); NEVER emit NULL for NOT NULL columns and NEVER emit NULL for PK columns.",
+   "text_enum": "Sample uniformly from the explicit enum list in per_column_exceptions using str(v) for every literal; with probability 0.1 emit a case variant of a listed value; never emit NULL for NOT NULL columns.",
+   "text_free": "Sample from the observed pool as str(v); with probability 0.2 emit a fresh near-duplicate (case/whitespace/typo variant) of a pool value.",
+   "real_numeric": "Sample uniformly from the observed distinct values (floats); with probability 0.2 emit a value one step (1.0) outside the observed min or max; keep integer-valued reals as integers; store as REAL.",
+   "real_quantity": "Sample from the observed distinct values; ensure at least two distinct values per group; with probability 0.2 emit a boundary value at min-1 or max+1.",
+   "primary_key_text": "Generate a unique value per row: take a pool value and, when the plain value collides, append a unique numeric suffix; generate n + len(existing_candidates) candidate values and loop until the filtered unique count equals the target n; never NULL.",
+   "primary_key_real": "Generate a unique numeric value per row: start from the observed pool (0..6) and add 1.0 increments for extra rows; generate enough candidates so that after deduplication the count equals the target n; never NULL.",
+   "foreign_key_text": "With probability 0.15 emit NULL (nullable FK); otherwise copy a value from the parent column pool; ensure at least one parent row has no child and at least one child row has a NULL FK; apply the NULL rule AFTER primary-key and unique filtering so the NULL survives, or re-inject a NULL into a surviving row.",
+   "date_text": "Sample from the observed date-string pool; with probability 0.2 emit a near-variant (one day earlier/later in the same format).",
+   "null_share": "For each nullable column (all columns not declared NOT NULL and not primary key, including nullable FK columns), emit NULL in about 10% of the surviving generated rows with at least one NULL row per nullable column per instance. NULL injection runs after PK/unique filtering; a planted NULL is never replaced to satisfy a rule. NOT NULL and PK columns never get NULL."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "chip_model",
+    "column": "Model_name",
+    "pattern": "primary_key_text",
+    "targets": "unique per row; pool of 8 observed names plus suffixed variants; generate n+existing candidates and loop until filtered unique count == n"
+   },
+   {
+    "table": "chip_model",
+    "column": "Launch_year",
+    "pattern": "comparison_boundary",
+    "targets": "boundary values at 2002, 2003, 2004, 2005 and one step outside within schema domain: 2001, 2006"
+   },
+   {
+    "table": "chip_model",
+    "column": "Launch_year",
+    "pattern": "ties_for_order_limit",
+    "targets": "at least two rows share the minimum Launch_year (tie at rank 1, ASC)"
+   },
+   {
+    "table": "chip_model",
+    "column": "RAM_MiB",
+    "pattern": "ties_for_order_limit",
+    "targets": "at least two rows share the minimum RAM_MiB (tie at rank 1, ASC)"
+   },
+   {
+    "table": "chip_model",
+    "column": "RAM_MiB",
+    "pattern": "rows_with_different_values",
+    "targets": "at least two distinct RAM_MiB values (32, 64) so MAX and MIN differ"
+   },
+   {
+    "table": "chip_model",
+    "column": "ROM_MiB",
+    "pattern": "ties_for_order_limit",
+    "targets": "at least two rows share the minimum ROM_MiB (tie at rank 1, ASC)"
+   },
+   {
+    "table": "chip_model",
+    "column": "ROM_MiB",
+    "pattern": "rows_with_different_values",
+    "targets": "at least two distinct ROM_MiB values so MAX and MIN differ"
+   },
+   {
+    "table": "chip_model",
+    "column": "WiFi",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT"
+   },
+   {
+    "table": "chip_model",
+    "column": "Bluetooth",
+    "pattern": "text_enum",
+    "targets": "No, 1.1, Yes, 1.2"
+   },
+   {
+    "table": "chip_model",
+    "column": "Slots",
+    "pattern": "text_enum",
+    "targets": "1CFII,1SD, 1SD"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Graphics_mode",
+    "pattern": "primary_key_real",
+    "targets": "unique per row; pool 0..6 plus increments; generate enough candidates so filtered unique count == n"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Type",
+    "pattern": "comparison_boundary",
+    "targets": "values Graphics, graphics (case variant)"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Type",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Pixels",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT (set:DISTINCT)"
+   },
+   {
+    "table": "screen_mode",
+    "column": "used_kb",
+    "pattern": "real_numeric",
+    "targets": "include literals 10 and 15 among sampled values"
+   },
+   {
+    "table": "phone",
+    "column": "Hardware_Model_name",
+    "pattern": "primary_key_text",
+    "targets": "unique per row; pool of 8 observed names plus suffixed variants; generate n+existing candidates and loop until filtered unique count == n"
+   },
+   {
+    "table": "phone",
+    "column": "Hardware_Model_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT"
+   },
+   {
+    "table": "phone",
+    "column": "Company_name",
+    "pattern": "comparison_boundary",
+    "targets": "Nokia Corporation, nokia corporation, Noion, noion, Nokia Cor, nokia cor, Nokia n, nokia n, orporat, ORPORAT"
+   },
+   {
+    "table": "phone",
+    "column": "Company_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_type",
+    "pattern": "like_near_variant",
+    "targets": "Full, %Full%, Full%, Fulm, Fullx, full, Full x; also exact match variants Full, full for comparison_boundary"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "ties_for_order_limit",
+    "targets": "at least two rows share the maximum Accreditation_level (tie at rank 1, DESC)"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "aggregate_boundary",
+    "targets": "group sizes 1, 2 and >= 3; COUNT(*) values 2, 3, 4"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "comparison_boundary",
+    "targets": "numeric-string values '2','3','4' added to the pool so PRED(accreditation_level > 3) can be true under SQLite coercion; keep 'joyn Hot Fixes','joyn' as well"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "group_sizes",
+    "targets": "groups of size 1, 2 and >= 3"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "pattern": "rows_with_different_values",
+    "targets": "at least two distinct Accreditation_level values so MAX differs"
+   },
+   {
+    "table": "phone",
+    "column": "chip_model",
+    "pattern": "foreign_key_text",
+    "targets": "copy from chip_model.Model_name; at least one NULL FK; at least one parent row without child; NULL injected after PK/unique filtering"
+   },
+   {
+    "table": "phone",
+    "column": "screen_mode",
+    "pattern": "foreign_key_text",
+    "targets": "copy from screen_mode.Graphics_mode; at least one NULL FK; at least one parent row without child; NULL injected after PK/unique filtering"
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "phone",
+    "child_column": "chip_model",
+    "parent_table": "chip_model",
+    "parent_column": "Model_name",
+    "copied_columns": []
+   },
+   {
+    "child_table": "phone",
+    "child_column": "screen_mode",
+    "parent_table": "screen_mode",
+    "parent_column": "Graphics_mode",
+    "copied_columns": []
+   },
+   {
+    "table": "chip_model",
+    "unique_tuple": [
+     "Model_name"
+    ]
+   },
+   {
+    "table": "screen_mode",
+    "unique_tuple": [
+     "Graphics_mode"
+    ]
+   },
+   {
+    "table": "phone",
+    "unique_tuple": [
+     "Hardware_Model_name"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "chip_model",
+    "column": "Launch_year",
+    "formula": "Launch_year BETWEEN 2001 AND 2006",
+    "evidence": "observed distinct 2002,2003,2004,2005; widened by one step on each side to satisfy comparison_boundary; preceded rows 2002,2003,2004,2005"
+   },
+   {
+    "table": "chip_model",
+    "column": "RAM_MiB",
+    "formula": "RAM_MiB IN (32, 64)",
+    "evidence": "observed distinct 32,64"
+   },
+   {
+    "table": "chip_model",
+    "column": "ROM_MiB",
+    "formula": "ROM_MiB IN (32, 48, 64, 128, 256)",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "chip_model",
+    "column": "WiFi",
+    "formula": "WiFi IN ('No', '802.11b')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "chip_model",
+    "column": "Bluetooth",
+    "formula": "Bluetooth IN ('No', '1.1', 'Yes', '1.2')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "chip_model",
+    "column": "Slots",
+    "formula": "Slots IN ('1CFII,1SD', '1SD')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Graphics_mode",
+    "formula": "Graphics_mode BETWEEN 0 AND 6",
+    "evidence": "observed distinct 0..6"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Hardware_colours",
+    "formula": "Hardware_colours IN (2, 4, 8)",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "screen_mode",
+    "column": "used_kb",
+    "formula": "used_kb IN (8, 10, 16, 20)",
+    "evidence": "observed distinct values; literal pool adds 10,15"
+   },
+   {
+    "table": "screen_mode",
+    "column": "Type",
+    "formula": "Type IN ('Graphics', 'Text')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_type",
+    "formula": "Accreditation_type IN ('Full', 'Provisional')",
+    "evidence": "observed distinct values"
+   },
+   {
+    "table": "phone",
+    "column": "Accreditation_level",
+    "formula": "Accreditation_level IN ('joyn Hot Fixes', 'joyn', '2', '3', '4')",
+    "evidence": "observed text values plus numeric-string values needed for PRED(accreditation_level > 3) under SQLite coercion"
+   },
+   {
+    "table": "phone",
+    "column": "chip_model",
+    "formula": "chip_model IS NULL OR chip_model IN (SELECT Model_name FROM chip_model)",
+    "evidence": "FK constraint"
+   },
+   {
+    "table": "phone",
+    "column": "screen_mode",
+    "formula": "screen_mode IS NULL OR screen_mode IN (SELECT CAST(Graphics_mode AS TEXT) FROM screen_mode)",
+    "evidence": "FK constraint"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "chip_model": 14,
+   "screen_mode": 7,
+   "phone": 8
+  },
+  "null_targets": [
+   "phone.chip_model",
+   "phone.screen_mode",
+   "chip_model.Launch_year",
+   "chip_model.RAM_MiB",
+   "chip_model.ROM_MiB",
+   "chip_model.Slots",
+   "chip_model.WiFi",
+   "chip_model.Bluetooth",
+   "screen_mode.Char_cells",
+   "screen_mode.Pixels",
+   "screen_mode.Hardware_colours",
+   "screen_mode.used_kb",
+   "screen_mode.map",
+   "screen_mode.Type",
+   "phone.Company_name",
+   "phone.Accreditation_type",
+   "phone.Accreditation_level",
+   "phone.Date"
+  ],
+  "supporting_evidence": {
+   "chip_model.Launch_year": "distinct 2002,2003,2004,2005; boundary targets 2001,2002,2003,2004,2005,2006; -1585/-1584/-1583 removed to respect semantic range",
+   "chip_model.RAM_MiB": "distinct 32,64; tie at rank 1 ASC",
+   "chip_model.ROM_MiB": "distinct 32,48,64,128,256; tie at rank 1 ASC",
+   "phone.Accreditation_type": "distinct Full, Provisional; LIKE near-variants Fulm, Fullx, full, Full x",
+   "phone.Company_name": "distinct 6 companies; boundary variants Noion, Nokia Cor, Nokia n, orporat",
+   "phone.Accreditation_level": "distinct joyn Hot Fixes, joyn; numeric strings '2','3','4' added; group sizes 1,2,>=3; COUNT boundary 2,3,4",
+   "screen_mode.Type": "distinct Graphics, Text; case variant graphics",
+   "screen_mode.used_kb": "literals 10,15 in literal pool",
+   "phone.chip_model": "FK includes X51v, X50 Advanced, X50 Standard not in parent pool; generation restricts FKs to valid parent values or NULL"
+  },
+  "uncertainty": "The original data has 14 chip_model rows but only 8 distinct Model_name values shown; generation uses 14 rows with unique PKs. Phone FK values include X51v, X50 Advanced, X50 Standard which are not in the chip_model pool; generation restricts FKs to valid parent values or NULL. Accreditation_level adds numeric strings '2','3','4' to exercise PRED(accreditation_level > 3) under SQLite type coercion. Launch_year boundary values -1585/-1584/-1583 were removed to keep the semantic range [2001,2006]; the BETWEEN -1584 AND 2004 pair is still exercisable through 2001/2002/2003/2004/2005/2006. NULL shares are estimated at 10% since observed null_rate is 0 but nullable columns are declared; NULL injection runs after PK/unique filtering and must produce at least one NULL per nullable column. Reproducibility requires re-running with the same seed_base and i0/i1 after fixing the str() coercion, PK enlargement and post-filter NULL injection."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 10 of 20 units failed with AttributeError(\"'float' object has no attribute 'upper'/'lower'\"). The traceback originates in tscore_gen/spec.py: enum_values() and duplicate_share_values() call v.upper()/v.lower()/case_variant(v) on sampled values, but the literal pool seeded by seed_literal_pool_from_queries() stores all literals as strings via str(v) while original_values for REAL columns (e.g. chip_model.Launch_year, RAM_MiB, ROM_MiB, screen_mode.used_used_kb) are floats. The spec functions for these columns (e.g. enum_spec for WiFi/Bluetooth) are fine, but the failure occurs when a numeric literal from the extracted operations (e.g. 2003, 10, 15) is routed into a text column's pool and then case_variant is applied. Concretely, spec.duplicate_share_values / enum_values / type_values / company_values / accreditation_types / accreditation_levels all call case_variant(v, rng) or v.upper()/v.lower() without coercing v to str, and the pool can contain non-str values (floats from numeric literals, or floats from original_values for REAL columns).",
+     "requested_revision": "In tscore_gen/spec.py, coerce every sampled value to str before applying case_variant/near_variant/like_variant/upper/lower (e.g. v = str(v) at the top of case_variant, near_variant, like_variant, and in enum_values/duplicate_share_values/type_values/company_values/accreditation_types/accreditation_levels). Alternatively, ensure seed_literal_pool_from_queries and _fallback_sampler only feed str values into text samplers. Re-run the construction and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added = {chip_model: 62, screen_mode: 3, phone: 4} across 10 successful units, i.e. ~6.2 chip_model rows, ~0.3 screen_mode rows, ~0.4 phone rows per instance. The specification's table_sizes_per_instance is {chip_model: 14, screen_mode: 7, phone: 8}. choose_table_sizes() in instance.py uses SPEC_SIZES with rng.randint(-2, 2) variation, so per-instance sizes should be ~12-16 / 5-9 / 6-10. The observed counts are far below spec, indicating that sample_fresh_primary_keys() and drop_unique_duplicates() are dropping most generated rows (e.g. chip_model.Model_name pool of 8 with suffixed variants collides with compact rows; screen_mode.Graphics_mode pool 0..6 collides with compact rows; phone.Hardware_Model_name pool of 8 collides with compact rows). The result is that the intended value variation (ties at rank 1, group sizes 1/2/>=3, duplicate shares) is largely lost because too few rows survive.",
+     "requested_revision": "In tscore_gen/instance.py, make the PK samplers produce enough fresh values to reach the target size after collision filtering: e.g. generate n + len(existing) candidates in chip_model_names/hw_model_names/graphics_modes, or loop until the filtered count equals n. Also verify that drop_unique_duplicates does not silently shrink tables below the spec sizes. Re-run and confirm rows_added per instance matches table_sizes_per_instance (within the +-2 variation)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows 'generated rows: NULL 0 / n' for every nullable column, including phone.chip_model and phone.screen_mode (the FK columns). The specification's null_targets are exactly phone.chip_model and phone.screen_mode, and the generic null_share rule requires at least one NULL row per nullable column per instance. fill_foreign_keys_consistently() in instance.py sets null_share=0.1 and forces one NULL, but the observed output shows 0 NULLs in generated rows. This is because the FK columns are filled before sample_fresh_primary_keys/drop_unique_duplicates, and the forced NULL row is likely being dropped by the PK/unique filter (phone.Hardware_Model_name is the PK, and the NULL FK row may collide on PK). Also, the non-FK nullable columns (e.g. chip_model.Launch_year, RAM_MiB, etc.) never receive NULLs because _spec_sampler never emits None and the null_share rule is only applied to FK columns.",
+     "requested_revision": "In tscore_gen/instance.py, apply the NULL rule after PK/unique filtering (or re-inject a NULL into a surviving row) so that each nullable column has at least one NULL per instance. Extend the NULL injection to all nullable columns (not just FKs), following the compact database's NULL share. Re-run and confirm nullable_columns shows NULL > 0 for phone.chip_model and phone.screen_mode at minimum."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note states: 'Accreditation_level is text but atomic ops compare it to numbers 2,3,4; generation keeps text values and relies on SQLite type coercion.' The atomic operations include PRED(phone.accreditation_level > 3), HAVING(COUNT(*) > 3), and comparison_boundary targets [2,3,4]. The semantic_rules_and_formulas restrict Accreditation_level to ('joyn Hot Fixes', 'joyn'), which are non-numeric strings. Under SQLite type coercion, 'joyn' > 3 evaluates to FALSE (text > integer is always false in SQLite), so the comparison_boundary pattern for Accreditation_level cannot be exercised by the generated data. The specification acknowledges this but does not resolve it.",
+     "requested_revision": "Clarify the Accreditation_level domain: either (a) add numeric-string values ('2','3','4') to the pool so PRED(accreditation_level > 3) can be true, or (b) explicitly document that the comparison_boundary pattern is not realizable for this column and remove it from per_column_exceptions. The current spec is internally inconsistent (text enum vs numeric comparison targets)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include chip_model.Launch_year comparison_boundary targets '-1585, -1584, -1583 for BETWEEN -1584 AND 2004', and LAUNCH_BOUNDARY in spec.py includes these. However, the semantic_rules_and_formulas state 'Launch_year BETWEEN 2002 AND 2005' with evidence 'observed distinct 2002,2003,2004,2005'. The two rules conflict: the boundary rule wants values outside [2002,2005] (e.g. 2001, 2006, -1585), while the semantic rule restricts to [2002,2005]. launch_years() emits LAUNCH_BOUNDARY values with p=0.2, violating the semantic rule.",
+     "requested_revision": "Reconcile the two rules: either drop the semantic_rules_and_formulas entry for Launch_year (since the boundary pattern requires out-of-range values), or restrict LAUNCH_BOUNDARY to values within [2002,2005] and remove the -1585/-1584/-1583 targets. The current spec cannot satisfy both."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'reproducible': false. The CLI uses rng = random.Random(a['seed_base'] * 100003 + i) per unit, which should be deterministic. However, build_random_instance() calls choose_table_sizes() which uses rng, and _fallback_sampler uses _init_sampler with rng.random() < 0.5 for max_l0, and make_column_sampler does els = [e for e in elements if rng.random() < 0.9]. These are deterministic given the seed. The non-reproducibility likely stems from the AttributeError failures: failed units are not written, so re-running produces different n_ok/n_fail depending on which units fail (the failures are deterministic per seed, but the summary aggregates differ if the seed_base or i0/i1 differ). More importantly, the writer uses shutil.copyfile(orig, part) and os.replace, which is deterministic. The 'reproducible: false' flag may be a harness artifact, but it should be investigated.",
+     "requested_revision": "Confirm reproducibility by running the same seed_base and i0/i1 twice and diffing the output SQLite files. If non-determinism is real, identify the source (e.g. dict iteration order in schema.tables, set iteration in _levels, or rng.sample in duplicate_share_values). Note: schema.tables is a dict built from tnames (ordered by sqlite_master rowid), so iteration is deterministic; _levels uses sorted(), so deterministic. The most likely cause is the AttributeError failures interacting with the harness's reproducibility check."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the AttributeError failures are fully resolved after coercing values to str in spec.py (requires re-run).",
+    "Whether table sizes match table_sizes_per_instance after fixing PK collision filtering (requires re-run).",
+    "Whether NULL injection works for all nullable columns after moving it post-filtering (requires re-run).",
+    "Whether the Launch_year and Accreditation_level spec inconsistencies are resolved by the designer.",
+    "Whether 'reproducible: false' is a real non-determinism or a harness artifact (requires two identical runs)."
+   ]
+  },
+  {
+   "reviewer": "independent",
+   "role": "consistency check of generation specification and generator against supplied schema, integrity constraints, and execution evidence",
+   "verdict_summary": "The generator runs cleanly (20/20 units, 0 errors, integrity clean, reproducible) and implements the bulk of the specification by construction. However, several specification targets are not actually realized by the samplers, and one specification rule is internally inconsistent with the schema. These are construction-level defects (not per-pair exceptions) and warrant a revise.",
+   "recommendation": "revise",
+   "issues": [
+    {
+     "id": "I1",
+     "agent": "engineer",
+     "severity": "blocking",
+     "title": "Accreditation_level group_sizes / aggregate_boundary / comparison_boundary targets are not constructed",
+     "evidence": {
+      "spec": "per_column_exceptions phone.Accreditation_level: aggregate_boundary 'group sizes 1, 2 and >= 3; COUNT(*) values 2, 3, 4'; comparison_boundary \"numeric-string values '2','3','4' added to the pool so PRED(accreditation_level > 3) can be true'; group_sizes 'groups of size 1, 2 and >= 3'.",
+      "code": "tscore_gen/spec.py accreditation_levels(): vals = ['joyn','joyn']; if n>=3 append 'joyn Hot Fixes'; then fill from ACCRED_LEVELS. With n=8 (SPEC_SIZES phone=8) the result is 2x'joyn', 1x'joyn Hot Fixes', and 5 random draws from ['joyn Hot Fixes','joyn','2','3','4']. There is no construction that guarantees a group of size exactly 1, a group of size exactly 2, and a group of size >=3 simultaneously, nor that COUNT(*) values 2,3,4 all appear, nor that a value > 3 (i.e. '4') is guaranteed present.",
+      "execution": "construction_pairs separated 25/67; construction_pairs_by_group is empty, so no per-pattern separation evidence is reported for these Accreditation_level patterns."
+     },
+     "requested_revision": "Make accreditation_levels(n, rng) deterministically emit at least one group of size 1, one of size 2, and one of size >=3 (e.g. ['joyn','joyn','joyn Hot Fixes','2','3','4', ...]) and guarantee at least one value strictly greater than 3 under SQLite coercion (e.g. '4'). Keep the tie-at-max (DESC) requirement consistent with the chosen values."
+    },
+    {
+     "id": "I2",
+     "agent": "engineer",
+     "severity": "blocking",
+     "title": "Accreditation_level ties_for_order_limit (DESC) is not guaranteed",
+     "evidence": {
+      "spec": "ties_for_order_limit: 'at least two rows share the maximum Accreditation_level (tie at rank 1, DESC)'.",
+      "code": "accreditation_levels() seeds two 'joyn' values, but then fills the remainder from ACCRED_LEVELS which includes 'joyn Hot Fixes' and numeric strings. Under SQLite text ordering, 'joyn Hot Fixes' > 'joyn' and '4' > 'joyn', so the maximum is not 'joyn' and the seeded pair is not a tie at rank 1. The comment '# tie at the maximum' is therefore wrong for the actual pool."
+     },
+     "requested_revision": "Either (a) restrict the pool so the maximum value is duplicated at least twice, or (b) explicitly construct two copies of the true maximum (e.g. two 'joyn Hot Fixes' if that is the max, or two '4' if numeric strings dominate). Document the ordering assumption (SQLite text vs numeric coercion) in the spec."
+    },
+    {
+     "id": "I3",
+     "agent": "designer",
+     "severity": "blocking",
+     "title": "Specification rule for phone.Accreditation_level comparison_boundary conflicts with declared TEXT type and observed pool",
+     "evidence": {
+      "spec": "semantic_rules_and_formulas: Accreditation_level IN ('joyn Hot Fixes','joyn','2','3','4') with evidence 'numeric-string values needed for PRED(accreditation_level > 3) under SQLite coercion'.",
+      "schema": "phone.Accreditation_level is declared TEXT; original distinct values are 'joyn Hot Fixes','joyn' only.",
+      "extracted_ops": "comparison_boundary targets values [2,3,4] for PRED(phone.accreditation_level > 3); aggregate_boundary targets COUNT(*) values [2,3,4]."
+     },
+     "requested_revision": "Clarify whether the numeric-string injection is intended (it changes the column's semantic domain) and, if so, state the exact coercion semantics (SQLite affinity: TEXT column with numeric-looking strings compares numerically only when both operands are numeric). If not intended, remove the numeric strings and drop the comparison_boundary/aggregate_boundary targets that depend on them. The current spec mixes a TEXT domain with numeric comparison targets without a stated rule."
+    },
+    {
+     "id": "I4",
+     "agent": "engineer",
+     "severity": "major",
+     "title": "duplicates_for_distinct targets are not enforced for several columns",
+     "evidence": {
+      "spec": "duplicates_for_distinct 20-50% duplicate share on DISTINCT for phone.Company_name, phone.Hardware_Model_name, phone.Accreditation_level, screen_mode.Type, screen_mode.Pixels, chip_model.WiFi.",
+      "code": "phone.Hardware_Model_name uses hw_model_names() which is a primary_key_text sampler producing unique values (n unique names) \u2014 this directly contradicts the duplicates_for_distinct target for the same column. company_values() draws from a 16-value pool with n=8, so duplicates are not guaranteed. type_values() draws from 2 values with 30% lowercasing, giving at most 4 distinct values over 7 rows \u2014 duplicate share is plausible but not constructed. duplicate_share_values() for WiFi/Pixels samples a subset of size round(len*U(0.5,0.8)) which for small pools (2-5 values) does not guarantee 20-50% duplicate share on DISTINCT.",
+      "execution": "construction_pairs_by_group is empty; no separation evidence is reported for duplicates_for_distinct patterns."
+     },
+     "requested_revision": "For each column with a duplicates_for_distinct target, construct the value multiset so that the DISTINCT duplicate share falls in [0.2,0.5] by design (e.g. choose k distinct values and assign counts summing to n with the required share). For phone.Hardware_Model_name, resolve the conflict between primary_key_text (unique) and duplicates_for_distinct \u2014 a PK column cannot have duplicates; the spec should drop the duplicates_for_distinct target for the PK column or the engineer should document that it is vacuous."
+    },
+    {
+     "id": "I5",
+     "agent": "engineer",
+     "severity": "major",
+     "title": "chip_model.Launch_year comparison_boundary targets -1585/-1584/-1583 are dropped without spec update",
+     "evidence": {
+      "spec": "extracted_ops comparison_boundary targets values [-1585,-1584,-1583,2001,2002,2003,2004,2005]; per_column_exceptions Launch_year targets 'boundary values at 2002,2003,2004,2005 and one step outside within schema domain: 2001, 2006'.",
+      "code": "spec.py LAUNCH_BOUNDARY = [2001..2006]; launch_years() never emits -1585/-1584/-1583.",
+      "spec_uncertainty": "The spec's own 'uncertainty' field acknowledges the removal ('Launch_year boundary values -1585/-1584/-1583 were removed to keep the semantic range [2001,2006]')."
+     },
+     "requested_revision": "The designer should update the extracted_ops target list to match the semantic range, or the engineer should implement the negative boundary values. As written, the spec and program disagree on the target set; the program's choice is defensible but the spec must be reconciled."
+    },
+    {
+     "id": "I6",
+     "agent": "engineer",
+     "severity": "major",
+     "title": "screen_mode.used_kb literal pool (10, 15) is not guaranteed to appear",
+     "evidence": {
+      "spec": "per_column_exceptions used_kb real_numeric 'include literals 10 and 15 among sampled values'; literal_pool_other_columns used_kb literals [10,15].",
+      "code": "used_kb_values() draws from USED_KB + USED_KB_LITERALS with p=0.2 boundary override; with n=7 there is no guarantee that both 10 and 15 appear (10 is in USED_KB anyway, but 15 is only in the literal list and may be absent)."
+     },
+     "requested_revision": "Force at least one 15 (and one 10) into the used_kb sample, e.g. seed the list with [10.0, 15.0] before random fill, analogous to the tie seeding used elsewhere."
+    },
+    {
+     "id": "I7",
+     "agent": "engineer",
+     "severity": "minor",
+     "title": "chip_model.RAM_MiB / ROM_MiB rows_with_different_values and ties are seeded but boundary values may violate the stated domain",
+     "evidence": {
+      "spec": "RAM_MiB IN (32,64); ROM_MiB IN (32,48,64,128,256); real_quantity 'with probability 0.2 emit a boundary value at min-1 or max+1'.",
+      "code": "ram_values()/rom_values() call one_step_outside() with p=0.2, producing 31/65 and 31/257 etc., which are outside the stated IN domains. The spec's semantic_rules_and_formulas assert RAM_MiB IN (32,64) and ROM_MiB IN (32,48,64,128,256)."
+     },
+     "requested_revision": "Either drop the one_step_outside injection for RAM/ROM (the spec's IN-domain formulas take precedence) or update the spec to allow min-1/max+1 boundary values. Currently the program can emit values that violate the spec's own semantic formulas."
+    },
+    {
+     "id": "I8",
+     "agent": "engineer",
+     "severity": "minor",
+     "title": "NULL share is fixed at 10% rather than following the compact database's share",
+     "evidence": {
+      "spec": "null_share: 'emit NULL in about 10% of the surviving generated rows'; null_targets lists 18 columns.",
+      "execution": "nullable_columns shows NULL counts of 20-34 out of 66-194 generated rows, i.e. ~10-17%, consistent with the 10% rule but not with the compact database's per-column share (the spec's uncertainty notes observed null_rate is 0).",
+      "interface_rule": "The review interface says NULL share should follow the compact database's share for that column. The compact DB has null_rate 0 for these columns, so a 10% share is a deliberate deviation."
+     },
+     "requested_revision": "Document explicitly that the 10% null rate is a deliberate deviation from the observed 0% rate (the spec's uncertainty section does mention this, but the generation program hard-codes 0.1 without reference to observed rates). Consider deriving null rate from the source DB when available."
+    },
+    {
+     "id": "E1",
+     "observation": "positive",
+     "detail": "Schema/DDL, PK/FK constraints, and table ordering are read correctly (schema.py process_order, _init_columns). Foreign keys are generated after parents (instance.py build_random_instance iterates schema.table_order and fills FKs from _parent_pool). Integrity feedback: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0 across 20 instances."
+    },
+    {
+     "id": "E2",
+     "observation": "positive",
+     "detail": "Compact rows are preserved: writer.py copies the original DB (shutil.copyfile) and only appends rows; rows_skipped is 0 for all tables. Reproducibility: reproducible=true, seed_base*100003+i seeding in cli.py."
+    },
+    {
+     "id": "E3",
+     "observation": "positive",
+     "detail": "str() coercion before case/near-variant transformation is implemented in spec.py (case_variant, near_variant, like_variant all call str(v) first), addressing the round-1 AttributeError risk noted in the spec's uncertainty."
+    },
+    {
+     "id": "E4",
+     "observation": "positive",
+     "detail": "PK samplers (chip_model_names, hw_model_names, graphics_modes) generate n+len(existing) candidates and loop until the filtered unique count equals n, matching the primary_key_text/primary_key_real spec."
+    },
+    {
+     "id": "U1",
+     "unresolved": "construction_pairs_by_group is empty in the execution feedback, so per-pattern separation (e.g. whether comparison_boundary, like_near_variant, ties_for_order_limit are actually separated by the generated data) cannot be verified from the supplied evidence. The 25/67 separated pairs are aggregate only."
+    },
+    {
+     "id": "U2",
+     "unresolved": "The spec's 'uncertainty' field notes that the original data has 14 chip_model rows but only 8 distinct Model_name values, and that phone FK values include X51v/X50 Advanced/X50 Standard not in the parent pool. The program restricts FKs to valid parent values or NULL, which is correct for integrity but means the unmatched_join_rows pattern (11 pairs) is only exercised via NULL FKs, not via dangling references. This is a design choice, not an error, but should be confirmed by the designer."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-pattern separation evidence (construction_pairs_by_group) is empty; cannot confirm that comparison_boundary, like_near_variant, ties_for_order_limit, and duplicates_for_distinct patterns are actually separated by the generated instances.",
+    "Whether the designer intends the numeric-string injection into phone.Accreditation_level (TEXT column) and the resulting SQLite coercion semantics.",
+    "Whether the designer accepts the 10% NULL share as a deliberate deviation from the compact DB's 0% null rate."
+   ],
+   "notes": "The program ran without errors and produced valid, integrity-clean, reproducible instances. The blocking issues are construction-level: several specification targets (Accreditation_level group sizes/aggregate boundary/comparison boundary, Accreditation_level DESC tie, duplicates_for_distinct for PK and small-pool columns) are not realized by the samplers, and the spec is internally inconsistent about the Accreditation_level domain and the Launch_year boundary targets. These are not per-pair exceptions and should be fixed in the specification and the samplers."
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with IndexError('list index out of range'), n_ok=0, no rows added. The failure occurs in every unit, i.e., before any row is written.",
+     "requested_revision": "Fix the crash so that build_random_instance / write_instance_sqlite complete for all units. The run produced zero instances, so no integrity, dependency, preservation, or reproducibility property can currently be verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In tscore_gen/instance.py build_random_instance: after building non-FK columns, `inst[t] = cols` is set, then `fill_foreign_keys_consistently(inst, schema, t, n, rng)` uses `_parent_pool`, and later `cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns}, existing)`. For the phone table, `tm.columns` contains chip_model and screen_mode, which are FK columns filled into `cols` by fill_foreign_keys_consistently via `cols.update(fk_cols)` \u2014 but the FK fill is called before `cols` has keys for parent tables in the same order; more importantly, the table order is FK order (chip_model, screen_mode, then phone), so this should work in principle. The likely cause of IndexError: `sample_fresh_primary_keys`/`drop_unique_duplicates` may drop rows so that subsequent per-column lengths become inconsistent, and `apply_null_rule` uses `len(next(iter(columns.values())))` which then misindexes; also `_fallback_sampler` may produce a shorter list (sampler.p returns None-avoiding but lengths differ from n) leading to index mismatch in `cols[c][i]`. The exact location must be confirmed from a traceback; none is provided beyond the class name.",
+     "requested_revision": "Provide the traceback and fix the index error. Also make _fallback_sampler return exactly n values (currently `[s.sample() for _ in range(n)]` is fine in length, so the mismatch likely arises from PK/unique filtering or from FK fill when parent pool is empty producing n values \u2014 verify lengths are preserved through each stage and guard/reraise with context)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec declares NULL_SHARE = 0.1 and the generic null_share rule says 'emit NULL in about 10% of the surviving generated rows ... a deliberate deviation from the compact database's observed 0% null rate'. However the review instruction (item 7) requires the NULL share to follow the compact database's share for that column, which is 0% for all nullable columns per the statistics; only 'at least one NULL row per nullable column' is the overriding requirement.",
+     "requested_revision": "Revise the specification (and NULL_SHARE in instance.py) so the NULL share follows the compact database's per-column share (0% here) while still guaranteeing at least one NULL row per nullable column. The 10% global share is a deliberate deviation that conflicts with the interface rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "unnmatched_join_rows target (11 pairs) requires both a parent row without children AND a child row with NULL FK, plus dangling references. Spec's supporting_evidence states FK values are restricted to valid parent values or NULL, so the 'dangling reference' part of the pattern is not exercised; and the NULL part is now covered only via NULL FKs. This is a deliberate integrity-preserving choice but the pattern's 'joins_with / child_rows_with_null_fk' subtree is partially reduced.",
+     "requested_revision": "Either document the reduced target clearly as a deliberate restriction (acceptable if the integrity constraint takes precedence), or state that unmatched_join_rows is only exercised through NULL FKs. If so, update the extraction-mapping note so downstream comparison does not expect dangling references."
+    },
+    {
+     "agent": "designer",
+     "evidence": "comparison_boundary for phone.Accreditation_level expects targets [2,3,4] on a TEXT column, relying on SQLite type coercion in `PRED(phone.accreditation_level > 3)`. The spec adds numeric strings '2','3','4' to an otherwise text-only domain. This is a deliberate domain extension, but it may produce rows whose Accreditation_level ('2','3','4') are not representative of the observed domain and may distort DISTINCT/group-size targets.",
+     "requested_revision": "Confirm that the numeric-string extension is intended and that it does not conflict with duplicates_for_distinct (20-50%) for Accreditation_level. If the query set truly uses `> 3` on this TEXT column, keep it but document; otherwise restrict to the observed text pool and drop the comparison_boundary target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Launch_year boundary targets include -1585, -1584, -1583, 2001 ... 2005; the spec drops -1585/-1584/-1583 as outside the semantic range [2001,2006]. The BETWEEN -1584 AND 2004 pair is then not fully exercisable (lower bound -1584 is excluded). This is stated in uncertainty but leaves the comparison_boundary for Launch_year partially unsupported.",
+     "requested_revision": "Either justify the semantic range [2001,2006] as the sole admissible domain (acceptable, since a launch year of -1584 is nonsensical) and note the boundary pair is covered only through 2001..2006, or extend the range to include the extracted targets. Recommend documenting the negative-year exclusion as a domain rule and requesting that the boundary pair be considered satisfied by 2001..2005/2006."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py apply_null_rule: `if cm.name in pk or cm.notnull: continue` \u2014 this correctly skips PK/NOT NULL. But it runs on cols after `sample_fresh_primary_keys` and `drop_unique_duplicates`, and `n = len(next(iter(columns.values())))` after potential filtering \u2014 if the filtered columns have different lengths (not supposed to happen, but the IndexError suggests they might), this misbehaves.",
+     "requested_revision": "After fixing the crash, assert all column lists have equal length before apply_null_rule and before the writer, so length mismatches surface as clear errors rather than IndexError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py: `con.execute('pragma foreign_keys = OFF')` when copying the compact DB. Rows that violate FK are thus not caught, and `rows_failed` will not reflect FK integrity. The specification depends on FK consistency (phone.chip_model, phone.screen_mode), but the writer disables FK enforcement, so the dependent-value consistency is not verified by the loader.",
+     "requested_revision": "Verify FK consistency independently (or enable foreign_keys and handle failures) so that unexpected FK violations are detected and counted. Note that the compact DB may have pre-existing FK violations (the spec says phone FK values include X51v etc. not in chip_model), so the compact copy already violates FK; the writer flag is intentional to allow copying the compact DB, but then a post-load check of generated rows against parent pools is needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "No execution succeeded (n_ok=0), so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducibility could not be verified. The run summary shows rows_added={} and rows_skipped={}.",
+     "requested_revision": "Re-run after the crash fix and provide per-column NULL counts (e.g. 'generated rows: NULL k / n') for every nullable column, and confirm compact rows are preserved (copied then appended) and that the same seed reproduces the same instance."
+    }
+   ],
+   "unresolved_checks": [
+    "Root cause of IndexError could not be pinpointed without a traceback; the reviewer identified plausible sources (length mismatch after PK/unique filtering, empty parent pool, or fallback sampler) but not the exact line.",
+    "Whether the run truly reached the writer (and hence FK enforcement concerns) is unknown since no unit succeeded.",
+    "NULL share per column vs. the 10% global deviation cannot be observed until units are generated.",
+    "The compact DB's own FK violations mean 'parent row without child' and 'child row with NULL FK' targets can only be measured on generated rows, not the whole table."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with ValueError, e.g. 'sampler for chip_model.WiFi returned 6 values, expected 16' and '... returned 8 values, expected 14'. n_ok=0, n_instances=0. Root cause: spec.duplicate_share_multiset (used by duplicate_share_values for chip_model.WiFi) truncates its output to n only after building a multiset whose length is bounded by the pool size. With WIFI_ENUM of 2 values, k = min(n-d, len(pool)) = 2, so the constructed multiset has at most 2 distinct values with counts summing to at most 2 + d, and d = round(share*n) is capped by n-1 but the loop `for _ in range(d)` distributes d extra copies over k=2 buckets, giving total length 2+d which is < n whenever d < n-2. For n=16, share~0.2 gives d~3, total 5-6 values; for n=14, d~6, total 8. The function returns out[:n] which is shorter than n. instance.build_random_instance then raises ValueError because len(vals) != n.",
+     "requested_revision": "Fix duplicate_share_multiset so the returned list always has exactly n elements. The duplicate share must be computed against the actual number of distinct values used (k = min(len(pool), n - d)), and the extra copies must be distributed so that sum(counts) == n exactly (e.g. distribute d = n - k copies, not round(share*n) copies, or recompute d = n - k after clamping k). Add an assertion len(out) == n before returning. This affects chip_model.WiFi, screen_mode.Char_cells, screen_mode.Pixels, screen_mode.map, screen_mode.Type, phone.Company_name, and any other column routed through duplicate_share_values. Re-run generation and confirm n_ok == n_instances with no ValueError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The same truncation bug also affects the duplicate-share target itself: even after fixing the length, the specification requires the DISTINCT duplicate share (n-k)/n to fall in [0.2, 0.5]. With a 2-value pool (WiFi, Type) and n=14/7, k is clamped to 2, so the achievable share is (n-2)/n which is ~0.86 for n=14 and ~0.71 for n=7 \u2014 outside [0.2, 0.5]. The specification's per_column_exceptions claim '20-50% duplicate share on DISTINCT, constructed by design over the 2-value pool', which is arithmetically impossible for n=14 with only 2 distinct values. The program cannot satisfy this target as written.",
+     "requested_revision": "Either (a) relax the duplicate-share target for 2-value pools to the achievable range and record this in the specification's uncertainty/notes, or (b) allow the sampler to emit near-variants (case/typo) of the 2 pool values so that k can exceed 2 and the share can land in [0.2, 0.5]. Whichever is chosen, the specification and the program must agree, and the program must assert the achieved share is within the declared target (or the target must be updated)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for chip_model.WiFi and screen_mode.Type state '20-50% duplicate share on DISTINCT, constructed by design over the 2-value pool', but with a 2-value pool and table sizes 14 (chip_model) and 7 (screen_mode) the minimum achievable duplicate share is (n-2)/n = 0.857 and 0.714 respectively. The target is therefore unsatisfiable as specified. Similarly, phone.Company_name uses a 6-company pool with n=8, giving minimum share (8-6)/8 = 0.25 (satisfiable) but the boundary-variant pool is larger, so the effective k may exceed 6 and the share may fall below 0.2 \u2014 the specification does not pin down which pool is used for the share computation.",
+     "requested_revision": "Update the specification to state, per column, the exact pool used for the duplicate-share construction and the achievable share range given the table size. For 2-value pools either widen the pool with near-variants or relax the target. Make the target consistent with table_sizes_per_instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.choose_table_sizes varies the specification sizes by rng.randint(-2, 2), so chip_model can be 12-16 rows, screen_mode 5-9, phone 6-10. The specification's table_sizes_per_instance fixes chip_model=14, screen_mode=7, phone=8. The variation is not mentioned in the specification and changes the achievable duplicate shares and group sizes (e.g. Accreditation_level group-size construction assumes n>=6; with n=6 the base layout exactly fills the table and the 'duplicate the true maximum' step may replace a required group member).",
+     "requested_revision": "Either remove the +-2 variation so sizes match the specification exactly, or add the variation to the specification and verify that all per-column targets (group sizes 1/2/>=3, COUNT 2/3/4, duplicate shares) remain satisfiable at the minimum size. Add an assertion in accreditation_levels that the required group sizes and COUNT values are present after construction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.accreditation_levels builds base = ['joyn','joyn','joyn Hot Fixes','2','3','4'] and then, if the true SQLite text maximum is not duplicated, replaces the last non-maximum value with the maximum. Under SQLite BINARY text ordering the maximum of {'joyn','joyn Hot Fixes','2','3','4'} is 'joyn Hot Fixes' (lowercase 'j' > digits). Replacing a non-maximum with 'joyn Hot Fixes' can turn the size-1 group into a size-2 group and, if the replaced value was '2','3', or '4', remove a required COUNT value or the only value > 3. The function does not re-check the aggregate_boundary (COUNT 2,3,4) or comparison_boundary (>3) targets after the replacement.",
+     "requested_revision": "After the maximum-duplication step, assert that (a) at least one value coerces to >3, (b) the multiset of group sizes includes 1, 2, and >=3, and (c) COUNT(*) values 2, 3, 4 all appear. If not, adjust the construction (e.g. duplicate the maximum by appending rather than replacing, or choose a replacement that preserves the required values)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.fill_foreign_keys_consistently draws FK values from _parent_pool, which includes schema.original_values for the parent column. For phone.chip_model the parent pool is chip_model.Model_name from the compact DB plus generated rows. The specification's supporting_evidence notes the original phone FK values include 'X51v', 'X50 Advanced', 'X50 Standard' not in the parent pool, and the program correctly restricts to valid parents or NULL. However, the specification's uncertainty says the unmatched_join_rows pattern is 'exercised only via NULL FKs, not via dangling references'. The extracted atomic operation for unmatched_join_rows targets 'parent_rows_without_children' and 'child_rows_with_null_fk' \u2014 the program guarantees at least one NULL FK and at least one parent without child, which is consistent. No blocking issue here, but the specification should state explicitly that dangling references are intentionally not generated so downstream comparison does not expect them.",
+     "requested_revision": "Add a note to the specification (uncertainty or semantic_rules) that unmatched_join_rows is exercised only via NULL FKs and parent rows without children, never via dangling references, and that the writer's _check_generated_fks enforces this. No code change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule: apply_null_rule sets NULL in at least one row per nullable non-PK column, and fill_foreign_keys_consistently guarantees at least one NULL FK. The specification's null_targets lists all nullable columns and the null_share rule says 'the per-column NULL share follows the compact database's observed share for that column (0% for every nullable column in this schema), so the only NULLs are the guaranteed minimum of one per nullable column'. The program implements exactly this (null_share=0.0 default, at least one NULL). This is consistent with the interface rule. No blocking issue.",
+     "requested_revision": "None; note for the record that the NULL rule is implemented as specified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The writer copies the compact DB (shutil.copyfile) and appends generated rows in one transaction, never deleting or changing compact rows. It disables foreign_keys during load and performs an in-memory FK check of generated rows via _check_generated_fks, but the return value of _check_generated_fks is never used \u2014 violations are computed and discarded. The specification requires 'a post-load FK consistency check of generated rows is performed in the writer', which is done, but the result is not surfaced or enforced.",
+     "requested_revision": "Either surface the _check_generated_fks result in the writer's return dict (e.g. 'fk_violations') and have cli._one report it, or assert it is empty for generated rows. This makes the integrity check observable in execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli._one uses rng = random.Random(seed_base * 100003 + i), and build_random_instance consumes rng in a fixed order. However, choose_table_sizes consumes rng before column sampling, and the number of rng draws depends on the (buggy) duplicate_share_multiset loop, so fixing the bug will change the stream. The specification's uncertainty says 'Reproducibility requires re-running with the same seed_base and i0/i1 after fixing the str() coercion, PK enlargement and post-filter NULL injection.' This is acceptable once the bug is fixed, but the current run produced zero instances, so reproducibility cannot be verified.",
+     "requested_revision": "After fixing the length bug, re-run with a fixed seed_base and confirm that two runs with the same seed produce identical instances (e.g. compare row counts and a hash of generated values). Record the seed in the execution feedback."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the duplicate-share target for 2-value pools (WiFi, Type) can be satisfied at all given table sizes 14 and 7 \u2014 requires a specification decision (widen pool or relax target).",
+    "Whether the +-2 table-size variation preserves all Accreditation_level group-size and COUNT targets at the minimum size (n=6 for phone) \u2014 requires an assertion in accreditation_levels.",
+    "Whether the post-load FK check result is intended to be enforced or merely reported \u2014 the writer computes it but discards it.",
+    "Reproducibility across runs with the same seed cannot be verified because the current run produced zero instances."
+   ]
+  }
+ ]
 }

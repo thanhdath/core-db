@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -39,11 +41,14 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 rng_range=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if rng_range is not None:
+            self.min, self.max = rng_range
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -67,7 +72,12 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        v = self._cast(v)
+        if v < self.min:
+            v = self.min
+        if v > self.max:
+            v = self.max
+        return v
 
 
 class StringSampler(ColumnSampler):
@@ -107,6 +117,34 @@ class StringSampler(ColumnSampler):
         return v
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform over a small enumeration (varchar_enum_small)."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 1.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class BoundaryTextSampler(ColumnSampler):
+    """Equality literals plus one-char variants (boundary_text)."""
+
+    def __init__(self, literals, rng):
+        vals = []
+        for s in literals:
+            vals.append(s)
+            if s:
+                vals.append(s[:-1] + chr((ord(s[-1]) + 1) % 128))
+                vals.append(s[:-1] + chr((ord(s[-1]) - 1) % 128))
+                if len(s) > 1:
+                    vals.append(s[:-1])
+        super().__init__(vals, 1.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
 def _parse_date(s: str):
     s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
@@ -120,7 +158,7 @@ def _parse_date(s: str):
 class DateSampler(ColumnSampler):
     """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
 
-    def __init__(self, elements, p, max_l0, rng):
+    def __init__(self, elements, p, max_l0, rng, window=None):
         super().__init__(elements, p, max_l0, rng)
         self.p = p
         self.as_int = bool(self.elements) and all(isinstance(e, int) for e in self.elements)
@@ -131,8 +169,10 @@ class DateSampler(ColumnSampler):
             if d is not None:
                 self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
+        self.template = self.template or '%Y-%m-%d %H:%M:%S'
         self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        if window is not None:
+            self.full = window
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -214,9 +254,14 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     return StringSampler(els, p, max_l0, rng)
 
 
-def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+def _spec_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
+                   max_l0: float = float('inf')) -> ColumnSampler:
+    """Specification-aware sampler selection (enumerations, ranges, boundaries, window)."""
+    key = (column.table, column.name)
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], rng)
+    if key in spec.BOUNDARY_TEXT:
+        return BoundaryTextSampler(spec.BOUNDARY_TEXT[key], rng)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,7 +270,23 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
+    t = (column.type_str or '').lower()
+    if key in spec.RANGES and any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
+        lo, hi = spec.RANGES[key]
+        is_int = 'int' in t
+        return NumberSampler(els, p, max_l0, rng, scale=10, is_int=is_int,
+                             precision=0 if is_int else 2, rng_range=(lo, hi))
+    if 'date' in t or 'timestamp' in t:
+        window = (dt.datetime.strptime(spec.DATE_LO, '%Y-%m-%d %H:%M:%S'),
+                  dt.datetime.strptime(spec.DATE_HI, '%Y-%m-%d %H:%M:%S'))
+        return DateSampler(els, p, max_l0, rng, window=window)
     return make_column_sampler(column, els, p, max_l0, rng)
+
+
+def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
+                  max_l0: float = float('inf')) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (specification-aware)."""
+    return _spec_sampler(column, literal_pool, original_values, p, rng, n_pk, max_l0)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

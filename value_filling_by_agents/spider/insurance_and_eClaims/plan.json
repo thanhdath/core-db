@@ -1,66 +1,482 @@
 {
  "db": "insurance_and_eClaims",
- "operator_io_quirks": [
-  "All 8 tables tiny (2-15 rows); no huge-table sampling needed, but read_schema must still handle max_rows_per_table path",
-  "Mixed-case table/column names (Claim_Headers, Customer_ID, Amount_Piad typo) - must double-quote and preserve original spelling",
-  "Claims_Documents has composite PK (Claim_ID, Document_Type_Code) -> composite-PK member max_l0=30 path exercised",
-  "Claims_Documents.Claim_ID is both PK member and FK to Claim_Headers.Claim_Header_ID (child PK is FK)",
-  "Claims_Processing_Stages.Next_Claim_Stage_ID looks self-referential by name but has NO declared FK; distinct=1, all value '1'",
-  "Claims_Processing.Claim_Stage_ID has no declared FK to Claims_Processing_Stages (dangling by name only)",
-  "Claims_Documents.Created_Date declared INTEGER, storage integer, values 2-9 (day-of-month-like) - Number fuzzer, not Date",
-  "All DATETIME columns stored as TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T) - Date fuzzer template must match",
-  "Amount_Piad storage mixed real+integer (e.g. 309.2 vs 582.03) - Number fuzzer with scale=4 precision=20",
-  "DECIMAL(20,4) -> Number scale=4 precision=20, range [-10^4,10^4] far wider than observed 100-800",
-  "CHAR(15) columns hold multi-word text ('Handphone Subsidy','In progress') - String fuzzer length=15 truncation risk",
-  "Claims_Processing_Stages only 2 rows; level-0 size 1+30*u may exceed parent pool for FK draws"
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME: template from first parsable element = '%Y-%m-%d %H:%M:%S' (space, seconds); fresh dates uniform 1800-2100 unless p returns element",
-  "Number fuzzer on INTEGER PKs: fresh uniform in [-10^4,10^4] then +-1/+-2 perturbation -> IDs far outside observed 15-986 range",
-  "String fuzzer on CHAR(15) codes: fresh random a-zA-Z0-9() strings length<=15, plus contaminate suffix/prefix -> implausible codes like 'Deputy' replaced by 'xK3(p'",
-  "String fuzzer on VARCHAR(255) names: random strings, not name-like -> FN when gold filters on name patterns",
-  "Number fuzzer on DECIMAL(20,4): scale=4 gives range +-10000, observed 100-800 -> implausible amounts, FN on amount thresholds",
-  "FK draws from parent final values with replacement -> duplicate Customer_ID in Policies (observed distinct=10 of 15) preserved; ties present",
-  "Composite PK Claims_Documents: sample_fresh_primary_keys drops dup (Claim_ID,Document_Type_Code) pairs; max_l0=30 caps fresh draws",
-  "Claims_Processing_Stages 2 rows but level-0 size 1+30*u -> FK from Claims_Processing.Claim_Stage_ID may draw NULLs if parent empty after filtering",
-  "Date_of_Settlement vs Date_of_Claim ordering (settlement>=claim) NOT enforced by TS -> FP on queries comparing them",
-  "Amount_Piad vs Amount_Claimed (paid<=claimed) NOT enforced -> FP on such comparisons",
-  "Claim_Status_Code in {Settled,Disputed,In Progress} vs Claim_Outcome_Code in {In progress,Disputed,Settled} - case differs ('In Progress' vs 'In progress'); TS String fuzzer ignores this -> FN on equality joins",
-  "Next_Claim_Stage_ID all '1' (distinct=1): Number fuzzer will scatter -> FN on stage-chain queries"
- ],
- "challenger_refs": [
-  "G4",
-  "G1",
-  "G3",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g8e42f490",
-  "g00aaa47f",
-  "g00aaa47f",
-  "g00aaa47f",
-  "g00aaa47f",
-  "g00aaa47f",
-  "g00aaa47f",
-  "g383b50c3",
-  "g383b50c3",
-  "g194a9969",
-  "g65445c32",
-  "g6e36c54e",
-  "ge50db19d"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL. When the instance is a copy of the compact database, generated PKs start at MAX(existing PK)+1 so they never collide with compact rows. PK columns are exempt from duplicate-share and group-size post-processing.",
+   "integer_fk": "Draw from the union of compact parent values (schema.original_values[(parent_table, parent_column)]) and generated parent values actually present in the instance; never emit a value absent from that union. For nullable FKs include NULL rows and non-NULL rows. For NOT NULL FKs the pool is never empty (fall back to compact values).",
+   "integer_generic": "Uniform integer in [1, 1000]; include boundary values 1, 2, 3 and one step around each listed literal.",
+   "decimal_amount": "Uniform decimal in [0, 1000] with 2-4 fractional digits; include 0 and values near listed literals.",
+   "varchar_name": "Random person-like name from a small pool; include near-duplicate variants (case, spacing) and exact duplicates for DISTINCT targets.",
+   "varchar_short": "Random short token of 3-15 chars; include near-variants of listed literals.",
+   "char_code": "Pick from the column's enum pool; include near-variants (case, truncation) of listed literals.",
+   "datetime": "Random datetime in 2016-01-01..2018-12-31 formatted '%Y-%m-%d %H:%M:%S'; respect table date-order rules. Perturbation for distinctness adds/subtracts a timedelta and re-formats with the column format, never string concatenation.",
+   "integer_date": "Random integer in [1, 31] representing a day-of-month.",
+   "null_share": "For each nullable column, at least one NULL row per instance; share follows the compact database's observed NULL share for that column (fallback ~10-20% when the compact share is 0). NULLs are planted before distinct-value and FK repair; a planted NULL is never replaced to satisfy a rule."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Customers.Customer_Details",
+    "pattern": "duplicates_for_distinct, group_sizes, comparison_boundary, ties_for_order_limit",
+    "targets": {
+     "duplicate_share": "20-50 % of rows repeat a value (COUNT(DISTINCT) between 50% and 80% of row count)",
+     "group_sizes": "1, 2 and >= 3",
+     "boundary_literals": [
+      "Dayana Robel"
+     ],
+     "ties": "at least two rows share the max/min rank value"
+    }
+   },
+   {
+    "column": "Policies.Policy_Type_Code",
+    "pattern": "aggregate_boundary, duplicates_for_distinct, comparison_boundary, group_sizes, ties_for_order_limit",
+    "targets": {
+     "enum": [
+      "Deputy",
+      "Jurisdiction",
+      "Uniformed",
+      "Normal"
+     ],
+     "near_variants": [
+      "deputy",
+      "Uniform",
+      "uniform",
+      "Uni",
+      "uni",
+      "form",
+      "FORM"
+     ],
+     "aggregate_counts": [
+      1,
+      2,
+      3
+     ],
+     "duplicate_share": "20-50 % of rows repeat a value",
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Policies.Customer_ID",
+    "pattern": "aggregate_boundary, null_rows, duplicates_for_distinct, group_sizes, unmatched_join_rows",
+    "targets": {
+     "aggregate_distinct_counts": [
+      1,
+      2,
+      3
+     ],
+     "null_share": "none (NOT NULL column)",
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Claims_Processing.Claim_Stage_ID",
+    "pattern": "group_sizes, duplicates_for_distinct, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "duplicate_share": "20-50 % of rows repeat a value",
+     "enum": [
+      1,
+      3
+     ],
+     "fk_target": "must reference existing Claims_Processing_Stages.Claim_Stage_ID (compact + generated); apply group-size/duplicate-share before FK assignment or repair FKs after"
+    }
+   },
+   {
+    "column": "Claims_Processing_Stages.Claim_Status_Name",
+    "pattern": "group_sizes, comparison_boundary, duplicates_for_distinct, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "enum": [
+      "Open",
+      "Close"
+     ]
+    }
+   },
+   {
+    "column": "Policies.Policy_ID",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "pk_exempt": "PK column; not subject to duplicate-share/group-size post-processing"
+    }
+   },
+   {
+    "column": "Claim_Headers.Policy_ID",
+    "pattern": "unmatched_join_rows, group_sizes",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Customers.Customer_ID",
+    "pattern": "group_sizes, unmatched_join_rows",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "parent_rows_without_children": true,
+     "pk_exempt": "PK column; group-size target realized on join result, not by duplicating PK values"
+    }
+   },
+   {
+    "column": "Claim_Headers.Amount_Claimed",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different non-NULL values",
+     "boundary": "include max and min distinct values"
+    }
+   },
+   {
+    "column": "Claim_Headers.Amount_Piad",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different non-NULL values",
+     "boundary": "include max and min distinct values"
+    }
+   },
+   {
+    "column": "Claim_Headers.Claim_Header_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Claims_Processing.Claim_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Claims_Processing.Staff_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Policies.Start_Date",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "format": "%Y-%m-%d %H:%M:%S",
+     "perturbation": "add/subtract timedelta and re-format; re-apply date-order after perturbation"
+    }
+   },
+   {
+    "column": "Claim_Headers.Claim_Status_Code",
+    "pattern": "enum",
+    "targets": {
+     "enum": [
+      "Settled",
+      "Disputed",
+      "In Progress"
+     ]
+    }
+   },
+   {
+    "column": "Claim_Headers.Claim_Type_Code",
+    "pattern": "enum",
+    "targets": {
+     "enum": [
+      "Handphone Subsidy",
+      "Child Birth",
+      "Overtime Meal Subsidy"
+     ]
+    }
+   },
+   {
+    "column": "Claims_Documents.Document_Type_Code",
+    "pattern": "enum",
+    "targets": {
+     "enum": [
+      "Document",
+      "Medical",
+      "Photo"
+     ]
+    }
+   },
+   {
+    "column": "Claims_Processing.Claim_Outcome_Code",
+    "pattern": "enum",
+    "targets": {
+     "enum": [
+      "In progress",
+      "Disputed",
+      "Settled"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Policies.Customer_ID",
+    "parent_table": "Customers",
+    "parent_column": "Customer_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claim_Headers.Policy_ID",
+    "parent_table": "Policies",
+    "parent_column": "Policy_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Documents.Claim_ID",
+    "parent_table": "Claim_Headers",
+    "parent_column": "Claim_Header_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Documents.Created_by_Staff_ID",
+    "parent_table": "Staff",
+    "parent_column": "Staff_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Processing.Claim_ID",
+    "parent_table": "Claim_Headers",
+    "parent_column": "Claim_Header_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Processing.Staff_ID",
+    "parent_table": "Staff",
+    "parent_column": "Staff_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Processing.Claim_Stage_ID",
+    "parent_table": "Claims_Processing_Stages",
+    "parent_column": "Claim_Stage_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims_Processing_Stages.Next_Claim_Stage_ID",
+    "parent_table": "Claims_Processing_Stages",
+    "parent_column": "Claim_Stage_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Policies",
+    "column": "Policy_Type_Code",
+    "formula": "Policy_Type_Code IN ('Deputy','Jurisdiction','Uniformed','Normal')"
+   },
+   {
+    "table": "Policies",
+    "column": "Start_Date",
+    "formula": "Start_Date IS NULL OR End_Date IS NULL OR Start_Date <= End_Date",
+    "condition": "row is generated (compact rows exempt)",
+    "evidence": "Compact row 151 violates (2017-12-20 > 2017-09-16); rule constrains generated rows only."
+   },
+   {
+    "table": "Claim_Headers",
+    "column": "Claim_Status_Code",
+    "formula": "Claim_Status_Code IN ('Settled','Disputed','In Progress')"
+   },
+   {
+    "table": "Claim_Headers",
+    "column": "Claim_Type_Code",
+    "formula": "Claim_Type_Code IN ('Handphone Subsidy','Child Birth','Overtime Meal Subsidy')"
+   },
+   {
+    "table": "Claim_Headers",
+    "column": "Amount_Claimed",
+    "formula": "Amount_Claimed IS NULL OR Amount_Claimed >= 0"
+   },
+   {
+    "table": "Claim_Headers",
+    "column": "Amount_Piad",
+    "formula": "Amount_Piad IS NULL OR Amount_Piad >= 0"
+   },
+   {
+    "table": "Claim_Headers",
+    "column": "Date_of_Claim",
+    "formula": "Date_of_Claim IS NULL OR Date_of_Settlement IS NULL OR Date_of_Claim <= Date_of_Settlement",
+    "evidence": "Claim 15: 2016-05-31 <= 2018-02-23; Claim 24: 2016-12-30 <= 2017-10-08."
+   },
+   {
+    "table": "Claims_Documents",
+    "column": "Document_Type_Code",
+    "formula": "Document_Type_Code IN ('Document','Medical','Photo')"
+   },
+   {
+    "table": "Claims_Processing",
+    "column": "Claim_Outcome_Code",
+    "formula": "Claim_Outcome_Code IN ('In progress','Disputed','Settled')"
+   },
+   {
+    "table": "Claims_Processing_Stages",
+    "column": "Claim_Status_Name",
+    "formula": "Claim_Status_Name IN ('Open','Close')"
+   },
+   {
+    "table": "Claims_Processing_Stages",
+    "column": "Next_Claim_Stage_ID",
+    "formula": "Next_Claim_Stage_ID IS NULL OR Next_Claim_Stage_ID IN (SELECT Claim_Stage_ID FROM Claims_Processing_Stages)",
+    "evidence": "Self-FK pool includes compact + generated stage IDs; if compact has no stage rows, rule is vacuously satisfied by generated-only pool."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 15,
+   "Staff": 15,
+   "Policies": 15,
+   "Claim_Headers": 15,
+   "Claims_Documents": 14,
+   "Claims_Processing_Stages": 2,
+   "Claims_Processing": 15
+  },
+  "null_targets": [
+   "Policies.Start_Date",
+   "Policies.End_Date",
+   "Claim_Headers.Date_of_Claim",
+   "Claim_Headers.Date_of_Settlement",
+   "Claim_Headers.Amount_Claimed",
+   "Claim_Headers.Amount_Piad",
+   "Claims_Documents.Created_by_Staff_ID",
+   "Claims_Documents.Created_Date",
+   "Claims_Processing.Staff_ID",
+   "Claims_Processing_Stages.Next_Claim_Stage_ID"
+  ],
+  "supporting_evidence": {
+   "Policies.Start_Date <= End_Date": "Soft rule for generated rows only; compact row 151 (2017-12-20 > 2017-09-16) is exempt. Generated rows always satisfy it.",
+   "Claim_Headers.Date_of_Claim <= Date_of_Settlement": "Claim 15: 2016-05-31 <= 2018-02-23; Claim 24: 2016-12-30 <= 2017-10-08; Claim 27: 2017-05-01 <= 2017-11-16.",
+   "Amounts non-negative": "All shown Amount_Claimed and Amount_Piad values are >= 0.",
+   "Enums": "Distinct values observed in statistics match the listed enum pools.",
+   "PK disjointness": "Generated PKs start at MAX(existing PK)+1 per table so they never collide with compact rows; FK values are drawn from the union of compact and generated parent values actually present in the instance.",
+   "FK pool fix": "FK sampling uses schema.original_values[(parent_table, parent_column)] union generated parent values; NOT NULL FK pools fall back to compact values so they are never empty.",
+   "Childless parents": "Realized by reserving at least one parent PK value and excluding it from the child FK draw; never by planting NULL into a NOT NULL FK column.",
+   "PK exemption": "PK columns (Customers.Customer_ID, Policies.Policy_ID, Claim_Headers.Claim_Header_ID, Claims_Processing.Claim_Processing_ID, Claims_Processing_Stages.Claim_Stage_ID) are removed from DISTINCT_COLUMNS and GROUP_SIZE_COLUMNS; group-size/unmatched-join targets are realized on the join result via child FK distribution.",
+   "Datetime perturbation": "Distinctness for datetime columns adds/subtracts a timedelta and re-formats with '%Y-%m-%d %H:%M:%S'; date-order is re-applied after perturbation.",
+   "FK-target post-processing": "Group-size/duplicate-share on Claims_Processing.Claim_Stage_ID and Claims_Processing_Stages.Claim_Status_Name is applied before FK assignment, or FKs are re-validated and repaired after post-processing so Claims_Processing.Claim_Stage_ID and Next_Claim_Stage_ID always reference existing stage IDs."
+  },
+  "uncertainty": "No formula linking Amount_Piad to Amount_Claimed holds on all shown rows (Amount_Piad exceeds Amount_Claimed in several rows), so no such formula is stated. Next_Claim_Stage_ID self-reference is nullable and only observed value is 1; treated as optional self-FK with pool = compact + generated stage IDs. Policies.Start_Date <= End_Date is contradicted by compact row 151; stated as a soft rule constraining generated rows only, with compact rows exempt. NULLs form their own group for COUNT(DISTINCT) targets and are excluded from the '>= 2 distinct non-NULL values per group' requirement; _ensure_distinct_values is applied after _plant_nulls and is NULL-aware. duplicate_share is interpreted as the fraction of rows that repeat a value (so COUNT(DISTINCT) lies between 50% and 80% of row count). Whether the compact database contains Claims_Processing_Stages rows is unconfirmed; if absent, the self-FK rule is vacuously satisfied by the generated-only pool."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows integrity.fk_violations = 89 across the run and validity.new_integrity_failures = 20 (every instance has new integrity failures), yet writer.write_instance_sqlite() DISABLES foreign key enforcement (`con.execute('pragma foreign_keys = OFF')`) before inserting rows. The FK column values are drawn from in-memory generated parent values (fill_foreign_keys_consistently), but the writer never verifies they exist in the actual DB, and the CLI never checks resulting integrity after commit. In addition, rows_skipped is nonzero for Customers (154) and Policies (167), meaning many generated rows were silently rejected (declared PK/UNIQUE collisions from sample_fresh_primary_keys applied only to the generated batch, while PKs restart at 1, colliding with existing compact rows). Combined with FK OFF, the seed parent values referenced by children may be the rejected ones, producing dangling FKs. This directly violates the requirement that dependent-value consistency and integrity be preserved.",
+     "request": "Enable `pragma foreign_keys = ON` (or verify FKs post-commit) and make the writer/CLI reject or repair rows whose FKs are violated. Fix primary key generation so generated PKs do not collide with existing compact PKs (do not restart at 1 when the compact DB already contains those keys; see same root cause below). After writing, run a referential-integrity check and fail the unit if fk_violations > 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "validity.reasons shows compact_rows_missing = 20 for all 20 instances and no_rows_added = 10. The spec says each instance is 'a copy of the compact database plus appended generated rows', and writer copies the compact DB with shutil.copyfile(orig_path, part). However write_instance_sqlite is called from cli._one without passing orig_path (`w = write_instance_sqlite(_G['schema'], inst, p)`) \u2014 orig_path defaults to None \u2014 so every unit is created from schema.ddl only (`created = True`), and the compact rows are absent from every instance. This is an outright implementation bug contradicting the spec's 'copy of the compact database' statement.",
+     "request": "Pass the original DB path from the CLI to write_instance_sqlite (e.g. write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])) so each unit is a true copy of the compact database before appended rows. Re-run and confirm compact rows are preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "PK/FK generation restarts at 1 for every generated batch. _spec_sizes builds sizes, samplers for integer PKs fall back to NumberSampler over original values, but generated rows for Customers get rejected 154 times and Policies 167 times (rows_skipped). Because the compact DB is copied in the (intended) design, generated PK values are almost certain to collide with compact PKs. The table_sizes_per_instance values (Customers=15 etc.) are also treated as sizes to append, not as sizes of the final instance, so even a successful copy would not match the spec's per-instance table sizes.",
+     "request": "Generate PK values disjoint from the existing compact PK range (e.g. start after MAX(existing PK) or use the writer's original rows to seed the sampler), and reduce/generate table sizes so the total per-table row count matches table_sizes_per_instance (do not blindly append 15 more rows on top of the compact DB). Align with the 'copy of the compact database plus appended generated rows' wording \u2014 either append rows sized so total equals BASE_SIZES, or document that the sizes are appended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "claims_documents.Created_Date shows 'generated rows: NULL 0 / 1' and Created_by_Staff_ID 'NULL 0 / 1'. Both are in spec.NULL_TARGETS; the low NULL counts trace to the same writer/PK rejection path (most generated rows for Claims_Documents appear OK but only 1 row was written to some instance). Also, _plant_nulls sets ~10-20% NULL share regardless of the compact DB's actual share, which the interface 7 explicitly asks to follow ('NULL share following the compact database's share for that column'). This is minor (the interface notes nullable columns with NULL 0 / n do not block) but the compact-share rule is not implemented at all.",
+     "request": "Compute per-column NULL share from the compact DB (schema.original_values) and use it as the sampling target for _plant_nulls, while keeping at least one NULL. Re-run so Claims_Documents nullable columns get at least one NULL; verify no nullable column reports 'NULL 0 / n'."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic rule section claims Amount_Piad has no formula linking to Amount_Claimed (correct) but 'Amount_Claimed/Amount_Piad >= 0' and non-negativity are enforced only after generation, with no rule for how NULL distinct rows should interact with the rows_with_different_values target. Also, _ensure_distinct_values perturbs only a single value and can be undone by _plant_nulls; the spec says '>= 2 per group with different values' but does not state whether NULL groups count. The construction_pairs: eligible 65, separated 27 (only ~42%) suggests several target patterns only weakly hold. Not blocking, but the interface targets need tightening so the generated instances reliably exercise the aggregate/group-size/distinct targets that the queries depend on.",
+     "request": "Specify in semantic_rules: (a) whether NULLs form their own group for COUNT(DISTINCT) targets, (b) the concrete 'duplicate_share' in COUNT(DISTINCT c) terms (the value 20-50% is ambiguous between 'rows repeating a value' and 'value counts'), and (c) that _ensure_distinct_values and _plant_nulls must be applied so that at least 2 non-NULL distinct values coexist per group even after NULL planting (order _ensure_distinct_values AFTER _plant_nulls, or make _ensure_distinct_values NULL-aware)."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not confirm whether FK OFF was intentional for batch speed vs. the 89 fk_violations \u2014 but violations are counted as new integrity failures and are blocking.",
+    "whether the 10 'no_rows_added' instances correspond to instance id where all generated PKs collided; not further diagnosed beyond rows_skipped counters.",
+    "Code is referenced from the review text; confirm writer receives orig_path after revision (currently cli.py:_one does not pass it)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows large numbers of skipped rows: Policies 53, Claim_Headers 47, Claims_Documents 80, Claims_Processing 120 skipped, while only 18/41/25/47 were added. Two of 20 instances are invalid with reason 'no_rows_added'. The writer (writer.py) inserts generated rows with `INSERT INTO t VALUES (...)` and silently counts failures; the instance builder (instance.py) generates FK values from `instance[pt][pc]` which for parent tables includes only *generated* rows (compact rows are not in `inst`), so FK values are drawn from a pool that may be empty or inconsistent with the compact parent rows actually present in the copied DB. When the parent pool is empty, `fill_foreign_keys_consistently` returns `[None]*n`, which then fails NOT NULL on Policies.Customer_ID / Claim_Headers.Policy_ID / Claims_Processing.Claim_ID, producing the mass skips.",
+     "requested_revision": "Make FK sampling draw from the union of compact parent values (schema.original_values[(pt,pc)]) and generated parent values, so child rows always reference rows actually present in the copied instance. Ensure the parent pool is never empty for NOT NULL FKs (fall back to compact values). Re-run and confirm rows_skipped is near zero and no instance has 'no_rows_added'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_reserve_childless_parents` sets a child FK value to None to create a childless parent: `cvals[i] = None`. For NOT NULL FK columns (Policies.Customer_ID, Claim_Headers.Policy_ID, Claims_Processing.Claim_ID) this produces a NOT NULL violation and the row is skipped by the writer. This directly conflicts with the spec's `child_rows_with_null_fk: false` target for these columns.",
+     "requested_revision": "Do not plant NULL into NOT NULL FK columns. Instead, ensure childless parents by leaving at least one parent PK unreferenced (e.g. reserve a parent PK value and exclude it from the child FK draw), never by nulling a NOT NULL child FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py lists `('Policies','Policy_ID')` in DISTINCT_COLUMNS and `('Customers','Customer_ID')` in GROUP_SIZE_COLUMNS, but these are primary keys. `_apply_duplicate_share` and `_apply_group_sizes` mutate these columns after PK assignment, which can create duplicate PKs (later dropped by sample_fresh_primary_keys only for the pre-post-processing pass, not after). The spec's per-column exceptions for Policy_ID and Customer_ID only require `unmatched_join_rows` / `group_sizes` on the *join* result, not duplicate PK values. Applying duplicate-share/group-size to a PK column is a spec/program mismatch and risks PK collisions.",
+     "requested_revision": "Remove PK columns from DISTINCT_COLUMNS and GROUP_SIZE_COLUMNS; realize the group-size/unmatched-join targets on the join result (e.g. via child FK distribution) rather than by duplicating PK values. Alternatively, re-run sample_fresh_primary_keys after post-processing and document that PKs are exempt from duplicate-share."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `supporting_evidence` for `Policies.Start_Date <= End_Date` admits the compact row 151 violates the rule (2017-12-20 > 2017-09-16) and calls it a 'soft order rule'. The program's `_enforce_date_order` swaps start/end for generated rows, but the compact violating row remains in every copied instance, so the rule does not hold on the instance as a whole. The spec should state clearly whether the rule is a hard constraint (then the compact row must be excluded or the rule dropped) or a soft rule (then it should not be listed as a semantic rule).",
+     "requested_revision": "Either drop the Start_Date <= End_Date rule from semantic_rules_and_formulas (since it is contradicted by compact data), or state it explicitly as a soft rule that only constrains generated rows and document that compact rows are exempt. Do not present it as a hard semantic rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` notes that `Next_Claim_Stage_ID` self-reference 'only observed value is 1' and is treated as optional self-FK, but the semantic rule `Next_Claim_Stage_ID IS NULL OR Next_Claim_Stage_ID IN (SELECT Claim_Stage_ID FROM Claims_Processing_Stages)` is listed as a hard formula. With Claims_Processing_Stages size 2 and INT_ENUMS only [1,3] for Claim_Stage_ID, the self-FK pool is small; the program's `fill_foreign_keys_consistently` for self-FK uses `instance[t][pc]` which is the generated PK list, but the compact stage rows (if any) are not included, so the self-FK may reference a stage ID not present in the copied instance. This is a dependency-consistency gap.",
+     "requested_revision": "Include compact parent values in the self-FK pool (same fix as issue 1) and confirm the self-FK rule holds on the full instance. If the compact DB has no Claims_Processing_Stages rows, document that the self-FK is generated-only and the rule is vacuously satisfied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_ensure_distinct_values` is applied to `Policies.Start_Date` (in DIFFERENT_VALUE_COLUMNS) after `_plant_nulls`, but it only perturbs a value if all non-NULL values are equal. For datetime strings it appends 'x' (`vals[i] = v + 'x'`), producing an invalid datetime string that violates the `%Y-%m-%d %H:%M:%S` format target and the date-order rule. This is a latent bug that can corrupt Start_Date values.",
+     "requested_revision": "For datetime columns, perturb by adding/subtracting a timedelta and re-formatting with spec.DATE_FMT, not by string concatenation. Re-apply `_enforce_date_order` after any perturbation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_duplicate_share` and `_apply_group_sizes` are applied to `Claims_Processing.Claim_Stage_ID` and `Claims_Processing_Stages.Claim_Status_Name`, but these columns are also FK targets (Claim_Stage_ID is referenced by Claims_Processing.Claim_Stage_ID and Next_Claim_Stage_ID). Mutating Claim_Stage_ID after FK assignment can break the FK (child references a stage ID no longer present). The self-FK fix loop in `build_random_instance` only runs for `pt == t`, not for cross-table FK to Claims_Processing_Stages.",
+     "requested_revision": "Apply group-size/duplicate-share to FK-target columns before FK assignment, or re-validate and repair FKs after post-processing. Ensure Claims_Processing.Claim_Stage_ID and Next_Claim_Stage_ID always reference existing Claims_Processing_Stages.Claim_Stage_ID values."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database actually contains Claims_Processing_Stages rows (needed to confirm self-FK pool correctness).",
+    "Whether the 2 invalid instances ('no_rows_added') are due to empty parent pools or another cause; the fix in issue 1 should resolve this but needs re-run confirmation.",
+    "Whether the duplicate-share/group-size targets on PK columns (issue 3) actually produced PK collisions in the 20 instances; the integrity check reports 0 pk_duplicates, but this may be because the writer skipped the colliding rows rather than because none were generated."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification states 'Policies.Start_Date <= End_Date' as a soft rule for generated rows only, citing compact row 151 (2017-12-20 > 2017-09-16). The program implements this via _enforce_date_order which swaps Start_Date/End_Date when violated (instance.py). This is consistent with the stated soft-rule treatment and the compact-row exemption.",
+     "requested_revision": "None required; the soft-rule framing is adequately evidenced by the cited compact row and the program honors it for generated rows only."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's 'uncertainty' section correctly notes that no formula links Amount_Piad to Amount_Claimed (Amount_Piad exceeds Amount_Claimed in several rows) and that Next_Claim_Stage_ID self-FK is optional. These are appropriately flagged as uncertain rather than asserted as hard rules.",
+     "requested_revision": "None required; uncertainty is documented and the program does not enforce an unsupported formula."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows Claims_Documents rows_skipped = 47 across 20 instances (out of 77 added). This is expected: Claims_Documents has a composite PK (Claim_ID, Document_Type_Code) and the generator's sample_fresh_primary_keys/drop_unique_duplicates plus FK repair can produce duplicate (Claim_ID, Document_Type_Code) tuples that are rejected by the PK constraint. Rows are counted, not silently dropped, and integrity reports pk_duplicates=0, fk_violations=0, not_null_violations=0.",
+     "requested_revision": "Optional: the engineer could reduce skipped rows by de-duplicating (Claim_ID, Document_Type_Code) pairs before insert, but this does not block a pass since skips are reported and integrity is clean."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable columns all show generated NULL counts > 0 (e.g., Claim_Headers.Amount_Claimed NULL 16/88, Policies.Start_Date NULL 17/71, Claims_Processing_Stages.Next_Claim_Stage_ID NULL 12/40), satisfying the NULL rule. NOT NULL / PK columns show no NULLs (not_null_violations=0).",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "FK integrity is clean (fk_violations=0) across all 20 instances; PKs start at MAX(existing)+1 per _pk_start; compact rows are copied verbatim via shutil.copyfile and only appended to. Reproducibility confirmed (reproducible=true, deterministic seed_base*100003+i).",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Construction pairs: 21 of 65 eligible pairs separated. This is a partial separation, not a failure. Per instructions, missing separation alone does not establish a generation error. The spec's per-column targets (duplicate_share 20-50%, group_sizes 1/2/>=3, aggregate boundaries, enum near-variants) are implemented in _apply_duplicate_share, _apply_group_sizes, EnumSampler, and boundary literals in _init_sampler.",
+     "requested_revision": "None required; value variation remains possible and separation is partial but non-zero."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database contains Claims_Processing_Stages rows (spec uncertainty); the self-FK rule is vacuously satisfied by generated-only pool if absent, which is acceptable.",
+    "Exact realization of 'parent_rows_without_children' for Customers.Customer_ID and Claim_Headers.Claim_Header_ID: _reserve_childless_pk_values reserves one parent PK per pair, but with small table sizes and random FK draws the reservation may occasionally be re-referenced by chance; execution shows fk_violations=0 and no integrity errors, so this is not blocking."
+   ]
+  }
+ ]
 }

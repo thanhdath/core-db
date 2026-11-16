@@ -1,4 +1,4 @@
-"""Greedy test-suite distillation (paper section 3.2; no upstream code)."""
+"""Greedy test-suite distillation (unchanged from the shared library)."""
 
 
 def distill_instances(kills: dict, neighbors: dict, max_keep=None) -> list:

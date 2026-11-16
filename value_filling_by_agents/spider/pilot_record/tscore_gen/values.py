@@ -1,7 +1,9 @@
-"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224; fuzz/{base,number,string,date,time,bool}.py)."""
+"""Per-type value generators (spec-driven; kept for compatibility with the original library)."""
 import datetime as dt
 import re
 import string
+
+from . import samplers as _samplers
 
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'

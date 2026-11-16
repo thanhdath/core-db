@@ -1,55 +1,563 @@
 {
  "db": "coffee_shop",
- "operator_io_quirks": [
-  "All identifiers are double-quoted in DDL; table/column names are mixed case (Shop_ID, Num_of_shaff_in_charge) \u2014 case-insensitive lookup + original-spelling quoting required.",
-  "happy_hour has a 3-column composite PK (HH_ID, Shop_ID, Month) and an FK on Shop_ID to shop; happy_hour_member has a 2-column composite PK (HH_ID, Member_ID) and an FK on Member_ID to member.",
-  "happy_hour.HH_ID and happy_hour_member.HH_ID are NOT FKs to each other (no parent), so TS will generate them independently \u2014 cross-table HH_ID joins will mostly miss.",
-  "happy_hour.Shop_ID is both a PK member and an FK to shop.Shop_ID; TS draws it from the parent's final values, then PK-dedup may drop rows.",
-  "happy_hour_member.Member_ID is both a PK member and an FK to member.Member_ID; same PK/FK overlap.",
-  "shop.Num_of_staff and shop.Open_Year are declared TEXT but store integer-looking strings ('13','2010'); TS String fuzzer will emit non-numeric strings, breaking numeric comparisons.",
-  "member.Time_of_purchase is INT but semantically an hour-of-day (18,41,20,27,44) \u2014 values >23 exist, so 'hour' predicates are already loose.",
-  "member.Membership_card is TEXT with only 2 distinct values ('Black','White') \u2014 TS String fuzzer will produce many other strings, killing equality filters.",
-  "happy_hour.Month is TEXT with month names ('May','April','June','July') \u2014 TS String fuzzer will not respect month vocabulary.",
-  "shop.Score is REAL with 7 distinct values in [30,42]; TS Number(scale=4) will draw from [-10^4,10^4], far outside the observed range.",
-  "All tables are tiny (6\u201310 rows); TS choose_table_sizes will produce 30\u20132500 rows, so cardinality-based queries (COUNT, DISTINCT) will diverge.",
-  "No NOT NULL, no CHECK, no UNIQUE indexes beyond PKs; no views/triggers; no dangling FKs; no self-references."
- ],
- "operator_ts_expectations": [
-  "shop.Shop_ID, member.Member_ID, happy_hour.HH_ID, happy_hour_member.HH_ID: Number fuzzer, int scale=0, range [-1,1] plus \u00b11/\u00b12 perturbation \u2014 will collide heavily and produce small ints, unlike the 1..10 originals.",
-  "shop.Address, member.Name, member.Address, happy_hour.Month, member.Membership_card: String fuzzer over 'a-zA-Z 0-9()' length 0..20 with 50% contamination \u2014 will not resemble street names, 'Last, First', city names, month names, or 'Black'/'White'.",
-  "shop.Num_of_staff, shop.Open_Year: String fuzzer (declared TEXT) \u2014 will emit arbitrary strings, so numeric predicates on these columns will mostly error or return empty.",
-  "shop.Score, happy_hour_member.Total_amount: Number(scale=4) \u2014 draws in [-10^4,10^4] with \u00b10.01/\u00b10.02 perturbation; observed ranges [30,42] and [4.9,20.92] are tiny subsets, so range predicates will be over/under-selective.",
-  "member.Age, member.Level_of_membership, happy_hour.Num_of_shaff_in_charge: Number int \u2014 plausible small ints but not the observed distributions (Age 29..67, Level 2..6, staff 3..15).",
-  "FK columns (happy_hour.Shop_ID, happy_hour_member.Member_ID) are drawn from parent's final values with replacement \u2014 referential integrity preserved, but parent PK dedup shrinks the pool, so child rows may be dropped by composite-PK dedup.",
-  "Composite PKs: sample_fresh_primary_keys keeps first occurrence \u2014 with small int ranges, many rows dropped, so happy_hour/happy_hour_member end up much smaller than requested size.",
-  "Likely FN drivers: String fuzzer on Month/Membership_card/Address/Name destroys equality and LIKE filters; Number fuzzer on Score/Total_amount destroys range filters; TEXT-declared numeric columns (Num_of_staff, Open_Year) break numeric comparisons.",
-  "Likely FP drivers: tiny int ranges on PKs and FK columns create accidental ties/duplicates that the original lacks; missing cross-table HH_ID linkage (no FK) means joins on HH_ID accidentally match or miss.",
-  "No Date/Time/Bool/Bit fuzzers dispatched here (no such declared types); no crash-fallback columns (all types map to Number or String).",
-  "p=0.2 default with 30% chance of p=0 per instance; checked=False everywhere so p is not forced to 0."
- ],
- "challenger_refs": [
-  "G2",
-  "G4",
-  "G1",
-  "G3",
-  "g5f6c1421",
-  "g5f6c1421",
-  "g5f6c1421",
-  "g5f6c1421",
-  "gd4bbaa0f",
-  "gc248a567",
-  "gc248a567",
-  "gc248a567",
-  "gc248a567",
-  "g0f255217",
-  "gc0f61f30",
-  "g404dd02f"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1; unique; never NULL; fresh-list capped at 1000 entries.",
+   "int_foreign_key": "Uniformly chosen from the parent table's finalized key list (for a composite-parent-PK parent, use the referenced column list, which may repeat); reserved parent keys are excluded so at least one parent row has no child; nullable foreign keys get NULL in about 10% of rows (at least one NULL row per nullable FK column) unless the column is part of a primary key, in which case it is never NULL.",
+   "int_quantity": "Uniform integer in [1, 50].",
+   "int_age": "Uniform integer in [18, 80].",
+   "int_small_code": "Uniform integer in [1, 10].",
+   "int_nonneg": "Uniform integer in [0, 100].",
+   "int_member_purchase_time": "Uniform integer in [0, 60].",
+   "int_level": "Uniform integer in [1, 30].",
+   "real_score": "Uniform real in [0, 50], rounded to 1 decimal.",
+   "real_amount": "Uniform real in [0, 100], rounded to 2 decimals.",
+   "text_address": "Random pick from a fixed pool of 12 street-style addresses (each row distinct per table within the 10-row size); 20-50% duplicate share for DISTINCT targets.",
+   "text_member_address": "Random pick from a fixed pool of member city names ['Hartford','Waterbury','Cheshire','Bridgeport','Harford','New Haven','Stamford','Norwalk']; 20-50% duplicate share for DISTINCT targets.",
+   "text_name": "Random pick from a pool of 20 person names in 'Last, First' format.",
+   "text_month": "Random pick from ['January','February','March','April','May','June','July','August','September','October','November','December'].",
+   "text_year": "Random pick from ['2005','2006','2007','2008','2009','2010','2011','2012'].",
+   "text_numeric_string": "Random integer in [1, 500] rendered as text.",
+   "text_enum": "Random pick from the column's declared enum values.",
+   "text_day": "Random pick from ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'].",
+   "boundary_numeric": "For each listed literal L, include L-1, L, L+1 (or L-step, L, L+step for real).",
+   "boundary_text": "For each listed text literal, include the literal and a case variant; only emit variants that are members of the column's domain pool (clamped by the domain sampler); do not emit numeric literals for text columns.",
+   "near_variant_text": "For each listed literal, include the literal, a case variant, a one-character typo, and a '%literal%' LIKE form; near-variants are used only to seed the literal pool and are emitted as column values only when they are plausible values of the column's declared pool/domain.",
+   "null_share": "For every nullable column (including nullable foreign keys), 10% of rows get NULL; at least one NULL row per nullable column per instance; NOT NULL / primary-key / composite-PK columns never get NULL; planted NULLs are never overwritten.",
+   "tie_order": "Ensure at least two rows share the tie value at the listed rank; bounded retries (max 100) with fallback to rng.choice(pool) if the domain cannot supply enough distinct values.",
+   "group_sizes": "Ensure groups of size 1, 2, and >=3 exist for the listed GROUP columns; bounded retries (max 100) with fallback to rng.choice(pool); not applicable to single-column primary keys or to foreign-key columns whose values are assigned in the foreign-key fill phase (those are covered instead by the parent-side group-size target).",
+   "unmatched_join": "Reserve at least one parent key value (the first column of the parent PK or the referenced column) that is never used as a child foreign-key value; child foreign keys are drawn from the remaining parent keys; parent key sets are finalized before child FK fill. For composite-parent-PK parents (e.g. happy_hour), the referenced column is the first PK column and reservation is applied to that column list.",
+   "aggregate_boundary": "Ensure at least one group has count equal to each listed boundary value (and one group just below and just above where the table size allows); group counts are computed over the grouped column's non-NULL rows; bounded retries (max 100)."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "member",
+    "column": "Address",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Waterbury",
+     "waterbury",
+     "Harford",
+     "harford"
+    ]
+   },
+   {
+    "table": "member",
+    "column": "Address",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%Hartford%",
+     "Hartford",
+     "Hartfore",
+     "Hartford x",
+     "hartford",
+     "%Harford%",
+     "Harford",
+     "Harfore",
+     "Harford x",
+     "harford",
+     "%Waterbury%",
+     "Waterbury"
+    ]
+   },
+   {
+    "table": "member",
+    "column": "Address",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "member",
+    "column": "Membership_card",
+    "pattern": "enum",
+    "targets": [
+     "Black",
+     "White"
+    ]
+   },
+   {
+    "table": "member",
+    "column": "Membership_card",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Black",
+     "black"
+    ]
+   },
+   {
+    "table": "member",
+    "column": "Membership_card",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "member",
+    "column": "Age",
+    "pattern": "comparison_boundary",
+    "targets": [
+     29,
+     30,
+     31,
+     39,
+     40,
+     41
+    ]
+   },
+   {
+    "table": "member",
+    "column": "Member_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(member.member_id)"
+     ],
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "shop",
+    "column": "Shop_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "happy_hour.Shop_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "shop",
+    "column": "Shop_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "shop",
+    "column": "Address",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "happy_hour",
+    "column": "Month",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "happy_hour",
+    "column": "Month",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "happy_hour",
+    "column": "Month",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "May",
+     "may"
+    ]
+   },
+   {
+    "table": "happy_hour",
+    "column": "Shop_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "shop.Shop_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "happy_hour",
+    "column": "Shop_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "happy_hour",
+    "column": "HH_ID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "happy_hour",
+    "child_column": "Shop_ID",
+    "parent_table": "shop",
+    "parent_column": "Shop_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "happy_hour_member",
+    "child_column": "Member_ID",
+    "parent_table": "member",
+    "parent_column": "Member_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "happy_hour_member",
+    "child_column": "HH_ID",
+    "parent_table": "happy_hour",
+    "parent_column": "HH_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "shop",
+    "column": "Shop_ID",
+    "formula": "Shop_ID > 0",
+    "evidence": "PK."
+   },
+   {
+    "table": "shop",
+    "column": "Score",
+    "formula": "Score BETWEEN 0 AND 50",
+    "evidence": "Scores 42.0, 38.0, 36.0, 32.0, 30.0, 40.0, 28.0 all in [0,50]."
+   },
+   {
+    "table": "shop",
+    "column": "Num_of_staff",
+    "formula": "CAST(Num_of_staff AS INTEGER) > 0",
+    "evidence": "Text values '13','19','42','27','24','34','425','28' all positive."
+   },
+   {
+    "table": "member",
+    "column": "Member_ID",
+    "formula": "Member_ID > 0",
+    "evidence": "PK."
+   },
+   {
+    "table": "member",
+    "column": "Age",
+    "formula": "Age BETWEEN 18 AND 80",
+    "evidence": "Ages 29,67,34,51,50,33,42,45 all in [18,80]."
+   },
+   {
+    "table": "member",
+    "column": "Membership_card",
+    "formula": "Membership_card IN ('Black','White')",
+    "evidence": "Only Black/White appear."
+   },
+   {
+    "table": "member",
+    "column": "Level_of_membership",
+    "formula": "Level_of_membership BETWEEN 1 AND 30",
+    "evidence": "Sample values 1-6 and 22; upper bound 30."
+   },
+   {
+    "table": "member",
+    "column": "Time_of_purchase",
+    "formula": "Time_of_purchase >= 0",
+    "evidence": "Sample 18,41,20,27,44,26,24 non-negative."
+   },
+   {
+    "table": "happy_hour",
+    "column": "HH_ID",
+    "formula": "HH_ID > 0",
+    "evidence": "Composite PK member; non-null."
+   },
+   {
+    "table": "happy_hour",
+    "column": "Month",
+    "formula": "Month IN ('January','February','March','April','May','June','July','August','September','October','November','December')",
+    "evidence": "May, April, June, July valid."
+   },
+   {
+    "table": "happy_hour",
+    "column": "Num_of_shaff_in_charge",
+    "formula": "Num_of_shaff_in_charge > 0",
+    "evidence": "Sample 10,12,15,5,3,4 positive; nullable per schema."
+   },
+   {
+    "table": "happy_hour_member",
+    "column": "Total_amount",
+    "formula": "Total_amount >= 0",
+    "evidence": "Amounts 20.9,20.92,4.9,16.9,16.92,4.2 all >= 0."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "shop": 10,
+   "member": 10,
+   "happy_hour": 10,
+   "happy_hour_member": 6
+  },
+  "null_targets": [
+   "member.Name",
+   "member.Membership_card",
+   "member.Age",
+   "member.Time_of_purchase",
+   "member.Level_of_membership",
+   "member.Address",
+   "shop.Address",
+   "shop.Num_of_staff",
+   "shop.Score",
+   "shop.Open_Year",
+   "happy_hour.Num_of_shaff_in_charge",
+   "happy_hour_member.Total_amount"
+  ],
+  "supporting_evidence": {
+   "member.Age": "Rows with Age 29, 67, 34, 51, 50, 33, 42, 45 all lie in [18, 80].",
+   "member.Membership_card": "Only 'Black' and 'White' appear in the sample.",
+   "shop.Score": "Scores 42.0, 38.0, 36.0, 32.0, 30.0, 40.0, 28.0 all lie in [0, 50].",
+   "happy_hour.Month": "Months May, April, June, July are valid month names.",
+   "happy_hour_member.Total_amount": "Amounts 20.9, 20.92, 4.9, 16.9, 16.92, 4.2 are all >= 0.",
+   "member.Level_of_membership": "Sample shows values 1-6 and 22; upper bound raised to 30 to cover the observed 22.",
+   "member.Time_of_purchase": "Sample values 18, 41, 20, 27, 44, 26, 24 are all non-negative integers.",
+   "shop.Num_of_staff": "Text values '13','19','42','27','24','34','425','28' are positive integer strings."
+  },
+  "uncertainty": {
+   "shop.Num_of_staff": "Stored as TEXT; assumed to hold positive integer strings.",
+   "happy_hour.Num_of_shaff_in_charge": "Nullable in schema; NULLs still generated per rule.",
+   "member.Address": "Numeric boundary literals 39/40/41 removed: member.Address is TEXT and numeric comparisons have no meaningful semantics. Fragments 'Har','har','rd','RD' removed: they are not plausible address values. 'Harford'/'harford' retained and added to the member-address pool so the boundary target is realizable.",
+   "member.Age": "Negative boundary literals removed: they are outside the declared domain 18..80 and cannot be realized.",
+   "shop.Shop_ID": "duplicates_for_distinct and group_sizes dropped: they cannot coexist with primary-key uniqueness.",
+   "happy_hour.Shop_ID": "Composite-PK member, therefore NOT NULL; removed from null_targets. group_sizes replaced by parent-side reservation via unmatched_join and by aggregate_boundary on COUNT(*) so the pattern is realizable in the FK fill phase. child_rows_with_null_fk is false because the column is part of the composite PK and cannot be NULL.",
+   "happy_hour.Month": "aggregate_boundary COUNT(*) values [1,2,3] realizable with 10 rows; ties_for_order_limit handled by group-count ties at rank 1.",
+   "happy_hour_member.HH_ID": "References happy_hour.HH_ID which is only the first column of a composite PK and is not unique; FK fill draws from the referenced column list (may repeat) and parent reservation for happy_hour is applied on the HH_ID list.",
+   "member.Time_of_purchase": "No semantic rule in original data; constrained to non-negative integer per int_nonneg sampler (member_purchase_time)."
+  }
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification lists per_column_exceptions targets for member.Address comparison_boundary including integer literals 39, 40, 41 (and the extracted ops PRED(member.address > 40), PRED(member.address >= 'Waterbury')). member.Address is a TEXT column whose supporting evidence is street-style city addresses ('Harford', 'Waterbury'); comparing a text address to 40 has no meaningful semantics. spec.py default_specification puts these into 'boundaries': {'member.Address': [..., 39, 40, 41]} and values.py DomainSampler._clamp returns the numeric for a text domain, so the sampler will emit the bare strings '39','40','41' (or numbers) as member.Address values.",
+     "requested_revision": "Remove numeric boundary literals 39/40/41 from the member.Address comparison_boundary target set in the specification and from spec.default_specification 'boundaries' for member.Address. Keep only the text boundaries (Waterbury, waterbury, Harford, harford, Har, har, rd, RD). Alternatively restate them as string literals ('39','40','41') if the boundary was intended to exercise numeric-vs-text comparison, and document that."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.default_specification sets 'duplicate_share': {'shop.Shop_ID': [0.2, 0.5]}, and instance.py overrides the PK with fresh sequential integers (cols[tm.primary_key[0]] = list(range(start, start+n))) after sampling, so the duplicate_share for shop.Shop_ID is never realized; worse, sample_fresh_primary_keys would then drop duplicate PK rows, shrinking the table. The specification target 'shop.Shop_ID / duplicates_for_distinct / duplicate_share 20-50%' is therefore not implementable against the generated PKs (the compact table already has distinct Shop_IDs, which is what DISTINCT actually needs). Similarly, group_sizes for shop.Shop_ID / happy_hour.Shop_ID are applied to the value columns but for a PK column the values are just unique 1..n, so 'group sizes 1,2,>=3' is vacuous.",
+     "requested_revision": "Either declare that duplicate_share/group_sizes for a single-column primary key are not meaningful and drop them from the specification (they cannot coexist with PK uniqueness), or explain that they refer to the pre-existing compact database and should not be applied to generated rows. The current code silently accepts these rules without realizing them; the specification and code must agree. Note that shop rows_skipped=156/200 in the feedback suggests generated shop rows are being rejected by constraints, which masks the intended construction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_unmatched_join only sets 'cols.setdefault(\"__reserved__\", [])' and never marks a parent PK to exclude; fill_foreign_keys_consistently and the shop-column insert path ignore '__reserved__'. The comment claims the FK filler 'will skip' the reserved value, but no such logic exists. Consequently the 'parent_rows_without_children: true' target for shop.Shop_ID vs happy_hour.Shop_ID depends on sampling luck only. In the run, 156/200 shop rows and 35/156 happy_hour rows were rejected, so the intended unmatched-join construction is confounded with PK/FK collisions.",
+     "requested_revision": "Implement the reservation properly: after generating happy_hour.Shop_ID, ensure at least one shop.Shop_ID in the parent has no child (either by choosing FK values from a strict subset, or by appending a shop row whose PK is guaranteed unused). Also investigate and fix why so many generated shop rows are failing insertion \u2014 the counts show broad rejection, meaning the specification's construction was largely undone at write time."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_sizes picks three existing values from the column and assigns sizes 1,2,3; but if the column has fewer than 3 distinct pool values (e.g. happy_hour.Month sampled from enum for n=10, or shop.Shop_ID which was overwritten afterwards), the reconstructed 'vals' may collapse to duplicates and the actual group sizes are not 1,2,>=3. Additionally _apply_group_sizes is called *before* the PK override for shop.Shop_ID? (no \u2014 it is called after fill_foreign_keys_consistently, but the PK override happens earlier in the column dict build). Because shop.Shop_ID is overwritten with strictly sequential unique values, the group-size rule for that column cannot be satisfied.",
+     "requested_revision": "Skip or explicitly no-op group_sizes for primary-key columns; for non-PK columns verify that at least three distinct values are actually assigned to sizes 1,2,3 and, if there are fewer, draw additional fresh values from the domain (for enum domains pick unused enum members). Update the specification to exclude PK columns from group_sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The extraction shows boundary target 39,40,41 for member.Address and 29,30,31,39,40,41 for member.Age; spec's Age boundaries include -31,-30,-29,-26,-25,-24 (below the declared domain 18..80) plus 29,30,31,39,40,41 (within). values.py DomainSampler._clamp clamps to [18,80], so -31 becomes 18 and -29..-24 become 18..30 \u2014 the negative boundary literals are silently destroyed and never appear. This is by design ('the rule wins over the literal'), but the specification should acknowledge that negative Age boundaries cannot coexist with Age BETWEEN 18 AND 80 and should not list them as achievable targets.",
+     "requested_revision": "Remove negative Age boundaries from the specification's boundaries list (or mark them 'unreachable by design'). Keep 29,30,31,39,40,41 which are in-domain and meaningful for the comparison boundaries Age > 40 / Age < 30."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'uncertainty' block notes member.Level_of_membership sample shows 1-6 and 22, yet the formula asserts BETWEEN 1 AND 10. default_specification uses {'range': [1,10]}. If the observed 22 is real, the formula is an over-constraint and the sampler will under-represent valid data. This is called out but not resolved.",
+     "requested_revision": "Resolve the uncertainty: either raise the Level_of_membership upper bound (e.g. 1..30) based on the observed sample, or document why 1..10 is retained. The specification should not carry an explicit 'uncertain' item that will bias the generated distribution without resolution."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: 46 eligible, only 13 separated; construction_pairs_by_group is empty. The separation rate is low (28%). Given the high rows_skipped for shop and happy_hour, and the vacuous unmatched-join/group-size handling for PK columns, the program implements the specification 'by construction' but the resulting instances frequently fail to separate the query pairs the specification targets (e.g., boundary comparisons involving member.Address numeric literals, Age negative boundaries). This is not a proof of query equivalence, but it is evidence that the construction is not delivering the intended variation.",
+     "requested_revision": "Address the root causes above (Address numeric literals, negative Age boundaries, PK group_sizes, unmatched-join reservation, shop row rejections) so that more of the 46 eligible pairs separate. Rerun and report construction_pairs_by_group so unseparated patterns can be diagnosed."
+    }
+   ],
+   "unresolved_checks": [
+    "The feedback's rows_skipped for shop (156/200) and happy_hour (35/156) is not explained by the code paths shown; further diagnostics (which constraint rejects them) are needed to confirm the construction is being realized rather than masked by constraint failures.",
+    "Whether happy_hour_member's composite FK (HH_ID, Member_ID) is correctly populated: instance.py fill_foreign_keys_consistently fills each FK column independently from the parent's single column, so HH_ID and Member_ID are drawn independently and the composite primary key (HH_ID, Member_ID) may collide or may not correspond to a real happy_hour+member pair \u2014 integrity feedback shows 0 PK duplicates, but the matching between HH_ID and member and the happy_hour was not verified against the actual parent rows.",
+    "The tie_order target for happy_hour.Month ('tie at rank 1, ASC and DESC, tie on COUNT(*)') is listed in spec.default_specification but no code in instance.py or values.py enforces tie counts for COUNT(*) groupings; only group sizes are enforced. This target appears unimplemented."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The construction execution feedback shows returncode -1, stderr_tail 'timeout', n_instances 0, run_seconds 900.1, and empty construction_pairs_by_group. No instance was produced within the 900s budget, so the program did not run to completion and no integrity/consistency evidence exists.",
+     "requested_revision": "Make generation complete within the execution budget. The per-instance work is dominated by build_random_instance, which for each table builds samplers, then calls fill_foreign_keys_consistently, sample_fresh_primary_keys, drop_unique_duplicates, _apply_group_sizes, _apply_tie_order, _apply_null_rule. Investigate and fix the timeout: e.g. the DomainSampler._fresh_or_reuse path with max_l0=inf keeps appending to self.fresh without bound, and _apply_group_sizes/_apply_tie_order loops (while len(vals) < 3 with sampler.sample()) can spin if the sampler keeps returning values already in vals or None. Add bounded retries and a hard cap on fresh-list growth, and re-run to produce instances and construction feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_null_rule: `if targets and spec_key(table, cm.name) not in targets: continue`. The spec's null_targets list is used as a whitelist, so any nullable column not listed gets no NULLs. The interface rule (point 7) requires NULL generation for every nullable column including nullable FKs. In this schema happy_hour.Shop_ID is a nullable FK (no NOT NULL) and is not in null_targets, so it never receives NULL. Also fill_foreign_keys_consistently only emits NULL when the parent tuple list is empty, not per the 10% nullable-FK rule.",
+     "requested_revision": "Apply the NULL rule to all nullable columns (including nullable foreign keys) regardless of the null_targets whitelist, using the compact-db share with at least one NULL row per nullable column; keep NOT NULL/PK columns NULL-free. Ensure planted NULLs are not overwritten by later steps (currently _apply_null_rule runs after group/tie steps, which is fine, but FK fill happens before and can be overwritten only by the self-FK fixup loop)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance: after fill_foreign_keys_consistently, the self-referencing FK fixup loop `if pt == t: ... cols[cm.name] = [v if v is None or v in fs else ...]` runs, but for non-self FKs there is no re-validation that the chosen child FK still exists in the parent after sample_fresh_primary_keys/drop_unique_duplicates may have removed parent rows. sample_fresh_primary_keys and drop_unique_duplicates are applied per-table in table order, so a parent's PK set can shrink after a child already drew from it. This can leave dangling FKs (writer sets foreign_keys=OFF, so they are silently inserted).",
+     "requested_revision": "Finalize parent PK/unique sets before filling child FKs, or re-run FK fill after all parent tables are finalized. Validate FK membership in _check_row (currently _check_row does not check FK existence despite the docstring claiming FK validation) and drop/repair rows that reference removed parents."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions include member.Address comparison_boundary targets 'Har','har','rd','RD' and like_near_variant targets '%Hartford%','Hartford','Hartfore', etc. The spec.py revision notes say numeric boundary literals 39/40/41 were removed because member.Address is TEXT, but the extracted atomic operations show the original comparison_boundary pairs also included numeric targets 39/40/41 and set:PRED(member.address > 40). The designer kept the text boundaries but the 'Har'/'rd' fragments are not real address values and the like_variants include 'Hartford' which is not in the ADDRESSES pool (pool has 'Hartford' actually \u2014 ok) but 'Harford' (typo) is not in the pool. DomainSampler._clamp for a pool domain returns str(b) for any non-numeric boundary, so 'Har','rd' are emitted as literal address values, producing addresses that are not street-style and not in the pool.",
+     "requested_revision": "Clarify in the specification whether boundary/like literals for member.Address should be emitted as actual column values (they currently are, via DomainSampler boundaries/like_variants) or only used to seed the literal pool. If they are column values, restrict them to plausible address strings consistent with the text_address pool; otherwise route them only to the literal pool and not to DomainSampler.sample()."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas: shop.Num_of_staff formula 'CAST(Num_of_staff AS INTEGER) > 0' and happy_hour.Num_of_shaff_in_charge '> 0'. The generic rule int_quantity is [1,50] and text_numeric_string is [1,500]. The spec.py default domain for shop.Num_of_staff is numeric_text [1,500] and for happy_hour.Num_of_shaff_in_charge range [1,50]. These are consistent, but the specification's uncertainty note says happy_hour.Num_of_shaff_in_charge is 'Nullable in schema but null_rate 0.0 in sample; NULLs still generated per rule' \u2014 yet null_targets does not include happy_hour.Num_of_shaff_in_charge? It does include it. OK. However member.Time_of_purchase is in null_targets but has no domain/sampler entry and no semantic rule; it will be sampled by the generic int sampler (NumberSampler) which can produce negative values, and there is no formula constraining it. This is an unsupported/uncertain column with no evidence.",
+     "requested_revision": "Add a domain or formula for member.Time_of_purchase (e.g. non-negative integer) or explicitly mark it as unconstrained in the specification so the sampler choice is justified; otherwise the generic NumberSampler can emit negative purchase times with no evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py DomainSampler._fresh_or_reuse inherits ColumnSampler._fresh_or_reuse: `if len(self.fresh) > self.max_l0: return rng.choice(self.fresh)`. For PK columns with n_pk==1, _init_sampler sets max_l0=inf, so self.fresh grows unboundedly across all sampled rows. Combined with the 900s timeout this is a plausible contributor. Also DomainSampler.sample calls _fresh_or_reuse(self._draw_domain) and then `if v is None: v = self._draw_domain()` \u2014 for a domain with no enum/range/numeric_text/pool (e.g. member.Time_of_purchase has no domain), _draw_domain returns None, so sample() returns None for every row, which then fails NOT NULL/PK checks or is inserted as NULL.",
+     "requested_revision": "Bound the fresh list (cap max_l0 for DomainSampler even for single-column PKs, or dedupe), and ensure DomainSampler falls back to a concrete sampler (NumberSampler/StringSampler by declared type) when the domain is empty, rather than returning None. This also fixes member.Time_of_purchase and any other column without a domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_sizes and _apply_tie_order: `while len(vals) < 3 and sampler is not None: v = sampler.sample(); if v is not None and v not in vals: vals.append(v)`. If the sampler's domain has fewer than 3 distinct values (e.g. member.Membership_card enum Black/White, or happy_hour.Month if pool small), this loop never terminates. group_sizes is specified for happy_hour.Month and happy_hour.Shop_ID; Month has 12 values so ok, but Shop_ID group_sizes with a small shop table (10 rows) and FK drawing could still be fine. However the unbounded while is a latent hang and matches the observed timeout.",
+     "requested_revision": "Add a bounded retry count to the while loops in _apply_group_sizes and _apply_tie_order; if the domain cannot supply enough distinct values, fall back to rng.choice(pool) or skip the pattern with a recorded note, rather than looping forever."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets `pragma foreign_keys = OFF` and inserts rows; _check_row in instance.py claims to validate FK but does not. The writer's row-by-row fallback silently skips failing rows and only counts them. Combined with the FK ordering issue above, dangling FKs and silently dropped rows can occur without surfacing as errors, so integrity-constraint evidence is weak even if instances are produced.",
+     "requested_revision": "Enable foreign_keys=ON during insert (or validate FK membership in Python before insert), and make the writer report skipped rows per table in the CLI summary (it does via counts.json, but the CLI only reads it if the file exists; ensure it is always written and surfaced). Re-run to confirm zero rows_failed and no dangling FKs."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (timeout), so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified by execution.",
+    "Whether the compact rows are preserved: writer copies orig and appends, which looks correct by inspection, but not confirmed by execution.",
+    "Whether the intended value variation (boundary, LIKE, group sizes, ties, unmatched joins) is realized: not confirmed by execution; construction_pairs_by_group is empty.",
+    "Whether member.Address boundary/like literals should be column values or only literal-pool seeds is a design ambiguity not resolved by the specification."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with KeyError('Shop_ID') (n_ok=0, n_fail=20, rows_added={}). The traceback originates in instance.py: in build_random_instance, phase 1 builds `cols` only for columns where `(t, cm.name) in samplers` (i.e. non-FK columns). For `happy_hour`, `Shop_ID` is a foreign key, so it is excluded from `samplers` and therefore absent from `cols`. Then `_finalize_table` calls `sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols})` \u2014 that is fine \u2014 but `_apply_group_sizes`/`_apply_tie_order` iterate `tm.columns` and access `cols[cm.name]` only when `cm.name in cols`, so those are safe. The actual KeyError('Shop_ID') is raised in `_apply_null_rule`/`_check_row` path or in `fill_foreign_keys_consistently` when `pcols.get(pk, [None]*plen)[i]` is evaluated: `happy_hour` has composite PK (HH_ID, Shop_ID, Month), so `pk = ptm.primary_key[0] if len(ptm.primary_key)==1 else None` is None and the reserved-skip branch is skipped \u2014 but the KeyError is on `'Shop_ID'` in `cols` during `_apply_group_sizes` for `happy_hour.Shop_ID`: the spec lists `group_sizes: {'happy_hour.Shop_ID': [1,2,3]}`, and `_apply_group_sizes` checks `if key not in gs or cm.name not in cols` \u2014 `Shop_ID` is not in `cols` at phase 1 (it is an FK), so it is skipped. The KeyError must therefore come from `_check_row`/`_filter` or from `fill_foreign_keys_consistently` when `pcols.get(pk, [None]*plen)` is indexed with `pcols` lacking the key. Concretely: `happy_hour` has composite PK, so `pk=None`; `pcols` is `inst['shop']` which has `Shop_ID`; but for `happy_hour_member` referencing `happy_hour`, `pcols = inst['happy_hour']` which does NOT contain `Shop_ID` (it is an FK, filled only in phase 2). `fill_foreign_keys_consistently` for `happy_hour_member` iterates `pairs` for parent `happy_hour` and does `pcols[pc][i]` where `pc='HH_ID'` \u2014 that exists. But `_fk_groups` for `happy_hour` returns parent `shop` with `(Shop_ID, Shop_ID)`; `pcols = inst['shop']` has `Shop_ID`. The KeyError('Shop_ID') is most plausibly raised in `_apply_group_sizes` for `happy_hour.Shop_ID` because `cols` for `happy_hour` at phase 1 does not contain `Shop_ID` (FK), and the guard `cm.name not in cols` should skip it \u2014 unless `_finalize_table` is called with `cols` that already includes `Shop_ID` from a prior partial fill. Regardless of the exact line, the execution evidence is unambiguous: the program crashes on every unit with KeyError('Shop_ID') and produces zero instances.",
+     "requested_revision": "Fix the KeyError('Shop_ID') so that generation completes. Likely causes to address: (a) `_apply_group_sizes`/`_apply_tie_order` must not assume FK columns are present in `cols` at phase 1 (they are filled in phase 2); (b) `fill_foreign_keys_consistently` must handle composite-PK parents (e.g. `happy_hour` with PK (HH_ID, Shop_ID, Month)) \u2014 the current `pk = ptm.primary_key[0] if len(ptm.primary_key)==1 else None` disables the reserved-skip for composite PKs, and the `pcols.get(pk, [None]*plen)` indexing is fragile; (c) `_check_row`/`_filter` must tolerate columns absent from `cols`. After the fix, re-run and confirm n_ok>0, rows_added populated, and no KeyError in stderr."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join` for `happy_hour.Shop_ID` requires `child_rows_with_null_fk: true` and `parent_rows_without_children: true`. `_reserved_parent_keys` only reserves a parent PK when `len(tm.primary_key)==1 and tm.primary_key[0]==c` \u2014 for `shop.Shop_ID` this holds, so a shop PK is reserved. But `fill_foreign_keys_consistently` skips reserved values only when `pk is not None` (single-column PK). For `happy_hour` (composite PK), the reserved set for `shop` is applied when filling `happy_hour.Shop_ID` (parent is `shop`, single PK) \u2014 that path is fine. However, the spec also lists `happy_hour.Shop_ID` as a `group_sizes` target with `[1,2,3]`, and `_apply_group_sizes` is called in phase 1 before FKs are filled, so `happy_hour.Shop_ID` is not in `cols` and the group-size pattern is silently skipped. This means the `group_sizes` requirement for `happy_hour.Shop_ID` is not implemented.",
+     "requested_revision": "Either (a) move `_apply_group_sizes`/`_apply_tie_order` for FK columns to phase 2 after `fill_foreign_keys_consistently`, or (b) explicitly document in the spec that `group_sizes` for FK columns is not realizable and remove it from the spec. The current code silently drops the pattern without recording it."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `per_column_exceptions` includes `member.Address` `comparison_boundary` targets `['Waterbury','waterbury','Harford','harford']` and `like_near_variant` targets including `'%Hartford%'`, `'Hartford'`, `'Hartfore'`, etc. The `default_specification()` in spec.py sets `boundaries['member.Address'] = ['Waterbury','waterbury','Harford','harford','Har','har','rd','RD']` and `like_variants['member.Address']` to the full list. `DomainSampler._clamp` for a TEXT pool only emits a boundary if `s in self.pool`; the pool is `ADDRESSES` which contains `'Hartford'` and `'Waterbury'` but NOT `'Harford'`, `'waterbury'`, `'Har'`, `'har'`, `'rd'`, `'RD'`. So the `Harford`/`harford` boundary targets and the `%Harford%`/`Harford`/`Harfore`/`Harford x`/`harford` LIKE variants are never emitted as column values. The spec's `uncertainty` note says fragments are 'used only to seed the literal pool, not emitted as column values' \u2014 but `Harford` is a full address-like value, not a fragment, and the spec lists it as a `comparison_boundary` target. This is a spec/program inconsistency: the spec claims `Harford` is a boundary target but the program cannot emit it.",
+     "requested_revision": "Either add `'Harford'` (and `'harford'`) to the `ADDRESSES` pool in spec.py so the boundary target is realizable, or remove `Harford`/`harford` from the `comparison_boundary` targets in the spec and document that only `Waterbury`/`waterbury` are realizable. Similarly, decide whether `%Hartford%`/`Hartford` LIKE variants should be emitted as column values (they are plausible addresses) or only used to seed the literal pool; the current spec text and code disagree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `per_column_exceptions` lists `member.Membership_card` `comparison_boundary` targets `['Black','black']` and `enum` targets `['Black','White']`. `DomainSampler._clamp` for an enum returns the enum value matching case-insensitively, so `'black'` is clamped to `'Black'` \u2014 the lowercase variant is never emitted. This is consistent with the semantic rule `Membership_card IN ('Black','White')`, but the spec's `comparison_boundary` target `'black'` is then unrealizable. The spec should note this.",
+     "requested_revision": "Document in the spec that `'black'` is clamped to `'Black'` by the enum domain and is not emitted as a distinct value; or remove `'black'` from the `comparison_boundary` targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `aggregate_boundary` for `member.Member_ID` targets `[4,5,6]` and for `happy_hour.Month` targets `[1,2,3]`. The program's `_apply_group_sizes` and `_apply_tie_order` implement group-size and tie patterns, but there is no code path that enforces `aggregate_boundary` (e.g. ensuring a `HAVING COUNT(*) > 5` boundary is realizable). The spec lists `aggregate_boundary` in `default_specification()` but `build_random_instance` never reads it. This is a spec/program gap: the pattern is declared but not implemented.",
+     "requested_revision": "Either implement `aggregate_boundary` (e.g. ensure at least one group has count 4, 5, and 6 for `member.Member_ID`; and counts 1, 2, 3 for `happy_hour.Month`), or remove `aggregate_boundary` from the spec and document that it is not realizable with the given table sizes (member has 10 rows, so COUNT(member_id) > 5 is realizable; happy_hour has 10 rows, so COUNT(*) > 2 is realizable)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_targets` includes `happy_hour.Shop_ID` and `happy_hour_member.Total_amount`, and the interface rule requires NULL generation for every nullable column. `_apply_null_rule` plants NULLs in every nullable column, including `happy_hour.Shop_ID`. However, `happy_hour.Shop_ID` is part of the composite PK `(HH_ID, Shop_ID, Month)` \u2014 in SQLite, a column that is part of a PRIMARY KEY is implicitly NOT NULL. The schema DDL declares `PRIMARY KEY (\"HH_ID\",\"Shop_ID\",\"Month\")`, so `Shop_ID` in `happy_hour` is NOT NULL. `_apply_null_rule` checks `cm.pk_pos > 0` and skips PK columns, so this is handled correctly. But the spec's `null_targets` lists `happy_hour.Shop_ID` as a NULL target, which contradicts the schema. The spec should be corrected.",
+     "requested_revision": "Remove `happy_hour.Shop_ID` from `null_targets` in the spec (it is part of the composite PK and therefore NOT NULL). The program already handles this correctly via `cm.pk_pos > 0`, but the spec is misleading."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `table_sizes_per_instance` sets `happy_hour_member: 6`. `happy_hour_member` has PK `(HH_ID, Member_ID)` and FKs to `happy_hour.HH_ID` and `member.Member_ID`. `fill_foreign_keys_consistently` for `happy_hour_member` draws `HH_ID` from `inst['happy_hour']['HH_ID']` and `Member_ID` from `inst['member']['Member_ID']`. But `happy_hour` has composite PK `(HH_ID, Shop_ID, Month)`, so `HH_ID` alone is not unique \u2014 multiple `happy_hour` rows can share the same `HH_ID`. The FK `happy_hour_member.HH_ID -> happy_hour.HH_ID` is declared in the schema as `FOREIGN KEY (\"HH_ID\") REFERENCES happy_hour(\"HH_ID\")`, which is a valid FK to a non-unique column in SQLite (it references the first column of the composite PK). The program's `fill_foreign_keys_consistently` uses `pcols.get(pk, [None]*plen)` where `pk = ptm.primary_key[0] if len(ptm.primary_key)==1 else None` \u2014 for `happy_hour` (composite PK), `pk=None`, so the reserved-skip is disabled and the code proceeds to `t = tuple(pcols[pc][i] for _, pc in pairs)` with `pc='HH_ID'`, which exists. This works, but the `unmatched_join` reservation for `happy_hour.Shop_ID` (which requires `parent_rows_without_children: true` for `happy_hour` as parent of `happy_hour_member`? No \u2014 the spec's `unmatched_join` for `happy_hour.Shop_ID` is about `shop` as parent, not `happy_hour` as parent). The spec does not list `happy_hour` as a parent in `unmatched_join`, so no reservation is needed. This is consistent.",
+     "requested_revision": "No change required; noted for completeness. The composite-PK handling in `fill_foreign_keys_consistently` is fragile but functional for this schema."
+    }
+   ],
+   "unresolved_checks": [
+    "The exact line raising KeyError('Shop_ID') could not be pinpointed from the stderr tail alone; the engineer should reproduce with a traceback to confirm the fix.",
+    "Whether `aggregate_boundary` for `member.Member_ID` and `happy_hour.Month` is intended to be implemented or is informational only is unclear from the spec.",
+    "Whether `Harford`/`harford` should be added to the address pool or removed from the spec's boundary targets is a design decision.",
+    "The `group_sizes` pattern for `happy_hour.Shop_ID` (an FK column) is silently skipped; the designer should confirm whether this is acceptable or should be removed from the spec."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Semantic rules are well supported by the compact data: shop.Score in [0,50] (42.0,38.0,36.0,32.0,30.0,40.0,28.0), member.Age in [18,80] (29,67,34,51,50,33,42,45), Membership_card only Black/White, Month valid names, Total_amount >= 0, Num_of_staff positive integer strings. Level_of_membership upper bound 30 is an extrapolation from a single observed value 22 (documented under uncertainty).",
+     "requested_revision": "None blocking. The Level_of_membership range [1,30] is an assumption; it is documented and does not conflict with observed data."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "The specification correctly drops unrealizable patterns: shop.Shop_ID duplicates_for_distinct/group_sizes (PK uniqueness), member.Address numeric boundary literals (TEXT column), member.Age negative boundaries (outside 18..80), happy_hour.Shop_ID from null_targets (composite PK). 'Harford'/'harford' added to the member-address pool so the comparison_boundary target is realizable. These are consistent with the extracted atomic operations and the uncertainty notes.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Program implements the specified domains and rules by construction: DomainSampler enforces enum/range/numeric_text/pool; _clamp drops numeric literals for TEXT pools and clamps out-of-domain boundaries; boundary/LIKE literals only emitted when plausible pool values. NULL rule applied to every nullable column with share from compact db and at least one NULL row (feedback shows NULL 18-20 per nullable column, 0 for PK/NOT NULL). FK fill draws from finalized parent tuples with reservation for unmatched joins; composite-PK parent handled via referenced column list. Python-side validation of NOT NULL/PK/UNIQUE/FK before insert.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Execution feedback: 20/20 instances valid, 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, 0 not_ok, reproducible=true, no errors. rows_added shop 200, member 200, happy_hour 194, happy_hour_member 113 with 0 skipped. Compact rows preserved (writer copies orig and only appends).",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "construction_pairs: eligible 46, separated 13, unknown_executions 0. Separation is partial but the specification is implemented by construction (group_sizes, tie_order, aggregate_boundary, unmatched_join reservation, boundary/like variants). A missing separation alone does not establish a generation error; the remaining pairs are not proven equivalent.",
+     "requested_revision": "None blocking. Note that only 13/46 pairs are separated; this is a coverage observation, not a defect."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Minor: _apply_group_sizes/_apply_tie_order/_apply_aggregate_boundary are re-run in phase 2 for FK columns and could overwrite values assigned by fill_foreign_keys_consistently, but the final _check_row validation and 0 FK violations in feedback confirm no integrity break. happy_hour_member.HH_ID references a non-unique first composite-PK column; FK fill draws from the referenced column list with repetition, consistent with the documented uncertainty.",
+     "requested_revision": "None blocking; behavior is validated by the integrity feedback."
+    }
+   ],
+   "unresolved_checks": [
+    "Level_of_membership upper bound 30 is inferred from a single value (22); not contradicted by data but not strongly evidenced.",
+    "Only 13 of 46 eligible construction pairs are separated; remaining pairs are neither proven equivalent nor shown to be generation errors."
+   ]
+  }
+ ]
 }

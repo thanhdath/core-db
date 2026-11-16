@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -231,5 +233,91 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, rng, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]
+
+
+def rand_date(rng, lo=spec.DATE_LO, hi=spec.DATE_HI):
+    """Random date in [lo, hi] (date_iso)."""
+    span = (hi - lo).days
+    return lo + dt.timedelta(days=rng.randint(0, max(0, span)))
+
+
+def rand_date_after(rng, earlier, max_days=spec.DATE_SPAN_DAYS):
+    """Later date in [earlier, earlier+max_days] (date_order)."""
+    return earlier + dt.timedelta(days=rng.randint(0, max_days))
+
+
+def rand_name(rng):
+    """Random first + last name from the fixed pool (varchar_name)."""
+    title = rng.choice(spec.NAME_TITLES)
+    return (title + rng.choice(spec.FIRST_NAMES) + ' ' + rng.choice(spec.LAST_NAMES)).strip()
+
+
+def rand_amount(rng):
+    """Uniform integer in [1, 100000] (integer_amount)."""
+    return rng.randint(spec.AMOUNT_LO, spec.AMOUNT_HI)
+
+
+def rand_small(rng):
+    """Uniform integer in [1, 2000] (integer_small)."""
+    return rng.randint(spec.SMALL_LO, spec.SMALL_HI)
+
+
+def rand_enum(rng, values):
+    """Random choice from an enum pool (char_code / varchar_code)."""
+    return rng.choice(values)
+
+
+def pad_char(v, length):
+    """Right-pad a CHAR(n) value to its declared length."""
+    v = str(v)
+    return v if len(v) >= length else v + ' ' * (length - len(v))
+
+
+def group_size_plan(rng, n, sizes=spec.GROUP_SIZE_PLAN):
+    """Return a list of n group ids whose multiset has groups of the requested sizes."""
+    if n <= 0:
+        return []
+    plan = []
+    for gi, s in enumerate(sizes):
+        plan.extend([gi] * s)
+    if len(plan) > n:
+        plan = plan[:n]
+    next_gid = len(sizes)
+    while len(plan) < n:
+        plan.append(next_gid)
+        next_gid += 1
+    rng.shuffle(plan)
+    return plan
+
+
+def duplicate_plan(rng, n, lo=spec.DUP_SHARE_LO, hi=spec.DUP_SHARE_HI):
+    """Return a list of n booleans: True = duplicate of an earlier value."""
+    if n <= 1:
+        return [False] * n
+    share = rng.uniform(lo, hi)
+    k = max(1, int(round(share * n)))
+    flags = [False] * n
+    for i in rng.sample(range(1, n), min(k, n - 1)):
+        flags[i] = True
+    return flags
+
+
+def tie_plan(rng, n, k=spec.TIE_ROWS):
+    """Return a list of n booleans: True = row shares the rank-1 value."""
+    flags = [False] * n
+    for i in rng.sample(range(n), min(k, n)):
+        flags[i] = True
+    return flags
+
+
+def null_plan(rng, n, share=spec.NULL_SHARE):
+    """Return a list of n booleans: True = NULL (at least one NULL)."""
+    if n <= 0:
+        return []
+    k = max(1, int(round(share * n)))
+    flags = [False] * n
+    for i in rng.sample(range(n), min(k, n)):
+        flags[i] = True
+    return flags

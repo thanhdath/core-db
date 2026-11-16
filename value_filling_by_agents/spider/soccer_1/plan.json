@@ -1,55 +1,476 @@
 {
  "db": "soccer_1",
- "operator_io_quirks": [
-  "Mixed-case table names: \"Player_Attributes\", \"Team\", \"Team_Attributes\" vs backtick-quoted Player/League/Country; identifiers must be double-quoted with original case.",
-  "DDL uses backtick quoting and tab-indented columns; CREATE TABLE text must be replayed verbatim for the empty clone.",
-  "Player_Attributes is large (183,978 rows) with 43 columns; read_schema must sample by rowid % k, not full scan.",
-  "Two FKs from Player_Attributes to Player on player_api_id and player_fifa_api_id; both parents are UNIQUE in Player, so FK fill is well-defined.",
-  "Team_Attributes FKs to Team.team_fifa_api_id, but Team.team_fifa_api_id is NOT unique (285 distinct of 299, 3.7% NULL) \u2014 FK parent has NULLs and duplicates.",
-  "Team_Attributes.team_fifa_api_id has 0 NULLs but its parent Team.team_fifa_api_id has NULLs; FK fill from parent values will inject NULLs into a NOT-NULL-looking column (declared notnull=0 so insert succeeds).",
-  "Player.height declared INTEGER but storage class is 'real' (e.g. 182.88) \u2014 declared type contradicts storage; Number fuzzer will emit ints, changing semantics of height comparisons.",
-  "date/birthday columns are TEXT storing 'YYYY-MM-DD 00:00:00' \u2014 declared TEXT dispatches to String fuzzer, not Date; TS will not produce date-shaped values.",
-  "attacking_work_rate / defensive_work_rate have dirty values ('None' string, 'le', '_0', '5') mixed with medium/high/low \u2014 String fuzzer will treat these as elements.",
-  "League.id and Country.id share identical values (1,1729,4769,...) \u2014 coincidental, not an FK; do not infer a relationship.",
-  "Player_Attributes.id and Team_Attributes.id are AUTOINCREMENT PKs; TS Number fuzzer will generate arbitrary ints, not sequential \u2014 fine for insert but breaks 'id ordering' assumptions.",
-  "buildUpPlayDribbling has 66.5% NULL \u2014 Number fuzzer drops None elements, so TS will rarely emit NULL there despite the original being mostly NULL."
- ],
- "operator_ts_expectations": [
-  "date/birthday/Team_Attributes.date: String fuzzer with charset a-zA-Z 0-9() and length 0-20 \u2014 produces garbage like 'aB3()' instead of 'YYYY-MM-DD'; any query filtering on date ranges or LIKE '2015%' will get implausible values (FN driver).",
-  "player_name, team_long_name, team_short_name, League.name, Country.name: String fuzzer with 0.5 contaminate \u2014 names become random strings with prefixes/suffixes; joins on name equality still work but DISTINCT/LIKE queries see noise.",
-  "preferred_foot (2 distinct: right/left): String fuzzer with p=0.2 will mostly emit fresh random strings, so 'WHERE preferred_foot = \"right\"' returns few/no rows \u2014 FN driver.",
-  "attacking_work_rate/defensive_work_rate: String fuzzer mixes the 8/19 dirty originals with random strings; 'WHERE attacking_work_rate = \"high\"' may return 0 rows \u2014 FN driver.",
-  "All *_Class columns (buildUpPlaySpeedClass etc., 2-3 distinct): String fuzzer with p=0.2 mostly fresh strings; equality filters on 'Balanced'/'Fast'/'Slow' return few rows \u2014 FN driver.",
-  "overall_rating/potential and all skill columns (INTEGER, 40-97 distinct, range ~0-100): Number fuzzer with scale=0 draws uniform in [-1,1] then perturbs \u00b11/\u00b12 \u2014 values cluster near 0, so 'WHERE overall_rating > 80' returns 0 rows \u2014 FN driver.",
-  "height (INTEGER, real storage): Number fuzzer emits ints near 0, not 150-200; 'WHERE height > 180' returns 0 rows \u2014 FN driver.",
-  "id/player_api_id/player_fifa_api_id/team_api_id/team_fifa_api_id: Number fuzzer with scale=0 draws near 0; FK fill copies parent values so joins work, but 'WHERE player_api_id = 505942' (a literal from train SQL) returns 0 rows unless the literal pool seeded it \u2014 FN driver.",
-  "League/Country (11 rows each): choose_table_sizes may give 1-30 rows; small tables mean joins on country_id/league_id have few matches \u2014 FP driver when gold expects specific counts.",
-  "Team_Attributes.team_fifa_api_id FK to non-unique Team.team_fifa_api_id: TS draws with replacement from parent values, so many child rows share the same parent \u2014 joins produce duplicate rows; gold queries with DISTINCT or COUNT(DISTINCT) may differ \u2014 FP/FN driver.",
-  "Team.team_fifa_api_id has NULLs; FK fill copies NULLs into Team_Attributes.team_fifa_api_id (declared notnull=0 so insert OK) \u2014 'WHERE team_fifa_api_id IS NOT NULL' counts differ from original \u2014 FP driver.",
-  "Player_Attributes has 183,978 rows but choose_table_sizes caps at 2500 (level-based) or ~230 (rand_lin) \u2014 TS instances are tiny relative to original; aggregate queries (AVG overall_rating) see different distributions \u2014 FP driver."
- ],
- "challenger_refs": [
-  "G1",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g98e0af7e",
-  "g9d9aedab",
-  "g9d9aedab",
-  "g9d9aedab",
-  "g9d9aedab",
-  "gc62d5220",
-  "G2",
-  "gabd68906"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer": "Uniform integer in [min,max] observed from the column statistics; for boundary columns use the listed boundary values plus one step on each side; for nullable columns use NULL with the stated share.",
+   "text": "For short text, use a small pool of observed values from the column; for near-duplicate targets, use a small edit of the listed literal; for nullable columns, use NULL with the stated share.",
+   "date": "Use ISO 'YYYY-MM-DD HH:MM:SS' text; dates within the date range of the table; for a date-order pair, keep the earlier date >= later date.",
+   "foreign_key": "Copy the parent key value from the parent row; for nullable parent keys, use NULL with the stated share.",
+   "primary_key": "Auto-increment integer; never NULL.",
+   "unique": "Use a unique value; for duplicate columns, use a small set of distinct values.",
+   "tie": "For ORDER BY column, use a small set of values at the target rank; ties are allowed.",
+   "null": "Use NULL with the stated share; never NULL for primary keys.",
+   "near_variant": "Use a small edit of the listed literal (e.g. one character changed, one character added, one character removed).",
+   "boundary": "Emit the listed boundary values verbatim without random perturbation; for numeric columns also include one step below the minimum and one step above the maximum listed target. Boundary pinning takes precedence over range clamping: apply the range first, then the boundary pool, so pinned values are never cleared.",
+   "tie_exact": "Emit the kept tie values verbatim without random mutation so that exact duplicates occur at the target rank."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Player_Attributes.overall_rating",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      84,
+      85,
+      86,
+      89,
+      90,
+      91
+     ],
+     "emit_verbatim": true,
+     "null_share": 0.0
+    }
+   },
+   {
+    "column": "Player_Attributes.reactions",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      89,
+      90,
+      91
+     ],
+     "emit_verbatim": true,
+     "null_share": 0.0
+    }
+   },
+   {
+    "column": "League.name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC",
+     "emit_verbatim": true,
+     "distinct_pool": "unique-sequential names 'League_<n>' to reach the target row count"
+    }
+   },
+   {
+    "column": "Country.name",
+    "pattern": "unique_text",
+    "targets": {
+     "distinct_pool": "unique-sequential names 'Country_<n>' to reach the target row count"
+    }
+   },
+   {
+    "column": "Player.weight",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": 0.05
+    }
+   },
+   {
+    "column": "Player_Attributes.attacking_work_rate",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "null_share": 0.017
+    }
+   },
+   {
+    "column": "Player_Attributes.defensive_work_rate",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "null_share": 0.005
+    }
+   },
+   {
+    "column": "Player.player_api_id",
+    "pattern": "unique_sequential",
+    "targets": {
+     "start": 1,
+     "step": 1
+    }
+   },
+   {
+    "column": "Player.player_fifa_api_id",
+    "pattern": "unique_sequential",
+    "targets": {
+     "start": 1,
+     "step": 1
+    }
+   },
+   {
+    "column": "Team.team_api_id",
+    "pattern": "unique_sequential",
+    "targets": {
+     "start": 1,
+     "step": 1
+    }
+   },
+   {
+    "column": "Team.team_fifa_api_id",
+    "pattern": "unique_sequential",
+    "targets": {
+     "start": 1,
+     "step": 1
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Player_Attributes.player_fifa_api_id",
+    "parent": "Player",
+    "parent_column": "player_fifa_api_id",
+    "copied": [
+     "player_fifa_api_id"
+    ]
+   },
+   {
+    "child": "Player_Attributes.player_api_id",
+    "parent": "Player",
+    "parent_column": "player_api_id",
+    "copied": [
+     "player_api_id"
+    ]
+   },
+   {
+    "child": "League.country_id",
+    "parent": "Country",
+    "parent_column": "id",
+    "copied": [
+     "country_id"
+    ]
+   },
+   {
+    "child": "Team_Attributes.team_fifa_api_id",
+    "parent": "Team",
+    "parent_column": "team_fifa_api_id",
+    "copied": [
+     "team_fifa_api_id"
+    ]
+   },
+   {
+    "child": "Team_Attributes.team_api_id",
+    "parent": "Team",
+    "parent_column": "team_api_id",
+    "copied": [
+     "team_api_id"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Player",
+    "column": "height",
+    "formula": "height BETWEEN 0 AND 200"
+   },
+   {
+    "table": "Player",
+    "column": "weight",
+    "formula": "weight BETWEEN 0 AND 300"
+   },
+   {
+    "table": "Player_Attributes",
+    "column": "overall_rating",
+    "formula": "overall_rating BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Player_Attributes",
+    "column": "potential",
+    "formula": "potential BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Player_Attributes",
+    "column": "preferred_foot",
+    "formula": "preferred_foot IN ('left','right')"
+   },
+   {
+    "table": "Player_Attributes",
+    "column": "attacking_work_rate",
+    "formula": "attacking_work_rate IN ('low','medium','high')"
+   },
+   {
+    "table": "Player_Attributes",
+    "column": "defensive_work_rate",
+    "formula": "defensive_work_rate IN ('low','medium','high')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "buildUpPlaySpeedClass",
+    "formula": "buildUpPlaySpeedClass IN ('Slow','Balanced','Fast')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "buildUpPlayDribblingClass",
+    "formula": "buildUpPlayDribblingClass IN ('Little','Normal','Lots')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "buildUpPlayPassingClass",
+    "formula": "buildUpPlayPassingClass IN ('Mixed','Long','Short')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "buildUpPlayPositioningClass",
+    "formula": "buildUpPlayPositioningClass IN ('Organised','Free Form')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "chanceCreationPassingClass",
+    "formula": "chanceCreationPassingClass IN ('Normal','Risky','Safe')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "chanceCreationCrossingClass",
+    "formula": "chanceCreationCrossingClass IN ('Normal','Lots','Little')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "chanceCreationShootingClass",
+    "formula": "chanceCreationShootingClass IN ('Normal','Lots','Little')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "chanceCreationPositioningClass",
+    "formula": "chanceCreationPositioningClass IN ('Organised','Free Form')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "defencePressureClass",
+    "formula": "defencePressureClass IN ('Medium','Deep','High')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "defenceAggressionClass",
+    "formula": "defenceAggressionClass IN ('Press','Double','Contain')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "defenceTeamWidthClass",
+    "formula": "defenceTeamWidthClass IN ('Normal','Wide','Narrow')"
+   },
+   {
+    "table": "Team_Attributes",
+    "column": "defenceDefenderLineClass",
+    "formula": "defenceDefenderLineClass IN ('Cover','Offside Trap')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Country": 230,
+   "League": 230,
+   "Player": 230,
+   "Player_Attributes": 230,
+   "Team": 230,
+   "Team_Attributes": 230
+  },
+  "null_targets": [
+   "Player.weight",
+   "Player_Attributes.potential",
+   "Player_Attributes.preferred_foot",
+   "Player_Attributes.attacking_work_rate",
+   "Player_Attributes.defensive_work_rate",
+   "Player_Attributes.crossing",
+   "Player_Attributes.finishing",
+   "Player_Attributes.heading_accuracy",
+   "Player_Attributes.short_passing",
+   "Player_Attributes.volleys",
+   "Player_Attributes.dribbling",
+   "Player_Attributes.curve",
+   "Player_Attributes.free_kick_accuracy",
+   "Player_Attributes.long_passing",
+   "Player_Attributes.ball_control",
+   "Player_Attributes.acceleration",
+   "Player_Attributes.sprint_speed",
+   "Player_Attributes.agility",
+   "Player_Attributes.balance",
+   "Player_Attributes.shot_power",
+   "Player_Attributes.jumping",
+   "Player_Attributes.stamina",
+   "Player_Attributes.strength",
+   "Player_Attributes.long_shots",
+   "Player_Attributes.aggression",
+   "Player_Attributes.interceptions",
+   "Player_Attributes.positioning",
+   "Player_Attributes.vision",
+   "Player_Attributes.penalties",
+   "Player_Attributes.marking",
+   "Player_Attributes.standing_tackle",
+   "Player_Attributes.sliding_tackle",
+   "Player_Attributes.gk_diving",
+   "Player_Attributes.gk_handling",
+   "Player_Attributes.gk_kicking",
+   "Player_Attributes.gk_positioning",
+   "Player_Attributes.gk_reflexes",
+   "Team_Attributes.buildUpPlayDribbling",
+   "Team_Attributes.team_fifa_api_id"
+  ],
+  "supporting_evidence": [
+   "Player_Attributes.overall_rating: sample rows 1-8 show 67,62,61,74,73,71,70,69; all within 0-100.",
+   "Player_Attributes.potential: sample rows 1-8 show 71,66,65,76,75,77,78,79; all within 0-100.",
+   "Player_Attributes.preferred_foot: sample rows 1-8 show only 'right' and 'left'.",
+   "Player_Attributes.attacking_work_rate: sample rows 1-8 show 'medium','high','low' plus corrupted fragments; domain restricted to {low,medium,high} per review.",
+   "Player_Attributes.defensive_work_rate: sample rows 1-8 show 'medium','high','low' plus corrupted fragments; domain restricted to {low,medium,high} per review.",
+   "Team_Attributes.buildUpPlaySpeedClass: sample rows 1-8 show 'Balanced','Fast','Slow'.",
+   "Team_Attributes.buildUpPlayDribblingClass: sample rows 1-8 show 'Little','Normal','Lots'.",
+   "Team_Attributes.buildUpPlayPassingClass: sample rows 1-8 show 'Mixed','Long','Short'.",
+   "Team_Attributes.buildUpPlayPositioningClass: sample rows 1-8 show 'Organised','Free Form'.",
+   "Team_Attributes.chanceCreationPassingClass: sample rows 1-8 show 'Normal','Risky','Safe'.",
+   "Team_Attributes.chanceCreationCrossingClass: sample rows 1-8 show 'Normal','Lots','Little'.",
+   "Team_Attributes.chanceCreationShootingClass: sample rows 1-8 show 'Normal','Lots','Little'.",
+   "Team_Attributes.chanceCreationPositioningClass: sample rows 1-8 show 'Organised','Free Form'.",
+   "Team_Attributes.defencePressureClass: sample rows 1-8 show 'Medium','Deep','High'.",
+   "Team_Attributes.defenceAggressionClass: sample rows 1-8 show 'Press','Double','Contain'.",
+   "Team_Attributes.defenceTeamWidthClass: sample rows 1-8 show 'Normal','Wide','Narrow'.",
+   "Team_Attributes.defenceDefenderLineClass: sample rows 1-8 show 'Cover','Offside Trap'."
+  ],
+  "uncertainty": "No formulas for the Player_Attributes numeric columns were verified because the sample rows are not aligned with the other columns. The attacking_work_rate and defensive_work_rate columns are restricted to {low,medium,high} per review; the odd observed strings are treated as corrupted. Boundary columns overall_rating and reactions are excluded from NULL injection (null_share 0.0) so pinned boundary values are always present. League.name and Country.name use unique-sequential pools to reach the target row count under UNIQUE constraints. Boundary pinning must be applied after range clamping so pinned values are never cleared."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback validity shows 'invalid': 20, 'reasons': {'compact_rows_missing': 20}. The writer (tscore_gen/writer.py) copies the compact DB only when `orig` is passed: `if orig and os.path.exists(orig): _copy_compact(orig, part)`. But cli.py calls `build_random_instance(...)` and then `write_instance_sqlite(_G['schema'], inst, p)` WITHOUT passing `orig`, so `orig` is None and the compact rows are never copied. The docstring/comment in writer.py and cli.py both claim 'instances are copies of the compact database with generated rows appended', but the call site omits the argument. This is a concrete bug: every generated instance is missing the compact rows, which is why all 20 instances are flagged invalid.",
+     "requested_revision": "In tscore_gen/cli.py `_one`, pass the original DB path to the writer, e.g. `write_instance_sqlite(_G['schema'], inst, p, orig=a['orig'])` (and thread `orig` through the worker args dict). Alternatively make `write_instance_sqlite` default `orig` to the schema's source path. Re-run and confirm `validity.valid == n_instances` and `compact_rows_missing` disappears."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` list includes `Player_Attributes.overall_rating`, `Player_Attributes.potential`, `Player_Attributes.preferred_foot`, `Player_Attributes.attacking_work_rate`, `Player_Attributes.defensive_work_rate`, and all the numeric skill columns, plus `Team_Attributes.buildUpPlayDribbling` and `Team_Attributes.team_fifa_api_id`. The execution feedback shows these columns DO get NULLs (e.g. `Player_Attributes.overall_rating: NULL 240 / 4600`), which is consistent. However, the specification's `per_column_exceptions` for `Player_Attributes.overall_rating` and `Player_Attributes.reactions` require boundary values [84,85,86,89,90,91] and [89,90,91] respectively, and `_apply_boundary_pool` sets `sampler.p = 0.0` and prepends the boundary values to `sampler.elements`. But `_inject_nulls` then replaces ~5% of values with NULL, and `NumberSampler.sample` applies random \u00b11/\u00b12 perturbations (`v += d`, `v -= d`, etc.) to the drawn value. This means the boundary values 84/85/86/89/90/91 are frequently perturbed to 83/84/85/88/89/90 or 85/86/87/90/91/92, so the exact boundary targets are not reliably present. The construction_pairs feedback shows only 1 of 19 pairs separated, which is consistent with boundary values not being reliably generated.",
+     "requested_revision": "In `_apply_boundary_pool` (or in `NumberSampler.sample`), ensure boundary values are emitted verbatim without the \u00b11/\u00b12 perturbation when the sampler is a boundary sampler. For example, add a `boundary_mode` flag to NumberSampler that skips the perturbation step, or set the perturbation probability to 0 for boundary columns. Verify that generated rows contain the exact target values 84,85,86,89,90,91 for overall_rating and 89,90,91 for reactions."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `supporting_evidence` for `attacking_work_rate` and `defensive_work_rate` states: 'sample rows 1-8 show medium,high,low,None,le,norm,stoc,y; the original data has these values, but the enum values are medium/high/low.' The `uncertainty` field also notes 'the sample rows show some values that are not in the enum'. The program's `ENUM_VALUES` restricts these columns to ['low','medium','high'], which contradicts the observed original data. The specification is internally inconsistent: it declares an enum domain but acknowledges the original data violates it. This is a designer-level ambiguity that should be resolved before the engineer's enum restriction can be validated.",
+     "requested_revision": "The designer should either (a) remove the enum restriction for attacking_work_rate/defensive_work_rate and treat them as free text (matching the observed original values), or (b) explicitly state that the enum is a normalization target and the original non-enum values are to be excluded. Update `semantic_rules_and_formulas` and `supporting_evidence` accordingly so the specification is self-consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` includes `Team_Attributes.team_fifa_api_id`, and the execution feedback shows `Team_Attributes.team_fifa_api_id: NULL 240 / 4600`. However, `team_fifa_api_id` is a foreign key to `Team.team_fifa_api_id`. The program's `fill_foreign_keys_consistently` fills FK columns with `rng.choice(pv)` where `pv` is the parent values list, and then `_inject_nulls` replaces some with NULL. This is consistent with the NULL rule (nullable FK gets NULLs). But the specification's `dependencies` list declares `Team_Attributes.team_fifa_api_id` as a copied FK, and the NULL rule says 'for nullable parent keys, use NULL with the stated share'. The program does inject NULLs into this FK, which is correct per the interface rule. No issue here \u2014 this is a confirmation, not a defect.",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `ties_for_order_limit` for `League.name` requires ties at the target rank with ASC direction. The program's `_apply_tie_pool` keeps only the first 3 sorted distinct values from `sampler.elements` and sets `p = 0.0`. However, `StringSampler.sample` still applies random mutations (append/prepend/truncate) with probability 0.5, so the 3 kept values are frequently mutated into near-duplicates rather than exact ties. This means exact ties at the target rank are not reliably produced. The construction_pairs feedback shows only 1 of 19 pairs separated, consistent with ties not being reliably generated.",
+     "requested_revision": "In `_apply_tie_pool` or `StringSampler.sample`, disable the mutation step for tie columns (e.g. add a `tie_mode` flag that skips the random append/prepend/truncate block). Verify that generated League.name values contain exact duplicates at the target rank."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` includes `Player.weight` with `null_share: 5-30%`. The execution feedback shows `Player.weight: NULL 34 / 638` (~5.3%), which is within range. However, the specification's `per_column_exceptions` for `Player.weight` says `null_share: 5-30% of generated rows`, and `spec.null_share` clamps to [0.05, 0.30]. The program's `_inject_nulls` uses `max(1, int(round(n * share)))`, which for n=638 and share=0.05 gives 32 NULLs, close to the observed 34. This is consistent. No issue.",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `table_sizes_per_instance` sets all tables to 230 rows. The execution feedback shows generated rows: Country 2049, League 1541, Player 638, Player_Attributes 4600, Team 956, Team_Attributes 4600. These are the totals across 20 instances (e.g. 230 * 20 = 4600 for Player_Attributes, but Player shows 638 which is ~32 per instance, not 230). Wait \u2014 638 / 20 \u2248 32, not 230. This suggests the Player table is generating far fewer rows than specified (230 per instance). The `drop_unique_duplicates` and `sample_fresh_primary_keys` filters may be dropping many rows, or the `_fresh_pk_start` / unique constraint on `player_api_id` and `player_fifa_api_id` is causing heavy deduplication. The specification requires 230 rows per table per instance, but Player is only getting ~32. This is a concrete deviation from the specification.",
+     "requested_revision": "Investigate why Player rows are being dropped. The `drop_unique_duplicates` function drops rows repeating any unique column value; with `player_api_id` and `player_fifa_api_id` both UNIQUE, and the sampler drawing from a small pool, many rows collide. The engineer should either (a) increase the diversity of the sampler pool for unique columns, or (b) generate unique values directly for UNIQUE columns (e.g. sequential integers for player_api_id/player_fifa_api_id). Verify that each instance has 230 Player rows."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows only 1 of 19 pairs separated, which is low. This may be due to the boundary-value perturbation issue (issue 2) and tie-mutation issue (issue 5), but could also indicate other value-domain problems. After fixing issues 2 and 5, re-run and confirm separation improves.",
+    "The `Player` table row count (~32 per instance vs. specified 230) needs verification after the fix in issue 7.",
+    "The `attacking_work_rate`/`defensive_work_rate` enum inconsistency (issue 3) requires designer resolution before the engineer's enum restriction can be validated.",
+    "The `compact_rows_missing` validity failure (issue 1) is the primary blocker; after fixing, re-run and confirm `validity.valid == n_instances`."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "specification.py NULL_TARGETS includes 'Player_Attributes.overall_rating' and 'Player_Attributes.reactions', and instance.py injects NULLs into every nullable column via _inject_nulls. But the specification's per_column_exceptions require these columns to emit boundary values verbatim (84,85,86,89,90,91 and 89,90,91) so that the atomic-operation targets are reliably present. Execution feedback shows 'Player_Attributes.overall_rating: generated rows: NULL 240 / 4600' and 'Player_Attributes.reactions: generated rows: NULL 240 / 4600', i.e. ~5% of rows are NULL, and the boundary sampler pins values but NULL injection then overwrites some of them. This weakens the boundary-target guarantee the spec explicitly demands ('emit_verbatim: true').",
+     "requested_revision": "Either (a) exclude boundary columns (overall_rating, reactions) from NULL injection so the pinned boundary values are always present, or (b) document in the specification that boundary columns may also carry NULLs and that the boundary targets are only guaranteed on non-NULL rows. Prefer (a) to match the 'emit_verbatim' intent, and re-run to confirm boundary values appear in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specification.py null_share clamps the compact share to [0.05, 0.30] and returns 0.05 when original_values is empty. For Player.weight the compact share is used, but for many Player_Attributes columns the compact share is 0 (no NULLs in compact), yet the program still injects 5% NULLs (execution feedback: 240/4600 for ~40 columns). The spec's null_targets list is broad, but the interface rule says the NULL share should follow the compact database's share; forcing 5% on columns that are non-NULL in the compact DB is a deviation from 'share following the compact database's share'.",
+     "requested_revision": "Make null_share return the compact share (0 when the compact column has no NULLs) rather than clamping to a 0.05 floor, unless the specification explicitly lists a target share. If a floor is intended, state it in the specification's null_targets with an explicit share per column so the program and spec agree."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'attacking_work_rate IS NOT NULL' and 'defensive_work_rate IS NOT NULL', but the same specification lists both columns in null_targets and the program injects NULLs into them (execution feedback: 240/4600 NULLs each). This is a direct contradiction between the NOT NULL formula and the NULL target.",
+     "requested_revision": "Resolve the contradiction: either remove attacking_work_rate/defensive_work_rate from null_targets (honoring the IS NOT NULL formula), or drop the IS NOT NULL formulas and keep them as nullable free-text columns. The current spec cannot be satisfied as written."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's supporting_evidence treats attacking_work_rate and defensive_work_rate as free text with observed values like 'None','le','norm','stoc','y' and '_0','5','ean','o','1'. These look like corrupted/truncated values rather than genuine domain values, and the spec's own 'uncertainty' note admits the sample rows are not aligned. Pinning these exact strings (FREE_TEXT_VALUES in specification.py) propagates likely-corrupt data into every instance.",
+     "requested_revision": "Verify the work-rate domains against the actual compact database (not misaligned sample rows). If the true domain is {low, medium, high} (plus NULL), restrict the free-text pool accordingly; otherwise document why the odd values are legitimate. Do not pin unverified corrupted strings."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows League rows_skipped=60 and Country rows_skipped=101 across 20 instances, and League/Country rows_added=0/1948. The writer counts these as 'bad' rows (unique constraint failures on League.name / Country.name). The spec sets table_sizes_per_instance League=230, Country=230, but the generator cannot add rows because League.name and Country.name are UNIQUE and the StringSampler draws from a small pool / mutates, producing duplicates that are dropped. The intended per-instance size is not achieved for these tables.",
+     "requested_revision": "Ensure League.name and Country.name generation produces enough distinct values to reach the target row count (e.g. unique-sequential or a larger distinct pool), or lower the specified table size for these tables to match what the generator can actually insert. The spec's table_sizes_per_instance should be achievable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs shows eligible=19, separated=1. Only one of 19 atomic-operation pairs is separated by the generated instances. While a missing separation alone does not prove an error, combined with the NULL injection into boundary columns (issue 1) and the tie column League.name being unable to add rows (issue 5), the boundary/tie targets are not reliably exercised. The spec's stated goal ('Boundary and tie columns must emit their target values verbatim ... so that the atomic-operation targets are reliably present') is not met.",
+     "requested_revision": "After fixing issues 1 and 5, re-run and confirm that boundary values (84,85,86,89,90,91; 89,90,91) and League.name ties are present in every instance, and that separation improves. If separation remains low, investigate whether the samplers actually emit the pinned values (e.g. NumberSampler._cast rounding, or pin_values being cleared by _apply_range)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In instance.py, _apply_range sets sampler.pin_values = [] before clamping, and _apply_boundary_pool is called before _apply_range. For overall_rating and reactions, RANGE_FORMULAS includes overall_rating (0,100) but not reactions. For overall_rating, _apply_range clears the boundary pin_values, so the boundary pool is discarded and only the range clamp remains. This means the boundary values 84,85,86,89,90,91 are not actually pinned for overall_rating.",
+     "requested_revision": "Reorder so boundary pinning wins over range clamping (apply range first, then boundary pool), or make _apply_range not clear pin_values when a boundary pool exists. Verify by inspecting generated overall_rating values for the exact boundary set."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's true work-rate domains are {low,medium,high} or the odd observed strings; requires inspecting the actual compact DB, not the misaligned sample rows.",
+    "Whether League.name/Country.name can reach 230 distinct rows per instance with the current sampler; needs a distinct-count check on generated instances.",
+    "Whether boundary values for overall_rating actually appear after the _apply_range pin-clearing bug; needs a value-frequency check on generated instances."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets lists Player_Attributes.potential, preferred_foot, attacking_work_rate, defensive_work_rate, and all skill columns as NULL targets, but the per_column_exceptions only pin null_share for attacking_work_rate (0.017) and defensive_work_rate (0.005). The generic rule says 'use NULL with the stated share' but no share is stated for most NULL targets; the program falls back to the compact-database share clamped to [0.05,0.30] (specification.py null_share). Execution shows 240/4600 = 5.2% NULL for these columns, consistent with the clamp floor, not with the compact share. This is a minor specification gap, not a blocking error.",
+     "requested_revision": "State explicit null_share values (or 'compact share') for every entry in null_targets so the program's fallback is not the de facto rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions for League.name says 'tie_at_rank: any (no LIMIT)' and 'distinct_pool: unique-sequential names League_<n>'. These two are contradictory: unique-sequential names cannot produce ties at any rank. The program (specification.py UNIQUE_SEQUENTIAL_TEXT + instance.py unique-text branch) implements the unique-sequential pool, so no ties are generated. The atomic-op pattern 'ties_for_order_limit' is therefore not exercised. Execution shows League.name NULL 0/4600 and no tie evidence.",
+     "requested_revision": "Resolve the contradiction: either drop the tie requirement for League.name (it is UNIQUE, so ties are impossible) or specify a non-unique tie column. The current spec is internally inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_tie_pool pins up to 3 observed values for tie columns, but League.name is also handled by the unique-text branch which overwrites cols['League.name'] with League_<n> values after samplers run. So even if ties were intended, the tie pool is discarded. This is consistent with the (contradictory) spec but means the tie pattern is never realized.",
+     "requested_revision": "If the designer keeps a tie requirement, ensure the unique-text branch does not overwrite the tie pool for the same column; otherwise remove the tie handling for League.name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "specification.py NULL_TARGETS comment says it is 'the union of the spec's null_targets plus Player_Attributes.overall_rating', but the set does not actually contain overall_rating. The spec explicitly excludes overall_rating from NULL (null_share 0.0), and execution confirms overall_rating NULL 0/4600. The comment is misleading but the behavior matches the spec.",
+     "requested_revision": "Fix the stale comment in specification.py NULL_TARGETS to match the actual set (no overall_rating)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs eligible=19, separated=1. Only 1 of 19 pairs is separated, meaning most boundary/tie/null patterns do not distinguish the original query from its neighbor. This is a weak-separation signal, not proof of equivalence. Boundary columns overall_rating and reactions are pinned to [84,85,86,89,90,91] and [89,90,91] verbatim (specification.py BOUNDARY_VALUES, values.py NumberSampler.pin_values), so boundary comparisons should separate; the low separation count suggests the neighbor queries mostly differ in ways not covered by the pinned boundaries.",
+     "requested_revision": "No blocking change; note that boundary pinning is implemented correctly but separation is low. Consider whether additional boundary values (e.g. 84/91 for reactions) would improve separation, but this is a quality improvement, not a correctness fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, valid=20/20, reproducible=true, rows_added=4600 per table (20 instances x 230 rows), rows_skipped=0. FK columns are filled from parent values (instance.py fill_foreign_keys_consistently) and re-validated after PK dedup. Unique-sequential keys (player_api_id, player_fifa_api_id, team_api_id, team_fifa_api_id) start above compact max (instance.py _fresh_pk_start, unique-sequential branch). NULL injection respects PK/NOT NULL (instance.py skips cm.pk_pos>0 or cm.notnull). All integrity checks pass.",
+     "requested_revision": "None; integrity and reproducibility are satisfied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Enum domains (preferred_foot, work rates, team-attribute classes) are pinned verbatim via specification.py ENUM_VALUES and values.py StringSampler.pin_values, matching the semantic_rules_and_formulas. Range formulas (height 0-200, weight 0-300, overall_rating 0-100, potential 0-100) are applied before boundary pinning (instance.py _apply_range then _apply_boundary_pool), matching the spec's 'boundary pinning takes precedence over range clamping' note. Table sizes 230 per table match table_sizes_per_instance.",
+     "requested_revision": "None; value domains and sampling rules are implemented as specified."
+    }
+   ],
+   "unresolved_checks": [
+    "The tie_for_order_limit pattern for League.name is specified but cannot be realized because League.name is UNIQUE and the program generates unique-sequential names; the spec is internally contradictory and the pattern is not exercised.",
+    "Only 1 of 19 construction pairs is separated; this is a weak-separation signal that does not by itself prove query equivalence or a generation error, but it limits confidence that boundary/null patterns are discriminating.",
+    "The compact-database share for most NULL targets is not stated in the spec; the program's [0.05,0.30] clamp fallback is the de facto rule and produces 5.2% NULL, which may not match the intended compact share."
+   ]
+  }
+ ]
 }

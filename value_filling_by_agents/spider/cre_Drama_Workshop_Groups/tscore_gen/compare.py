@@ -1,4 +1,4 @@
-"""Denotation comparison (unofficial/exec_eval.py:20-119, 171-232)."""
+"""Denotation comparison (unchanged from the shared library)."""
 import random
 from collections import Counter
 from itertools import product
@@ -31,7 +31,7 @@ def _perms(sets1: list, r2: list):
 
 
 def result_eq(rows_a: list, rows_b: list, order_matters: bool) -> bool:
-    """Bag equality up to column permutation (exec_eval.py:20-119)."""
+    """Bag equality up to column permutation."""
     a, b = [tuple(r) for r in rows_a], [tuple(r) for r in rows_b]
     if not a and not b:
         return True
@@ -56,7 +56,7 @@ def result_eq(rows_a: list, rows_b: list, order_matters: bool) -> bool:
 
 
 def execute_batch(api_base: str, ds: str, db_id: str, sqls: list, timeout_ms: int = 30000) -> list:
-    """POST <base>/execute_batch of the db_execution API (replaces upstream subprocess execution)."""
+    """POST <base>/execute_batch of the db_execution API."""
     r = requests.post(api_base.rstrip('/') + '/execute_batch',
                       json={'dataset_name': ds, 'db_id': db_id, 'sqls': list(sqls), 'mode': 'read_only',
                             'timeout_ms': timeout_ms, 'max_rows': 10000},
@@ -66,7 +66,7 @@ def execute_batch(api_base: str, ds: str, db_id: str, sqls: list, timeout_ms: in
 
 
 def execute_and_compare(sql_a: str, sql_b: str, instance_id: str, ds: str, api_base: str, order_matters=None):
-    """True same denotation, False differ or sql_b fails, None if sql_a unusable (exec_eval.py:171-232)."""
+    """True same denotation, False differ or sql_b fails, None if sql_a unusable."""
     if order_matters is None:
         order_matters = 'order by' in sql_a.lower()
     ra, rb = execute_batch(api_base, ds, instance_id, [sql_a, sql_b])

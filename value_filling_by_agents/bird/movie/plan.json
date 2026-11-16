@@ -1,50 +1,642 @@
 {
  "db": "movie",
- "operator_io_quirks": [
-  "Mixed-case + spaced identifiers: 'Date of Birth', 'Birth City', 'MPAA Rating', 'Release Date', 'Height (Inches)', 'Character Name', 'Rating Count' \u2014 must be double-quoted; column lookup case-insensitive.",
-  "Table 'characters' is a SQL keyword-ish name; must be quoted in generated SQL.",
-  "actor.\"Date of Birth\" declared DATE but stored as TEXT 'YYYY-MM-DD' (storage=['text','null']); ts_fuzzer dispatches to Date|Number(int elements) \u2014 first element '1954-02-18' does NOT parse as int, so Date fuzzer with template %Y-%m-%d.",
-  "movie.\"Release Date\" declared TEXT (not DATE) storing 'YYYY-MM-DD' \u2014 dispatches to String fuzzer, NOT Date; text-stored dates will be fuzzed as random strings.",
-  "actor.NetWorth TEXT storing '$250,000,000.00' \u2014 String fuzzer; int-like detection fails (has $ and commas), so no +-1 neighbors added.",
-  "characters.pay TEXT storing '$5,000,000.00' with null_rate 0.998 (only ~9 non-null rows) \u2014 String fuzzer, elements nearly all NULL.",
-  "characters.screentime TEXT storing 'H:MM:SS' with null_rate 0.998 \u2014 String fuzzer (not Time; declared TEXT), so no HH:MM:SS template.",
-  "characters composite PK (MovieID, ActorID) \u2014 both members get max_l0=30 cap; sample_fresh_primary_keys drops duplicate tuples.",
-  "characters FKs to movie(MovieID) and actor(ActorID) both exist; parent PKs are single-column INTEGER \u2014 FK fill draws from parent's final filtered column.",
-  "actor.Gender distinct=2 (Male/Female) but null_rate 0.568; Ethnicity distinct=17 null_rate 0.791 \u2014 String fuzzer will produce implausible values, not the 2/17 real ones.",
-  "movie.Rating REAL with 48 distinct values in [~5,~8]; Number fuzzer range [-10^scale,10^scale] with scale from 'real' (no args) \u2014 will emit wild values.",
-  "No NOT NULL constraints anywhere (all notnull=0); no CHECK; no UNIQUE indexes \u2014 insert failures rare, so TS rows mostly survive.",
-  "actor.Biography/Summary are long text (~40 chars truncated samples) \u2014 String fuzzer length range [min,max+1] from elements, so ~40-char random strings."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on actor.\"Date of Birth\": template %Y-%m-%d, range from min/max parsed dates (~1921..~2000); p=0.2 means 20% element reuse, 80% fresh uniform dates in range \u2014 plausible, low FN.",
-  "String fuzzer on movie.\"Release Date\": random a-zA-Z0-9() strings, NOT dates \u2014 any query comparing Release Date to a date literal or ordering by it will see garbage; likely FP source (ties/ordering) and FN (no plausible dates).",
-  "String fuzzer on Gender/Ethnicity/MPAA Rating/Genre: random strings, not the small real domains \u2014 queries filtering 'Gender = Male' or 'MPAA Rating = PG-13' will return 0 rows in generated instances; strong FN driver.",
-  "Number fuzzer on Budget/Gross/Runtime/Rating Count: full range [-10^scale,10^scale] with scale from type args (INTEGER -> scale 0 -> [-1,1]? actually int family scale default) \u2014 implausible magnitudes; queries with numeric thresholds (Budget > 1000000) will match everything or nothing; FN/FP driver.",
-  "Number fuzzer on Rating (REAL): scale from 'real' no args -> default; values far from [5,8] real range; queries 'Rating > 7' become meaningless.",
-  "Number fuzzer on Height (Inches): real range ~[60,80] but fuzzer emits full int range; 'Height > 70' matches randomly.",
-  "String fuzzer on NetWorth/pay: '$...' strings get '%' stripped only; int-like detection fails so no +-1; random strings \u2014 money comparisons broken.",
-  "Composite PK on characters: sample_fresh_primary_keys keeps first occurrence; FK fill draws from parent final column with replacement, so many duplicate (MovieID,ActorID) pairs get dropped \u2014 row count shrinks, ties/duplicates differ from original.",
-  "FK fill: characters.MovieID drawn from movie.MovieID final values (634 distinct), ActorID from actor.ActorID (2713) \u2014 join cardinality roughly preserved but distribution differs; queries counting characters per movie may see different multiplicities (FP on ties).",
-  "String fuzzer contaminate (0.5 prob) adds/removes chars \u2014 Title/Name/Character Name get corrupted; LIKE '%Travolta%' queries miss (FN).",
-  "p=0.2 default with 0.3 chance whole-instance p=0: when p=0, all columns draw fresh random values (no element reuse) \u2014 even more implausible; Date fuzzer with p=0 always-fresh dates.",
-  "max_l0 cap (rng*30) on non-PK columns: after ~30 fresh draws, values repeat \u2014 creates artificial ties/duplicates that original lacks (FP on DISTINCT/COUNT queries)."
- ],
- "challenger_refs": [
-  "G2",
-  "G7",
-  "G5",
-  "G9",
-  "G1",
-  "G3",
-  "G6",
-  "G4",
-  "G8"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers 1..N unique per generated table; continue numbering after the compact DB's max PK for that table; never NULL.",
+   "integer_fk": "Sample from the parent table's compact+generated PK pool; child values must reference an existing parent row; never NULL (child FK columns are NOT NULL); ensure a few generated parent rows have no children (cold parent rows).",
+   "integer_quantity": "Uniform integer in [1, 200]; never NULL unless the column is in null_targets.",
+   "integer_amount": "Uniform integer in [0, 500000000]; never NULL unless the column is in null_targets.",
+   "integer_year": "Uniform integer in [1900, 2025]; never NULL unless the column is in null_targets.",
+   "integer_height": "Uniform integer in [50, 90] inches; never NULL unless the column is in null_targets.",
+   "real_rating": "Uniform real in [0.0, 10.0] rounded to 1 decimal (printf('%.1f')); never NULL unless the column is in null_targets.",
+   "text_short": "Random token from a pool of 30 distinct strings; duplicate_share 20-50% for columns carrying duplicates_for_distinct (repeat an earlier generated value in that share of rows); 5% near-variants (case swap) for columns carrying comparison_boundary; never NULL unless the column is in null_targets.",
+   "text_long": "Random sentence of 100-400 chars assembled from a word pool; duplicate_share 20-50% for columns carrying duplicates_for_distinct (copy an earlier generated sentence); never NULL unless the column is in null_targets.",
+   "text_title": "Title-like string from a pool of >= 40 strings; duplicate_share 20-50%; boundary planting handled by per_column_exceptions.",
+   "date_iso": "Random date between 1920-01-01 and 2010-12-31 formatted YYYY-MM-DD; never NULL unless the column is in null_targets.",
+   "date_yyyy_mm_dd_text": "Random date between 1920-01-01 and 2010-12-31 formatted YYYY-MM-DD stored as TEXT; never NULL unless the column is in null_targets.",
+   "time_hms": "Random time between 0:00:00 and 3:00:00 formatted H:MM:SS (no leading zero on hour); never NULL unless the column is in null_targets.",
+   "time_hms_padded": "Random time between 00:00:00 and 03:00:00 formatted HH:MM:SS; never NULL unless the column is in null_targets.",
+   "money_text": "Random amount formatted '${:,.2f}' with 2 decimals; never NULL unless the column is in null_targets.",
+   "money_text_networth": "Random amount formatted '${:,.2f}' in range [1,000,000.00, 600,000,000.00]; 15% of rows get the tie-top value (see per_column_exceptions); never NULL unless in null_targets.",
+   "enum_small": "Uniform choice from the column's enum list (see semantic_rules_and_formulas); never NULL unless the column is in null_targets.",
+   "mpaa_rating": "Uniform choice from ('G','PG','PG-13','R'); never NULL.",
+   "movie_genre": "Uniform choice from the 17-value Genre enum; case-variant 'thriller' planted for comparison_boundary; never NULL.",
+   "null_share": "For each column listed in null_targets, ~20% of generated rows get NULL, matching the compact DB's share for that column (actor.Gender ~57%, actor.Ethnicity ~79%, actor.NetWorth ~20%, actor dates/city/country ~15%, actor.Height ~24%, actor.Biography ~6%, actor.Name ~4%, movie.Gross/Rating/RatingCount ~0-2%, characters.pay/screentime ~95%); at least one NULL row and at least one non-NULL row per listed column per instance. Columns not listed in null_targets are generated non-NULL.",
+   "boundary_planting": "For every column with pattern comparison_boundary in per_column_exceptions, after NULLs/duplicates/ties are planted, overwrite the first k generated rows (k = number of listed literals) with the listed literals exactly, never NULL, never overwritten later.",
+   "tie_planting": "For every column with pattern ties_for_order_limit, after NULLs are planted choose the top-ranked non-NULL generated value using the spec's tie_on numeric key and place it in >= 2 generated rows so rank-1 ties occur.",
+   "duplicates_planting": "For every column with pattern duplicates_for_distinct, copy earlier generated values into 20-50% of generated rows (never apply to a primary-key column).",
+   "near_variant_planting": "For every column with a comparison_boundary target containing equality pairs (X vs x), plant both cases exactly as listed, one per generated row."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "actor.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "ops": [
+      "DISTINCT"
+     ]
+    }
+   },
+   {
+    "column": "actor.Name",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "~4 % of generated rows"
+    }
+   },
+   {
+    "column": "actor.ActorID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "characters.ActorID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "actor.NetWorth",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "actor.NetWorth",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "CAST(REPLACE(REPLACE(actor.networth, ',', ''), '$', '') AS REAL)"
+     ]
+    }
+   },
+   {
+    "column": "actor.NetWorth",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "actor.Gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Male",
+      "male"
+     ]
+    }
+   },
+   {
+    "column": "actor.Biography",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "actor.Ethnicity",
+    "pattern": "literals",
+    "targets": {
+     "values": [
+      "White",
+      "African American"
+     ]
+    }
+   },
+   {
+    "column": "movie.MovieID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "characters.MovieID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "movie.Title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie.Title",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Mrs. Doubtfire",
+      "mrs. doubtfire",
+      "Batman",
+      "batman",
+      "American Hustle",
+      "american hustle"
+     ]
+    }
+   },
+   {
+    "column": "movie.Runtime",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "movie.Budget",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "movie.Genre",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Thriller",
+      "thriller"
+     ]
+    }
+   },
+   {
+    "column": "movie.Rating",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "CAST(REPLACE(REPLACE(movie.rating, ',', ''), '$', '') AS REAL)"
+     ]
+    }
+   },
+   {
+    "column": "movie.Gross",
+    "pattern": "literals",
+    "targets": {
+     "values": [
+      136766062
+     ]
+    }
+   },
+   {
+    "column": "characters.MovieID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "movie.MovieID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "characters.ActorID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "actor.ActorID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "characters.creditOrder",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "column": "characters.screentime",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "CAST(REPLACE(characters.screentime, ':', '') AS INTEGER)"
+     ]
+    }
+   },
+   {
+    "column": "characters.pay",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "CAST(REPLACE(REPLACE(characters.pay, ',', ''), '$', '') AS REAL)"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "characters.ActorID",
+    "parent_table": "actor",
+    "parent_column": "ActorID",
+    "copied_columns": []
+   },
+   {
+    "child": "characters.MovieID",
+    "parent_table": "movie",
+    "parent_column": "MovieID",
+    "copied_columns": []
+   },
+   {
+    "unique": "actor.ActorID",
+    "type": "primary_key"
+   },
+   {
+    "unique": "movie.MovieID",
+    "type": "primary_key"
+   },
+   {
+    "unique": "characters.(MovieID, ActorID)",
+    "type": "composite_primary_key"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "actor",
+    "column": "ActorID",
+    "formula": "ActorID > 0"
+   },
+   {
+    "table": "actor",
+    "column": "Height (Inches)",
+    "formula": "Height (Inches) IS NULL OR Height (Inches) BETWEEN 50 AND 90"
+   },
+   {
+    "table": "actor",
+    "column": "Gender",
+    "formula": "Gender IS NULL OR lower(Gender) IN ('male','female')"
+   },
+   {
+    "table": "actor",
+    "column": "Ethnicity",
+    "formula": "Ethnicity IS NULL OR Ethnicity IN ('White','African American','Lebanese','Armenian','Asian','Latino','Native American','Asian American')"
+   },
+   {
+    "table": "actor",
+    "column": "NetWorth",
+    "formula": "NetWorth IS NULL OR NetWorth LIKE '$%'"
+   },
+   {
+    "table": "movie",
+    "column": "MovieID",
+    "formula": "MovieID > 0"
+   },
+   {
+    "table": "movie",
+    "column": "MPAA Rating",
+    "formula": "MPAA Rating IN ('G','PG','PG-13','R')"
+   },
+   {
+    "table": "movie",
+    "column": "Budget",
+    "formula": "Budget >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "Gross",
+    "formula": "Gross IS NULL OR Gross >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "Runtime",
+    "formula": "Runtime > 0"
+   },
+   {
+    "table": "movie",
+    "column": "Rating",
+    "formula": "Rating IS NULL OR Rating BETWEEN 0.0 AND 10.0"
+   },
+   {
+    "table": "movie",
+    "column": "Rating Count",
+    "formula": "Rating Count IS NULL OR Rating Count >= 0"
+   },
+   {
+    "table": "movie",
+    "column": "Genre",
+    "formula": "Genre IN ('Romance','Comedy','Crime','War','Drama','Family','Action','Animation','Thriller','thriller','Horror','Sci-Fi','Fantasy','Mystery','Adventure','Western','Musical','Documentary')"
+   },
+   {
+    "table": "characters",
+    "column": "creditOrder",
+    "formula": "creditOrder >= 0"
+   },
+   {
+    "table": "characters",
+    "column": "pay",
+    "formula": "pay IS NULL OR pay LIKE '$%'"
+   },
+   {
+    "table": "characters",
+    "column": "screentime",
+    "formula": "screentime IS NULL OR screentime LIKE '%:%:%'"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "actor": 40,
+   "movie": 40,
+   "characters": 80
+  },
+  "null_targets": [
+   "actor.Name",
+   "actor.Date of Birth",
+   "actor.Birth City",
+   "actor.Birth Country",
+   "actor.Height (Inches)",
+   "actor.Biography",
+   "actor.Gender",
+   "actor.Ethnicity",
+   "actor.NetWorth",
+   "movie.Gross",
+   "movie.Rating",
+   "movie.Rating Count",
+   "characters.pay",
+   "characters.screentime"
+  ],
+  "supporting_evidence": {
+   "actor.Height (Inches)": "Sample rows 1-8 heights 74,67,63,71,73,72,62,64 all within 50-90.",
+   "actor.Gender": "Sample rows show only 'Male' and 'Female' (case-insensitive boundary handled by lower(Gender)).",
+   "actor.Ethnicity": "Sample shows 'White' and 'African American' as values in the exported literal pool.",
+   "movie.MPAA Rating": "Sample rows show PG-13, PG, R, G.",
+   "movie.Runtime": "Sample rows 93,99,100,145,107,96,129,124 all > 0.",
+   "movie.Rating": "Sample rows 5.9,7.4,7.2,7.5,7.0,7.6,8.1,6.8 all within 0-10.",
+   "movie.Budget": "Sample rows 7500000..25000000 all >= 0.",
+   "movie.Gross": "Sample rows 296000000,145793296,71079915,161001698,84431625,79258538,92800000,235860116 all >= 0; 136766062 is in literal pool.",
+   "characters.creditOrder": "Sample rows 1-8 all >= 0; boundary values 0,1,2 planted.",
+   "characters.screentime": "Sample rows formatted H:MM:SS (e.g. '0:32:30')."
+  },
+  "uncertainty": "movie.MovieID/actor.ActorID primary keys cannot carry duplicates: duplicates_for_distinct removed from PK columns (only non-PK columns actor.Name, movie.Title, movie.Runtime, actor.Biography carry it). null_targets is the exhaustive set of columns that receive NULL in generated rows; all other nullable schema columns (movie.Title, movie.Budget, movie.Genre, movie.MPAA Rating, movie.Runtime, movie.Summary, movie.Release Date, characters.Character Name/creditOrder) are generated non-NULL to keep boundary/duplicate/tie patterns and semantic rules intact. Genre enum extended with 'thriller' to reconcile the comparison_boundary lowercase variant with the enum rule (case-insensitive match acceptable); Gender rule uses lower() for the same reason. NetWorth/pay formatted '${:,.2f}'. Boundary planting runs last; tie planting uses the same numeric parse key as the spec's tie_on; NULL planting runs first and never overwrites boundary/tie positions. No cross-table computed formula is derivable from the sample rows. NetWorth NULL share reconciled to 5-30% (per_column_exceptions) overriding the generic 50-79% text; characters.pay/screentime NULL share set to ~95% to match execution; actor.Name NULL share set to ~4% with an explicit null_rows pattern."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback validity shows 'compact_rows_missing: 20' and 'no_rows_added: 19' for all 20 instances. In cli.py `_one` calls `write_instance_sqlite(_G['schema'], inst, p)` without passing `orig_path`, so writer.py takes the `if not (orig_path and os.path.exists(orig_path))` branch and only creates the schema DDL \u2014 the compact database rows are never copied. The spec's writer contract ('Copy the compact DB ... Compact rows are never deleted or changed') and the whole point of appending generated rows to the compact DB are violated. This is why every instance is reported invalid.",
+     "requested_revision": "Pass the original DB path through to `write_instance_sqlite` (e.g. add `orig_path` to the worker args and call `write_instance_sqlite(schema, inst, p, orig_path=a['orig'])`), so each unit is a copy of the compact DB with generated rows appended. Re-run and confirm `compact_rows_missing` and `no_rows_added` are 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` is applied to every nullable column including `movie.Budget`, `movie.Genre`, `movie.MPAA Rating`, `movie.Runtime`, `movie.Title`, `movie.Summary`, `movie.Release Date`, `actor.Name`, `actor.Gender`, `actor.Ethnicity`, `actor.Height (Inches)`, `actor.Date of Birth`, `actor.Birth City`, `actor.Birth Country`. The execution feedback confirms NULLs in all of these (e.g. 'movie.Title: NULL 53 / 518', 'actor.Name: NULL 57 / 565'). The specification's `null_targets` list only includes actor.Name, actor.Date of Birth, actor.Birth City, actor.Birth Country, actor.Height (Inches), actor.Biography, actor.Gender, actor.Ethnicity, actor.NetWorth, movie.Gross, movie.Rating, movie.Rating Count, characters.pay, characters.screentime. Columns like movie.Title, movie.Budget, movie.Genre, movie.MPAA Rating, movie.Runtime, movie.Summary, movie.Release Date are not in the null_targets and the semantic rules (e.g. `MPAA Rating IN (...)`, `Genre IN (...)`, `Runtime > 0`) treat them as non-null. Planting NULLs there contradicts the spec and also breaks the comparison_boundary/duplicates_for_distinct patterns for those columns (e.g. Title boundary literals can be overwritten by NULL).",
+     "requested_revision": "Restrict `_plant_nulls` to the columns listed in the specification's `null_targets` (and to nullable FKs per the interface rule). Do not plant NULLs in movie.Title, movie.Budget, movie.Genre, movie.MPAA Rating, movie.Runtime, movie.Summary, movie.Release Date, or any other column not in null_targets. Re-run and confirm the nullable_columns feedback only lists the spec's null_targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` writes the boundary literals into `values[0]` and `values[1]` (or `values[j % len(values)]`), but this happens *before* `_plant_nulls` and before `_plant_duplicates`/`_plant_ties` in the same loop, and `_plant_nulls` then overwrites those positions with NULL for nullable columns. For movie.Title (nullable in the generated schema) the boundary literals 'Mrs. Doubtfire'/'mrs. doubtfire'/'Batman'/'batman'/'American Hustle'/'american hustle' can be replaced by NULL, so the comparison_boundary pattern is not guaranteed. Similarly `_plant_duplicates` for movie.Title runs after `_plant_boundary` and can overwrite the boundary literals with duplicates of earlier values. The construction_pairs feedback shows only 38/129 separated, consistent with boundary literals being lost.",
+     "requested_revision": "Apply boundary planting after duplicates/ties and after NULL planting (or exclude boundary positions from NULL/duplicate overwrites), so that both boundary literals are guaranteed to appear in the generated rows for each comparison_boundary column. Re-run and confirm the boundary literals are present in the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_ties` uses `top = max(values)` on the raw values. For `characters.screentime` the values are strings like 'H:MM:SS'; `max` on strings is lexicographic, not the numeric ordering the spec's tie_on expression `CAST(REPLACE(characters.screentime, ':', '') AS INTEGER)` uses. For `characters.pay` and `actor.NetWorth` the values are money strings ('$#,###,###.##'); `max` on strings is lexicographic, not the numeric ordering used by the spec's `CAST(REPLACE(REPLACE(..., ',', ''), '$', '') AS REAL)`. So the planted 'top' value is not the numeric maximum, and the tie_at_rank[1] target is not satisfied. The construction_pairs feedback (38/129 separated) is consistent with ties not being planted at the correct rank.",
+     "requested_revision": "Compute the tie 'top' value using the same numeric key as the spec's tie_on expression (parse screentime to seconds, parse money to float), then plant that value in at least two rows. Re-run and confirm the top-ranked value is shared by \u22652 rows for each ties_for_order_limit column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` is applied to `('movie', 'Runtime')` and `('actor', 'Biography')` and `('movie', 'Title')` and `('actor', 'Name')`, but the spec's duplicates_for_distinct targets are on `actor.Name`, `movie.MovieID`, `movie.Title`, `movie.Runtime`, `actor.Biography`. `movie.MovieID` is a primary key generated sequentially in `build_random_instance` (the `cm.pk_pos > 0 and len(tm.primary_key) == 1` branch), so `_plant_duplicates` is never applied to it \u2014 the spec's `movie.MovieID` duplicates_for_distinct target (duplicate_share 20-50%) is not implemented. Also `_plant_duplicates` is applied to `movie.Runtime` but Runtime is an integer column; the spec's duplicates_for_distinct on Runtime is fine, but the spec also lists `movie.MovieID` which is missed.",
+     "requested_revision": "Either (a) implement the movie.MovieID duplicates_for_distinct target (e.g. by allowing duplicate MovieID values in the generated rows, which is compatible with the PK constraint only if the compact DB's MovieIDs are not reused \u2014 clarify with the designer), or (b) remove the movie.MovieID duplicates_for_distinct target from the specification since it conflicts with the primary-key constraint. Coordinate with the designer on which is intended."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `per_column_exceptions` includes `movie.MovieID` with `duplicates_for_distinct` (duplicate_share 20-50%) and `unmatched_join_rows`, but `movie.MovieID` is the primary key of `movie` (per the schema and the `dependencies` list `{\"unique\": \"movie.MovieID\", \"type\": \"primary_key\"}`). A primary key cannot contain duplicates, so the duplicates_for_distinct target is unsatisfiable. Similarly `actor.ActorID` is a primary key and the spec's `duplicates_for_distinct` minor pattern on it is unsatisfiable.",
+     "requested_revision": "Remove the duplicates_for_distinct targets on primary-key columns (movie.MovieID, actor.ActorID) from the specification, or clarify that they refer to the compact DB's existing duplicates (which the generator must preserve, not create)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` list does not include `movie.Title`, `movie.Budget`, `movie.Genre`, `movie.MPAA Rating`, `movie.Runtime`, `movie.Summary`, `movie.Release Date`, yet the schema declares these columns as nullable (no NOT NULL). The interface rule says 'for every nullable column ... each instance contains generated rows with NULL and rows with non-NULL values'. The spec's null_targets is therefore inconsistent with the interface rule for these columns. The engineer's program follows the interface rule (planting NULLs everywhere nullable), which conflicts with the spec's null_targets.",
+     "requested_revision": "Reconcile the specification's null_targets with the interface rule: either add all nullable columns to null_targets, or explicitly state that only the listed columns get NULLs and the others are treated as effectively NOT NULL (and add NOT NULL to the schema or document the exception)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_make_sampler` for `('actor', 'NetWorth')` sets `top = '${:,.2f}'.format(rng.randint(400000000, 500000000))` and MoneySampler returns `top` with probability 0.15. But `_plant_ties` is also applied to NetWorth, and `_plant_nulls` (share 0.20) is applied after, so the top value can be overwritten by NULL. The spec's ties_for_order_limit on NetWorth requires tie_at_rank[1] with the numeric max; if the top value is NULLed out, the tie is lost. The execution feedback shows NetWorth NULL 114/565 (20%), consistent with the top value sometimes being NULLed.",
+     "requested_revision": "Apply `_plant_ties` after `_plant_nulls` (or exclude the tie positions from NULL planting) so the top-ranked non-NULL value is shared by \u22652 rows. Re-run and confirm the top non-NULL NetWorth value appears in \u22652 rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` for `('actor', 'Gender')` plants 'Male' and 'male', but the spec's semantic rule `Gender IS NULL OR Gender IN ('Male', 'Female')` and the `_ENUMS` list only allow 'Male'/'Female'. Planting 'male' violates the semantic rule. Similarly `('movie', 'Genre')` plants 'thriller' but the `_ENUMS` list only has 'Thriller'. The spec's comparison_boundary targets explicitly list 'male' and 'thriller' as boundary values, so the spec and the semantic rules are inconsistent.",
+     "requested_revision": "Designer: reconcile the comparison_boundary values with the semantic enum rules (either allow the lowercase variants in the enum, or drop them from comparison_boundary). Engineer: ensure the planted boundary values satisfy the semantic rules (e.g. use case-insensitive comparison in the rule, or only plant values in the enum)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` for `('movie', 'Title')` plants 'Mrs. Doubtfire', 'mrs. doubtfire', 'Batman', 'batman', 'American Hustle', 'american hustle' into `values[0..5]`, but `_plant_duplicates` for movie.Title runs after and can overwrite these with duplicates of earlier values. Also `_plant_nulls` for movie.Title (nullable) can overwrite them with NULL. The spec's comparison_boundary on movie.Title requires all six literals to appear.",
+     "requested_revision": "Apply boundary planting last (after duplicates, ties, and NULLs) and exclude boundary positions from overwrites, so all six boundary literals appear in the generated rows. Re-run and confirm."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` for `('actor', 'Name')` and `('movie', 'Title')` uses `values[rng.randrange(i)]` to copy an earlier value, but if the earlier value was a boundary literal (planted by `_plant_boundary` before), the duplicate is a boundary literal, which is fine. However, `_plant_duplicates` for `('actor', 'Biography')` and `('movie', 'Runtime')` is applied, but the spec's duplicates_for_distinct on `actor.Biography` and `movie.Runtime` is fine. The issue is that `_plant_duplicates` is applied to `movie.Runtime` (integer) but the spec's duplicates_for_distinct on Runtime is fine. No issue here beyond the boundary overwrite already noted.",
+     "requested_revision": "No change needed beyond the boundary-overwrite fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` draws FK values from `instance.get(pt, {}).get(pc) or []`, which is the parent's *generated* values only, not the parent's compact+generated values. The docstring says 'FK child columns draw from the parent's compact+generated values', but the code only uses `instance[pt][pc]` (generated). Since the compact rows are not copied (issue 1), this is moot for now, but once issue 1 is fixed, FK values will not reference compact parent rows, violating the spec's `unmatched_join_rows` target `parent_rows_without_children: true` (which requires some parent rows to have no children, but also requires FK values to be valid references to parent rows).",
+     "requested_revision": "After fixing issue 1, ensure `fill_foreign_keys_consistently` draws from the parent's compact+generated PK values (e.g. by including `schema.original_values[(pt, pc)]` in the pool). Re-run and confirm FK values reference existing parent rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `choose_table_sizes` uses `SPEC_SIZES = {'actor': 40, 'movie': 40, 'characters': 80}` and multiplies by `rng.uniform(0.5, 1.5)` or uses `s = 1 + 30 * rng.random()` with `s *= 4` per level. The spec's `table_sizes_per_instance` is `{'actor': 40, 'movie': 40, 'characters': 80}`. The variation is allowed by the spec's 'per-instance variation' note, but the spec does not explicitly authorize the `s *= 4` growth or the 0.5-1.5 multiplier. This is a minor spec ambiguity, not a blocking error.",
+     "requested_revision": "Designer: clarify whether per-instance size variation is allowed and what range. Engineer: if not allowed, use the exact spec sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs: eligible 129, separated 38`. The spec's `stats` shows `pairs_with_targets: 47`. The low separation (38/129) is consistent with the boundary/duplicate/tie/NULL overwrite issues above. This is not itself a blocking error (per instruction 4), but it indicates the planted patterns are not reliably surviving.",
+     "requested_revision": "After fixing the overwrite ordering issues, re-run and confirm separation improves toward the spec's targets."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's existing rows contain duplicates that the spec's duplicates_for_distinct targets refer to (vs. generated duplicates).",
+    "Whether the spec intends movie.MovieID duplicates_for_distinct to be satisfiable given the PK constraint.",
+    "Whether the spec's null_targets is meant to be exhaustive or illustrative.",
+    "Whether the comparison_boundary lowercase variants ('male', 'thriller') are meant to be allowed by the semantic enum rules."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "summary": "Generation crashes with ValueError in 9/20 instances (45%), blocking instance production.",
+     "evidence": "Execution feedback stderr: \"unit 0 failed: ValueError(\\\"could not convert string to float: 'Tom Cruise'\\\")\" (repeated across units 0,2,4,6,7,8,12,13,18). n_ok=11, n_fail=9. The error is raised by a `float()` conversion on a text value. In instance.py, `_TIES` maps ('actor','NetWorth'), ('characters','pay') to `float(str(v).replace('$','').replace(',',''))` and ('movie','Rating') to `float(v)`; `_plant_ties` calls `key` on every non-NULL value without guarding against non-numeric strings. MoneySampler/StringSampler/short-text path can yield non-numeric strings (e.g. a literal-pool name like 'Tom Cruise'), and `_plant_ties` does not filter `values` to parseable numbers before calling `max(..., key=key)`. The None check in `idx` does not exclude non-numeric strings.",
+     "revision": "In instance.py `_plant_ties` (and the tie-key lambdas in `_TIES`), skip values that fail the numeric parse (e.g. wrap in try/except and treat as non-tieable), or filter `values` to numeric strings before computing the top value. Alternatively coerce/filter out non-numeric strings before tie planting. The spec's tie_on expressions assume numeric strings; the sampler must honor that invariant."
+    },
+    {
+     "agent": "engineer",
+     "summary": "NULL handling is over-applied and null shares are inconsistent with spec; some columns get all-NULL and others get 0 NULL even though listed.",
+     "evidence": "Feedback: characters.pay NULL 752/752 (all NULL), characters.screentime NULL 752/752 (all NULL) \u2014 100%; spec null_targets lists these with ~99.8% share but the note says 'at least one NULL and at least one non-NULL row per listed column per instance'. Also movie.Gross/Rating/Rating Count get NULL 11/271 (~4%) though spec share is 0-2%. Conversely nullable_columns with 'NULL 0 / n': movie.Title, movie.Runtime, movie.Summary, movie.MPAA Rating, movie.Genre, movie.Budget, movie.Release Date, characters.Character Name, characters.creditOrder \u2014 these are NOT in null_targets, so 0 NULL is acceptable per note. But characters.pay/screentime being all-NULL violates the 'at least one non-NULL value per listed column per instance' requirement.",
+     "revision": "In instance.py `_plant_nulls`, cap the share so that at least one non-NULL row remains when a column is in null_targets (e.g. k = min(n-1, max(1, round(n*share)))). Also reduce movie.Gross/Rating/Rating Count share to match spec (0-2% \u2192 use 0.01 with at least one NULL)."
+    },
+    {
+     "agent": "designer",
+     "summary": "Spec null_share ranges for actor.Gender/Ethnicity (~50-79%) and the 'at least one non-NULL' requirement are mutually ambiguous with near-100% characters.pay/screentime share; the spec text 'rows with different values' for these columns is not assertable if all NULL.",
+     "evidence": "Feedback shows actor.Gender NULL 132/250 (53%), actor.Ethnicity 197/250 (79%) \u2014 consistent with spec. But characters.pay/screentime all NULL breaks the note's 'at least one non-NULL row per listed column per instance' wording. Spec's `null_share` rule text says '~99.8%' AND 'at least one NULL row and at least one non-NULL row per listed column per instance' \u2014 these conflict when the share is ~100%. Also spec declares characters.screentime is a ties_for_order_limit column whose tie_on parses `':'`-containing strings; if the column is all NULL, tie planting has no effect and the tie pattern is never realized.",
+     "revision": "Clarify the spec: characters.pay/screentime should have a bounded share (e.g. 95-99%) that still guarantees >=2 distinct non-NULL values per instance so tie planting is realizable. Explicitly exclude primary-key and NOT NULL columns. State that near-100% shares must leave at least a small non-NULL population to support tie and boundary patterns."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Spec boundary values for characters.creditOrder [0,1,2] and other targets are planted but at least one row may conflict with creditOrder UNIQUE-ish semantics; more importantly, boundary planting for movie.Genre places 'Thriller'/'thriller' but the spec's Genre enum in instance.py omits 'thriller' from _ENUMS (only in _BOUNDARY), and null_targets is respected.",
+     "evidence": "In instance.py `_ENUMS[('movie','Genre')]` has 17 entries (no 'thriller'), while spec semantic rule and boundary planting expects a lowercase 'thriller' variant. `_BOUNDARY` overwrites first 2 rows with 'Thriller','thriller', which does cover the boundary. However, if boundary planting is skipped (e.g. n==0 rows) the enum never contains 'thriller'; and spec's semantic rule formula explicitly lists 'thriller' as valid. The program is consistent in practice but relies solely on boundary planting. Secondary: `characters.creditOrder` boundary [0,1,2] is planted onto rows that already have unique-ish creditOrder? creditOrder is not UNIQUE in schema, so acceptable.",
+     "revision": "Either (a) add 'thriller' to the _ENUMS['movie','Genre'] list, or (b) document in the spec that 'thriller' enters only via boundary planting (as implemented). Prefer (a) so it survives any future modification of boundary planting."
+    },
+    {
+     "agent": "engineer",
+     "summary": "duplicates_for_distinct and ties interact poorly: `_plant_duplicates` runs before `_plant_ties`, so ties overwrite duplicates and may reduce duplicate share below the target for movie.Runtime, actor.Name, actor.Biography, movie.Title.",
+     "evidence": "Order in instance.py build loop: `_plant_duplicates` \u2192 `_plant_ties` \u2192 `_plant_nulls` \u2192 `_plant_boundary`. But `_TIES` does NOT include those duplicate columns (NetWorth, Rating, pay, screentime), so no direct conflict there. However, `_plant_nulls` for actor.Name (0.04) runs after duplicates, overwriting some duplicated cells with NULL \u2014 reducing duplicate share by ~4%, likely still within 20-50%. Order of null-before-boundary is per spec (boundary last). So this is low risk. Note: spec's duplicates_planting and null_planting ordering is 'null planting runs first and never overwrites boundary/tie positions' \u2014 the code plants NULLs AFTER ties (via tie planting), then boundary. Contradiction: spec `uncertainty` says 'NULL planting runs first', but code order in loop is duplicates\u2192ties\u2192nulls\u2192boundary. This is an ordering discrepancy between spec & code, not a proven failure, but ambiguous.",
+     "revision": "Align instance.py ordering with the spec's stated order (nulls first, then duplicates, then ties, then boundary) OR update spec to match code (duplicates\u2192ties\u2192nulls\u2192boundary). Make the spec and program carry the same ordering and document which step may overwrite which."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Table sizes deviate widely from spec's `table_sizes_per_instance` {actor:40,movie:40,characters:80}.",
+     "evidence": "Feedback rows_added: actor 250, movie 271, characters 512 over 11 instances \u2192 avg ~22.7/24.6/46.5 per instance, not 40/40/80. `choose_table_sizes` uses `int(base * rng.uniform(0.5,1.5))` and can even use the `else` branch producing 1..30 rows per table. Spec table_sizes_per_instance declares fixed 40/40/80. The comment says 'per-instance variation', but the spec is silent on variation, so any ratio is under-specified and the code misimplements the fixed sizes.",
+     "revision": "In instance.py `choose_table_sizes`, produce exactly 40/40/80 per instance to match the spec, or amend the spec to explicitly allow the 0.5-1.5 multiplier and the alternative branch. Also ensure characters row count >= actor+2 (enough children) and that FK generation cannot crash (see issue 1)."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Nullable FK generation for characters.ActorID/MovieID can still yield FK violations or drop into `NULL * n` wholesale.",
+     "evidence": "Execution shows fk_violations=0 for 11 valid instances, but `fill_foreign_keys_consistently` returns `[None]*n` when the parent pool is empty for an instance (`if pv else [None]*n`), i.e. an all-NULL FK column, violating 'child values must reference an existing parent row' from spec integer_fk rule. With actor/movie sizes sometimes 0 (choose_table_sizes can return 0), this triggers. Additionally spec says 'allow ~8% NULL only if nullable' \u2014 a full NULL column is not 8%. `cash[:,]` for char FK: creditOrder is not FK. Evidence is potential, not directly observed in feedback because some units failed before writing.",
+     "revision": "Guard `fill_foreign_keys_consistently` to always seed `pv` from schema.original_values plus generated parent PKs, and never emit a full NULL column: enforce ~8% NULL with at least one non-NULL when parent pool is non-empty; if parent pool is empty, that instance should be rejected or its parent table regenerated with >=1 row. Bump min table sizes so parent tables never go to 0 unless spec says so."
+    },
+    {
+     "agent": "engineer",
+     "summary": "Reproducibility=false and non-deterministic failure pattern indicates the RNG seeding or program path differs across runs.",
+     "evidence": "Feedback: reproducible=false. `_one` seeds `random.Random(seed_base*100003+i)`, which should be deterministic, but `execute_batch` and multiprocessing are involved, plus `literal_pool` dict iteration order and `schema.fks` iteration affect sampling. More relevant: if the ValueError arises only on some seeds, then determinism per seed should still hold; 'reproducible=false' suggests either a shared-state bug or a nondeterministic source (e.g., `rng.choices(ov, ...)` ordering, `dict` ordering, or multiprocessing pool ordering). The failure itself is deterministic per seed (e.g., 'Tom Cruise' literal appears in NetWorth pool via seed_literal_pool).",
+     "revision": "Ensure all iteration that feeds sampling uses sorted keys (`sorted(schema.fks.items())`, `sorted(pool.items())`) and that any dict-derived iteration order is stable. Verify `_one` deterministic: re-run with same seed-base and i to confirm. Fix issue 1 (ValueError) as well, which is the primary determinism blocker."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the spec's text 'NULL planting runs first' vs code order (duplicates\u2192ties\u2192nulls\u2192boundary) causes duplicate/tie share degradation exceeding the 20-50% or >=2-rows targets is not directly observable in feedback and needs manual spot check.",
+    "Whether movie.Gross literal 136766062 is actually planted (spec literal pool) is not reflected in feedback; literal planting for non-target columns goes through ShortTextSampler/NumberSampler as pool values, so probability is low. This is a probabilistic, not guaranteed, adherence to the literal pool requirement."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` overwrites the first k rows with the listed literals, but `_plant_nulls` runs first and can place NULLs at those same positions; the boundary step then overwrites NULLs with literals. More importantly, `_plant_boundary` is applied to `characters.creditOrder` with values [0,1,2], but the spec's comparison_boundary for creditOrder targets values [0,1,2] as a boundary between `<= 1` and `= 1` \u2014 planting 0,1,2 in the first three rows is fine, but the spec's `_BOUNDARY` for creditOrder is a list of ints while `_plant_boundary` writes them into a list that may contain None from `_plant_nulls`; since creditOrder is not in `_NULL_SHARE` this is OK. However, the real defect: `_plant_boundary` for `actor.Gender` writes 'Male','male' into the first two rows, but `_plant_nulls` for Gender (share 0.57) may have already set those rows to NULL \u2014 boundary overwrites them, which is acceptable per spec ('boundary planting runs last'). No blocking error here.",
+     "requested_revision": "No change required for this item; noted for clarity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_NULL_SHARE` sets `characters.pay` and `characters.screentime` to 0.95, but the spec's null_share rule states 'characters.pay/screentime ~99.8%'. The execution feedback shows pay NULL 1432/1507 (~95%) and screentime 1431/1507 (~95%), consistent with the code but not with the spec's stated 99.8%. This is a spec-vs-code mismatch on the NULL share for these two columns.",
+     "requested_revision": "Either update the spec's null_share text to ~95% for characters.pay/screentime, or change `_NULL_SHARE` to 0.998 to match the spec. Since the spec explicitly says '~99.8%', the engineer should align the code (or the designer should correct the spec if 95% is intended)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_NULL_SHARE` includes `('actor', 'Name'): 0.04`, but the spec's null_targets list includes actor.Name and the null_share rule says 'actor dates/city/country ~15%; actor.Height ~24%; actor.Biography ~6%' \u2014 it does not give a share for actor.Name. The spec's per_column_exceptions for actor.Name only lists duplicates_for_distinct and comparison_boundary, not null_rows. The execution feedback shows actor.Name NULL 14/565 (~2.5%), which is close to 0.04 but the spec does not authorize NULLs in actor.Name at all (it is not in the null_rows pattern for actor.Name, only in null_targets list). This is a minor inconsistency: null_targets lists actor.Name but no null_rows pattern or share is specified for it.",
+     "requested_revision": "Designer should either remove actor.Name from null_targets or add an explicit null_rows pattern with a share for actor.Name; engineer should then match it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_TIES` for `characters.screentime` uses `lambda v: int(str(v).replace(':', ''))`, which parses 'H:MM:SS' as an integer by stripping colons (e.g. '1:23:45' -> 12345). The spec's tie_on for screentime is `CAST(REPLACE(characters.screentime, ':', '') AS INTEGER)`, which matches. However, `_plant_ties` picks the max by this key and forces >= 2 rows to share it; since screentime is 95% NULL, the tie planting operates on the ~5% non-NULL rows, which is fine. No blocking error.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` is applied to `movie.Runtime` (in `_DUPLICATES`), but Runtime is also in `_INT_RANGES` with range (1,200) and is a non-PK integer column. The spec's duplicates_for_distinct for movie.Runtime targets duplicate_share 20-50%, which the code implements. However, `_plant_duplicates` copies earlier values including possibly None (it filters `values[j] is not None`), so it is safe. No blocking error.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` draws FK values from `instance.get(pt, {}).get(pc)` plus `schema.original_values`, but for `characters` the parent `movie` and `actor` tables are built earlier in `order` (topological), so `instance[pt]` exists. However, `sample_fresh_primary_keys` and `drop_unique_duplicates` are applied to `characters` after FK fill, and the composite PK (MovieID, ActorID) dedup may drop rows \u2014 the execution feedback shows characters rows_skipped 340/1507 (~22.6%), which is expected from composite PK collisions. This is consistent with the spec's composite_primary_key dependency. No blocking error.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_make_sampler` for `('actor', 'NetWorth')` sets `top = '${:,.2f}'.format(rng.randint(400000000, 500000000))` and MoneySampler returns this top with 15% probability. The spec's money_text_networth rule says '15% of rows get the tie-top value' and range [1,000,000.00, 600,000,000.00]. The code's top is in [400M, 500M], within range, and 15% matches. However, MoneySampler's non-top branch uses `r.randint(0, 500000000) + r.random()`, which can produce values below 1,000,000 (the spec's lower bound). This violates the spec's stated range [1,000,000.00, 600,000,000.00].",
+     "requested_revision": "Engineer should change MoneySampler's non-top branch for NetWorth to draw from [1,000,000, 600,000,000] (e.g., pass lo/hi or a dedicated sampler), or the designer should relax the spec's lower bound. As written, generated NetWorth values can be below $1,000,000, contradicting the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` for `movie.Title` writes 6 literals into the first 6 rows, but `_plant_duplicates` for movie.Title (share 20-50%) runs before boundary and may have set some of those rows to duplicated values; boundary overwrites them, which is fine. However, `_plant_boundary` uses `values[j % len(values)] = lit`, so if n < 6 (e.g., small table size), some literals are overwritten by later ones. With SPEC_SIZES movie=40 and variation 0.5-1.5x, n >= 20, so all 6 fit. No blocking error.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_share` rule states 'actor.Gender/Ethnicity/NetWorth ~50-79%', but the code uses Gender 0.57, Ethnicity 0.79, NetWorth 0.20. NetWorth at 0.20 is outside the stated 50-79% range. The execution feedback shows NetWorth NULL 113/565 (~20%), consistent with code but not spec. The spec's per_column_exceptions for NetWorth null_rows says 'null_share: 5-30% of generated rows', which conflicts with the null_share rule's '~50-79%'. This is an internal spec contradiction.",
+     "requested_revision": "Designer should reconcile the two NetWorth NULL share statements (5-30% vs 50-79%) and update the spec; engineer should then match the corrected value."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_share` rule lists 'characters.pay/screentime ~99.8%', but the code uses 0.95 and the execution feedback confirms ~95%. Additionally, the spec's `null_targets` includes `actor.Name` but no null_rows pattern or share is given for it, while the code uses 0.04. These are spec gaps/inconsistencies.",
+     "requested_revision": "Designer should add explicit null_rows patterns with shares for actor.Name and correct the pay/screentime share to match the intended value (95% or 99.8%)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs: eligible 129, separated 35`. This means 94 of 129 intended pattern pairs were not separated by the generated instances. While the instructions note that a missing separation alone does not prove a generation error, the low separation rate (27%) combined with the spec-vs-code mismatches above (NetWorth range, NULL shares) suggests the planting may not be effective for many patterns. For example, `_plant_ties` for NetWorth picks the max by numeric key and forces 2 rows to share it, but if the top value is drawn from the 15% tie-top branch, many rows already share it, so the tie is trivially satisfied; conversely, if the top is a random value, only 2 rows share it, which may not separate the intended query pair. This is a design concern rather than a blocking error.",
+     "requested_revision": "Engineer should verify that tie planting for NetWorth/Rating/pay/screentime actually produces rank-1 ties in the generated data (e.g., by checking that at least 2 non-NULL rows share the max numeric key), and that boundary planting for movie.Title/actor.Name/Genre/Gender actually places both case variants in distinct rows. The designer should confirm the intended separation semantics for each pattern."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 94 unseparated construction pairs are due to ineffective planting or to query pairs that are genuinely equivalent on the generated data; this requires per-pair inspection not available in the feedback.",
+    "Whether the spec's '~99.8%' NULL share for characters.pay/screentime is intentional or a typo for ~95%.",
+    "Whether actor.Name should receive NULLs at all (it is in null_targets but has no null_rows pattern).",
+    "Whether the NetWorth lower bound of $1,000,000 is intended to be enforced (code allows values down to $0)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "actor.Name is listed in comparison_boundary in the extracted atomic operations (values 'Morgan Freeman'/'morgan freeman' appear in the example) and in _BOUNDARY in instance.py, but the specification's per_column_exceptions does NOT list actor.Name under comparison_boundary; the spec's null/duplicate handling for actor.Name is consistent with the program. The program's _BOUNDARY for actor.Name ('Morgan Freeman','morgan freeman') is not supported by the spec's per_column_exceptions.",
+     "requested_revision": "Either add actor.Name to the specification's per_column_exceptions with comparison_boundary (values ['Morgan Freeman','morgan freeman']) or remove the actor.Name entry from _BOUNDARY in instance.py. This is a minor inconsistency; the spec's uncertainty note already mentions the boundary planting, but the spec's per_column_exceptions list omits actor.Name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_share says 'actor.Gender ~57%, actor.Ethnicity ~79%' and 'movie.Gross/Rating/RatingCount ~0-2%'. The implementation's _NULL_SHARE uses these values, and the execution feedback shows actor.Gender 300/565 (53%), actor.Ethnicity 414/565 (73%), movie.Gross 19/518 (3.7%), movie.Rating 19/518 (3.7%), movie.Rating Count 19/518 (3.7%). The Gross/Rating/RatingCount shares are slightly above the spec's 0-2% band, but this is within the spec's stated intent ('~0-2%') and the spec's null_targets list is not violated. The spec's null_share is a soft guideline, not a hard constraint.",
+     "requested_revision": "No change required. The spec's '~0-2%' is a soft target; the implementation's 3.7% is within the spec's stated intent and the null_targets list is satisfied. If the engineer wants to be strict, they could reduce the _NULL_SHARE values for movie.Gross/Rating/Rating Count from 0.01 to 0.005, but this is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_share says '~20% of generated rows get NULL for actor.NetWorth'. The execution feedback shows actor.NetWorth 113/565 = 20.0%, which matches. The spec's per_column_exceptions for actor.NetWorth says null_share '5-30%', which is 20% \u2014 consistent. The spec's uncertainty note says 'NetWorth NULL share reconciled to 5-30% (per_column_exceptions) overriding the generic 50-79% text'. The implementation's _NULL_SHARE uses 0.20 for actor.NetWorth, which is consistent with the spec's per_column_exceptions.",
+     "requested_revision": "No change required. The spec's generic null_share text (50-79%) is inconsistent with the per_column_exceptions (5-30%), but the spec's uncertainty note explicitly says the per_column_exceptions overrides the generic text. The implementation uses 0.20, which is within the per_column_exceptions band. The spec's generic text should be corrected to avoid confusion, but this is a minor documentation issue, not a blocker."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows characters.pay and characters.screentime have 1437/1511 NULL (95.1%) and 1435/1511 NULL (95.0%), which matches the spec's ~95% target. The spec's null_share says 'characters.pay/screentime ~95%'. The implementation's _NULL_SHARE uses 0.95 for both. Consistent.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The construction_pairs shows 39/129 separated, which is low but not zero. The spec's uncertainty note says 'No cross-table computed formula is derivable from the sample rows'. The low separation is due to the spec's null_targets and the program's planting rules (e.g., actor.pay NULL 95%, actor.screentime NULL 95%), which makes many queries return NULL for NULL operands. The spec's null rule says 'rules, lookups and formulas constrain only non-NULL operands (SQL three-valued logic: a rule holds when its expression is not FALSE)'. The program's NULL planting is consistent with the spec's null rule. The low separation is a consequence of the spec's null_targets, not a bug.",
+     "requested_revision": "No change required. The spec's null rule is consistent with the program's NULL planting. The low separation is a consequence of the spec's null_targets, not a bug. If the spec's null_targets are intended to be reduced, the spec should be updated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_targets says 'actor.Height (Inches) ~24%'. The execution feedback shows actor.Height 134/565 = 23.7%, consistent. The spec's null_targets says 'actor.Biography ~6%'. The execution feedback shows actor.Biography 26/565 = 4.6%, close. The spec's null_targets says 'actor.Name ~4%'. The execution feedback shows actor.Name 14/565 = 2.5%, close. The spec's null_targets says 'actor.Date of Birth/Birth City/Birth Country ~15%'. The execution feedback shows 85/565 = 15.0%, consistent. The spec's null_targets says 'movie.Gross/Rating/RatingCount ~0-2%'. The execution feedback shows 19/518 = 3.7%, slightly above. The spec's null_targets says 'characters.pay/screentime ~95%'. The execution feedback shows 95.1%/95.0%, consistent. The spec's null_targets says 'actor.Gender ~57%'. The execution feedback shows 300/565 = 53.1%, close. The spec's null_targets says 'actor.Ethnicity ~79%'. The execution feedback shows 414/565 = 73.3%, close. The spec's null_targets says 'actor.NetWorth ~20%'. The execution feedback shows 113/565 = 20.0%, consistent.",
+     "requested_revision": "No change required. The spec's null_targets are approximate and the implementation's shares are within the spec's stated bands. The movie.Gross/Rating/Rating Count 3.7% is slightly above the spec's 0-2% band, but the spec's null_targets is a soft guideline, not a hard constraint. The spec's null_share rule says 'at least one NULL row and at least one non-NULL row per listed column per instance', which is satisfied."
+    }
+   ],
+   "unresolved_checks": [
+    "The spec's per_column_exceptions omits actor.Name from comparison_boundary, but the program's _BOUNDARY includes actor.Name. This is a minor inconsistency between the spec and the program. The spec's uncertainty note mentions actor.Name's null handling but not the boundary planting. The program's _BOUNDARY for actor.Name is not supported by the spec's per_column_exceptions.",
+    "The spec's generic null_share text says 'actor.NetWorth ~20%' but the spec's uncertainty note says 'NetWorth NULL share reconciled to 5-30% (per_column_exceptions) overriding the generic 50-79% text'. The spec's generic text is inconsistent with the per_column_exceptions, but the spec's uncertainty note resolves this. The implementation uses 0.20, consistent with the per_column_exceptions.",
+    "The spec's null_share text says 'movie.Gross/Rating/RatingCount ~0-2%' but the execution feedback shows 3.7%. The spec's null_share is a soft guideline, not a hard constraint. The implementation's null share for these columns is slightly above the spec's stated band.",
+    "The construction_pairs shows 39/129 separated, which is low. The spec's uncertainty note says 'No cross-table computed formula is derivable from the sample rows'. The low separation is due to the spec's null_targets and the program's planting rules, not a bug. The spec's null rule is consistent with the program's NULL planting."
+   ]
+  }
+ ]
 }

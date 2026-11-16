@@ -1,4 +1,4 @@
-"""Random instance construction (fuzz/fuzz.py:83-196)."""
+"""Random instance construction (fuzz/fuzz.py:83-196): generic path used when no specification exists."""
 from .values import _init_sampler
 
 
@@ -6,12 +6,14 @@ def _filter(columns: dict, keep: list) -> dict:
     return {c: [v[i] for i in keep] for c, v in columns.items()}
 
 
-def sample_fresh_primary_keys(table_meta, columns: dict) -> dict:
-    """Drop rows whose PK tuple repeats, first occurrence kept (fuzz.py:188-190)."""
+def sample_fresh_primary_keys(table_meta, columns: dict, base_rows: list = ()) -> dict:
+    """Drop rows whose PK tuple repeats (and collides with a compact key), first occurrence kept."""
     if not table_meta.primary_key or not columns:
         return columns
     n = len(next(iter(columns.values())))
-    seen, keep = set(), []
+    seen = {tuple(r[i] for i, c in enumerate(table_meta.columns) if c.name in table_meta.primary_key)
+            for r in base_rows}
+    keep = []
     for i in range(n):
         k = tuple(columns[c][i] for c in table_meta.primary_key)
         if k not in seen:
@@ -34,20 +36,20 @@ def drop_unique_duplicates(table_meta, columns: dict) -> dict:
 
 
 def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
-    """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
+    """FK child columns draw from the parent's values with replacement (compact + generated)."""
     out = {}
     for cm in schema.tables[table].columns:
         key = (table, cm.name)
         if key not in schema.fks:
             continue
         pt, pc = schema.fks[key]
-        pv = instance.get(pt, {}).get(pc) or []
+        pv = instance.get(pt, {}).get(pc) or [v for v in schema.original_values.get((pt, pc), []) if v is not None]
         out[cm.name] = [rng.choice(pv) for _ in range(n)] if pv else [None] * n
     return out
 
 
 def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+    """Uniform rand_lin sizes w.p."""
     sizes = {}
     if rng.random() < 0.5:
         for lvl in schema.table_order:

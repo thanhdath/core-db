@@ -1,48 +1,432 @@
 {
  "db": "gas_company",
- "operator_io_quirks": [
-  "All identifiers are mixed-case with underscores (Company_ID, Rank_of_the_Year); must be double-quoted in generated SQL.",
-  "DDL uses backticks in FK clauses (`Station_ID`) while table/column defs use double quotes; sqlite_master text must be replayed verbatim.",
-  "Tiny tables: company=10, gas_station=11, station_company=6 rows; original_values fully captured, no sampling needed.",
-  "station_company has composite PK (Station_ID, Company_ID) and two FKs to two different parents; both parents exist and are unique.",
-  "FK parent columns are the PKs of company/gas_station, so parent values are unique; child FK draws with replacement will create duplicate (Station_ID,Company_ID) pairs that get dropped by sample_fresh_primary_keys.",
-  "No NOT NULL, no CHECK, no UNIQUE constraints anywhere; only PKs and FKs. Insert failures will be rare (only PK collisions).",
-  "Open_Year is declared INT and stored as integer (1998..2003); TS dispatches to Number, not Date \u2014 no date fuzzer involved.",
-  "Sales/Profits/Assets/Market_Value are REAL with values up to 2550.0; Number fuzzer with scale=0 (no args) will draw from [-1,1] and perturb by \u00b11/\u00b12, wildly off-scale.",
-  "Rank and Rank_of_the_Year are small ints (1..10); Number fuzzer will produce values far outside this range.",
-  "Text columns contain spaces, trailing spaces ('James Colin ', 'Rob Jefferies '), and concatenated names ('BrianWingrave'); String fuzzer's contaminate step will add more noise.",
-  "Headquarters distinct=5, Main_Industry distinct=3 \u2014 low-cardinality categorical columns; TS String fuzzer will not preserve the small domain.",
-  "No views, triggers, or indexes beyond PKs; DDL replay is simple."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on Company_ID/Station_ID (INT, no args): scale=0, range [-1,1], int perturbation \u00b11/\u00b12 \u2014 PKs will be tiny and collide often, causing many dropped rows in sample_fresh_primary_keys.",
-  "Number fuzzer on Sales_billion etc. (REAL, no args): scale=0, range [-1,1], float perturbation \u00b10.01/\u00b10.02 \u2014 values will be ~0, never near the real 100-2500 range; queries filtering Sales_billion > 100 will return empty on generated instances (FN driver).",
-  "Number fuzzer on Open_Year: draws from [-1,1] plus perturbation \u2014 years like 0, -1, 2; queries with Open_Year BETWEEN 1998 AND 2003 will be empty (FN driver).",
-  "String fuzzer on Company/Headquarters/Main_Industry: 5 original samples + literal pool, p=0.2 fresh random strings over a-zA-Z0-9() of length 0-20, then 50% contaminate \u2014 will produce garbage like 'xK3(' mixed with real names; equality/IN queries on these columns will mostly miss (FN).",
-  "String fuzzer on Manager_Name etc.: same; trailing-space originals preserved as elements, so 'James Colin ' vs 'James Colin' ties may appear (FP driver for = comparisons).",
-  "station_company FK columns draw from parent's FINAL filtered values with replacement; since parents are tiny (10-11 rows) and PKs collide, parent may end up with very few rows, so FK columns get few distinct values \u2014 joins may be sparse.",
-  "Composite PK (Station_ID,Company_ID) in station_company: sample_fresh_primary_keys drops duplicate pairs; with tiny parent domains, many rows dropped, table may shrink to a handful.",
-  "No unique columns besides PKs, so drop_unique_duplicates is a no-op here.",
-  "choose_table_sizes: level 0 (company, gas_station) gets 1+30*u rows, level 1 (station_company) gets 4x that capped at 2500 \u2014 station_company will be much larger than its parents, amplifying FK duplication and PK-drop.",
-  "Literal pool from train SQL will seed real company names, locations, years into the samplers, partially mitigating the garbage \u2014 but only for columns that appear in train queries.",
-  "Overall: TS will produce instances where numeric range predicates (Sales, Open_Year, Rank) are almost always empty and string equality is mostly noise \u2014 classic FN pattern; ties from trailing spaces and duplicate FK draws give occasional FP."
- ],
- "challenger_refs": [
-  "G5",
-  "G6",
-  "g9c70cd9b",
-  "g7de9f835",
-  "G3",
-  "G4",
-  "G1",
-  "G2",
-  "gccdb9794"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table, never NULL; when appending to a compact database, start at max(existing)+1 and increment by 1.",
+   "int_foreign_key": "Copy an existing parent primary-key value drawn with replacement from the parent pool; never NULL for NOT NULL FK columns.",
+   "int_numeric": "Uniform integer within the column's range rule; include boundary values and one step on each side of listed literals.",
+   "real_numeric": "Uniform real within the column's range rule, rounded to 1 decimal; include boundary values and one step on each side of listed literals.",
+   "text_short": "Pick from a small pool of realistic values; allow near-duplicate variants (case, spacing, trailing space); NULL only where nullable, with NULL share matching the compact database's share for that column (at least one NULL row per nullable column).",
+   "text_name": "Pick from a pool of person names; allow near-duplicate variants; NULL only where nullable, with NULL share matching the compact database's share (at least one NULL row per nullable column).",
+   "text_location": "Pick from a pool of place names; allow near-duplicate variants; NULL only where nullable, with NULL share matching the compact database's share (at least one NULL row per nullable column).",
+   "text_enum": "Pick uniformly from the enum list; NULL only where nullable, with NULL share matching the compact database's share (at least one NULL row per nullable column).",
+   "fresh_value_share": "0.3 of text values are fresh variants not seen in the original sample; enum and literal-pool columns are exempt (they draw only from their declared pool). Mutation is applied only within this 0.3 share; the remaining 0.7 are exact copies of pool values.",
+   "null_share_rule": "For every nullable column, generated NULL share equals the compact database's NULL share for that column (tolerance 0.1); when the compact share is 0, force exactly one NULL row per nullable column per instance and no more; NOT NULL and primary-key columns never get NULL.",
+   "pattern_precedence": "When a column carries both group_sizes and duplicates_for_distinct, apply group_sizes first (establish the 1/2/>=3 histogram), then duplicates_for_distinct only on non-key positions so the group-size histogram is preserved; FK columns are re-validated against the parent pool after all pattern transformations."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "gas_station",
+    "column": "Open_Year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      1999,
+      2000,
+      2001,
+      2004,
+      2005,
+      2006
+     ],
+     "rule": "Open_Year BETWEEN 1990 AND 2010",
+     "boundary_share": "0.25 of rows drawn from the boundary set, remainder uniform in 1990-2010"
+    }
+   },
+   {
+    "table": "gas_station",
+    "column": "Open_Year",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC",
+     "tie_at_rank": [
+      1000
+     ]
+    }
+   },
+   {
+    "table": "station_company",
+    "column": "Company_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "enforce": "per instance, after FK re-validation, guarantee at least one Company_ID with count >= 3, at least one with count = 2, and at least one with count = 1"
+    }
+   },
+   {
+    "table": "station_company",
+    "column": "Company_ID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "station_company",
+    "column": "Company_ID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "gas_station",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "gas_station",
+    "column": "Location",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC",
+     "tie_at_rank": "any (no LIMIT)",
+     "tie_on": [
+      "COUNT(*)"
+     ],
+     "enforce": "at least two distinct Location values have equal COUNT(*) in each instance"
+    }
+   },
+   {
+    "table": "company",
+    "column": "Company",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "company",
+    "column": "Company",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "company",
+    "column": "Main_Industry",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "DESC",
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "SUM(company.market_value)",
+      "AVG(company.market_value)"
+     ],
+     "min_distinct": 2,
+     "enforce": "at least two industries have equal SUM(Market_Value) and equal AVG(Market_Value) per instance"
+    }
+   },
+   {
+    "table": "gas_station",
+    "column": "Manager_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "gas_station",
+    "column": "Station_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC",
+     "tie_at_rank": "any (no LIMIT)"
+    }
+   },
+   {
+    "table": "company",
+    "column": "Market_Value",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      99.9,
+      100,
+      100.1
+     ]
+    }
+   },
+   {
+    "table": "company",
+    "column": "Profits_billion",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC and DESC",
+     "tie_at_rank": "any (no LIMIT)"
+    }
+   },
+   {
+    "table": "station_company",
+    "column": "Station_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "company",
+    "column": "Headquarters",
+    "pattern": "literal_pool",
+    "targets": {
+     "literals": [
+      "USA"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "station_company",
+    "child_column": "Station_ID",
+    "parent_table": "gas_station",
+    "parent_column": "Station_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "station_company",
+    "child_column": "Company_ID",
+    "parent_table": "company",
+    "parent_column": "Company_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "company",
+    "column": "Company_ID",
+    "formula": "Company_ID > 0"
+   },
+   {
+    "table": "company",
+    "column": "Rank",
+    "formula": "Rank > 0"
+   },
+   {
+    "table": "company",
+    "column": "Sales_billion",
+    "formula": "Sales_billion >= 0"
+   },
+   {
+    "table": "company",
+    "column": "Profits_billion",
+    "formula": "Profits_billion >= 0"
+   },
+   {
+    "table": "company",
+    "column": "Assets_billion",
+    "formula": "Assets_billion >= 0"
+   },
+   {
+    "table": "company",
+    "column": "Market_Value",
+    "formula": "Market_Value >= 0"
+   },
+   {
+    "table": "company",
+    "column": "Main_Industry",
+    "formula": "Main_Industry IN ('Oil and gas','Conglomerate','Banking')"
+   },
+   {
+    "table": "gas_station",
+    "column": "Station_ID",
+    "formula": "Station_ID > 0"
+   },
+   {
+    "table": "gas_station",
+    "column": "Open_Year",
+    "formula": "Open_Year BETWEEN 1990 AND 2010"
+   },
+   {
+    "table": "station_company",
+    "column": "Station_ID",
+    "formula": "Station_ID > 0"
+   },
+   {
+    "table": "station_company",
+    "column": "Company_ID",
+    "formula": "Company_ID > 0"
+   },
+   {
+    "table": "station_company",
+    "column": "Rank_of_the_Year",
+    "formula": "Rank_of_the_Year > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "company": 10,
+   "gas_station": 11,
+   "station_company": 6
+  },
+  "null_targets": [],
+  "supporting_evidence": {
+   "company.Main_Industry": "Rows 1-8 show values Oil and gas, Conglomerate, Banking.",
+   "gas_station.Open_Year": "Rows 1-8 show years 1998-2006, within 1990-2010.",
+   "company numeric columns": "All shown values are non-negative.",
+   "station_company.Company_ID": "Schema declares NOT NULL and part of PRIMARY KEY; never NULL."
+  },
+  "uncertainty": "Headquarters pool is small; only USA literal confirmed. Exact enum for Main_Industry may include more values. Location comparison_boundary rule removed as a type-mismatched misclassified neighbor query. Per-instance sizes are fixed at the compact baselines (company=10, gas_station=11, station_company=6) to make group-size and FK-ratio targets reproducible; the program must not apply a random size multiplier. station_company.Company_ID group-size enforcement must be verified per instance after FK re-validation and must include a size-2 group in addition to the size-3 group. company.Company_ID is a primary key and therefore excluded from group-size targets. Nullable columns use the compact NULL share directly (no minimum floor); when the compact share is zero, exactly one NULL is generated per nullable column per instance."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The specification (table_sizes_per_instance) sets company=10, gas_station=11, station_company=6, and the supporting_evidence explicitly describes original sample sizes of that order (rows 1-8). But execution feedback shows rows_added per instance roughly company=49/20\u22482.45, gas_station=73/20\u22483.65, station_company=210/20\u224810.5. More importantly, choose_table_sizes in instance.py scales sizes as `base + rng.randint(-base, 30)` or `base * rng.uniform(0.5, 3.0)` and then caps at 230; for station_company this yields 3-18 rows per instance, so the group_sizes target '1, 2 and >= 3' and the FK-to-parent ratio are effectively unreproducible/dominated by whatever shares occur. station_company is the pivot table for group_sizes on Company_ID; with only ~3-18 rows and Company_ID drawn with replacement from the parent pool (10 compact + generated), the 'group of >= 3' target is satisfied only by accident.",
+     "request": "Make per-instance sizes deterministic around the spec baselines (company\u224810, gas_station\u224811, station_company\u22486) or, if variance is desired, apply a much tighter multiplier and document it. Ensure station_company.Company_ID repeatedly targets at least one distinct value with count >= 3, as _apply_group_sizes attempts \u2014 but note that _apply_group_sizes also mutates the column BEFORE drop_unique_duplicates / PK-filter and may clobber the FK-drawn values, so it does not actually enforce the group-size target. Verify with an execution check that reports observed group-size histogram for station_company.Company_ID per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies and PRAGMA-exposed FK relationships require child station_company.Company_ID / Station_ID values to reference existing parent keys. fill_foreign_keys_consistently draws from `compact_parent[(pt, pc)] + instance[pt][pc]`, so consistency appears preserved (integrity shows fk_violations=0). However, _apply_group_sizes, _apply_duplicate_share, and _apply_ties run AFTER FK fill and mutate arbitrary columns including FK columns (station_company.Company_ID, Station_ID appear in GROUP_SIZE_TARGETS and DUPLICATE_SHARE), which can overwrite FK values with values not drawn from the parent. The subsequent self-FK relativization only handles `pt == t`; the cross-table case is not re-validated after these mutations. Integrity passed here (0 violations), but it is only because the parent company.Company_ID pool happened to contain the value chosen by _apply_group_sizes.",
+     "request": "Move _apply_group_sizes/_apply_duplicate_share/_apply_ties to run before FK drawing for FK columns, or re-run fill_foreign_keys_consistently on already-mutated FK columns using the parent pool (with replacement) so that the drawn values are guaranteed to exist. Alternatively restrict GROUP_SIZE_TARGETS / DUPLICATE_SHARE to non-FK columns. Add an execution check that verifies FK containment after all pattern transformations, not only after fill_foreign_keys_consistently."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Executable evidence reports construction_pairs: eligible=55, separated=17 (31%). The atomic operations list includes many pattern pairs that map directly to columns in the schema and are used in the spec (comparison_boundary on Open_Year with literals 1999-2006; PRIMARY_KEY/COUNT DISTINCT duplicates_for_distinct on Location and headquarters; ties_for_order_limit on Open_Year, Location, Main_Industry with tie_at_rank=1 etc.). Construction_pairs separated=17 means 38 pairs of original vs neighbor queries were NOT distinguished by the generated instances, but the report provides no per-pair evidence (construction_pairs_by_group is empty). Removing the boundary-independent separation cannot be blamed on the program alone; still, only ~31% of eligible pairs separated is low relative to the specified targets (e.g., ties_for_order_limit on Main_Industry requires SUM(AVG) ties at rank 1, which requires more than 1 group; if instances frequently have <2 distinct Main_Industry values the tie target is automatic and not informative).",
+     "request": "Either (a) run a per-group breakdown of construction_pairs so that low-separation groups can be distinguished from unavoidable groups, or (b) tighten pattern samplers: with base Main_Industry enum size 3, ensure at least 2 distinct values in every instance and both a tie at the top (via _apply_ties) and a distinct value at rank 2. Similarly verify Open_Year coverage: boundary values [1999..2006] should be rare-but-present; the base range (1990,2010) plus a 0.25 uniform pick from boundary implies boundary values occur at most ~4% of generated rows \u2014 likely too sparse to reliably separate predicates like Open_Year > 2000 vs BETWEEN 2000 AND 2005."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `company.Company: generated rows: NULL 4 / 49` etc. show NULLs generated for many `company.*` columns that are NULLable in SQLite's DDL (no NOT NULL constraint), but the spec's generic_sampling_rules for text columns says 'allow ... NULL where nullable' and null_targets lists only station_company.Company_ID ('none (NOT NULL column)'). The interface NULL rule says each instance must contain NULL and non-NULL generated rows for every nullable column. The proportionality 'NULL share following the compact database's share' is not enforced: Company, Headquarters, Main_Industry, Rank, Sales_billion, Profits_billion, Assets_billion, Market_Value, gas_station.Location, Manager_Name, Open_Year, Representative_Name, Vice_Manager_Name, Rank_of_the_Year all show nonzero NULL counts but the report does not say they match the compact share.",
+     "request": "Add an execution check per nullable column: (a) at least one NULL and at least one non-NULL generated row, and (b) |generated NULL share - compact NULL share| <= epsilon (e.g. 0.1). Ensure the sampler's null_share is computed from original_values for each column (currently the code sets null_share=max(computed,0.1) and then uses _maybe_null which forces exactly one NULL then draws at null_share; that can overshoot the compact share when the compact share is 0)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec adds `gas_station.Location comparison_boundary {values:[1999,2000,2001]}` and states Open_Year range 1990-2010. This rule only makes sense if a query compares Location (a TEXT place name) against numeric year literals \u2014 a type mismatch. It maps to the observed atomic op `PRED(gas_station.location > 2000)` in the examples tab ('comparison_boundary' example: added PRED(gas_station.location > 2000)). This is a per-column 'boundary' rule that cannot be satisfied by meaningful Location values.",
+     "request": "Remove or reclassify the Location comparison_boundary rule; the corresponding op appears to be a misclassified neighbor query. Do not require numeric boundary literals (1999, 2000, 2001) in a TEXT column; if numeric-looking literals were seen as Location comparison operands, treat them as noise, not as a value-domain target. If a Location literal pool is desired, specify actual place names / the confirmed literals, since the only confirmed literal is 'USA' (for Headquarters, not Location)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence states 'Rows 1-8 show values Oil and gas, Conglomerate, Banking' and 'Headquarters pool is small; only USA literal confirmed. Exact enum for Main_Industry may include more values.' Yet the spec adds `company.Main_Industry ties_for_order_limit {tie_at_rank: 1, tie_on: [SUM(market_value), AVG(market_value)]}` \u2014 with only 3 enum values this is trivial and not an interesting tie. Similarly `company.Company group_sizes 1,2,>=3` with base size 10 yields at most a handful of distinct companies; a duplicate-share target combined with the group-size target on the same column is underspecified about which pattern takes precedence (see _apply_group_sizes then _apply_duplicate_share).",
+     "request": "Specify explicit precedence between group_sizes and duplicates_for_distinct on the same column (Company.Company, station_company.Company_ID, gas_station.Location, gas_station.Manager_Name, station_company.Station_ID). Confirm whether Company and Location are allowed to be NULL (schema says they are, but tabs 'MAIN Industry enum' and 'literal_pool' only specify non-NULL values). Confirm whether 'duplicate_share 20-50%' means fraction of rows whose key appears at least twice (currently _apply_duplicate_share copies values to positions 0..n_dup-1 and can collapse distinctness below the expected variety)."
+    }
+   ],
+   "unresolved_checks": [
+    "No evidence that station_company group-size target (1,2,>=3) actually holds per instance \u2014 only aggregate rows_ok reported.",
+    "No evidence that boundary values 99.9/100/100.1 (Market_Value), 1999-2006 (Open_Year), and 1999/2000/2001 (Location) appear in at least some generated instances; the 25% boundary draw plus range clamp may suppress Open_Year boundary values above 2006 or below 1999.",
+    "No evidence that duplicate_share (20-50%) targets are met after the fresh/sample distribution; duplicates come from _apply_duplicate_share which can be invalidated by subsequent sample_fresh_primary_keys / drop_unique_duplicates for PK / UNIQUE-tuple columns.",
+    "No per-instance compaction preservation check was included in the feedback (only rows_added is reported); writer._copy_compact does shutil.copyfile, which should preserve compact rows, but this was not exercised in the delivered integrity summary.",
+    "No evidence that the fresh-value share 0.3 is realized (implementation calls _variant with probability FRESH_VALUE_SHARE=0.3 on non-enum/non-literal-pool text columns, but the enum path returns immediately in sample()). For enum columns (Main_Industry) and literal-pool columns (Headquarters), fresh_value_share never applies; confirm that is intended for those columns."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py sets SIZE_MULTIPLIER = (0.9, 1.2) and choose_table_sizes() multiplies BASE_SIZES by a random factor, so per-instance sizes vary (e.g. company 9-12, gas_station 10-13, station_company 5-7). The specification's table_sizes_per_instance fixes company=10, gas_station=11, station_company=6, and the spec's own uncertainty note says 'Per-instance sizes are fixed at the compact baselines to make group-size and FK-ratio targets reproducible'. Execution feedback confirms variability: rows_added company=21, gas_station=52, station_company=114 over 20 instances (i.e. ~1.05, ~2.6, ~5.7 per instance), inconsistent with fixed 10/11/6 appended rows.",
+     "requested_revision": "Make choose_table_sizes return exactly BASE_SIZES (company=10, gas_station=11, station_company=6) per instance, or update the specification to declare a size range and justify it. The current mismatch between spec (fixed sizes) and program (random multiplier) must be resolved in one direction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance computes null_share = max(null_share, 0.1) for every nullable column, forcing a 10% floor even when the compact database's share is 0. The spec's null_share_rule says 'generated NULL share equals the compact database's NULL share for that column (tolerance 0.1)'. Execution feedback shows many nullable columns with substantial NULL counts (e.g. company.Company 8/21, gas_station.Location 14/52, station_company.Rank_of_the_Year 30/114) \u2014 the 0.1 floor plus the forced first-NULL in _maybe_null inflates NULL share well above compact shares for columns that are non-NULL in the compact DB.",
+     "requested_revision": "Remove the max(null_share, 0.1) floor; use the compact share directly (with the at-least-one-NULL guarantee handled separately, e.g. by forcing exactly one NULL when compact share is 0). This keeps the NULL share within the 0.1 tolerance of the compact share as the spec requires."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py COLUMN_RULES gives ('company','Company_ID') min=1 and ('company','Rank') min=1, but the generic_sampling_rules say int_primary_key is 'Sequential integers starting at 1, unique per table'. instance.py sample_fresh_primary_keys only drops duplicate PK tuples; it does not generate sequential PKs. The NumberSampler for Company_ID draws from a range with boundary/random logic, so generated Company_IDs are not sequential. Similarly gas_station.Station_ID and station_company.Station_ID are not sequential.",
+     "requested_revision": "Either implement sequential PK generation (start at max(existing)+1, increment) for int primary keys, or amend the specification to state that PKs are drawn from the min-rule range with uniqueness enforced by dedup. The current spec text and program disagree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py TIE_COLUMNS includes ('gas_station','Location') and ('company','Main_Industry'), and _apply_ties copies values to create ties. But the spec's per_column_exceptions for gas_station.Location ties_for_order_limit says tie_on=['COUNT(*)'] (a group-count tie, not a value tie), and for company.Main_Industry says tie_on=['SUM(company.market_value)','AVG(company.market_value)'] (aggregate ties). _apply_ties only duplicates raw column values; it does not create ties in the aggregate (COUNT/SUM/AVG) that the ORDER BY actually sorts on. The tie targets are therefore not implemented as specified.",
+     "requested_revision": "For Location, ensure at least two locations have equal COUNT(*) (e.g. by controlling group sizes of Location). For Main_Industry, ensure at least two industries have equal SUM(Market_Value) and AVG(Market_Value) (e.g. by assigning equal market values across two industries). Alternatively, document that value-level ties are the intended proxy and update the spec's tie_on fields."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py GROUP_SIZE_TARGETS includes ('company','Company_ID') with '1,2,>=3', but Company_ID is the primary key of company, so every group has size exactly 1. _apply_group_sizes is called on Company_ID but key_cols includes the PK, so positions are restricted to non-key positions (none), and the function returns values unchanged. The target is unsatisfiable and the spec's inclusion of it is a design error.",
+     "requested_revision": "Remove ('company','Company_ID') from GROUP_SIZE_TARGETS in spec.py (a PK cannot have group sizes 1,2,>=3), and correspondingly remove the per_column_exceptions entry for company.Company_ID group_sizes in the specification."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include gas_station.Location comparison_boundary with values [1999,2000,2001] and ops PRED(gas_station.location > 2000), but the spec's own uncertainty note says 'Location comparison_boundary rule removed as a type-mismatched misclassified neighbor query'. The per_column_exceptions list still contains the entry, contradicting the uncertainty note. The program (spec.py) correctly omits it, so spec and program disagree.",
+     "requested_revision": "Remove the gas_station.Location comparison_boundary entry from per_column_exceptions in the specification, consistent with the uncertainty note and the program."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets lists ['station_company.Company_ID'], but the schema declares station_company.Company_ID as part of the PRIMARY KEY (NOT NULL), and the spec's own supporting_evidence says 'Schema declares NOT NULL; null_targets entry is informational only.' Listing a NOT NULL PK column in null_targets is misleading and conflicts with the null_share_rule ('NOT NULL and primary-key columns never get NULL').",
+     "requested_revision": "Remove station_company.Company_ID from null_targets, or rename the field to clarify it is informational. The program correctly never NULLs it (execution feedback shows no NOT NULL violations), so only the spec needs correction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_fk_group_size for station_company.Company_ID assigns a single parent value to max(3, len(out)//3) positions, which for n=6 gives 3 positions. But _revalidate_fk runs afterward and may replace values; more importantly, the group-size target '1, 2 and >= 3' requires at least one group of size 1 and one of size 2 as well. With n=6 and 3 positions forced to one value, the remaining 3 positions may all be distinct (sizes 1,1,1) or may collide, but there is no guarantee of a size-2 group. The spec's enforce note says 'at least one distinct Company_ID with count >= 3 per instance' \u2014 that is met \u2014 but the group_sizes target '1, 2 and >= 3' is not fully enforced.",
+     "requested_revision": "Extend _enforce_fk_group_size to also guarantee at least one group of size 2 (e.g. assign two positions to a second parent value) in addition to the size-3 group, so the full '1, 2, >=3' histogram is present per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py StringSampler.sample applies _variant with probability FRESH_VALUE_SHARE (0.3) and then, in the elif branch, applies additional mutations with probability 0.5. This means up to 0.3 + 0.7*0.5 = 0.65 of values are mutated, far exceeding the spec's fresh_value_share of 0.3. The spec says '0.3 of text values are fresh variants not seen in the original sample'.",
+     "requested_revision": "Restrict mutation to the FRESH_VALUE_SHARE fraction only (remove the additional 0.5-probability mutation branch, or fold it into the 0.3 share), so the fresh-variant share matches the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows construction_pairs separated=15 of 55 eligible, with 0 unknown executions. The spec's pattern targets (boundary values, ties, group sizes, duplicate shares) are intended to make neighbor queries distinguishable. 15/55 separation is low but not zero; per instructions a missing separation alone does not prove a generation error. However, combined with the tie-target and group-size issues above, the low separation is consistent with those targets not being fully realized.",
+     "requested_revision": "After fixing the tie and group-size issues, re-run construction and confirm separation improves. No separate change requested beyond the above."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL shares for each nullable column are within 0.1 of the generated shares (the 0.1 floor issue suggests they are not, but exact compact shares were not provided in fast mode).",
+    "Whether company.Main_Industry tie at rank 1 on SUM/AVG(Market_Value) is achievable with the enum of 3 values and 10 rows; the program enforces min_distinct=2 but not equal aggregates.",
+    "Whether gas_station.Location COUNT(*) ties are present in generated instances (not directly measured in feedback)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification lists per_column_exceptions for gas_station.Location comparison_boundary (PRED(gas_station.location > 2000)) in the extracted atomic operations, but the specification's uncertainty note explicitly removes it as a type-mismatched misclassified neighbor query, and spec.py/instance.py correctly omit it. The extracted-ops block still shows it, so the spec text and the atomic-ops extraction disagree.",
+     "requested_revision": "No change required for pass; optionally annotate the atomic-ops extraction to mark the Location comparison_boundary as dropped so the two artifacts agree."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's per_column_exceptions include company.Company group_sizes '1,2,>=3' and duplicates_for_distinct 20-50%, but company.Company is not a key column and the program applies _apply_group_sizes then _apply_duplicate_share on it (instance.py). However, the group-size histogram is not verified per instance in the execution feedback (construction_pairs_by_group is empty), so the enforcement is asserted by construction but not independently confirmed.",
+     "requested_revision": "No change required for pass; the construction is consistent with the spec. If stronger evidence is desired, add a per-instance group-size histogram check to the feedback."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows nullable columns with NULL counts, e.g. company.Company NULL 29/200, company.Profits_billion NULL 41/200, gas_station.Open_Year NULL 38/220, gas_station.Location NULL 16/220. The spec's null_share_rule says when compact share is 0, force exactly one NULL per nullable column per instance and no more. 20 instances \u00d7 1 = 20 NULLs is the expected floor; company.Company (29), Profits_billion (41), Open_Year (38) exceed 20, indicating the compact share for those columns is nonzero and the sampler draws additional NULLs at that share \u2014 consistent with the rule. Location (16) is below 20, which would violate 'at least one NULL per instance' if Location is nullable in all 20 instances.",
+     "requested_revision": "No change required for pass per instruction 7 (a 'NULL 0 / n' line is non-blocking; here it is 16/220, not 0). Confirm that gas_station.Location is nullable in the compact DB and that the 16 NULLs are distributed with at least one per instance; if any instance has zero NULLs for a nullable column, adjust the sampler's first-draw NULL forcing (values.py _maybe_null) to guarantee one per instance."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _enforce_industry_aggregate_ties sets remaining rows of the two chosen industries to 0.0 Market_Value to preserve the SUM/AVG tie. This can push Market_Value to 0.0, which satisfies the >=0 rule, but it also overrides the comparison_boundary target (99.9/100/100.1) for those rows and may reduce boundary coverage. The boundary draw in NumberSampler is 0.25 per row, so boundary values still appear elsewhere.",
+     "requested_revision": "No change required for pass; boundary coverage is preserved by the 0.25 draw on other rows. Optionally re-apply boundary values to non-tie rows after the aggregate-tie enforcement to strengthen boundary presence."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py _enforce_location_count_ties forces two Location values to each have exactly two occurrences, but _apply_duplicate_share and _apply_ties run before it and may alter counts; the tie is enforced last for Location, so it holds. However, the spec also requires 'at least two distinct Location values have equal COUNT(*)' \u2014 satisfied by construction. No execution check confirms it (construction_pairs_by_group empty).",
+     "requested_revision": "No change required for pass; construction is consistent. Optionally add a per-instance COUNT(*) tie check to feedback."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "writer.py copies the compact DB and appends generated rows; execution feedback shows rows_added company 200, gas_station 220, station_company 118 across 20 instances = 10/11/6 per instance, matching BASE_SIZES. Integrity: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0. Reproducible: true. This confirms compact-row preservation and dependency consistency.",
+     "requested_revision": "None; evidence supports pass."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's supporting_evidence notes 'Exact enum for Main_Industry may include more values' and 'Headquarters pool is small; only USA literal confirmed'. The program restricts Main_Industry to the three-value enum and Headquarters to the USA literal pool, which is a conservative but defensible reading. The extracted-ops literal_pool_other_columns shows only 'USA' for Headquarters, consistent.",
+     "requested_revision": "No change required for pass; the uncertainty is acknowledged in the spec and the program's conservative choice is consistent with available evidence."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance group-size histogram for station_company.Company_ID (1, 2, >=3) and company.Company is enforced by construction but not independently verified in the execution feedback (construction_pairs_by_group is empty).",
+    "Per-instance COUNT(*) tie for gas_station.Location and SUM/AVG tie for company.Main_Industry are enforced by construction but not independently verified in the feedback.",
+    "Whether gas_station.Location has at least one NULL per instance (16 NULLs across 20 instances is below 20; needs per-instance confirmation).",
+    "Whether the 0.25 boundary draw for Open_Year and Market_Value yields the intended boundary_share in every instance (not measured in feedback)."
+   ]
+  }
+ ]
 }

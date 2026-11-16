@@ -1,55 +1,215 @@
 {
  "db": "device",
- "operator_io_quirks": [
-  "All identifiers are mixed-case (Device_ID, Shop_Name, Package_Version); must be double-quoted in generated SQL.",
-  "Tiny tables: device=6, shop=12, stock=8 rows; original_values fully read, no sampling needed.",
-  "Open_Date is TEXT storing 'D Month' (e.g. '1 January', '15 July') \u2014 no year, no zero-padding; String fuzzer will not reproduce this format.",
-  "Open_Year is INT but semantically a year (2006-2014); declared type INT dispatches to Number, not Year fuzzer.",
-  "Package_Version / Applications are TEXT holding dotted version strings ('5.0.0.808'); String fuzzer treats as generic text.",
-  "stock has composite PK (Shop_ID, Device_ID) and two FKs to shop and device; both parents exist and are unique.",
-  "stock.Device_ID has only 2 distinct values (4,6) over 8 rows \u2014 heavy duplication in FK child column.",
-  "stock.Shop_ID distinct=6 but samples show 9 \u2014 FK values may reference shop rows; parent shop has 12 rows.",
-  "No NOT NULL constraints anywhere; all columns nullable, so TS NULL injection is unconstrained by schema.",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs; drop_unique_duplicates only affects PK columns.",
-  "No self-references, no dangling FKs, no views/triggers; DDL is plain CREATE TABLE only.",
-  "All storage classes match declared types (INT->integer, TEXT->text); no affinity contradictions."
- ],
- "operator_ts_expectations": [
-  "Device_ID / Shop_ID / Open_Year / Quantity -> Number fuzzer: uniform ints in [-10^scale,10^scale] with +-1/+-2 perturbation; scale from INT args (none) so default range.",
-  "Device, Carrier, Shop_Name, Location, Package_Version, Applications, Software_Platform, Open_Date -> String fuzzer: random a-zA-Z0-9() strings length 0-20, plus 5 original samples, plus contaminate suffix/prefix.",
-  "Open_Date will be filled with random strings, not 'D Month' format -> queries filtering on month names or LIKE '%January%' will miss (FN).",
-  "Package_Version / Applications will be random strings, not dotted versions -> version-comparison queries (e.g. LIKE '5.0.%') miss (FN).",
-  "Number fuzzer on Open_Year produces values far outside 2006-2014 -> year-range predicates (BETWEEN 2010 AND 2015) may match spuriously (FP) or miss (FN).",
-  "stock FK columns draw from parent's final filtered values with replacement; with tiny parents (6,12 rows) and stock size possibly >parent, duplicates and NULLs (empty parent) appear.",
-  "Composite PK (Shop_ID,Device_ID) dedup keeps first occurrence; with only 2 distinct Device_ID values, many stock rows dropped -> small stock tables.",
-  "String fuzzer's 5 original samples per column preserve some real values (e.g. 'Android','iOS','Verizon Wireless') -> equality queries on those may still hit.",
-  "Number fuzzer on Device_ID/Shop_ID may produce values not in parent -> FK consistency only enforced via fill_foreign_keys_consistently, not for non-FK PK columns.",
-  "No NOT NULL/CHECK -> TS inserts all rows; rows_failed only from PK/unique collisions after dedup (rare).",
-  "Tiny DB: choose_table_sizes gives 1-31 rows per table (level 0 = 1+30u), so instances are small; joins on stock may be empty often.",
-  "String fuzzer contaminate (drop first/last char, add 5 chars) breaks exact-match queries on Device/Carrier names -> FN on equality predicates."
- ],
- "challenger_refs": [
-  "g3084dc3e",
-  "g1783436e",
-  "g03f9f343",
-  "g03f9f343",
-  "g03f9f343",
-  "g03f9f343",
-  "g03f9f343",
-  "g40baf4fc",
-  "g73532cfb",
-  "g73532cfb",
-  "g8fcac131",
-  "g102dc4b4",
-  "g93c0600b",
-  "g19f8226c",
-  "g01df69aa"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL.",
+   "int_foreign_key": "Sample from the parent table's generated primary-key values; include at least one child row per parent where the join pattern requires it, and leave some parent rows without children.",
+   "int_quantity": "Positive integers in [1, 500]; include boundary values 1 and 2 and one step around any listed literal.",
+   "int_year": "Integers in [2000, 2020]; include at least two distinct values per group where a MAX/MIN pattern is listed.",
+   "text_short": "Short human-readable strings drawn from a small pool of 3-12 distinct values; allow near-duplicate variants (case, spacing) and a NULL share of 5-15% on nullable columns.",
+   "text_version": "Dotted numeric version strings of the form d.d.d.ddd; pool of 4-6 distinct values with duplicates.",
+   "text_date": "Day-month strings like '1 January'; keep Open_Year consistent with the month/day where a year is present.",
+   "text_enum": "Draw from an explicit small enum listed in per_column_exceptions.",
+   "null_rule": "Every nullable column gets at least one NULL row per instance; NULL share follows the compact database share (0% observed, so use 5-10% to exercise NULL logic); planted NULLs are never replaced."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "device",
+    "column": "Device_ID",
+    "pattern": "unmatched_join_rows, group_sizes",
+    "targets": "parent rows without children in stock; group sizes 1, 2 and >=3 when joined"
+   },
+   {
+    "table": "device",
+    "column": "Carrier",
+    "pattern": "duplicates_for_distinct, group_sizes, aggregate_boundary",
+    "targets": "duplicate share 20-50%; group sizes 1, 2 and >=3; COUNT(*) boundary at 1 and 2"
+   },
+   {
+    "table": "device",
+    "column": "Software_Platform",
+    "pattern": "ties_for_order_limit, group_sizes",
+    "targets": "enum {Android, iOS}; tie at rank 1 on COUNT(*) and SUM(stock.quantity) DESC; group sizes 1, 2 and >=3"
+   },
+   {
+    "table": "device",
+    "column": "Applications",
+    "pattern": "null_rows",
+    "targets": "NULL share 5-30% of generated rows"
+   },
+   {
+    "table": "device",
+    "column": "Package_Version",
+    "pattern": "group_sizes",
+    "targets": "group sizes 1, 2 and >=3"
+   },
+   {
+    "table": "shop",
+    "column": "Shop_ID",
+    "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows, ties_for_order_limit",
+    "targets": "group sizes 1, 2 and >=3; COUNT(*) boundary at 1 and 2; parent rows without children in stock; tie at rank 1 on COUNT(DISTINCT stock.device_id) DESC and COUNT(*) DESC"
+   },
+   {
+    "table": "shop",
+    "column": "Shop_Name",
+    "pattern": "duplicates_for_distinct, group_sizes, ties_for_order_limit",
+    "targets": "duplicate share 20-50%; group sizes 1, 2 and >=3; tie at rank 1 on COUNT(DISTINCT stock.device_id) ASC and DESC"
+   },
+   {
+    "table": "shop",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct",
+    "targets": "duplicate share 20-50%"
+   },
+   {
+    "table": "shop",
+    "column": "Open_Year",
+    "pattern": "rows_with_different_values",
+    "targets": "at least 2 rows per group with different values so MAX(open_year) is non-trivial"
+   },
+   {
+    "table": "stock",
+    "column": "Shop_ID",
+    "pattern": "group_sizes, aggregate_boundary, ties_for_order_limit, unmatched_join_rows",
+    "targets": "group sizes 1, 2 and >=3; COUNT(*) boundary at 1 and 2; tie at rank 1 on COUNT(*) DESC and SUM(quantity) DESC; child rows referencing parent shop rows"
+   },
+   {
+    "table": "stock",
+    "column": "Device_ID",
+    "pattern": "group_sizes, aggregate_boundary, unmatched_join_rows",
+    "targets": "group sizes 1, 2 and >=3; COUNT(*) boundary at 1 and 2; child rows referencing parent device rows"
+   },
+   {
+    "table": "stock",
+    "column": "Quantity",
+    "pattern": "ties_for_order_limit, comparison_boundary",
+    "targets": "tie at rank 1 on quantity DESC; boundary at literal 1 (values 1 and 2)"
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "stock",
+    "child_column": "Shop_ID",
+    "parent_table": "shop",
+    "parent_column": "Shop_ID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "stock",
+    "child_column": "Device_ID",
+    "parent_table": "device",
+    "parent_column": "Device_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "device",
+    "column": "Device_ID",
+    "formula": "Device_ID > 0"
+   },
+   {
+    "table": "device",
+    "column": "Software_Platform",
+    "formula": "Software_Platform IN ('Android','iOS')"
+   },
+   {
+    "table": "shop",
+    "column": "Shop_ID",
+    "formula": "Shop_ID > 0"
+   },
+   {
+    "table": "shop",
+    "column": "Open_Year",
+    "formula": "Open_Year BETWEEN 2000 AND 2020"
+   },
+   {
+    "table": "stock",
+    "column": "Quantity",
+    "formula": "Quantity > 0"
+   },
+   {
+    "table": "stock",
+    "column": "Shop_ID",
+    "formula": "Shop_ID IN (SELECT Shop_ID FROM shop)"
+   },
+   {
+    "table": "stock",
+    "column": "Device_ID",
+    "formula": "Device_ID IN (SELECT Device_ID FROM device)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "device": 8,
+   "shop": 12,
+   "stock": 16
+  },
+  "null_targets": [
+   "device.Applications",
+   "device.Carrier",
+   "device.Package_Version",
+   "device.Software_Platform",
+   "shop.Shop_Name",
+   "shop.Location",
+   "shop.Open_Date",
+   "shop.Open_Year",
+   "stock.Quantity"
+  ],
+  "supporting_evidence": {
+   "device.Software_Platform": "Observed values Android and iOS only; enum rule holds on all 6 shown rows.",
+   "stock.Quantity": "All shown quantities (100,110,134,56,200,112,124,51) are > 0; range rule holds.",
+   "shop.Open_Year": "Observed years 2006-2015; range [2000,2020] covers all shown rows.",
+   "stock.Shop_ID": "All shown stock Shop_ID values (1,2,3,4,9,11) reference shop rows; FK rule holds.",
+   "stock.Device_ID": "All shown stock Device_ID values (4,6) reference device rows; FK rule holds."
+  },
+  "uncertainty": "Original stock sample shows Shop_ID values 9 and 11 not present in the shown shop sample; generation enforces FK integrity so all child Shop_ID values come from generated shop rows. NULL shares are set to 5-10% because observed null_rate is 0 but nullable columns must exercise NULL logic. Device.Device text values are heterogeneous (brands and model names); treated as free short text."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "issue": "Nullability of non-listed columns is inconsistent with the schema vs. spec intent",
+     "evidence": "The DB schema declares no NOT NULL constraints on any column (device.Carrier, Package_Version, Software_Platform, Applications, shop.Shop_Name, Location, Open_Date, Open_Year, stock.Quantity are all nullable per the CREATE TABLE statements). The generation specification's null_targets list covers device.Applications, Carrier, Package_Version, Software_Platform, shop.Shop_Name, Location, Open_Date, Open_Year and stock.Quantity, but omits device.Device, shop.Open_Date is included. Execution feedback shows 'device.Device: generated rows: NULL 0 / 163' \u2014 this is consistent with the per_column_exceptions (Device has no NULL rule) and the spec's null_rule exception, and the feedback note explicitly says NULL 0 lines may be noted but do not block. No blocking defect. NOTE only: device.Device has no null spec entry although nullable; acceptable.",
+     "requested_revision": "None required to pass. Optionally add device.Device NULL share to null_targets for completeness."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Spec requires 'at least two distinct Open_Year values per group where MAX/MIN is listed' but rows_with_different_values pattern applies to shop, and the Open_Year sampler draws uniformly at random \u2014 this generally satisfies >=2 distinct values per shop group only stochastically.",
+     "evidence": "spec.py build_column 'year' kind: vals = _group_assign(...) then [_year(rng, lo, hi) ...] with rng.randint(2000,2020); with n=12 shop rows jittered, the chance all identical across a group is negligible; execution reports 20/20 instances valid and 35/72 construction pairs separated, no group reported failing. The 'rows_with_different_values' pattern is only listed for shop.Open_Year and no per-group guarantee is encoded, but random draws make it overwhelmingly likely. Not blocking.",
+     "requested_revision": "None required. Could strengthen by forcing distinct years within shop groups, but not necessary given observed separation."
+    },
+    {
+     "agent": "designer",
+     "issue": "Some per-column target patterns are not directly enforced by construction (e.g., stock.Shop_ID tie at rank 1 on COUNT(*) DESC and SUM(quantity) DESC; shop.Shop_Name tie on COUNT(DISTINCT stock.device_id) ASC/DESC; aggregate boundary COUNT(*) = 0/1/2).",
+     "evidence": "Execution feedback: construction_pairs: eligible 72, separated 35, unknown_executions 0. Roughly half the pairs are not separated, indicating some target patterns (ties at rank 1, aggregate boundary exactly at values) are only probabilistically realized via random FK draws and random quantity/text sampling. This is expected for a construction-based generator and does not violate any integrity or semantic rule; missing separation alone is not a generation error per instructions.",
+     "requested_revision": "None blocking. For higher pair separation, engineer could deterministically plant ties (equal COUNT(*)/SUM(quantity) for top-ranked group) and force aggregate boundary counts 0,1,2, but this is an enhancement, not required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Semantic rules evidence check",
+     "evidence": "spec.py enforces Software_Platform IN ('Android','iOS') via enum; stmt in semantic_rules_and_formulas. Quantity > 0 via _quantity returning >=1. Open_Year BETWEEN 2000 AND 2020 via rng range. Device_ID/Shop_ID > 0 via _next_primary_values starting at compact max+1 (>=1). FK rules via fill_foreign_keys_consistently drawing from compact+generated parent values. Execution: fk_violations 0, not_null_violations 0, pk_duplicates 0. All supported rules hold.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Compact-row preservation and reproducible generation",
+     "evidence": "writer.py copies orig_path to part file then appends rows in a transaction; original rows never deleted or modified. cli.py seeds RNG deterministically from seed_base*100003+i. Execution: reproducible=true, 20/20 instances valid, rows_added device 163, shop 237, stock 300, rows_skipped 0; integrity all clean.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Null generation rule compliance",
+     "evidence": "plant_nulls plants at least one NULL when share>0; execution shows NULL 20/163 for device nullable text columns, 20/237 for shop, 19/300 for stock.Quantity \u2014 all >0, consistent with the interface NULL rule. device.Device NULL 0/163 is permitted (nullable but no planted NULL required to block). FK columns device/stock have null_share 0.0 matching spec (child_rows_with_null_fk: false). PK columns never null.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Full separation of all 72 target construction pairs (35/72 separated) was not achieved; this is expected for construction-based generation and, per instructions, missing separation alone does not block a pass.",
+    "Tie-at-rank-1 targets for stock.Shop_ID, shop.Shop_Name and aggregate boundary counts 0/1/2 are probabilistic rather than guaranteed; not verifiable per-pair without held-out queries."
+   ]
+  }
+ ]
 }

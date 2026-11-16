@@ -16,7 +16,6 @@ _QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
 
 
 def _unquote(v: str) -> str:
-    """Strip surrounding quotes, collapse doubled quotes (parse.py:246-253)."""
     v = v.strip().rstrip(';')
     if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
         v = v[1:-1].replace(v[0] * 2, v[0])
@@ -24,7 +23,6 @@ def _unquote(v: str) -> str:
 
 
 def _split_cols(name: str) -> list:
-    """Column key plus tolerant table variants: (table, COL), (raw qualifier, COL), (None, COL)."""
     raw = name.strip().split('.')
     parts = [p.replace('"', '').replace('`', '').strip() for p in raw]
     col = parts[-1].upper().replace(_PH.upper(), '')
@@ -42,7 +40,6 @@ def _split_cols(name: str) -> list:
 
 
 def _left_name(tok):
-    """Identifier, or the identifier inside a Function/Parenthesis wrapper (e.g. LOWER(x))."""
     if isinstance(tok, Identifier) and re.fullmatch(r'[\w."` -]+', tok.value):
         return tok.value
     if isinstance(tok, (Function, Parenthesis, Identifier)):
@@ -53,7 +50,6 @@ def _left_name(tok):
 
 
 def _is_literal(tok) -> bool:
-    """True only for a constant right operand: string/number literal, not a column reference."""
     if tok is None:
         return False
     if tok.ttype is not None and tok.ttype in T.Literal:
@@ -92,7 +88,6 @@ def _walk(tok, out: list) -> None:
 
 
 def _is_ident_operand(v: str) -> bool:
-    """True if v looks like a bare (possibly qualified) column reference, not a constant."""
     if not v or v[0] in '\'"':
         return False
     if re.fullmatch(r'-?\d+(?:\.\d+)?', v):
@@ -103,7 +98,6 @@ def _is_ident_operand(v: str) -> bool:
 
 
 def _clean_qualifier(q: str) -> str:
-    """Reduce a regex-captured qualifier to a bare table name (drop keywords, spaces, quotes)."""
     q = q.strip().replace('"', '').replace('`', '').lower()
     if not q:
         return ''
@@ -116,7 +110,6 @@ def _clean_qualifier(q: str) -> str:
 
 
 def _add_regex(out: list, qual: str, col: str, v: str) -> None:
-    """Add a regex match, normalising the qualifier to a bare table name."""
     q = _clean_qualifier(qual)
     col = col.strip().replace('"', '').replace('`', '').replace(_PH, '')
     if not col:
@@ -127,8 +120,6 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -184,7 +175,6 @@ def _root(schema, key: tuple) -> tuple:
 
 
 def _routing_items(tv: list) -> list:
-    """One routing key per literal: the first tabled variant, or (None, COL) if none exists."""
     best: dict = {}
     order = []
     for (t, c), v in tv:
@@ -198,7 +188,7 @@ def _routing_items(tv: list) -> list:
 
 
 def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> dict:
-    """Route literals to FK-root columns = type_values_w_db(loose=True) (value_typing.py:31-75)."""
+    """Route literals to columns; returns {(table, COLUMN): [values]}."""
     pool: dict = {}
     cache: dict = {}
 

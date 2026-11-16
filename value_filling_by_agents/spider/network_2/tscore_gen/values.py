@@ -7,6 +7,9 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+FRESH_SHARE = 0.1
+VARIANT_SHARE = 0.1
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -36,6 +39,33 @@ def _num(x):
         return None
 
 
+def _str_variants(v: str) -> list:
+    """Near-variants of a string (specification generic_sampling_rules.varchar/text)."""
+    out = []
+    if not v:
+        return out
+    out.append(v.upper())
+    out.append(v.lower())
+    out.append(v.capitalize())
+    out.append(v + 'x')
+    out.append('x' + v)
+    if len(v) > 1:
+        out.append(v[:-1])
+        out.append(v[1:])
+    if len(v) > 2:
+        i = len(v) // 2
+        out.append(v[:i] + v[i + 1] + v[i] + v[i + 2:])
+    n = len(v)
+    for a in range(n):
+        for b in range(a + 1, n + 1):
+            sub = v[a:b]
+            if sub != v:
+                out.append(sub)
+    out.append(v + '%')
+    out.append('%' + v)
+    return [x for x in out if x != v]
+
+
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
@@ -58,15 +88,21 @@ class NumberSampler(ColumnSampler):
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
-        d = 1 if self.is_int else 0.01
-        if r.random() < 1 / 6:
-            v += d
-        elif r.random() < 1 / 5:
-            v -= d
-        elif r.random() < 1 / 4:
-            v += 2 * d
-        elif r.random() < 1 / 3:
-            v -= 2 * d
+        if r.random() < VARIANT_SHARE:
+            d = 1 if self.is_int else 0.01
+            u = r.random()
+            if u < 0.2:
+                v += d
+            elif u < 0.4:
+                v -= d
+            elif u < 0.6:
+                v += 2 * d
+            elif u < 0.8:
+                v -= 2 * d
+            elif u < 0.9:
+                v += 0
+            else:
+                v -= 1
         return self._cast(v)
 
 
@@ -92,18 +128,11 @@ class StringSampler(ColumnSampler):
             v = self._fresh_or_reuse(lambda: self._rand(r.randint(self.lo, self.hi)))
         else:
             v = r.choice(self.elements)
-        if r.random() < 0.5:
-            u = r.random()
-            if u < 0.2:
-                v = v + self._rand(5)
-            elif u < 0.4:
-                v = self._rand(5) + v
-            elif u < 0.6:
-                v = self._rand(3) + v + self._rand(3)
-            elif u < 0.8:
-                v = v[:-1]
-            else:
-                v = v[1:]
+        if r.random() < VARIANT_SHARE and self.elements:
+            base = str(r.choice(self.elements))
+            variants = _str_variants(base)
+            if variants:
+                v = r.choice(variants)
         return v
 
 
@@ -217,7 +246,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
-    ov = list(original_values)
+    ov = [v for v in original_values if v is not None]
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
         p = 0.0
@@ -229,7 +258,7 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = FRESH_SHARE, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]

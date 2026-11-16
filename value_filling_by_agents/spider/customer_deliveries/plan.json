@@ -1,50 +1,539 @@
 {
  "db": "customer_deliveries",
- "operator_io_quirks": [
-  "All identifiers are backtick-quoted in DDL; generated SQL must double-quote them (\"Products\", \"product_id\").",
-  "Mixed-case table names (Products, Regular_Orders, Delivery_Route_Locations, Order_Deliveries) and mixed-case columns; column lookup must be case-insensitive.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional seconds); storage class text contradicts declared DATETIME.",
-  "DATETIME dispatch: type contains 'date' -> Number(scale=4) if first element parses as int else Date; here elements are '2011-04-25 22:20:35' (not int) so Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "DECIMAL(19,4) -> Number(scale=4, precision=19); product_price stored as real, samples like 1322.78.",
-  "VARCHAR(n) -> String(length=n) for all text columns; product_description VARCHAR(255) but only 3 distinct values.",
-  "location_code is VARCHAR(10) PRIMARY KEY and also an FK target from Order_Deliveries; values are street-like strings ('04 Elm Rd') not codes.",
-  "No composite PKs; Regular_Order_Products, Actual_Order_Products, Customer_Addresses, Order_Deliveries have NO primary key (pk=[]).",
-  "All FKs resolve to existing parents (parent_exists true); no dangling FKs, no self-references.",
-  "FK columns are NOT NULL (distributer_id, regular_order_id, product_id, address_id, customer_id, employee_address_id, location_code, actual_order_id, driver_employee_id, truck_id) \u2014 empty parent would force NULL and fail insert.",
-  "Tiny tables: Products 6 rows, all others 15 rows; no huge-table sampling needed.",
-  "country has distinct=1 ('USA'); zip_postcode distinct=14 of 15 (one duplicate); most other columns fully distinct."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max parsed originals (e.g. 2009-12-29..2018-03-21), fresh draws uniform in that range.",
-  "String fuzzer on VARCHAR columns: random strings over a-zA-Z 0-9() of length up to declared length, plus 0.5 contaminate (prefix/suffix/drop) \u2014 names, cities, emails, phones become implausible.",
-  "Number fuzzer on INTEGER PKs: uniform in [-10^4,10^4] with +-1/+-2 perturbation; PKs become large/negative ints, not 1..15.",
-  "Number fuzzer on DECIMAL(19,4): scale=4 -> range [-10^4,10^4], float perturbation +-0.01/+-0.02; product_price plausible magnitude but random.",
-  "FK columns draw from parent's FINAL filtered values with replacement -> many-to-one ties preserved; but parent PKs are random ints so joins still work.",
-  "Tables with no PK (Regular_Order_Products etc.) get no PK dedup; unique-column dedup only applies to single-column unique indexes (none here).",
-  "NOT NULL columns (payment_method, order_status_code, address_type, delivery_status_code, all FK cols) may get NULL from String/Number samplers -> insert fails, row skipped, table shrinks.",
-  "String fuzzer on payment_method/order_status_code/address_type/delivery_status_code: original 2-4 enum values replaced by random strings -> queries filtering 'Visa'/'Success'/'House'/'Ready' return empty (FN).",
-  "String fuzzer on location_code (PK, VARCHAR(10)): random strings, not street names; FK from Order_Deliveries still consistent but values implausible.",
-  "Date fuzzer on date_from/date_to: independent draws -> date_to < date_from possible (no ordering constraint enforced).",
-  "country distinct=1 'USA': String fuzzer replaces with random strings -> WHERE country='USA' returns empty (FN).",
-  "zip_postcode has one duplicate in original; TS String fuzzer produces mostly distinct values -> GROUP BY zip_postcode cardinality changes (FP/FN)."
- ],
- "challenger_refs": [
-  "g5433f3b1",
-  "g5433f3b1",
-  "g095e56f0",
-  "g071bb0c8",
-  "ged1d6578",
-  "gd8233334",
-  "g05740403",
-  "g05740403",
-  "G1",
-  "g83b5e752"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL. For a fresh PK, generate the next value from the current table's max key; if the row would collide with a compact row or an existing generated row, resample and continue until the row is unique. The final row count must equal table_sizes_per_instance exactly; never drop rows for PK/unique violations.",
+   "integer_fk": "Uniformly sample an existing parent key from the final parent key set (compact rows plus generated rows that survived PK/unique filtering); never NULL for NOT NULL FK columns; 5% NULL only if the column is nullable. For unmatched_join_rows targets, reserve at least one parent key that is never sampled as a child FK (see per_column_exceptions).",
+   "varchar_short": "Random token of 3-12 alphanumeric characters; 10% near-duplicates of an existing value (one char changed).",
+   "varchar_name": "Random capitalized word pair from a small built-in name pool.",
+   "varchar_email": "lowercase(firstname) + digits + '@example.' + {com,net,org}.",
+   "varchar_phone": "Random pattern like '###-###-####' or '###.###.####x####'.",
+   "varchar_address": "Random house number + street word + suffix (St, Rd, Av, Blvd) + optional 'Suite ###'.",
+   "varchar_city": "Random capitalized word + suffix (ville, town, side, mouth).",
+   "varchar_zip": "3-5 digit numeric string.",
+   "varchar_country": "Fixed 'USA'.",
+   "varchar_state": "Random pick from a fixed list of US states.",
+   "varchar_status": "Random pick from the enum values declared in per_column_exceptions.",
+   "varchar_code": "Random 2-10 char uppercase token; 10% near-variants of an existing value.",
+   "decimal_price": "Uniform in [0.01, 9999.99] rounded to 4 decimals; 10% boundary values at 0.01 and 9999.99.",
+   "datetime": "Uniform random timestamp in [2009-01-01, 2018-12-31] formatted '%Y-%m-%d %H:%M:%S'; 10% boundary at the min/max of the column's observed range.",
+   "nullable_text": "80% non-NULL sampled as above, 20% NULL.",
+   "distinct_share": "For DISTINCT-target columns, ensure 20-50% of rows share a value with another row; verify over compact+generated rows.",
+   "group_sizes": "For GROUP-target columns, ensure at least one group of size 1, one of size 2, and one of size >= 3; draw three distinct values from the pool and assign group sizes explicitly, then verify with a Counter over compact+generated rows.",
+   "rows_with_different_values": "For rows_with_different_values-target columns, ensure at least two distinct non-NULL values per instance (the whole table is the group); verify after NULL planting.",
+   "boundary_values": "For comparison_boundary targets, plant the listed literal and at least one value that compares strictly on each side of the boundary (for strings, the next lexicographic string and the previous lexicographic string; for numbers, the value plus/minus one step; for dates, one day before/after) while keeping the table's date-order rules. For case-insensitive boundaries, also plant the listed variant.",
+   "null_planting_order": "Apply the NULL rule before planting group_sizes/duplicates_for_distinct/rows_with_different_values so planted structure is not destroyed; never NULL a NOT NULL or PK column; skip NULL planting for FK columns whose spec target forbids NULL FKs.",
+   "unmatched_join_rows": "For each targeted parent column, reserve at least one parent key that is never inserted as a child FK; all other child rows are sampled from existing parent keys. Verify after generation that every targeted parent has at least one childless row and every child FK is non-NULL and references an existing parent.",
+   "row_count_guard": "After generating the table, verify the row count equals table_sizes_per_instance; if a row is a duplicate, regenerate PK/unique values and resample the row until the count is exact. Never drop rows."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Addresses.state_province_county",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Addresses.state_province_county",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Addresses.address_details",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Addresses.address_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Products.product_price",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 non-NULL distinct values per instance (whole table is the group)"
+    }
+   },
+   {
+    "column": "Customers.customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customer_Addresses.customer_id",
+      "Regular_Orders.distributer_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Customer_Addresses.customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.customer_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Customers.payment_method",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.payment_method",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Customers.payment_method",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Visa",
+      "MasterCard",
+      "Discover",
+      "American"
+     ]
+    }
+   },
+   {
+    "column": "Actual_Order_Products.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Actual_Orders.actual_order_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Actual_Orders.order_status_code",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Success",
+      "success"
+     ]
+    }
+   },
+   {
+    "column": "Actual_Orders.order_status_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Success",
+      "Cancel",
+      "success"
+     ]
+    }
+   },
+   {
+    "column": "Customers.date_became_customer",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Employees.employee_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Products.product_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Actual_Order_Products.product_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Regular_Orders.distributer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.customer_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Customer_Addresses.address_type",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "House",
+      "Flat",
+      "Apartment"
+     ]
+    }
+   },
+   {
+    "column": "Order_Deliveries.delivery_status_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Ready",
+      "On Road",
+      "Delivered"
+     ]
+    }
+   },
+   {
+    "column": "Products.product_description",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "good condition",
+      "great condition",
+      "bad condition"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Regular_Orders.distributer_id",
+    "parent": "Customers.customer_id",
+    "copied": []
+   },
+   {
+    "child": "Regular_Order_Products.regular_order_id",
+    "parent": "Regular_Orders.regular_order_id",
+    "copied": []
+   },
+   {
+    "child": "Regular_Order_Products.product_id",
+    "parent": "Products.product_id",
+    "copied": []
+   },
+   {
+    "child": "Actual_Orders.regular_order_id",
+    "parent": "Regular_Orders.regular_order_id",
+    "copied": []
+   },
+   {
+    "child": "Actual_Order_Products.actual_order_id",
+    "parent": "Actual_Orders.actual_order_id",
+    "copied": []
+   },
+   {
+    "child": "Actual_Order_Products.product_id",
+    "parent": "Products.product_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Addresses.customer_id",
+    "parent": "Customers.customer_id",
+    "copied": []
+   },
+   {
+    "child": "Customer_Addresses.address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   },
+   {
+    "child": "Delivery_Route_Locations.route_id",
+    "parent": "Delivery_Routes.route_id",
+    "copied": []
+   },
+   {
+    "child": "Delivery_Route_Locations.location_address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   },
+   {
+    "child": "Employees.employee_address_id",
+    "parent": "Addresses.address_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Deliveries.location_code",
+    "parent": "Delivery_Route_Locations.location_code",
+    "copied": []
+   },
+   {
+    "child": "Order_Deliveries.actual_order_id",
+    "parent": "Actual_Orders.actual_order_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Deliveries.driver_employee_id",
+    "parent": "Employees.employee_id",
+    "copied": []
+   },
+   {
+    "child": "Order_Deliveries.truck_id",
+    "parent": "Trucks.truck_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Products",
+    "column": "product_price",
+    "formula": "product_price >= 0"
+   },
+   {
+    "table": "Customers",
+    "column": "payment_method",
+    "formula": "payment_method IN ('Visa','MasterCard','Discover','American')"
+   },
+   {
+    "table": "Actual_Orders",
+    "column": "order_status_code",
+    "formula": "order_status_code IN ('Success','Cancel','success')"
+   },
+   {
+    "table": "Customer_Addresses",
+    "column": "address_type",
+    "formula": "address_type IN ('House','Flat','Apartment')"
+   },
+   {
+    "table": "Order_Deliveries",
+    "column": "delivery_status_code",
+    "formula": "delivery_status_code IN ('Ready','On Road','Delivered')"
+   },
+   {
+    "table": "Products",
+    "column": "product_description",
+    "formula": "product_description IN ('good condition','great condition','bad condition')"
+   },
+   {
+    "table": "Customer_Addresses",
+    "column": "date_to",
+    "formula": "date_to IS NULL OR date_to >= date_from"
+   },
+   {
+    "table": "Actual_Orders",
+    "column": "actual_order_date",
+    "formula": "actual_order_date IS NULL OR actual_order_date >= '2009-01-01 00:00:00'"
+   },
+   {
+    "table": "Order_Deliveries",
+    "column": "delivery_date",
+    "formula": "delivery_date IS NULL OR delivery_date >= '2009-01-01 00:00:00'"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Products": 6,
+   "Addresses": 15,
+   "Customers": 15,
+   "Regular_Orders": 15,
+   "Regular_Order_Products": 15,
+   "Actual_Orders": 15,
+   "Actual_Order_Products": 15,
+   "Customer_Addresses": 15,
+   "Delivery_Routes": 15,
+   "Delivery_Route_Locations": 15,
+   "Trucks": 15,
+   "Employees": 15,
+   "Order_Deliveries": 15
+  },
+  "null_targets": [
+   "Addresses.address_details",
+   "Addresses.city",
+   "Addresses.zip_postcode",
+   "Addresses.state_province_county",
+   "Addresses.country",
+   "Customers.customer_name",
+   "Customers.customer_phone",
+   "Customers.customer_email",
+   "Customers.date_became_customer",
+   "Customer_Addresses.date_to",
+   "Delivery_Route_Locations.location_name",
+   "Delivery_Routes.route_name",
+   "Delivery_Routes.other_route_details",
+   "Employees.employee_name",
+   "Employees.employee_phone",
+   "Order_Deliveries.delivery_date",
+   "Products.product_name",
+   "Products.product_price",
+   "Products.product_description",
+   "Trucks.truck_licence_number",
+   "Trucks.truck_details",
+   "Actual_Orders.actual_order_date"
+  ],
+  "supporting_evidence": {
+   "Products.product_price >= 0": [
+    "Products rows 1-6 all have positive prices (1322.78, 6402.09, 2511.29, 7111.68, 3644.45, 5022.39)"
+   ],
+   "Customers.payment_method IN (...)": [
+    "Customers rows 1-8 show Visa, MasterCard, Discover, American"
+   ],
+   "Actual_Orders.order_status_code IN (...)": [
+    "Actual_Orders rows 1-8 show Success and Cancel; 'success' added as legal boundary variant"
+   ],
+   "Customer_Addresses.address_type IN (...)": [
+    "Customer_Addresses rows 1-8 show House, Flat, Apartment"
+   ],
+   "Order_Deliveries.delivery_status_code IN (...)": [
+    "Order_Deliveries rows 1-8 show Ready, On Road, Delivered"
+   ],
+   "Products.product_description IN (...)": [
+    "Products rows 1-6 show good condition, great condition, bad condition"
+   ],
+   "Customer_Addresses.date_to >= date_from": [
+    "Customer_Addresses rows 1-8: date_to (2018-02-25) >= date_from (2016-09-06), etc."
+   ]
+  },
+  "uncertainty": "No formula for calculated columns was found; all numeric columns are independent. The rows_with_different_values target group for Products.product_price is the whole table (one grouping key per instance). The comparison_boundary target for string columns requires both 'Success' and 'success' plus a lexicographically smaller and strictly greater value; the enum list includes 'success' so the boundary is legal. table_sizes_per_instance are exact generated row counts per instance; the program must never drop rows for PK/unique violations and must ensure the final count equals the target. FK child values must be re-resolved against the final parent key set (including compact rows and generated rows that survived PK/unique filtering) before writing, and 'pragma foreign_keys = ON' must be enabled during append with a post-write 'pragma foreign_key_check'. The instance file must start as a copy of the compact database (pass the compact path into write_instance_sqlite)."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=7901 and validity.reasons.new_integrity_failures=20 across all 20 instances. The writer (writer.py) opens the part file with 'pragma foreign_keys = OFF' and never re-enables/validates FKs; instance.py's fill_foreign_keys_consistently draws child FKs from in-memory parent values, but the writer appends rows table-by-table in schema.tables order while the compact DB already contains rows. Because generated child rows may reference generated parent rows that are inserted later in the same transaction (or parent rows whose PKs were dropped by sample_fresh_primary_keys/drop_unique_duplicates after FK assignment), the appended rows violate FKs. The FK columns are NOT NULL in the schema (e.g. Regular_Orders.distributer_id, Actual_Orders.regular_order_id), so the 'child_rows_with_null_fk: false' target is not the cause; the cause is stale/unsynchronized parent keys.",
+     "requested_revision": "After building the instance and before writing, re-resolve every FK child value against the final parent key set (including compact rows and generated rows that survived PK/unique filtering), and either drop or re-point child rows whose FK no longer exists. Enable 'pragma foreign_keys = ON' during the append (or run a post-write 'pragma foreign_key_check') and count/report violations; do not silently write instances with FK violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "validity.reasons.compact_rows_missing=20 and no_rows_added=12. The CLI calls build_random_instance(...) and write_instance_sqlite(schema, inst, p) without passing orig, so writer.write_instance_sqlite's 'orig' parameter is None and the 'if orig and os.path.exists(orig)' copy branch is skipped; the unit file is created from schema.ddl only. The docstring/comment claims 'the instance file starts as a copy of the compact database', but the CLI never supplies the compact path. This also explains why 12 instances report no_rows_added (generated rows collide with/omit compact rows) and why compact rows are missing in all 20.",
+     "requested_revision": "Pass the compact database path (a['orig']) into write_instance_sqlite so the unit file is a copy of the compact DB plus appended rows, as the specification and module docstring require. Alternatively, if appending is not intended, update the specification and docstring to state that instances are freshly built and remove the compact-copy claim."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's comparison_boundary target for Actual_Orders.order_status_code requires values ['Success','success'], while the enum rule restricts order_status_code to ['Success','Cancel']. The spec's own 'uncertainty' note admits 'success' is treated as a near-variant exception 'not as a valid enum value'. The program resolves this by EnumSampler emitting boundary values with 25% probability (values.py EnumSampler.sample), so ~25% of generated order_status_code values are 'success', which violates the declared enum formula order_status_code IN ('Success','Cancel'). This is a genuine spec/program inconsistency, not just a sampling nuance.",
+     "requested_revision": "Either (a) add 'success' to the enum values for Actual_Orders.order_status_code so the boundary variant is a legal value, or (b) remove the comparison_boundary target for this column and instead achieve the >= 'Success' vs = 'Success' separation through case-insensitive comparison or a different column. The program's EnumSampler should not emit values outside the declared enum."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_null_rule is applied to every column whose name is in cols, including FK columns filled by fill_foreign_keys_consistently. For NOT NULL FK columns the nullable flag is computed as '(not cm.notnull) and cm.pk_pos == 0', so NOT NULL FKs are excluded \u2014 good. However, the null rule is applied AFTER fill_foreign_keys_consistently and AFTER _plant_group_sizes/_plant_duplicate_share/_plant_tie_ranks, and _apply_null_rule can set values to None on columns that are NOT NULL in the schema if is_null_target(spec, t, cm.name) is true. The spec's null_targets list does not include NOT NULL columns, so this is currently safe, but the code path 'if is_null_target(...): nullable = True' would override the NOT NULL constraint for any misconfigured null target. More importantly, _apply_null_rule is applied to FK columns too (they are in cols), so a nullable FK column would get NULLs \u2014 which is allowed \u2014 but the spec's unmatched_join_rows target for Customer_Addresses.customer_id and Regular_Orders.distributer_id requires 'child_rows_with_null_fk: false', and those columns are NOT NULL so they are excluded. No violation observed here, but the ordering means planted group/duplicate values can be overwritten by NULLs, weakening the group_sizes/duplicates_for_distinct targets.",
+     "requested_revision": "Apply _apply_null_rule before planting group_sizes/duplicates_for_distinct/tie_ranks so planted structure is not destroyed by NULL overwrites, and guard the 'is_null_target => nullable=True' override so it never applies to NOT NULL or PK columns. Also skip _apply_null_rule for FK columns whose spec target forbids NULL FKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes and _plant_duplicate_share operate on the raw sampled list and may set values to None-adjacent choices; _plant_group_sizes picks 'a, b, c = rng.choice(pool)' from non-None values but then writes out[0]=a, out[1]=b, out[2]=b, out[3..5]=c \u2014 this only guarantees groups of size 1 (a), 2 (b), and >=3 (c) if a, b, c are distinct. If rng.choice returns the same value for a and b (or b and c), the group sizes collapse. The spec target 'group_sizes: 1, 2 and >= 3' is therefore not reliably constructed. Similarly _plant_duplicate_share picks a single src and assigns it to k random indices, which may not achieve 20-50% duplicate share if src already appears elsewhere or if indices overlap with existing duplicates.",
+     "requested_revision": "In _plant_group_sizes, draw three distinct values (e.g. rng.sample(pool, 3) when len(pool)>=3) and assign group sizes explicitly; verify the resulting Counter has at least one group of size 1, one of size 2, and one of size >=3. In _plant_duplicate_share, compute the target duplicate count from n and the desired share, and assign a value that is guaranteed to create exactly that many duplicates (accounting for existing occurrences)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's generic_sampling_rules include 'tie_ranks: For ORDER-target columns, plant at least two rows with equal value at the top rank', but the extracted atomic operations list no ORDER-target columns (the examples show ORDER(products.product_price, DESC) was removed in favor of rows_with_different_values). The program's _plant_tie_ranks is only invoked when has_pattern(spec, t, cm.name, 'rows_with_different_values') is true (instance.py), and it sets out[0]=out[1]=max(nums). This conflates tie_ranks with rows_with_different_values and does not implement the stated tie_ranks rule for ORDER targets. The spec's rows_with_different_values target is '>= 2 per group with different values', which _plant_tie_ranks does not guarantee (it only plants equal top values).",
+     "requested_revision": "Either remove the tie_ranks generic rule (no ORDER targets exist) or add explicit ORDER-target columns to the spec and implement _plant_tie_ranks for them. For rows_with_different_values, implement a separate planting step that guarantees at least two distinct values per qualifying group, rather than reusing _plant_tie_ranks."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies list includes Order_Deliveries.location_code -> Delivery_Route_Locations.location_code and Order_Deliveries.actual_order_id -> Actual_Orders.actual_order_id etc. The program's fill_foreign_keys_consistently uses schema.fks (read from the compact DB via pragma foreign_key_list), not spec['dependencies']. If the compact DB's FK declarations differ from the spec's dependencies (e.g. a dependency declared in spec but not enforced in the compact schema, or vice versa), the program will not honor the spec. The spec's dependencies are loaded into spec['dependencies'] by load_specification but are never consulted in instance.py or values.py.",
+     "requested_revision": "In fill_foreign_keys_consistently (or a pre-pass), merge spec['dependencies'] with schema.fks so that every declared dependency is enforced, and warn/fail if a spec dependency has no matching parent column. Alternatively, document that schema.fks is authoritative and remove the redundant dependencies from the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's null_targets includes 'Products.product_price' and 'Products.product_description', and the program's _apply_null_rule sets NULLs on these. However, the spec's semantic formula 'product_price >= 0' and the enum formula 'product_description IN (...)' are applied in _repair_row via _fix_formula, which returns True for None values ('v is None or ...'). This is consistent with SQL three-valued logic. But the spec's rows_with_different_values target for Products.product_price requires '>= 2 per group with different values'; _apply_null_rule runs AFTER _plant_tie_ranks and can NULL out the planted top values, and _repair_row does not re-plant them. The interaction between NULL planting and value-variation planting is not coordinated.",
+     "requested_revision": "Coordinate the planting order: plant rows_with_different_values/group_sizes/duplicates_for_distinct AFTER the NULL rule, or exclude the planted rows from NULL assignment. Ensure the final column still satisfies the target after NULLs are applied."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's supporting_evidence cites compact rows (e.g. 'Products rows 1-6 all have positive prices (1322.78, ...)') and the spec's table_sizes_per_instance lists Products: 6. The program's choose_table_sizes varies sizes per instance (0-230 rows, or level x4 capped at 2500) and the CLI appends generated rows to a copy of the compact DB. The spec's table_sizes_per_instance is described as 'per instance' but the program interprets it as a base for variation. This is a spec ambiguity, not necessarily an error, but the spec should state whether sizes are exact or base values.",
+     "requested_revision": "Clarify in the spec whether table_sizes_per_instance are exact row counts or base values subject to variation. If exact, change choose_table_sizes to use them directly; if base, document the variation range."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback reports eligible=25, separated=11, unknown_executions=0. The 14 unseparated pairs may be due to the FK violations and compact-row loss rather than genuine query equivalence; re-run after fixing integrity and compact-row preservation to confirm.",
+    "The spec's comparison_boundary for order_status_code and the enum rule conflict; the program's EnumSampler emits 'success' at 25% probability. Whether this is acceptable depends on the designer's intent for the boundary target.",
+    "The program's _plant_group_sizes and _plant_duplicate_share do not guarantee the stated group sizes/duplicate shares when random choices collide; execution feedback does not directly report per-column group-size or duplicate-share statistics, so this cannot be confirmed from the provided evidence.",
+    "The spec's dependencies are not consulted by the program; whether schema.fks matches spec['dependencies'] for all 15 declared dependencies cannot be confirmed without inspecting the compact DB's FK declarations."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` and `_plant_duplicate_share` are applied to the *generated* column values only, but the specification's group_sizes/duplicates_for_distinct targets are evaluated over the whole table (compact rows + generated rows). The execution feedback shows large `rows_skipped` counts (e.g. Products 59 skipped, Addresses 128, Customers 142, Regular_Orders 158, Actual_Orders 107, Delivery_Routes 129, Trucks 124, Employees 119) \u2014 the writer's row-by-row fallback drops rows that violate NOT NULL/PK/unique constraints, so the final per-table row counts are far below the exact `table_sizes_per_instance` (e.g. Products target 6 but only 35 added across 20 instances \u2248 1.75/instance; Customers target 15 but 57/20 \u2248 2.85/instance). The spec explicitly states 'table_sizes_per_instance are exact generated row counts per instance; the program must not vary them.'",
+     "requested_revision": "Make the generated row count per table equal the specified size after PK/unique filtering (e.g. resample rows that would be dropped, or generate fresh PKs/unique values so no row is skipped), and verify the final per-instance row count equals `table_sizes_per_instance`. Also ensure group_sizes/duplicates_for_distinct are verified over compact+generated rows, not just generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` and `_plant_duplicate_share` are only invoked for columns that are NOT foreign keys (`if (t, cm.name) in fks or cm.name not in cols: continue`). But the specification lists group_sizes/duplicates_for_distinct targets on FK columns: `Customers.customer_id` (unmatched_join_rows, but also PK), `Customer_Addresses.customer_id` (unmatched_join_rows), `Regular_Orders.distributer_id` (unmatched_join_rows), `Actual_Order_Products.product_id` (unmatched_join_rows), `Products.product_id` (unmatched_join_rows). The `unmatched_join_rows` target requires 'parent_rows_without_children: true' \u2014 i.e. some parent rows must have no child rows. The program's `fill_foreign_keys_consistently` samples child FKs uniformly from the parent set, which with 15 children and 15 parents will almost surely give every parent at least one child, so the 'parent_rows_without_children' target is not guaranteed. The execution feedback's `construction_pairs.separated = 9` out of 25 eligible suggests many targets are not separated.",
+     "requested_revision": "Implement `unmatched_join_rows` by construction: explicitly leave at least one parent row without any child row (e.g. reserve a parent key and never sample it as a child FK), and ensure child rows point at existing parents. Verify with a post-generation check that each targeted parent has at least one childless row and each targeted child FK is non-NULL and references an existing parent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_rows_with_different_values` is only invoked for non-FK columns, and `Products.product_price` is a nullable column (in `null_targets`). The NULL rule runs first (`_apply_null_rule`), then `_plant_rows_with_different_values` runs. But `_plant_rows_with_different_values` only plants two distinct values if `len(nums) >= 2 and len(set(nums)) >= 2` \u2014 otherwise it plants `lo`/`hi` in the first two non-NULL slots. However, the spec target is 'qualifying_rows: >= 2 per group with different values' \u2014 i.e. for each group (by some grouping key) there must be at least 2 rows with different values. The program does not group by anything; it just ensures the column overall has 2 distinct values. The execution feedback shows `Products.product_price` generated rows: NULL 4 / 26, so only 22 non-NULL values across 20 instances \u2014 likely not enough to guarantee >= 2 distinct values per qualifying group.",
+     "requested_revision": "Clarify the grouping key for `rows_with_different_values` on `Products.product_price` (the spec says 'per group' but does not name the group). If the group is the whole table, ensure at least 2 distinct non-NULL values per instance. If the group is something else (e.g. per product_id), implement that grouping explicitly and verify with a Counter."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `comparison_boundary` target for `Actual_Orders.order_status_code` lists values `['Success', 'success']`, and the `enum` target lists `['Success', 'Cancel', 'success']`. The program's `EnumSampler` only emits declared enum values, and `spec.py` adds `'success'` to the enum list, so the boundary is achievable. However, the spec's `boundary_values` rule says 'plant the listed literal and one step on each side (numbers by their step, dates by one day in the column's format, strings by the listed near-variant)'. For strings, 'one step on each side' of `'Success'` is ambiguous \u2014 the program only plants `'Success'` and `'success'`, not a value strictly less than `'Success'` and strictly greater than `'Success'` (e.g. `'Succeqs'` and `'Succesu'`). The execution feedback does not show whether the boundary is actually separated.",
+     "requested_revision": "Clarify in the specification what 'one step on each side' means for string comparison boundaries, and whether the enum list should include values strictly below and above the boundary literal. If the intent is only to have both `'Success'` and `'success'` present (to exercise case-sensitivity), state that explicitly and remove the 'one step on each side' language for strings."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs.separated = 9` out of 25 eligible, with `construction_pairs_by_group` empty. This means 16 of 25 targeted pattern pairs are not separated by the generated instances. While a missing separation alone does not prove a generation error, the combination with the large `rows_skipped` counts and the FK-column exclusion above suggests the program is not reliably achieving the specified targets. The `nullable_columns` feedback shows several columns with very low NULL counts (e.g. `Addresses.state_province_county: NULL 2 / 35`, `Customers.customer_phone: NULL 3 / 49`), which is consistent with the NULL rule being applied but then rows being dropped by the writer's fallback.",
+     "requested_revision": "After fixing the row-count and FK-target issues above, re-run the construction check and confirm that `construction_pairs.separated` is close to `construction_pairs.eligible` (or that the unseparated pairs are explained by data-dependent ties, not by missing planting). Add a post-generation verification step that checks each specified target (group_sizes, duplicates_for_distinct, unmatched_join_rows, rows_with_different_values, comparison_boundary) over the final instance and reports failures."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the `rows_with_different_values` target on `Products.product_price` is meant to be per-table or per-group (grouping key not specified).",
+    "Whether the `comparison_boundary` target on `Actual_Orders.order_status_code` requires values strictly below/above 'Success' or only the case variants.",
+    "Whether the `unmatched_join_rows` target on `Customers.customer_id` (a PK) is meant to require childless customers, and how that interacts with the `Regular_Orders.distributer_id` and `Customer_Addresses.customer_id` targets.",
+    "The exact per-instance row counts after PK/unique filtering are not reported in the execution feedback; only aggregate `rows_added`/`rows_skipped` across 20 instances are shown."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "writer.py write_instance_sqlite append path: the executemany fallback increments ok[t]/bad[t] per failed row, but on a partial executemany failure sqlite3 may have already inserted some rows; the row-by-row retry re-inserts the whole batch, causing rows_skipped reporting (rows_added + rows_skipped = 20*15=300 per table, e.g. Products 36+84=120=20*6) to diverge from actual final row counts. Execution feedback confirms rows_skipped is large for every 15-row table (Addresses 215, Customers 202, Delivery_Routes 183, Trucks 177) while rows_added+rows_skipped exactly equals n_instances*table_size, indicating near-total batch rejection and row-by-row re-insert.",
+     "requested_revision": "Report rows_added from the actual post-write SELECT COUNT(*) - compact_size rather than from the batch counter, so rows_added/rows_skipped reflects the true final table contents. This is a reporting accuracy issue; integrity and validity checks pass (fk_violations 0, not_null 0, pk_duplicates 0, valid 20/20)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "values.py NumberSampler with unsigned=False sets min/max to (-10**scale, 10**scale) but DECIMAL(19,4) with args (19,4) gives scale=15; product_price is then clamped into [0.01,9999.99] only because rows_with_different_values is detected. For other decimal columns without that pattern (none present here) the domain would be [-10^15,10^15], inconsistent with the generic decimal_price rule of [0.01,9999.99].",
+     "requested_revision": "Apply the decimal_price domain generically to DECIMAL columns unless overridden, or explicitly document that generically-typed decimals fall outside the decimal_price domain when no rows_with_different_values target applies. Not blocking for this schema."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The spec lists comparison_boundary for Actual_Orders.order_status_code with values ['Success','success'] and enum ['Success','Cancel','success'], but enum comparison in the DEFAULT_FORMULAS uses Python `v in vals`, which is case-sensitive, so 'success' is accepted as a legal value. spec.py _f_enum is fine; however concrete row sampling via EnumSampler with boundary variants from boundary_variants() only yields 'success' (since it is already in the enum). Both values fit the spec, so this is consistency-by-construction.",
+     "requested_revision": "None required \u2014 confirm the boundary variant family is intended only for separate-cased tokens; no change needed."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Construction feedback shows 25 eligible pattern-pairs but only 9 separated (unknown 0). This is not a blocking error: separation of query denotations is a downstream property, not a generation requirement. All integrity checks pass (fk_violations 0, not_null_violations 0, pk_duplicates 0), all 20 instances valid, generation reproducible (reproducible=true), and verifiable targets (sizes, group_sizes, duplicates_for_distinct, unmatched_join_rows, rows_with_different_values, comparison_boundary) are computed by verify_instance and reported in spec.py / instance.py.",
+     "requested_revision": "No change required for this review \u2014 flag for continued monitoring of construction_pairs."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction feedback reports 9/25 separated pairs; no per-group breakdown (construction_pairs_by_group empty), so we could not inspect which specific pattern classes (group_sizes, duplicates_for_distinct, unmatched_join_rows, rows_with_different_values) failed to separate. Absence of separation alone does not prove a generation error.",
+    "Rows_added / rows_skipped counts per instance were aggregated only; we did not confirm the actual row-count equality against table_sizes_per_instance per instance (verify_instance computes this but the feedback summary did not echo the per-table 'ok' flags)."
+   ]
+  }
+ ]
 }

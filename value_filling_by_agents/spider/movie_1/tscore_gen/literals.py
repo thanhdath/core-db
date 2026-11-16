@@ -12,6 +12,7 @@ _COL = r'((?:[`"]?[\w -]+?[`"]?\.)*[`"]?[\w-]+[`"]?)'
 _IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
 _BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
 _CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
+_QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
 
 
 def _unquote(v: str) -> str:
@@ -64,8 +65,10 @@ def _is_literal(tok) -> bool:
     if tok.is_group:
         return False
     v = tok.value.strip()
-    if not v or v.lower() in ('select', 'not', 'null', 'true', 'false'):
+    if not v or v.lower() in ('select', 'not', 'true', 'false'):
         return False
+    if v.lower() == 'null':
+        return True
     if v[0] in '\'"':
         return True
     return bool(re.fullmatch(r'-?\d+(?:\.\d+)?', v))
@@ -94,12 +97,37 @@ def _is_ident_operand(v: str) -> bool:
         return False
     if re.fullmatch(r'-?\d+(?:\.\d+)?', v):
         return False
+    if v.lower() == 'null':
+        return False
     return bool(re.fullmatch(r'[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*', v))
 
 
+def _clean_qualifier(q: str) -> str:
+    """Reduce a regex-captured qualifier to a bare table name (drop keywords, spaces, quotes)."""
+    q = q.strip().replace('"', '').replace('`', '').lower()
+    if not q:
+        return ''
+    tok = q.split()[-1] if q.split() else ''
+    if not _QUAL.match(tok):
+        return ''
+    if tok in ('and', 'or', 'where', 'on', 'not', 'select', 'from', 'join', 'as', 'in', 'between', 'like'):
+        return ''
+    return tok
+
+
+def _add_regex(out: list, qual: str, col: str, v: str) -> None:
+    """Add a regex match, normalising the qualifier to a bare table name."""
+    q = _clean_qualifier(qual)
+    col = col.strip().replace('"', '').replace('`', '').replace(_PH, '')
+    if not col:
+        return
+    if q:
+        out.append(((q, col.upper()), _unquote(v)))
+    out.append(((None, col.upper()), _unquote(v)))
+
+
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -110,11 +138,11 @@ def extract_typed_values(sql: str) -> list:
             pass
         for m in _CMP.finditer(s):
             v = m.group(2)
-            if v.lower() in ('select', 'not', 'null'):
+            if v.lower() in ('select', 'not'):
                 continue
             if _is_ident_operand(v):
                 continue
-            _add(out, m.group(1), v)
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], v)
         for m in _IN.finditer(s):
             inner = m.group(2).strip()
             if not inner or inner.lower().startswith('select'):
@@ -122,10 +150,10 @@ def extract_typed_values(sql: str) -> list:
             for it in _ITEM.findall(inner):
                 if _is_ident_operand(it):
                     continue
-                _add(out, m.group(1), it)
+                _add_regex(out, m.group(1), m.group(1).split('.')[-1], it)
         for m in _BETWEEN.finditer(s):
-            _add(out, m.group(1), m.group(2))
-            _add(out, m.group(1), m.group(3))
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], m.group(2))
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], m.group(3))
     except Exception:
         pass
     seen, res = set(), []

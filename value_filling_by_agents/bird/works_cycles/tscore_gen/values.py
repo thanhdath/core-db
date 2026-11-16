@@ -3,10 +3,40 @@ import datetime as dt
 import re
 import string
 
-# fuzz/number.py:5 MAX = 9223372036854775807 - epsilon (int64, no 2^31 clamp)
-MAX = 9223372036854775807 - 1e-9
+from .spec import (
+    BOUNDARIES, NEAR_VARIANTS, LIKE_VARIANTS,
+    DUP_COLUMNS, TIE_COLUMNS, GROUP_COLUMNS, DIFFERENT_COLUMNS,
+    NULL_COUNT_COLUMNS, UNMATCHED_COLUMNS,
+)
+
+_MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _near_variants(value, rng):
+    """Return exact, lower, upper, one-char-edit and one-char-append variants."""
+    s = str(value)
+    out = [s]
+    if s.isdigit():
+        n = int(s)
+        out += [str(n - 1), str(n + 1), str(n + 2)]
+    else:
+        out.append(s.lower())
+        out.append(s.upper())
+        if len(s) > 1:
+            i = rng.randrange(len(s))
+            out.append(s[:i] + s[i + 1:])
+            out.append(s[:i] + s[i] + s[i:])
+        out.append(s + 'x')
+    return out
 
 
 class ColumnSampler:
@@ -30,53 +60,43 @@ class ColumnSampler:
         raise NotImplementedError
 
 
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py: int64 MAX, list range [min, max+1] capped at MAX, type range [-10^scale, 10^scale]."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, MAX)) if unsigned else (-hi, hi)
-        if self.elements:
-            self.list_min = min(self.elements)
-            self.list_max = min(max(self.elements) + 1, MAX)
-        else:
-            self.list_min, self.list_max = self.min, self.max
+        hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        self.list_min = min(self.elements) if self.elements else self.min
+        self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        # number.py:88: integer columns truncate, float columns keep precision
-        return int(v) if self.is_int else (round(v, self.precision) if self.precision else v)
-
-    def _draw(self, lo, hi):
-        # number.py:79: random.random() * (end - start) + start
-        return self.rng.random() * (hi - lo) + lo
+        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: self._draw(lo, hi))
+            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
-            v = r.choice(self.elements)
+            v = rng_choice_num(self.elements, r)
         d = 1 if self.is_int else 0.01
-        if r.random() < 1 / 6:
+        u = r.random()
+        if u < 1 / 6:
             v += d
-        elif r.random() < 1 / 5:
+        elif u < 1 / 5:
             v -= d
-        elif r.random() < 1 / 4:
+        elif u < 1 / 4:
             v += 2 * d
-        elif r.random() < 1 / 3:
+        elif u < 1 / 3:
             v -= 2 * d
         return self._cast(v)
+
+
+def rng_choice_num(els, r):
+    return r.choice(els)
 
 
 class StringSampler(ColumnSampler):
@@ -117,7 +137,8 @@ class StringSampler(ColumnSampler):
 
 
 def _parse_date(s: str):
-    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
+    s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*',
+               lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
         try:
             return t, dt.datetime.strptime(s, t)
