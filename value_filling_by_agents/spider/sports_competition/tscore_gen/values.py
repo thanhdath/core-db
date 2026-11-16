@@ -39,19 +39,28 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0,
+                 unsigned=False, lo=None, hi=None, boundaries=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_s = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_s, hi_s)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
+        self.boundaries = [b for b in (boundaries or []) if b is not None]
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
+        if self.boundaries and r.random() < 0.25:
+            v = r.choice(self.boundaries)
+            return self._cast(v)
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
@@ -67,7 +76,12 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        v = self._cast(v)
+        if self.min is not None and v < self.min:
+            v = self._cast(self.min)
+        if self.max is not None and v > self.max:
+            v = self._cast(self.max)
+        return v
 
 
 class StringSampler(ColumnSampler):
@@ -105,6 +119,59 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Closed enumeration: values drawn from the declared domain (plus near-variants)."""
+
+    def __init__(self, domain: list, variants: list, p: float, max_l0: float, rng):
+        super().__init__(list(domain), p, max_l0, rng)
+        self.domain = list(domain)
+        self.variants = [v for v in variants if v not in self.domain]
+
+    def sample(self):
+        r = self.rng
+        if self.variants and r.random() < 0.15:
+            return r.choice(self.variants)
+        return r.choice(self.domain)
+
+
+class YearStringSampler(ColumnSampler):
+    """Four-digit year string between 1990 and 2020."""
+
+    def __init__(self, elements, p, max_l0, rng, lo=1990, hi=2020):
+        super().__init__(elements, p, max_l0, rng)
+        self.lo, self.hi = lo, hi
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return str(r.choice(self.elements))
+        return str(r.randint(self.lo, self.hi))
+
+
+class ScoreSampler(ColumnSampler):
+    """'A:B' with A,B integers 0-40."""
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return str(r.choice(self.elements))
+        return '%d:%d' % (r.randint(0, 40), r.randint(0, 40))
+
+
+class GoalsSampler(ColumnSampler):
+    """'made/attempted' or '0'."""
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return str(r.choice(self.elements))
+        if r.random() < 0.3:
+            return '0'
+        made = r.randint(0, 10)
+        att = made + r.randint(0, 10)
+        return '%d/%d' % (made, att)
 
 
 def _parse_date(s: str):
@@ -182,9 +249,25 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng,
+                        spec: dict = None, key: str = None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    spec = spec or {}
     els = [e for e in elements if rng.random() < 0.9]
+    if key:
+        enums = spec.get('enums', {})
+        if key in enums:
+            return EnumSampler(enums[key], spec.get('enum_variants', {}).get(key, []),
+                               p, max_l0, rng)
+        fmts = spec.get('formats', {})
+        if key in fmts:
+            f = fmts[key]
+            if f == 'year':
+                return YearStringSampler(els, p, max_l0, rng)
+            if f == 'score':
+                return ScoreSampler(els, p, max_l0, rng)
+            if f == 'goals':
+                return GoalsSampler(els, p, max_l0, rng)
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
@@ -208,14 +291,22 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        lo = hi = None
+        boundaries = None
+        if key:
+            rng_spec = spec.get('ranges', {}).get(key)
+            if rng_spec:
+                lo, hi = rng_spec[0], rng_spec[1]
+            boundaries = spec.get('boundaries', {}).get(key)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, lo=lo, hi=hi, boundaries=boundaries)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), spec: dict = None, key: str = None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +316,13 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, spec=spec, key=key)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), spec: dict = None,
+                               key: str = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng,
+                      1 if column_meta.pk_pos else 0, max_l0, spec=spec, key=key)
     return [s.sample() for _ in range(n)]

@@ -7,6 +7,33 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+PARTY_POOL = ['Republican', 'Democratic', 'republican', 'Republican ']
+STATE_POOL = ['New York', 'Pennsylvania', 'new york', 'pennsylvania', 'Indiana', 'Minnesota', 'Tennessee']
+NAME_POOL = ['Dan Quayle', 'John Quayle', 'Al Quie', 'James M. Quigley', 'Jimmy Quillen',
+             'Jack Quinn', 'James L. Quinn', 'Dan Quayle', 'John Quayle']
+DATE_POOL = ['July 1942', 'October 1942', '1946', '1949', '1953', '1940', '1957', '1960', 'March 1948']
+LIFESPAN_POOL = ['1947-', '1868-1930', '1923-', '1918-', '1916-2003', '1951-', '1875-1960', '1900-1970']
+
+PARTY_WEIGHTED = ['Republican', 'Republican', 'Republican', 'Democratic', 'Democratic',
+                  'republican', 'Republican ']
+STATE_WEIGHTED = ['New York', 'New York', 'New York', 'Pennsylvania', 'Pennsylvania',
+                  'new york', 'pennsylvania', 'Indiana', 'Minnesota', 'Tennessee']
+
+_TEXT_SPEC = {
+    'party': (PARTY_WEIGHTED, 'enum'),
+    'state': (STATE_WEIGHTED, 'short'),
+    'name': (NAME_POOL, 'name'),
+    'date': (DATE_POOL, 'date'),
+    'lifespan': (LIFESPAN_POOL, 'lifespan'),
+}
+
+_NUM_RANGE = {
+    'votes': (0.0, 20000.0, False),
+    'vote_percent': (0.0, 100.0, False),
+    'seats': (0.0, None, False),
+    'place': (1.0, None, False),
+}
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -39,16 +66,28 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_s = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_s, hi_s)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
+
+    def _clamp(self, v):
+        if v < self.min:
+            v = self.min
+        if v > self.max:
+            v = self.max
+        return v
 
     def sample(self):
         r = self.rng
@@ -58,7 +97,7 @@ class NumberSampler(ColumnSampler):
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
-        d = 1 if self.is_int else 0.01
+        d = 1 if self.is_int else 0.1
         if r.random() < 1 / 6:
             v += d
         elif r.random() < 1 / 5:
@@ -67,7 +106,7 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._cast(self._clamp(v))
 
 
 class StringSampler(ColumnSampler):
@@ -104,6 +143,36 @@ class StringSampler(ColumnSampler):
                 v = v[:-1]
             else:
                 v = v[1:]
+        return v
+
+
+class PoolStringSampler(ColumnSampler):
+    """Spec-driven text sampler: draws from a fixed pool (with near-variants) and only occasionally perturbs."""
+
+    def __init__(self, pool: list, p: float, max_l0: float, rng, kind: str = 'short'):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.kind = kind
+
+    def _variant(self, v: str) -> str:
+        r = self.rng
+        u = r.random()
+        if u < 0.25:
+            return v.upper() if r.random() < 0.5 else v.lower()
+        if u < 0.5:
+            return v + ' '
+        if u < 0.7 and len(v) > 1:
+            return v[:-1]
+        if u < 0.85 and len(v) > 1:
+            return v[1:]
+        return v
+
+    def sample(self):
+        r = self.rng
+        if not self.elements:
+            return ''
+        v = r.choice(self.elements)
+        if r.random() < 0.35:
+            v = self._variant(v)
         return v
 
 
@@ -186,7 +255,11 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
+    cname = column.name.lower()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    if cname in _TEXT_SPEC and (t == '' or 'char' in t or 'text' in t or 'blob' in t):
+        pool, kind = _TEXT_SPEC[cname]
+        return PoolStringSampler(pool, p, max_l0, rng, kind)
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
@@ -208,7 +281,12 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        lo = hi = None
+        if cname in _NUM_RANGE:
+            rlo, rhi, _ = _NUM_RANGE[cname]
+            lo, hi = rlo, rhi
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, lo=lo, hi=hi)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)

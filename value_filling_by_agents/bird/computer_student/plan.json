@@ -1,55 +1,678 @@
 {
  "db": "computer_student",
- "operator_io_quirks": [
-  "Mixed-case table names: 'advisedBy', 'taughtBy' (camelCase) alongside lowercase 'course','person'; must double-quote in generated SQL.",
-  "advisedBy has a composite PK (p_id, p_id_dummy) AND a composite FK (p_id,p_id_dummy)->person(p_id,p_id) \u2014 the FK parent column list repeats p_id, so the FK is effectively (p_id,p_id_dummy)->(person.p_id, person.p_id); parent column 'p_id' is used twice.",
-  "advisedBy.p_id_dummy is a FK to person.p_id but is also a PK member; its distinct count (39) is far below person.p_id distinct (278) \u2014 FK values are a strict subset, not a permutation.",
-  "taughtBy.p_id samples include 279 and 415 which exceed person.p_id max (person has 278 rows, p_id samples 3..7) \u2014 FK values may reference non-existent parents in the original (dangling FK rows).",
-  "taughtBy.course_id distinct 113 < course.course_id distinct 132 \u2014 FK subset again; also taughtBy has 189 rows > 132 courses, so course_id repeats (many-to-one).",
-  "All columns notnull=0 (nullable) even PKs; no NOT NULL constraints declared \u2014 TS will not be forced to emit non-null.",
-  "No CHECK constraints, no UNIQUE indexes beyond PKs; 'checked' flag will be false for all columns.",
-  "person.professor and person.student are INTEGER with only 2 distinct values (0/1) \u2014 boolean-like stored as int, TS Number fuzzer will produce wide ints, not 0/1.",
-  "person.hasPosition / inPhase / yearsInProgram are TEXT but store enum-like tokens ('Faculty','Faculty_adj','Post_Quals','Year_2',...) plus '0' \u2014 String fuzzer will emit random charset strings, not these tokens.",
-  "course.courseLevel TEXT with 3 distinct 'Level_300/400/500' \u2014 enum-like text.",
-  "All declared types are INTEGER or TEXT; no Date/Time/Bool/Bit/Year dispatch \u2014 every column goes to Number or String fuzzer.",
-  "Small tables (132/278/113/189 rows) \u2014 no huge-table sampling concern; original_values fully readable."
- ],
- "operator_ts_expectations": [
-  "course_id, p_id, professor, student, p_id_dummy: Number fuzzer, scale from 'INTEGER' (no args -> scale 0, is_int True), range [-1,1] perturbed by +-1/+-2 \u2014 will produce tiny ints, mostly 0/1/-1, far from original 0..278.",
-  "courseLevel, hasPosition, inPhase, yearsInProgram: String fuzzer, length default 20, random charset a-zA-Z0-9() \u2014 will NOT reproduce 'Level_500','Faculty_adj','Year_10' tokens; FN risk on queries filtering these enums.",
-  "PK columns (course_id, p_id, composite PKs) get max_l0=inf (single) or 30 (composite) \u2014 fresh draws not capped, so PKs spread but Number range [-1,1] means heavy collisions -> sample_fresh_primary_keys drops many rows, shrinking tables below original sizes.",
-  "FK fill: advisedBy.p_id and p_id_dummy both drawn from person.p_id final values; taughtBy.course_id from course.course_id, taughtBy.p_id from person.p_id \u2014 consistent, but parent tables already shrunk by PK dedup, so FK cardinality collapses.",
-  "Composite PK (p_id,p_id_dummy) in advisedBy: both drawn independently from person.p_id, so many duplicate pairs -> heavy dedup, advisedBy may end up tiny.",
-  "Enum text columns: literal pool from train SQL may inject 'Faculty','Post_Quals' etc. as elements (p=0.2 fresh), giving partial coverage \u2014 but 80% fresh random strings break enum equality/IN filters -> FN.",
-  "Number fuzzer on professor/student (0/1) will emit values outside {0,1} -> queries like 'professor=1' may match wrong rows or none -> FP/FN.",
-  "No Date/Time columns, so no date-template quirks; no Bool/Bit dispatch.",
-  "Missing ties/duplicates: original has many-to-one (taughtBy 189 rows/113 courses, advisedBy 113/91 p_id) \u2014 TS dedup on PKs and unique columns may remove the duplicate multiplicity that aggregate queries (COUNT, GROUP BY) rely on -> FP on count-based gold.",
-  "Dangling FK in original (taughtBy.p_id=279,415) means original itself has rows with no parent; TS FK fill from parent values will NOT reproduce these -> queries relying on orphan rows differ.",
-  "String fuzzer contaminate (0.5) adds/removes chars -> enum tokens like 'Faculty' become 'FacultyX' etc., breaking exact-match filters."
- ],
- "challenger_refs": [
-  "G3",
-  "g75864c7e",
-  "G7",
-  "g2a4963a7",
-  "G4",
-  "g4c4852a0",
-  "g4c4852a0",
-  "g4c4852a0",
-  "g4c4852a0",
-  "g4c4852a0",
-  "g4c4852a0",
-  "g4c4852a0",
-  "G2",
-  "ga175492c",
-  "G1",
-  "G5"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers starting at 1; never NULL; no duplicates.",
+   "integer_fk": "Copy from the parent key pool (extended to include any boundary literals required for the child column); allow parent rows without children; no NULL unless the column is nullable; keep referential integrity; for composite-PK child tables, draw the non-grouping FK from a pool that excludes values already paired with the chosen grouping key so the composite PK stays unique.",
+   "integer_flag": "Uniform choice from {0, 1}.",
+   "integer_small": "Uniform integer in [0, 2].",
+   "text_enum": "Uniform choice from the column's enum list; occasionally emit a case variant (lower/upper) for LIKE near-variants.",
+   "text_short": "Random short token from a fixed pool of 5-12 distinct values.",
+   "nullable": "For each nullable column, ~5% of rows get NULL; at least one NULL row per instance; never plant NULL on NOT NULL / PK / FK columns; plant NULLs before group/ties/boundary planting so required structure is not erased.",
+   "boundary": "For numeric columns with listed literals, include the literal, literal-1 and literal+1; for FK child columns, extend the parent pool so the literals exist and inject them into the child.",
+   "duplicates": "For DISTINCT-target columns, ensure 20-50% duplicate share; applies to FK child columns too.",
+   "ties": "For ORDER/LIMIT-target columns, plant ties at the listed ranks in both ASC and DESC directions on the aggregated group counts of the actual grouping column (taughtBy.p_id, taughtBy.course_id); apply after the group structure is fixed and PK-deduped; verify by querying the written instance.",
+   "group_sizes": "Ensure groups of size 1, 2 and >=3 exist for GROUP BY-target columns; applies to FK child columns too.",
+   "aggregate_boundary": "For aggregate-target columns, construct groups straddling the listed HAVING thresholds (e.g. sizes 3 and 5 for COUNT(*), 4 and 5 for COUNT(col)) while preserving FK integrity; make the aggregate-group builder PK-aware so the non-grouping FK is drawn from a pool excluding already-used (grouping_key, other_fk) pairs; compute group counts on the final deduplicated row set and verify post-write that COUNT(*) and COUNT(DISTINCT taughtby.course_id) straddle the thresholds."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      17,
+      18,
+      19,
+      129,
+      130,
+      131
+     ]
+    }
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(course.course_id)"
+     ]
+    }
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "course",
+    "column": "course_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "course",
+    "column": "courseLevel",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Level_300",
+      "level_300",
+      "Level_400",
+      "level_400",
+      "Level_500",
+      "level_500",
+      "Level_0",
+      "level_0"
+     ]
+    }
+   },
+   {
+    "table": "course",
+    "column": "courseLevel",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "course",
+    "column": "courseLevel",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(course.course_id)"
+     ]
+    }
+   },
+   {
+    "table": "course",
+    "column": "courseLevel",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "person",
+    "column": "p_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      39,
+      40,
+      41,
+      49,
+      50,
+      51
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "p_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "person",
+    "column": "p_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "person",
+    "column": "p_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3,
+      5
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(taughtby.course_id)"
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "p_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "person",
+    "column": "professor",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "student",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "hasPosition",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Faculty_eme",
+      "faculty_eme",
+      "FACULTY_EME"
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "hasPosition",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "person",
+    "column": "hasPosition",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(taughtby.course_id)"
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "inPhase",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "0",
+      "Post_Quals",
+      "Post_Generals",
+      "Pre_Quals"
+     ]
+    }
+   },
+   {
+    "table": "person",
+    "column": "yearsInProgram",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Year_1",
+      "year_1",
+      "Year_2",
+      "year_2"
+     ]
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      39,
+      40,
+      41,
+      49,
+      50,
+      51
+     ]
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3,
+      5
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(taughtby.p_id)",
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4,
+      5
+     ]
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "course_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      10,
+      11,
+      12,
+      17,
+      18,
+      19
+     ]
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "course_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "taughtBy",
+    "column": "course_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(taughtby.course_id)"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "taughtBy.course_id",
+    "parent": "course.course_id",
+    "copied": []
+   },
+   {
+    "child": "taughtBy.p_id",
+    "parent": "person.p_id",
+    "copied": []
+   },
+   {
+    "child": "advisedBy.p_id",
+    "parent": "person.p_id",
+    "copied": []
+   },
+   {
+    "child": "advisedBy.p_id_dummy",
+    "parent": "person.p_id",
+    "copied": []
+   },
+   {
+    "unique": [
+     "course.course_id"
+    ]
+   },
+   {
+    "unique": [
+     "person.p_id"
+    ]
+   },
+   {
+    "unique": [
+     "taughtBy.course_id",
+     "taughtBy.p_id"
+    ]
+   },
+   {
+    "unique": [
+     "advisedBy.p_id",
+     "advisedBy.p_id_dummy"
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "course",
+    "column": "course_id",
+    "formula": "course_id >= 0"
+   },
+   {
+    "table": "course",
+    "column": "courseLevel",
+    "formula": "courseLevel IN ('Level_300','Level_400','Level_500')"
+   },
+   {
+    "table": "person",
+    "column": "professor",
+    "formula": "professor IN (0, 1)"
+   },
+   {
+    "table": "person",
+    "column": "student",
+    "formula": "student IN (0, 1)"
+   },
+   {
+    "table": "person",
+    "column": "hasPosition",
+    "formula": "hasPosition IN ('0','Faculty','Faculty_adj','Faculty_eme','Faculty_aff')"
+   },
+   {
+    "table": "person",
+    "column": "inPhase",
+    "formula": "inPhase IN ('0','Post_Quals','Post_Generals','Pre_Quals')"
+   },
+   {
+    "table": "person",
+    "column": "yearsInProgram",
+    "formula": "yearsInProgram IN ('0','Year_1','Year_2','Year_3','Year_5','Year_6','Year_7','Year_10','Year_4','Year_8','Year_9','Year_11')"
+   },
+   {
+    "table": "taughtBy",
+    "column": "course_id",
+    "formula": "course_id >= 0"
+   },
+   {
+    "table": "taughtBy",
+    "column": "p_id",
+    "formula": "p_id >= 0"
+   },
+   {
+    "table": "advisedBy",
+    "column": "p_id",
+    "formula": "p_id >= 0"
+   },
+   {
+    "table": "advisedBy",
+    "column": "p_id_dummy",
+    "formula": "p_id_dummy >= 0"
+   },
+   {
+    "table": "advisedBy",
+    "column": "p_id_dummy",
+    "formula": "p_id <> p_id_dummy",
+    "evidence": "added semantic constraint: no self-advising; not implied by schema"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "course": 40,
+   "person": 80,
+   "taughtBy": 60,
+   "advisedBy": 30
+  },
+  "null_targets": [
+   "course.courseLevel",
+   "person.professor",
+   "person.student",
+   "person.hasPosition",
+   "person.inPhase",
+   "person.yearsInProgram"
+  ],
+  "supporting_evidence": {
+   "course.courseLevel": "Observed values Level_500, Level_300, Level_400; distinct=3.",
+   "person.professor": "Observed values 0,1; distinct=2. Domain is exactly {0,1}; boundary literals -1/2 are comparison probes only and are never emitted as non-NULL values.",
+   "person.student": "Observed values 1,0; distinct=2. Domain is exactly {0,1}; boundary literals -1/2 are comparison probes only and are never emitted as non-NULL values.",
+   "person.hasPosition": "Observed values 0, Faculty, Faculty_adj, Faculty_eme, Faculty_aff; distinct=5.",
+   "person.inPhase": "Observed values 0, Post_Quals, Post_Generals, Pre_Quals; distinct=4.",
+   "person.yearsInProgram": "Observed values 0, Year_2, Year_5, Year_7, Year_10, Year_3, Year_1, Year_6; statistics report distinct=12, so the domain is extended to 12 values: the 8 observed plus Year_4, Year_8, Year_9, Year_11; case variants year_1/year_2 are boundary probes only.",
+   "advisedBy composite FK": "Schema declares foreign key (p_id, p_id_dummy) references person(p_id, p_id); since person.p_id is the PK, the tuple (p_id, p_id) is unique and the composite FK is satisfiable by drawing both child columns from person.p_id. The p_id <> p_id_dummy rule is an added semantic constraint (no self-advising), not implied by the schema."
+  },
+  "uncertainty": "advisedBy FK references person(p_id,p_id) which is not a declared unique tuple in person; treated as two independent FKs to person.p_id for generation (p_id and p_id_dummy each drawn from person.p_id, p_id <> p_id_dummy to avoid self-advising). This guarantees the composite tuple exists because person.p_id is unique. Nullable columns have null_rate 0.0 in stats but are declared nullable; NULLs are still planted per instruction 10. yearsInProgram distinct=12 in stats vs 8 observed values; domain extended to 12 values (Year_4, Year_8, Year_9, Year_11 added) with case variants as boundary probes only. person.inPhase is TEXT; numeric boundary targets [-1,0,1] from the atomic summary are dropped as contradictory with the TEXT enum domain, keeping only the TEXT enum plus '0'. person.professor/student boundary literals -1/2 are kept as sampling-domain boundary probes but the semantic rule restricts non-NULL values to IN (0,1); boundary probes outside the domain are not emitted as non-NULL values. taughtBy aggregate-group builder must be PK-aware to avoid duplicate (course_id, p_id) tuples; ties and aggregate thresholds must be verified on the written instance after dedup."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance`: after planting ties/duplicates/group-sizes per column, the code appends generated rows but never repairs cross-column FK consistency. `taughtBy.course_id`/`taughtBy.p_id` are filled with `rng.choice(pv)` from the parent pool, but the specification rule 'comparison_boundary' for `taughtBy.p_id` requires target values {39,40,41,49,50,51} \u2014 those literals must exist among generated `taughtBy.p_id` and correspond to actual `person.p_id`. The construction treats boundary planting only for independent columns (skips FK columns via `if (t, cm.name) in schema.fks: continue`), so `taughtBy.p_id`/`taughtBy.course_id` never receive planted boundary literals. Execution feedback reports `construction_pairs.separated = 59 / 175`, and the boundary pairs for FK columns are among the unresolved ones.",
+     "requested_revision": "In `instance.py`, for FK child columns that have entries in `_boundary_pool(spec, t, cm.name)`, either (a) ensure the parent pool contains the boundary values before sampling (extend `person.p_id` generator / PK generation so 39-41 and 49-51 and 17-19/129-131 exist), or (b) inject boundary values into the generated FK child column while keeping referential integrity by also emitting the corresponding parent rows. Do not just skip FK columns in the boundary-planting branch."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py also skips FK columns for `_plant_duplicates`, `_plant_group_sizes` and `_plant_nulls` \u2014 but the specification explicitly lists patterns for `taughtBy.p_id` (duplicates_for_distinct, group_sizes, aggregate_boundary, ties_for_order_limit), `taughtBy.course_id` (comparison_boundary, ties_for_order_limit, aggregate_boundary), `advisedBy.p_id` / `advisedBy.p_id_dummy` (duplicates_for_distinct). The code does run `_plant_ties`/`_plant_duplicates` after the FK fill loop, but the aggregate_boundary (COUNT > 3 and COUNT > 4) for `taughtBy.p_id` and `taughtBy.course_id` is never constructed. Table size 60 with duplicate trues random choice may not reliably produce groups of size \u2265 5. Execution feedback shows 175 eligible construction pairs with only 59 separated, and no aggregate-boundary separation reported.",
+     "requested_revision": "Add explicit construction of the aggregate boundaries for `taughtBy.p_id` and `taughtBy.course_id` (e.g. build counts that straddle both 3 and 4, i.e. groups of size 3 and 5 for `COUNT(*)`, 4 and 5 for `COUNT(taughtby.p_id)`), while preserving FK integrity (inject parent rows to match)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification forbids NULLs on `course.course_id`, `person.p_id`, `taughtBy.course_id`, `taughtBy.p_id`, `advisedBy.p_id`, `advisedBy.p_id_dummy` (not in null_targets, all PK/FK non-nullable). `fill_foreign_keys_consistently` returns `[None]*n` when a parent pool is empty \u2014 this would insert NULL into non-nullable FK columns. In practice pools are non-empty, but the fallback is a latent risk; also `_plant_nulls` is called for `None`-only columns (no guard on `if None in values`). More importantly, `sample_fresh_primary_keys` calls `_filter` on `columns` \u2014 if `cols` has been nulled via `_plant_nulls` on non-PK nullable columns, PK filtering is unaffected, but if `person.p_id` (a boundary target) is NULL-planted it would corrupt PKs. Code does skip `cm.pk_pos > 0`, so this is fine \u2014 noted as latent only.",
+     "requested_revision": "Guard `fill_foreign_keys_consistently` and the FK branch of `build_random_instance` against emitting NULL into non-nullable FK columns (raise or fall back to filling from an empty-parent seed instead of `None`)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` states: 'advisedBy FK references person(p_id,p_id) which is not a declared unique tuple in person; treated as FK to person.p_id'. The integrity constraint explicitly has `foreign key (p_id, p_id_dummy) references person (p_id, p_id)` \u2014 a composite FK to a non-declared-unique tuple. Generation fills `advisedBy.p_id` and `advisedBy.p_id_dummy` independently from `person.p_id`, which is not a valid row pair per the declared FK tuple. Execution feedback reports 0 fk_violations, but this may be because pair-constraint checking is not enforced. This is an unresolved semantic inconsistency between schema and behavior.",
+     "requested_revision": "Designer: clarify the intended referential semantics of `advisedBy` \u2014 is it (a) a composite FK requiring `(p_id, p_id_dummy)` to be a valid row in `person(p_id, p_id)` (impossible since PK is single-column), or (b) two independent FKs to `person.p_id`? Specification should state the actual generation rule and whether `p_id <> p_id_dummy` (self-advising) is permitted."
+    },
+    {
+     "agent": "designer",
+     "evidence": "`supporting_evidence.person.yearsInProgram` claims 'distinct=12' but `domains` lists 8 values (0, Year_1, Year_2, Year_3, Year_5, Year_6, Year_7, Year_10). The `yearsInProgram` boundary targets Year_1, year_1, Year_2, year_2 \u2014 case variants of two domains. This is consistent with the LIKE-near-variant rule but the 'distinct=12' figure is unexplained by the listed domains.",
+     "requested_revision": "Designer: reconcile `supporting_evidence` counts with `domains` (either extend `yearsInProgram` domain to include all 12 observed values, or explain the discrepancy)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.py` default `_DEFAULT` and the loaded specification.json are merged shallowly (`spec[k].update(v)`), so if `specification.json` lacks e.g. `tie_ranks['taughtBy.course_id']`, the default stands \u2014 but the code hard-codes dup/group keys (`course.courseLevel`, `person.p_id`, `taughtBy.p_id`, `advisedBy.p_id`, `advisedBy.p_id_dummy`) rather than reading `duplicates_for_distinct` from the spec. Group sizes are applied based on a hard-coded column list rather than `group_sizes` targets. This couples construction to specifics that the spec describes more generally.",
+     "requested_revision": "Read `duplicates_for_distinct`, `group_sizes`, `ties_for_order_limit` targets from the merged spec's per-column exceptions instead of the hard-coded list so the generated database faithfully tracks the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction separation is 59/175 (34%). The program produces valid instances (20/20 valid, 0 integrity violations, reproducible=true, nullable non-zero for all six nullable targets), so it runs cleanly, but a substantial fraction of the intended value-variation pairs (comparison boundaries on FK children, aggregate boundaries, group-size boundaries involving FK grouping) are not separated \u2014 consistent with the FK-skip bug above. Per instruction 4, missing separation alone does not prove generation error; the code-level cause (FK columns excluded from planting) is the actual defect.",
+     "requested_revision": "After fixing the FK-planting issue, re-run construction feedback and confirm separation improves meaningfully. Also verify aggregate boundary counts exist via a direct SQL audit (e.g. groups of size 3, 4, 5 for taughtBy.p_id / taughtBy.course_id)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether advisedBy composite FK against person(p_id,p_id) is intended as two independent single-column FKs or a genuine tuple constraint; the schema as written cannot satisfy a tuple constraint since person has single-column PK.",
+    "Whether `yearsInProgram` really should have 12 distinct values (supporting_evidence) vs 8 in `domains`.",
+    "Whether the `NULL 0/n` rule (instruction 7) applies to non-nullable columns that are not in `null_targets` \u2014 the feedback shows all six nullable targets have non-zero NULLs, so the note is informational only.",
+    "Long-term reproducibility across worker partitions \u2014 only seed=42, i0=0..20 was executed; larger i1 with multiprocessing was not independently verified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "All 20 construction executions failed with `IndexError('list index out of range')` (returncode 0 but n_ok=0, n_fail=20, n_instances=0, no construction pairs produced). The failure occurs before any instance is written, so no integrity, dependency, compact-preservation, or reproducibility evidence exists.",
+     "requested_revision": "Fix the IndexError so instances are produced. Likely cause: in `tscore_gen/instance.py` `_build_taughtby_aggregate_groups` and the `writer.py` row-assembly, columns produced by different code paths (`agg_rows`, samplers, `_plant_nulls`, `sample_fresh_primary_keys`/`drop_unique_duplicates` filtering) can end up with differing lengths; when `writer.py` builds `rows = [[cols[c][n_base + i] for c in names] for i in range(n_gen)]`, any column shorter than `n_total` (or `agg_rows` columns not covering all rows, or `drop_unique_duplicates`/PK-dedup shrinking some columns but not all after `_plant_nulls`/planting) triggers an index error. Ensure every column dict for a table has equal length after all planting/dedup steps, and that `inst[t]` (compact + generated) columns stay aligned. Re-run generation and confirm `n_ok > 0`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` declare `person.inPhase IN ('0','Post_Quals','Post_Generals','Pre_Quals')` and `person.yearsInProgram IN ('0','Year_1',...)` as TEXT enums, but the extracted atomic operations report `PRED(person.inphase <= 0)`, `PRED(person.inphase = 0)` with numeric targets `[-1,0,1]` and boundary values `[-1,0,1]` for `person.inPhase` in the default spec (`spec.py` boundary_values). Mixing numeric comparisons (`<= 0`) with TEXT domain values ('0','Post_Quals',...) is contradictory: on TEXT values `inphase <= 0` compares strings, so the intended numeric boundary (0, -1, 1) has no coherent meaning. Similarly `person.professor`/`person.student` boundary targets include `-1`/`2` while the domain formula is `IN (0,1)`.",
+     "requested_revision": "Reconcile the boundary targets with the declared domains. Either (a) drop the numeric `inPhase` boundary values `[-1,0,1]` and the `inphase <= 0` comparison targets, keeping only the TEXT enum domain plus `'0'`, or (b) declare `inPhase` as an integer flag with numeric domain and document that the enum values are not used. Likewise decide whether `professor`/`student` boundary literals `-1`/`2` are intended (contradicting `IN (0,1)`); if not, remove them from boundary_values so the specification is internally consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification requires per-column patterns including `comparison_boundary` literals be present (`literal, literal-1, literal+1`) and `ties_for_order_limit`, `group_sizes`, `aggregate_boundary` for FK-child columns (`taughtBy.p_id`, `taughtBy.course_id`). The implementation defers by construction but has known correctness gaps: (1) `_plant_ties` sets `values[r] = values[0]` for ranks but the target says ties at rank 1,3,5 on `COUNT(...)` \u2014 the code ties arbitrary positions, not the aggregate-count ranks, so rank ties on the aggregated grouping are not guaranteed. (2) `_plant_group_sizes` reuses `pool[i % len(pool)]` and truncates, which can destroy FK-distinct relationships and does not guarantee groups of size 1, 2 and >=3 for the *grouping* column when `group_targets` includes columns whose values were already FK-injected. (3) `_build_taughtby_aggregate_groups` only builds for `taughtBy` and only the first grouping column, leaving `taughtBy.course_id` aggregate boundaries (COUNT(DISTINCT) > 3) unaddressed. Since generation currently produces 0 instances, none of this is verifiable, but the code as written does not implement the aggregate/ties targets faithfully.",
+     "requested_revision": "After fixing the IndexError, rework the pattern planters to operate on grouped aggregates (compute group counts from the constructed multi-row table and adjust membership so COUNT(...) at the required ranks ties and straddles thresholds for both `taughtBy.p_id` and `taughtBy.course_id`, including COUNT(DISTINCT taughtby.course_id) > 3). Ensure FK values are drawn from the *extended* parent pool so injected boundary literals and referential integrity coexist, and that all columns of a row remain the same length through planting and dedup."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`advisedBy` FK is declared as `foreign key (p_id, p_id_dummy) references person (p_id, p_id)` \u2014 a composite FK to the (non-unique-per-column but tuple) person(p_id,p_id). The spec's `uncertainty` correctly notes this is odd; the program treats both as independent FKs to `person.p_id` and enforces `p_id <> p_id_dummy`. There is no explicit evidence the composite-FK semantics (tuple must exist in person(p_id,p_id)) are preserved; with independent sampling `p_id` and `p_id_dummy` each from `person.p_id` guarantees the tuple exists only because person PK is unique on `p_id`, so the composite target is trivially satisfied. This is acceptable but should be documented; also `tscore_gen/schema.py` maps composite FKs by iterating `pragma foreign_key_list` rows independently (`fks[(t, child)] = (pt, pc)`), which would overwrite the second column of a composite FK rather than treat it as a tuple \u2014 for `advisedBy` both rows map to `person.p_id`, so both child columns map to the same parent, which works here but is fragile.",
+     "requested_revision": "Document that composite FK `(p_id, p_id_dummy) -> person(p_id,p_id)` is generated as two independent single-column FKs to a unique `person.p_id`, guaranteeing the tuple. Optionally make `schema.py` FK handling composite-aware to avoid silent overwriting of composite FK columns. Re-run and confirm `advisedBy` rows are FK-valid with `p_id <> p_id_dummy`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The nullable-NULL rule (instruction 7) requires all six nullable columns (`course.courseLevel`, `person.professor`, `person.student`, `person.hasPosition`, `person.inPhase`, `person.yearsInProgram`) to receive generated NULLs (~5% share, at least one) per instance. `_plant_nulls` is called only when `_k(t, cm.name) in null_targets` and skips `pk_pos>0`/`notnull`/FK \u2014 okay \u2014 but it is applied *after* `_plant_group_sizes`/`_plant_duplicates`/`_plant_ties`, and then `sample_fresh_primary_keys`/`drop_unique_duplicates` may filter rows; whether at least one NULL survives per nullable column per instance cannot be verified because 0 instances were generated. Additionally, `course.courseLevel` is used as a group/ties target; replacing values with NULL after grouping plants can erase the planted group structure.",
+     "requested_revision": "After fixing generation, verify per instance that each nullable column has \u22651 NULL and a non-NULL row, and that the ~5% share matches compact share; ensure `_plant_nulls` runs in a way that does not erase required group/ties/boundary structure (e.g., plant NULLs first, then apply group/ties on non-NULL subsets, or reserve rows)."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was generated, so integrity constraints (PK uniqueness, composite unique tuples, FK validity), dependent-value consistency (FK child \u2286 parent pool), compact-row preservation, and reproducibility (deterministic seed per unit) could not be evaluated from execution evidence.",
+    "Presence of boundary literals, ties, group sizes, and aggregate boundaries in produced rows could not be verified because construction produced no output.",
+    "NULL share and at-least-one-NULL per nullable column per instance could not be verified.",
+    "`_plant_ties` semantics vs aggregate tie ranks (COUNT-based ties at rank 1/3/5) is suspect in code and needs runtime verification once generation works."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped = {taughtBy: 271, advisedBy: 5} out of rows_added {taughtBy: 816, advisedBy: 572}. The writer (writer.py) inserts generated rows with `INSERT INTO t VALUES (...)` and counts failures per row; 271/816 (~33%) of taughtBy rows and 5/572 of advisedBy rows fail. The spec requires taughtBy to have 60 generated rows per instance (table_sizes_per_instance), but ~13.5 rows/instance are silently dropped. This directly erodes the aggregate-boundary construction (COUNT(*) thresholds 2,3,4,5 and COUNT(DISTINCT course_id) > 3) and the group-size/ties planting, because the constructed group structure is computed in Python over rows that are then rejected by SQLite.",
+     "requested_revision": "Diagnose why taughtBy rows are rejected (most likely PK (course_id, p_id) duplicates from the aggregate-group builder assigning the same (gkey, other-FK) pair, or NULL in a NOT NULL FK column). Fix the construction so that the aggregate-group builder produces unique (course_id, p_id) tuples (e.g. dedupe within the builder or draw the non-grouping FK from a pool excluding already-used pairs), and ensure no NULL is emitted for NOT NULL FK columns. Re-run and confirm rows_skipped is 0 (or explain any residual skips as intentional)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_taughtby_aggregate_groups` builds rows for the grouping column `gcol` and fills other FK columns with `rng.choice(pools[c.name])` independently. For taughtBy the PK is (course_id, p_id); the builder assigns group keys round-robin and random p_id values, so the same (course_id, p_id) pair can repeat, violating the PK. `sample_fresh_primary_keys` is applied afterwards, but it only keeps the first occurrence of each PK tuple and drops the rest \u2014 which is exactly the 271 skipped rows. The aggregate thresholds are therefore computed on a row set that is then truncated, so the intended HAVING boundaries (COUNT(*) > 3, COUNT(DISTINCT course_id) > 3) are not guaranteed in the written instance.",
+     "requested_revision": "Make the aggregate-group builder PK-aware: when assigning the non-grouping FK column, exclude values that would duplicate an existing (gcol, other_col) pair, or construct the group sizes on the final deduplicated row set. Verify post-write that the taughtBy group counts actually straddle the thresholds (e.g. by querying the written instance) rather than only in the in-memory dict."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` states `person.professor IN (0,1)` and `person.student IN (0,1)`, but the atomic-operation targets list boundary values [0,1,2] for professor and [-1,0,1,2] for student. The spec's `uncertainty` note acknowledges this and marks -1/2 as probe-only. This is a genuine conflict between the observed boundary probes and the declared domain; the designer resolved it by restricting non-NULL values to {0,1}. That resolution is defensible, but the spec should state explicitly that the boundary probes for professor/student are *not* part of the value domain and that the domain is {0,1}.",
+     "requested_revision": "Clarify in the specification that person.professor and person.student domains are exactly {0,1} and that the -1/2 boundary literals are comparison probes only (never emitted). Optionally note that the observed data may contain only 0/1, so the boundary probes are synthetic."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `supporting_evidence` for person.yearsInProgram says distinct=12 in statistics but only 8 observed values, and the domain is 'extended to include case variants (year_1, year_2) and additional Year_N values to reach 12 distinct'. However the `domains` entry lists only 8 values: ['0','Year_1','Year_2','Year_3','Year_5','Year_6','Year_7','Year_10']. The stated extension to 12 distinct is not actually implemented in the domain list, and the boundary_values only add year_1/year_2 case variants. This is an internal inconsistency in the spec.",
+     "requested_revision": "Either (a) list the full 12-value domain in `domains` (including the additional Year_N values and case variants) so the spec matches its own supporting evidence, or (b) correct the supporting_evidence text to state that the domain is the 8 observed values plus case variants, and drop the claim of 12 distinct. The program should then sample from the corrected domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_aggregate_ties` is applied to raw column value lists (e.g. `cols[cm.name]` for taughtBy.p_id) *before* the rows are written, and it reassigns values between groups by scanning the list. But for taughtBy the grouping column is a FK and the PK is composite; reassigning a p_id value to a different group can create duplicate (course_id, p_id) pairs, which are then dropped by `sample_fresh_primary_keys`. The tie planting is therefore not reliably reflected in the written instance. Additionally, `_plant_aggregate_ties` is called for `course.course_id`, `person.p_id`, `course.courseLevel`, `person.hasPosition` \u2014 columns that are not the grouping column of the aggregate query in the atomic summary (which groups by taughtBy.p_id / taughtBy.course_id). Planting ties on the wrong column does not produce the required ORDER BY COUNT(...) ties.",
+     "requested_revision": "Apply tie planting to the *aggregate group counts* of the actual grouping column (taughtBy.p_id, taughtBy.course_id) after the group structure is fixed and PK-deduped, not to arbitrary column value lists. Remove tie_ranks entries for columns that are not aggregate grouping columns (course.course_id, course.courseLevel, person.hasPosition) unless there is evidence they are grouped on. Verify ties by querying the written instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `construction_pairs`: eligible=175, separated=58 (~33%). The spec's atomic operations list 175 pairs, and the program is supposed to construct instances that separate them. 58/175 is low; combined with the 271 skipped taughtBy rows, many aggregate/group/ties pairs are likely not separated because the constructed structure is destroyed at write time. This is consistent with the PK-dedup issue above.",
+     "requested_revision": "After fixing the PK-dedup and tie-planting issues, re-run and report the separated count. If it remains low, identify which pattern groups (aggregate_boundary, ties_for_order_limit, group_sizes) are not separated and adjust the construction accordingly. Do not request exceptions for individual query pairs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets `pragma foreign_keys = OFF` before inserting generated rows. This means FK violations in generated rows are not caught at write time; the integrity check reports fk_violations=0, but that is measured post-hoc, not enforced during generation. The spec requires 'keep referential integrity' for FK columns. While the post-hoc check passes, relying on it rather than enforcement means a bug in FK sampling (e.g. the `_extend_parent_pk` reserving PKs that are later not actually inserted as parent rows) could go undetected until the external check.",
+     "requested_revision": "Either enable `pragma foreign_keys = ON` during the generated-row insert (and handle failures explicitly), or add an in-program assertion that every generated FK value exists in the parent table's written rows. The current post-hoc check is acceptable as a safety net but should not be the only guard."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` notes: 'advisedBy FK references person(p_id,p_id) which is not a declared unique tuple in person; treated as two independent FKs to person.p_id for generation (p_id and p_id_dummy each drawn from person.p_id, p_id <> p_id_dummy to avoid self-advising).' The schema declares `foreign key (p_id, p_id_dummy) references person (p_id, p_id)`. Since person.p_id is the PK, the tuple (p_id, p_id) is unique, so the composite FK is satisfiable. The designer's treatment is correct, but the spec should state that the composite FK is satisfied by drawing both child columns from person.p_id (which is unique), and that p_id <> p_id_dummy is an additional semantic constraint (no self-advising) not implied by the schema.",
+     "requested_revision": "Document in the spec that the composite FK is satisfied because person.p_id is unique, and that the no-self-advising rule is an added semantic constraint. This is a documentation clarification, not a program change."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 271 skipped taughtBy rows are entirely due to PK (course_id, p_id) duplicates or also include NULL FK values \u2014 the writer counts failures but does not report the reason.",
+    "Whether the aggregate HAVING thresholds (COUNT(*) > 3, COUNT(DISTINCT course_id) > 3) are actually satisfied in the written instances after dedup \u2014 the construction is done in memory before dedup, and no post-write verification is reported.",
+    "Whether the tie planting on taughtBy.p_id / taughtBy.course_id survives the PK dedup \u2014 not verified.",
+    "The exact 12-value domain for person.yearsInProgram is not implemented; the spec is internally inconsistent."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped.advisedBy = 585 with skip_reasons.advisedBy = {\"other\": 585}, and rows_added.advisedBy = 0 across 20 instances. The writer classifies the error as 'other' (writer.py `_classify`), meaning the insert failed for a reason other than pk/unique/fk/notnull/check. Since advisedBy has only two INTEGER columns and a composite PK, the most likely cause is that the generated rows contain NULLs in p_id/p_id_dummy (the FK columns are not in `null_targets`, but `_equalize` pads with None and the aggregate/independent samplers can leave None), or that the composite-PK dedup in `sample_fresh_primary_keys` is not applied because `advisedBy` has a composite PK and the code path only handles single-column PKs. Either way, zero advisedBy rows are ever added, so the specification's table_sizes_per_instance.advisedBy = 30 and the advisedBy patterns (duplicates_for_distinct on p_id and p_id_dummy, no-self-advising) are never realized.",
+     "requested_revision": "Fix the advisedBy construction so that generated rows are actually inserted: ensure p_id and p_id_dummy are non-NULL (they are FK columns and must not be NULL), and make the composite-PK dedup (`sample_fresh_primary_keys`) work for the (p_id, p_id_dummy) tuple. Add a post-write assertion that rows_added.advisedBy > 0 and that skip_reasons.advisedBy is empty. Re-run and confirm rows_added.advisedBy \u2248 30 per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped.taughtBy = 168 with skip_reasons.taughtBy = {\"unique\": 168}. The taughtBy table has composite PK (course_id, p_id). The aggregate-group builder `_build_taughtby_aggregate_groups` is PK-aware for the non-grouping FK, but the subsequent `_plant_ties_on_group_counts` reassigns the grouping column (`rows[gcol] = new_keys`) without re-checking the (course_id, p_id) uniqueness, and `_plant_duplicates` / `_plant_group_sizes` on taughtBy.p_id and taughtBy.course_id can also create duplicate (course_id, p_id) pairs. The writer then drops 168 rows as 'unique' skips, so the intended aggregate-boundary and tie structure is partially erased after construction.",
+     "requested_revision": "Make the tie/duplicate/group-size planting on taughtBy PK-aware end-to-end: after any reassignment of course_id or p_id, re-verify that (course_id, p_id) pairs remain unique (e.g. re-run the composite-PK dedup or restrict reassignment to rows whose new pair is unused). Add a post-write check that skip_reasons.taughtBy is empty and that the aggregate thresholds (COUNT(*) and COUNT(DISTINCT course_id) straddling 3/4/5) still hold on the written instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `advisedBy.p_id_dummy: p_id <> p_id_dummy` with evidence 'added semantic constraint: no self-advising; not implied by schema'. The schema only declares a composite FK (p_id, p_id_dummy) -> person(p_id, p_id); it does not forbid p_id = p_id_dummy. The specification itself flags this as an added constraint, not a supported rule. The atomic-operation summary for advisedBy.p_id_dummy lists only duplicates_for_distinct and minor patterns (unmatched_join_rows, aggregate_boundary, null_in_count_column) \u2014 no comparison_boundary or self-advising evidence.",
+     "requested_revision": "Either (a) remove the `p_id <> p_id_dummy` rule from semantic_rules_and_formulas and from the program (`advisedby_no_self`), or (b) mark it explicitly as an uncertain/optional pattern rather than a supported semantic rule, and document that it is not derived from the schema or the atomic-operation evidence. Do not enforce it as a hard constraint in the generator unless it is reclassified as a supported rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` states: 'advisedBy FK references person(p_id,p_id) which is not a declared unique tuple in person; treated as two independent FKs to person.p_id for generation'. The schema declares `foreign key (p_id, p_id_dummy) references person (p_id, p_id)`. Since person.p_id is the PK, the tuple (p_id, p_id) is trivially unique, so the composite FK is satisfiable by drawing both child columns from person.p_id \u2014 the specification's own supporting_evidence says this. The 'uncertainty' note is therefore misleading and could lead the engineer to treat the FK as two independent FKs, which is what the program does (`schema.fks` maps both child columns to person.p_id independently). This is acceptable for generation but should be stated as a deliberate simplification, not as an unresolved uncertainty.",
+     "requested_revision": "Rewrite the `uncertainty` note to state clearly that the composite FK is satisfiable because person.p_id is the PK, and that the generator deliberately treats it as two independent FKs to person.p_id (with the no-self-advising rule if retained). Remove the claim that the tuple is 'not a declared unique tuple'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs separated = 55 / 175 eligible, with construction_pairs_by_group empty. The specification's per_column_exceptions list 30+ patterns (comparison_boundary, ties_for_order_limit, group_sizes, aggregate_boundary, duplicates_for_distinct, unmatched_join_rows) across course, person, taughtBy, advisedBy. Only 55 pairs are separated, and the by-group breakdown is empty, so it is not possible to verify which patterns are actually realized. In particular, the aggregate_boundary targets for taughtBy.p_id (COUNT(taughtby.p_id) > 4, COUNT(*) > 3) and taughtBy.course_id (COUNT(DISTINCT taughtby.course_id) > 3) are not confirmed by the feedback.",
+     "requested_revision": "Add per-pattern verification to the execution feedback (populate construction_pairs_by_group) so that each specified pattern (comparison_boundary, ties_for_order_limit, group_sizes, aggregate_boundary, duplicates_for_distinct, unmatched_join_rows) is confirmed on the written instances. In particular, verify post-write that taughtBy group counts straddle the HAVING thresholds for both grouping columns and that ties exist at the listed ranks in both ASC and DESC directions."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows NULL counts for course.courseLevel (77/740), person.hasPosition (142/1019), person.inPhase (147/1019), person.professor (147/1019), person.student (153/1019), person.yearsInProgram (150/1019). The NULL share is ~10-15%, not the specified null_share = 0.05. The program's `_plant_nulls` uses `_null_share(spec)` = 0.05, but the independent samplers also emit None (e.g. `_equalize` pads with None, and `_init_sampler` can produce None via `rng.choices` of original values that include None). The result is a NULL share roughly 2-3x the specified 5%.",
+     "requested_revision": "Ensure the NULL share on generated rows matches the specified null_share (0.05) by (a) not padding with None in `_equalize` for nullable columns that already have values, and (b) filtering None out of the independent sampler's element pool for nullable columns before `_plant_nulls` is applied. Verify post-write that the NULL share per nullable column is \u2248 5% and that at least one NULL row exists per nullable column."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 55/175 separated construction pairs cover all specified patterns; the by-group breakdown is empty in the feedback.",
+    "Whether the taughtBy aggregate thresholds (COUNT(*) and COUNT(DISTINCT course_id) straddling 3/4/5) hold on the written instances after the 168 'unique' skips.",
+    "Whether the advisedBy no-self-advising rule is intended as a supported rule or an optional pattern (designer decision needed).",
+    "Whether the NULL share deviation (10-15% vs 5%) is acceptable given the interface rule that NULL share should follow the compact database's share."
+   ]
+  }
+ ]
 }

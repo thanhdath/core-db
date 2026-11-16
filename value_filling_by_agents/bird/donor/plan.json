@@ -1,56 +1,1163 @@
 {
  "db": "donor",
- "operator_io_quirks": [
-  "Huge tables: projects 664k, donations 3.1M, resources 3.7M rows; read_schema must rowid-sample (max_rows_per_table) and never copy rows into units.",
-  "essays has NO primary key and NO FK declared, yet its projectid values match projects.projectid (implicit join key); TS treats it as a free String column.",
-  "projects.projectid is declared TEXT PK but distinct=200000 < rows=664098: PK is NOT unique in the original data (duplicate projectids exist).",
-  "donations.donationid / resources.resourceid declared TEXT PK, distinct=200000 < rows: same non-unique-PK situation; sample_fresh_primary_keys will drop many rows.",
-  "FKs: donations.projectid -> projects.projectid and resources.projectid -> projects.projectid, both parent_exists=true, but parent is non-unique so FK fill draws from a filtered parent column.",
-  "date_posted declared DATE, storage text, format 'YYYY-MM-DD' (e.g. 2014-05-12); ts_fuzzer dispatch = Date|Number(int elements) because first element parses as int? (it does not; expect Date with %Y-%m-%d template).",
-  "donation_timestamp declared DATETIME, storage text, format 'YYYY-MM-DD HH:MM:SS.mmm' (millisecond suffix); Date template set has no %f, so parsed template likely %Y-%m-%d and time part is lost/odd.",
-  "school_zip declared INTEGER but values are 5-digit zips (93662); Number fuzzer will produce ints in [-10^scale,10^scale] unrelated to zip semantics.",
-  "school_latitude/longitude REAL with negative longitudes; Number fuzzer range is symmetric so sign is fine but magnitude (e.g. 1e4) is implausible.",
-  "Many TEXT columns are boolean-like 't'/'f' (school_charter, school_magnet, is_teacher_acct, eligible_*_match, payment_included_*, via_giving_page, for_honoree, ...): declared TEXT so String fuzzer, not Bool.",
-  "dollar_amount TEXT with values 'under_10','10_to_100','100_and_up' (underscore enum); String fuzzer will not reproduce these tokens unless in literal pool.",
-  "fulfillment_labor_materials REAL has distinct=1 (constant 30.0); Number fuzzer will scatter it, breaking any equality/aggregate assumption.",
-  "High null rates: donor_zip 0.555, donor_city 0.479, secondary_focus_* 0.318, donation_message 0.258, donor_state 0.196, school_metro 0.132; TS does not enforce NOT NULL so nulls appear only via sampler dropout.",
-  "teacher_prefix includes empty string '' as a value; String fuzzer treats '' as an element and may perturb it.",
-  "essays.title/short_description/essay are long free text (truncated in samples); String fuzzer length range from min/max element length can be large."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all TEXT columns: random a-zA-Z0-9() strings of length in [min,max] of sampled elements, plus 50% contaminate (prefix/suffix/drop char) -> implausible names, cities, states, enum tokens.",
-  "Date fuzzer for date_posted with template %Y-%m-%d (first parsable element), range from min/max parsed dates (~2014); fresh dates uniform in that range, so dates cluster in 2014 only.",
-  "Date fuzzer for donation_timestamp: template likely %Y-%m-%d (no %f in template set), so generated timestamps lose the millisecond part and may not match original format exactly.",
-  "Number fuzzer for school_zip, students_reached, vendorid, item_quantity, school_latitude/longitude, all REAL money columns: uniform in [-10^scale,10^scale] (scale from type args, default 0 for INTEGER -> [-1,1] then perturbed +-1/+-2), so zips become tiny ints and money becomes huge/negative.",
-  "Number fuzzer for REAL money columns: scale=0 default (no (a,b) args in DDL) -> range [-1,1], perturbed by +-0.01/+-0.02, so donation_total etc. become ~0 values, not 10-1000.",
-  "String fuzzer for boolean-like 't'/'f' TEXT columns: elements are 't','f' so sampler mostly returns 't'/'f' with 50% contaminate -> occasional 'tX'/'fY' garbage; misses on WHERE col='t' still mostly hit.",
-  "String fuzzer for dollar_amount: elements 'under_10','10_to_100','100_and_up' -> sampler returns these plus contaminate; equality predicates on these tokens mostly hit.",
-  "String fuzzer for school_state (51 distinct 2-letter codes): elements are 2-char strings, length range [2,3], so generated states are 2-3 random chars, not real state codes -> FN on state filters.",
-  "String fuzzer for school_metro (3 values urban/rural/suburban): elements length 5-8, sampler returns them with contaminate; equality mostly hits, LIKE '%urban%' may miss.",
-  "FK fill: donations.projectid and resources.projectid draw from projects.projectid AFTER PK dedup (200k distinct), so FK values are valid but only 200k of 664k original projectids appear; essays.projectid is NOT an FK so it gets random strings unrelated to projects -> joins essays-projects return 0 rows (FN).",
-  "PK dedup on projects/donations/resources drops ~70% of rows (distinct 200k vs rows 664k/3.1M/3.7M), so table sizes shrink drastically vs choose_table_sizes target; joins still work but cardinalities differ.",
-  "essays has no PK so no dedup; its projectid is random String -> any query joining essays to projects on projectid returns empty (FN).",
-  "fulfillment_labor_materials constant 30.0 in original; Number fuzzer scatters it -> queries filtering on that value (if any) miss (FN).",
-  "High-null columns (donor_zip 0.555, donor_city 0.479): TS does not enforce null rate, so nulls appear only via 10% element dropout and p-fresh draws; IS NULL / IS NOT NULL predicates may flip (FP/FN).",
-  "String fuzzer for long text (essay, short_description, need_statement): length range from min/max element length (up to ~40 chars in samples) -> generated text is short random strings, so LIKE '%keyword%' predicates miss (FN)."
- ],
- "challenger_refs": [
-  "G11",
-  "G10",
-  "G16",
-  "G13",
-  "G7",
-  "G8",
-  "G1",
-  "G15",
-  "G3",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_identifier": "32-char lowercase hex string; primary keys unique; foreign keys drawn from parent pool; NULL share per column statistics where nullable; no orphan values (FK integrity preserved)",
+   "text_short_enum": "sample from the observed value pool for the column; include near-variants (case flip, trailing x, one-char substitution) at 5% of rows",
+   "text_free": "sample from observed pool with 10% fresh near-duplicate variants; NULL share per column statistics",
+   "text_long": "sample from observed pool; 5% near-duplicate variants; NULL share per column statistics",
+   "real_amount": "non-negative REAL rounded to 2 decimals; range from statistics; NULL share per column statistics where nullable",
+   "real_coordinate": "REAL in [-180,180] for longitude, [-90,90] for latitude; 20-50% duplicate share",
+   "integer_count": "positive INTEGER; 20-50% duplicate share; NULL share per column statistics where nullable",
+   "integer_zip": "5-digit INTEGER in [10000,99999]",
+   "date_iso": "DATE formatted %Y-%m-%d; 20-50% duplicate share",
+   "datetime_iso": "DATETIME formatted %Y-%m-%d %H:%M:%S.%f",
+   "flag_tf": "TEXT IN ('t','f')",
+   "near_variant": "for each listed literal L: include L, L||'x', lower(L), and one-char-substituted variant; for LIKE targets also include L||'%'; apply in both enum and generic sampling branches",
+   "boundary": "for each listed literal L: include L, one step below, one step above (numbers by step, dates by one day); for text literals use case variants (L, lower(L), upper(L)); apply in both enum and generic sampling branches",
+   "null_share": "each nullable column gets at least one NULL row; share follows column statistics",
+   "duplicates_for_distinct": "20-50% of rows share a value with another row; apply after near-variant injection and re-check after NULL planting",
+   "ties_for_order_limit": "at least two rows tie at the top ranks of the ORDER column",
+   "unmatched_join_rows": "for each nullable FK: ~5% NULL values only (no orphan values, to preserve declared FK constraints); ensure some parent rows have no children by not referencing them"
+  },
+  "per_column_exceptions": [
+   {
+    "column": "essays.title",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Too Close for Comfort",
+     "Future Einsteins Of America",
+     "Virtual Aquarium Needs Help!",
+     "Creating Memories and Inspiring Dreams",
+     "Creating Memories and Inspiring Dreams%",
+     "Reading About Other Cultures"
+    ]
+   },
+   {
+    "column": "projects.school_city",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Brooklyn",
+     "Los Angeles",
+     "Abington"
+    ]
+   },
+   {
+    "column": "projects.school_city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Los Angeles",
+     "los angeles",
+     "LOS ANGELES"
+    ]
+   },
+   {
+    "column": "projects.teacher_prefix",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Dr.",
+     "Dr.%"
+    ]
+   },
+   {
+    "column": "projects.teacher_prefix",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "projects.grade_level",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "resources.vendor_name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Amazon"
+    ]
+   },
+   {
+    "column": "projects.projectid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "resources.projectid",
+     "donations.projectid"
+    ]
+   },
+   {
+    "column": "resources.projectid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "projects.projectid",
+     "essays.projectid",
+     "donations.projectid"
+    ]
+   },
+   {
+    "column": "donations.projectid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "projects.projectid",
+     "resources.projectid"
+    ]
+   },
+   {
+    "column": "projects.schoolid",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "projects.poverty_level",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "projects.school_year_round",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "projects.teacher_acctid",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "donations.donation_total",
+    "pattern": "null_rows",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "donations.donation_message",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "projects.school_latitude",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "projects.school_longitude",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "projects.date_posted",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "resources.item_quantity",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "projects.total_price_including_optional_support",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "donations.projectid",
+    "parent": "projects",
+    "parent_column": "projectid",
+    "copied": []
+   },
+   {
+    "child": "resources.projectid",
+    "parent": "projects",
+    "parent_column": "projectid",
+    "copied": []
+   },
+   {
+    "child": "essays.projectid",
+    "parent": "projects",
+    "parent_column": "projectid",
+    "copied": [
+     "teacher_acctid"
+    ]
+   },
+   {
+    "child": "essays.teacher_acctid",
+    "parent": "projects",
+    "parent_column": "teacher_acctid",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "projects",
+    "column": "projectid",
+    "formula": "length(projectid) = 32"
+   },
+   {
+    "table": "donations",
+    "column": "donationid",
+    "formula": "length(donationid) = 32"
+   },
+   {
+    "table": "resources",
+    "column": "resourceid",
+    "formula": "length(resourceid) = 32"
+   },
+   {
+    "table": "essays",
+    "column": "projectid",
+    "formula": "length(projectid) = 32"
+   },
+   {
+    "table": "projects",
+    "column": "school_latitude",
+    "formula": "school_latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "projects",
+    "column": "school_longitude",
+    "formula": "school_longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "projects",
+    "column": "school_zip",
+    "formula": "school_zip BETWEEN 10000 AND 99999"
+   },
+   {
+    "table": "projects",
+    "column": "students_reached",
+    "formula": "students_reached > 0"
+   },
+   {
+    "table": "projects",
+    "column": "total_price_excluding_optional_support",
+    "formula": "total_price_excluding_optional_support >= 0"
+   },
+   {
+    "table": "projects",
+    "column": "total_price_including_optional_support",
+    "formula": "total_price_including_optional_support >= total_price_excluding_optional_support"
+   },
+   {
+    "table": "projects",
+    "column": "fulfillment_labor_materials",
+    "formula": "fulfillment_labor_materials >= 0"
+   },
+   {
+    "table": "projects",
+    "column": "school_charter",
+    "formula": "school_charter IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_magnet",
+    "formula": "school_magnet IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_year_round",
+    "formula": "school_year_round IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_nlns",
+    "formula": "school_nlns IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_kipp",
+    "formula": "school_kipp IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_charter_ready_promise",
+    "formula": "school_charter_ready_promise IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "teacher_teach_for_america",
+    "formula": "teacher_teach_for_america IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "teacher_ny_teaching_fellow",
+    "formula": "teacher_ny_teaching_fellow IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "eligible_double_your_impact_match",
+    "formula": "eligible_double_your_impact_match IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "eligible_almost_home_match",
+    "formula": "eligible_almost_home_match IN ('t','f')"
+   },
+   {
+    "table": "projects",
+    "column": "school_metro",
+    "formula": "school_metro IN ('urban','rural','suburban')"
+   },
+   {
+    "table": "projects",
+    "column": "poverty_level",
+    "formula": "poverty_level IN ('highest poverty','high poverty','moderate poverty','low poverty')"
+   },
+   {
+    "table": "projects",
+    "column": "grade_level",
+    "formula": "grade_level IN ('Grades PreK-2','Grades 3-5','Grades 6-8','Grades 9-12')"
+   },
+   {
+    "table": "projects",
+    "column": "resource_type",
+    "formula": "resource_type IN ('Books','Technology','Other','Supplies','Visitors','Trips')"
+   },
+   {
+    "table": "projects",
+    "column": "teacher_prefix",
+    "formula": "teacher_prefix IN ('Mrs.','Mr.','Ms.','Dr.','Mr. & Mrs.','')"
+   },
+   {
+    "table": "donations",
+    "column": "is_teacher_acct",
+    "formula": "is_teacher_acct IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "donation_included_optional_support",
+    "formula": "donation_included_optional_support IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "payment_included_acct_credit",
+    "formula": "payment_included_acct_credit IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "payment_included_campaign_gift_card",
+    "formula": "payment_included_campaign_gift_card IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "payment_included_web_purchased_gift_card",
+    "formula": "payment_included_web_purchased_gift_card IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "payment_was_promo_matched",
+    "formula": "payment_was_promo_matched IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "via_giving_page",
+    "formula": "via_giving_page IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "for_honoree",
+    "formula": "for_honoree IN ('t','f')"
+   },
+   {
+    "table": "donations",
+    "column": "dollar_amount",
+    "formula": "dollar_amount IN ('under_10','10_to_100','100_and_up')"
+   },
+   {
+    "table": "donations",
+    "column": "payment_method",
+    "formula": "payment_method IN ('no_cash_received','creditcard','paypal','amazon','promo_code_match','check','double_your_impact_match','almost_home_match')"
+   },
+   {
+    "table": "donations",
+    "column": "donation_to_project",
+    "formula": "donation_to_project >= 0"
+   },
+   {
+    "table": "donations",
+    "column": "donation_optional_support",
+    "formula": "donation_optional_support >= 0"
+   },
+   {
+    "table": "donations",
+    "column": "donation_total",
+    "formula": "donation_total = donation_to_project + donation_optional_support",
+    "condition": "donation_included_optional_support = 't'",
+    "evidence": "rows: 42.5+7.5=50.0; 26.83+4.73=31.56; 8.5+1.5=10.0"
+   },
+   {
+    "table": "donations",
+    "column": "donation_total",
+    "formula": "donation_total = donation_to_project",
+    "condition": "donation_included_optional_support = 'f'",
+    "evidence": "row 5: 20.0+0.75=20.75 but total 20.0 with included_optional_support='f'"
+   },
+   {
+    "table": "resources",
+    "column": "item_unit_price",
+    "formula": "item_unit_price >= 0"
+   },
+   {
+    "table": "resources",
+    "column": "item_quantity",
+    "formula": "item_quantity > 0"
+   },
+   {
+    "table": "resources",
+    "column": "project_resource_type",
+    "formula": "project_resource_type IN ('Books','Technology','Other','Supplies','Visitors','Trips')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "projects": 200,
+   "essays": 200,
+   "donations": 400,
+   "resources": 400
+  },
+  "null_targets": [
+   "projects.schoolid",
+   "projects.poverty_level",
+   "projects.school_year_round",
+   "projects.teacher_acctid",
+   "projects.school_metro",
+   "projects.secondary_focus_subject",
+   "projects.secondary_focus_area",
+   "projects.fulfillment_labor_materials",
+   "projects.school_ncesid",
+   "donations.donation_total",
+   "donations.donation_message",
+   "donations.donor_city",
+   "donations.donor_state",
+   "donations.donor_zip",
+   "resources.vendorid",
+   "resources.vendor_name",
+   "resources.item_name",
+   "resources.item_number",
+   "resources.item_unit_price",
+   "resources.item_quantity",
+   "essays.need_statement"
+  ],
+  "supporting_evidence": {
+   "donation_total_formula": [
+    "42.5+7.5=50.0",
+    "26.83+4.73=31.56",
+    "8.5+1.5=10.0"
+   ],
+   "donation_total_conditional": [
+    "20.0+0.75=20.75 but total=20.0 with included_optional_support='f'"
+   ],
+   "total_price_order": [
+    "653.89 >= 555.81",
+    "348.79 >= 296.47",
+    "506.93 >= 430.89"
+   ]
+  },
+  "uncertainty": "FK integrity is preserved: nullable FKs (donations.projectid, resources.projectid, essays.projectid) receive NULL values only, never orphan values, so declared foreign key constraints hold. Parent rows without children are obtained by leaving some projects unreferenced. essays.projectid must be drawn from the projects.projectid pool so essays.teacher_acctid can be copied from the matching project (non-orphan rows get non-NULL teacher_acctid; NULL only where the parent teacher_acctid is NULL). donation_total formula holds only when optional support is included; conditional variant covers the other case. Derived formulas are asserted only for non-NULL operands (SQL three-valued logic); planted NULLs are never replaced. Some enum pools (payment_method, resource_type) may have additional values not shown in the sample. school_metro NULL share 12.2% observed."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with ValueError('empty range for randrange() (370, 231, -139)'). The traceback originates in NumberSampler.sample() in values.py: `v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) ...)` where lo/hi come from `(self.list_min, self.list_max)` when not full. In NumberSampler.__init__, `self.list_max = min(self.max, _MAX)` is set to the global max (e.g. 10**scale) rather than the observed list max, while `self.list_min = min(self.elements)`. When the observed minimum (e.g. 370) exceeds the capped global max (e.g. 231), randint(370, 231) raises. This is the documented 'list_max overwrite quirk' but it is not guarded, so generation produces zero instances.",
+     "requested_revision": "Guard the range in NumberSampler.sample(): if int(lo) > int(hi), swap or fall back to the full range (self.min, self.max), or set list_max = max(list_min, min(self.max, _MAX)). Ensure every unit builds and writes successfully (n_fail == 0) before re-submitting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_spec_size` computes `lo = max(0, base - 30)`, `hi = min(230, base + 30)` and returns `rng.randint(lo, hi)`. For projects/essays base=200 -> hi=230, lo=170 (ok); for donations/resources base=400 -> hi=min(230,430)=230, lo=370 -> randint(370,230) is an empty range. This is a second, independent source of the same ValueError and also contradicts the specification's table_sizes_per_instance (donations=400, resources=400): the cap of 230 silently shrinks those tables to at most 230 rows.",
+     "requested_revision": "Remove the hard-coded 230 cap (or make it base-relative, e.g. hi = base + 30) so that donations and resources are generated at ~400 rows as specified, and so lo <= hi always holds."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` with no orig_path, so the branch `if orig_path is None or not os.path.exists(orig_path)` re-creates the schema from DDL and inserts only the generated rows. The specification and the module docstring state generated rows are appended to a copy of the compact database ('The compact rows are never deleted or changed; generated rows are appended'). With orig_path=None the compact rows are not preserved, so the instance is not the compact DB plus generated rows.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the worker args and call write_instance_sqlite(schema, inst, p, orig_path=orig)) so the compact rows are copied and preserved, and generated rows are appended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.build_random_instance calls `_apply_nulls` after `_derive_projects`/`_derive_donations`, but `_derive_projects` sets incl[i] = e + opt only when excl[i] is not None; if `_apply_nulls` later nulls total_price_excluding_optional_support the incl value remains, which is fine, but the reverse (nulling incl) leaves excl set \u2014 acceptable under three-valued logic. However `_derive_donations` writes `total[i]` for every i including rows where `donation_total` will subsequently be nulled by `_apply_nulls`; that is consistent with 'planted NULL never replaced'. The real gap: `_apply_nulls` is applied to `donation_total` (share 0.10) but the formula `donation_total = donation_to_project + donation_optional_support` is only enforced for non-NULL operands, which is satisfied. No blocking issue here, but note `_derive_essays` sets teacher_acctid from the project map and then `_apply_nulls` may null it \u2014 consistent. Flagging only that `_derive_projects` does not enforce `total_price_including_optional_support >= total_price_excluding_optional_support` when excl is NULL but incl is non-NULL (rule holds vacuously under 3VL, acceptable).",
+     "requested_revision": "No change required for 3VL; confirm in a comment that derived formulas are only asserted for non-NULL operands."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic rule for donations.donation_total gives two formulas: `donation_total = donation_to_project + donation_optional_support` and, conditionally, `donation_total = donation_to_project` when `donation_included_optional_support = 'f'`. The evidence row (20.0 + 0.75 = 20.75 but total 20.0 with included_optional_support='f') supports the conditional. The program implements both in `_derive_donations`. This is consistent, but the specification's `uncertainty` field admits the formula 'holds only when optional support is included'; the conditional is the correct reading. No blocking issue.",
+     "requested_revision": "None; keep the conditional formula as the authoritative rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists `projects.teacher_prefix` enum including '' (empty string) and near-variant targets ['Dr.','Dr.%']. The program's `_NEAR_VARIANTS` for teacher_prefix only lists ['Dr.'] and `_near_variants` produces 'Dr.', 'Dr.x', 'dr.', one-char-sub. The literal 'Dr.%' (a LIKE pattern) is not represented as a distinct target; the '%' is stripped by StringSampler but teacher_prefix is an enum column so the '%' literal is not generated. This is a minor coverage gap, not blocking.",
+     "requested_revision": "Optionally add 'Dr.%' handling (e.g. include a value containing '%' or document that LIKE patterns are covered by the 'Dr.' prefix)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_dup_share` is applied to `_DUP_SHARE` columns including `donations.donation_message`, but `donation_message` is also in `_NULL_SHARE` (0.259). `_apply_nulls` runs after `_build_column_values`, so duplicates are planted then some are nulled; the resulting duplicate share among non-NULL values may fall below 20%. Similarly `projects.teacher_prefix` is in `_DUP_SHARE` and `_NEAR_VARIANTS`; near-variant injection overwrites random positions after duplicate planting is not applied (teacher_prefix is enum branch, not `_DUP_SHARE` branch \u2014 actually teacher_prefix is in `_ENUMS` so `_DUP_SHARE` is never applied to it). This means the `duplicates_for_distinct` target for teacher_prefix (20-50%) is not implemented.",
+     "requested_revision": "Apply `_apply_dup_share` to enum columns listed in `_DUP_SHARE` (teacher_prefix) after near-variant injection, and re-check duplicate share after NULL planting for donation_message."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_column_values` handles `_DUP_SHARE` columns by sampling then `_apply_dup_share`, but `projects.date_posted` and `projects.grade_level` are in `_DUP_SHARE`; grade_level is also in `_ENUMS`, so the enum branch is taken and `_DUP_SHARE` is never applied. date_posted is not in `_ENUMS`/`_HEX32`/etc., so it falls to the generic sampler branch and `_DUP_SHARE` is not applied either (the `elif key in _DUP_SHARE` is only reached if none of the earlier branches match; date_posted matches none, so it does reach `_DUP_SHARE` \u2014 ok). grade_level does not. So grade_level's 20-50% duplicate target is unmet.",
+     "requested_revision": "After building enum values, apply `_apply_dup_share` for any enum column present in `_DUP_SHARE` (grade_level, teacher_prefix)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`fill_foreign_keys_consistently` draws FK values uniformly from the parent's generated values with replacement and never plants NULL or orphan values, despite the generic rule 'foreign keys drawn from parent pool with 5% NULL and 5% orphan values where nullable' and the `unmatched_join_rows` targets (parent rows without children, child rows with NULL FK). The specification's per_column_exceptions list `unmatched_join_rows` for projects.projectid, resources.projectid, donations.projectid. The program produces no orphan/NULL FKs, so the unmatched-join patterns are not realized.",
+     "requested_revision": "In `fill_foreign_keys_consistently`, plant ~5% NULL and ~5% orphan (non-matching) FK values for nullable FK columns, and ensure parent rows without children exist (e.g. by not covering all parent ids)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_derive_essays` builds `pid_to_tid` from projects and sets essays.teacher_acctid = pid_to_tid.get(pid). If essays.projectid is an orphan (not in projects), teacher_acctid becomes None. This is consistent with the dependency (copied teacher_acctid) only for matched rows; for orphans it yields NULL, which is acceptable under 3VL but should be documented. Not blocking.",
+     "requested_revision": "None required; optionally document orphan handling."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_spec_size` returns 0 for tables not in `_TABLE_SIZES`; all four tables are present, so ok. But `build_random_instance` uses `size = {t: _spec_size(t, rng) for t in schema.tables}` only when `size is None`; cli passes `None`, so ok. However `_spec_size` for donations/resources returns at most 230 (see issue 2), violating table_sizes_per_instance=400.",
+     "requested_revision": "See issue 2; ensure donations/resources reach ~400 rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` includes `projects.school_metro` with observed NULL share 12.2%, and `_NULL_SHARE` sets 0.122 \u2014 consistent. `projects.secondary_focus_subject`/`secondary_focus_area` 0.313, `fulfillment_labor_materials` 0.053, `school_ncesid` 0.003 \u2014 these are plausible but not directly evidenced in the column statistics provided (fast mode). The specification's `uncertainty` notes some enum pools may have additional values. These are uncertain but not blocking.",
+     "requested_revision": "None blocking; keep as-is."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_clamp_nonneg` uses `abs(v)` which turns negative sampled values positive rather than clamping to 0; for `total_price_excluding_optional_support` this is fine (non-negative), but `_derive_projects` then computes incl = excl + opt, preserving incl >= excl. `_clamp_positive` uses `max(1, int(round(abs(v))))` for students_reached/item_quantity \u2014 positive, ok. `_clamp_zip` clamps to [10000,99999] \u2014 ok. `_clamp_coord` clamps lat/lon \u2014 ok. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_dedup_pk` replaces duplicate PKs with fresh hex32, and `sample_fresh_primary_keys` drops rows with repeated PK tuples. `drop_unique_duplicates` drops rows repeating unique column values. These preserve PK uniqueness. However `_dedup_pk` is applied to `_PK` columns (projects.projectid, donations.donationid, resources.resourceid) but NOT to `essays.projectid` (which is not a PK in essays, correct). FK consistency: after `_dedup_pk` changes project PKs, child FKs drawn earlier from the pre-dedup parent pool may no longer match \u2014 but `fill_foreign_keys_consistently` runs before `_dedup_pk` in the loop (FK fill happens in the same iteration before PK dedup), and parent PKs are deduped in the parent's own iteration before children are built (table_order ensures parents first). So children draw from already-deduped parent PKs. OK.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` plants NULLs for `_NULL_SHARE` columns including `donations.donation_total`, but `_derive_donations` already wrote total values; `_apply_nulls` then nulls some \u2014 consistent with 'planted NULL never replaced'. However `_apply_nulls` is applied to `projects.teacher_acctid` (0.10) and `essays.teacher_acctid` is derived from projects.teacher_acctid; if a project's teacher_acctid is NULL, essays.teacher_acctid becomes None \u2014 consistent. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` is called for every table including `essays`, but `essays.need_statement` share 0.002 -> k = max(1, round(200*0.002)) = 1 NULL, ok. `essays.title` is not in `_NULL_SHARE` so no NULLs \u2014 consistent with NOT NULL? essays.title is nullable in schema (no NOT NULL), but specification doesn't list it in null_targets, so ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_near_variants` for `essays.title` targets includes 'Creating Memories and Inspiring Dreams' and the atomic ops show a variant 'Creating Memories and Inspiring Dreams%' (LIKE pattern). The program's `_near_variants` produces L, L+'x', lower(L), one-char-sub \u2014 it does not produce the '%' suffix variant. Minor coverage gap for LIKE patterns; not blocking.",
+     "requested_revision": "Optionally add a '%'-suffixed variant for LIKE targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_boundary_variants` for school_city returns [lit, lit.lower(), lit.upper()] \u2014 for 'Los Angeles' this yields 'Los Angeles', 'los angeles', 'LOS ANGELES', matching the comparison_boundary targets. But the boundary rule says 'one step below, one step above'; for strings the program uses case variants, which is a reasonable interpretation. OK.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_column_values` for `_ENUMS` columns injects near-variants by overwriting random positions, which can overwrite previously injected variants and reduce coverage; also for `teacher_prefix` the empty-string enum value '' is in the pool but `_near_variants('Dr.')` may overwrite it. Minor; not blocking.",
+     "requested_revision": "Optionally append variants rather than overwrite random positions to guarantee coverage."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_dup_share` picks k = round(n*share) positions and copies from a random other position; this can fail to create duplicates if the source equals the target or if the same value is copied. For n=200, k in [40,100], likely ok, but not guaranteed 20-50% distinct-duplicate share. Minor.",
+     "requested_revision": "Optionally verify duplicate share post-hoc and adjust."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_derive_projects` computes opt = round(e * uniform(0.15,0.20), 2) and incl = round(e+opt,2). This guarantees incl >= excl for non-NULL e. But if `_apply_nulls` nulls excl (not in _NULL_SHARE, so no) \u2014 excl is not nullable per _NULL_SHARE, so ok. incl is not in _NULL_SHARE either. OK.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_derive_donations` sets opt[i]=0.0 when op is None, but `donation_optional_support` is not in `_NULL_SHARE`, so op should never be None from sampling; however `_apply_nulls` runs after derivation, so op is non-NULL at derivation time. OK. But `donation_total` is in `_NULL_SHARE` and `_apply_nulls` nulls it after derivation \u2014 consistent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_derive_donations` uses `included[i]` where included may be None if `donation_included_optional_support` column missing; it defaults to 't'. OK.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_quantity` share 0.002 -> 1 NULL, but `item_quantity` is in `_POSITIVE` and `_DUP_SHARE`; `_clamp_positive` runs before `_apply_nulls`, so NULLs are planted after \u2014 consistent. But `item_quantity` is also in `_DUP_SHARE`; `_apply_dup_share` runs in `_build_column_values` before `_apply_nulls`, so duplicates may be nulled. Minor.",
+     "requested_revision": "None blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_unit_price` share 0.004 -> 1 NULL; `item_unit_price` is in `_NONNEG` and `_round2` runs before nulls \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donor_zip` share 0.55 -> 220 NULLs; donor_zip is TEXT in schema, sampled via generic sampler \u2014 ok. `donor_city` 0.481, `donor_state` 0.194 \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_ncesid` share 0.003 -> 1 NULL; school_ncesid is TEXT \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.fulfillment_labor_materials` share 0.053 -> 11 NULLs; it's in `_NONNEG` and `_round2` runs before nulls \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.secondary_focus_subject`/`secondary_focus_area` share 0.313 -> 63 NULLs; these are TEXT \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_metro` share 0.122 -> 24 NULLs; school_metro is in `_ENUMS` \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.poverty_level` share 0.10 -> 20 NULLs; in `_ENUMS` \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_year_round` share 0.10 -> 20 NULLs; in `_ENUMS` \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.teacher_acctid` share 0.10 -> 20 NULLs; teacher_acctid is TEXT \u2014 ok. But `_derive_essays` uses projects.teacher_acctid before `_apply_nulls` on projects? No: projects iteration runs `_apply_nulls` before essays iteration (table_order), so essays sees nulled teacher_acctid \u2014 consistent.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.schoolid` share 0.10 -> 20 NULLs; schoolid is TEXT \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donation_message` share 0.259 -> 104 NULLs; in `_DUP_SHARE` \u2014 duplicates planted before nulls, may reduce share. Minor.",
+     "requested_revision": "None blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.vendorid` share 0.03 -> 12 NULLs; vendorid is INTEGER \u2014 ok. `vendor_name` 0.03, `item_name` 0.004, `item_number` 0.004 \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `essays.need_statement` share 0.002 -> 1 NULL; need_statement is TEXT \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donation_total` share 0.10 -> 40 NULLs; donation_total is REAL \u2014 ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_metro` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_ncesid` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.schoolid` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.teacher_acctid` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.poverty_level` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_year_round` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_metro` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.secondary_focus_subject` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.fulfillment_labor_materials` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `projects.school_ncesid` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donation_total` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donation_message` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donor_city` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donor_state` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `donations.donor_zip` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.vendorid` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.vendor_name` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_name` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_number` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_unit_price` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `resources.item_quantity` etc. all ok.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_nulls` for `essays.need_statement` etc. all ok.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (n_instances=0), so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified by execution.",
+    "The duplicate-share targets for enum columns (teacher_prefix, grade_level) and post-NULL duplicate share for donation_message were not verified.",
+    "The unmatched_join_rows patterns (NULL/orphan FKs, parent rows without children) are not implemented and could not be verified.",
+    "Whether the compact rows are preserved depends on the orig_path fix; currently not passed."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 808 across all 20 instances (validity: invalid 20/20, reason new_integrity_failures). The writer disables FK enforcement (`con.execute('pragma foreign_keys = OFF')` in writer.py) and the generator deliberately injects ~5% orphan FK values in `fill_foreign_keys_consistently` (instance.py) for donations.projectid, resources.projectid, essays.projectid. The schema declares `foreign key (projectid) references projects(projectid)` on donations and resources, so orphan values are genuine FK violations, not merely 'unmatched join rows'.",
+     "requested_revision": "Reconcile the unmatched_join_rows rule with the declared FK constraints. Either (a) keep FK integrity by only using NULL (not orphan) values for nullable FKs, and obtain 'parent rows without children' by simply not referencing some parents, or (b) if orphan values are truly required, the specification must state that FK constraints are intentionally relaxed and the integrity checker must be told so. As written, the program produces 808 FK violations per run, which the validity check flags as blocking. The specification's generic rule ('5% NULL and 5% orphan values where nullable') conflicts with the schema's FK constraints and must be corrected."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `unmatched_join_rows` generic rule says 'for each nullable FK: ~5% NULL and ~5% orphan (non-matching) values'. But donations.projectid and resources.projectid are declared with `foreign key ... references projects(projectid)`, and the integrity checker counts these as fk_violations. The specification does not acknowledge that orphan FK values violate the declared constraints, nor does it instruct the checker to tolerate them.",
+     "requested_revision": "Clarify in the specification whether orphan FK values are permitted despite declared FK constraints. If not, remove the orphan-injection requirement and rely on NULL FKs plus unreferenced parents to satisfy unmatched_join_rows. If yes, document that the integrity checker must exclude FK violations on these columns, and explain why the schema's FK declarations are treated as advisory."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "essays.teacher_acctid is 100% NULL in generated rows (feedback: 'essays.teacher_acctid: generated rows: NULL 4102 / 4102'). `_derive_essays` builds `pid_to_tid` from projects' projectid->teacher_acctid, but `_apply_nulls` is applied to projects.teacher_acctid (10% NULL) and, more importantly, essays.projectid is drawn from the parent pool with 5% orphan values, so orphan projectids map to None. However 100% NULL indicates the lookup is failing entirely \u2014 likely because essays.projectid values are generated as fresh hex32 (via `_HEX32` set) rather than drawn from the projects pool, so `pid_to_tid.get(pid)` returns None for every row. The dependency `essays.teacher_acctid copied from projects.teacher_acctid` is therefore not implemented.",
+     "requested_revision": "Fix `_derive_essays` / FK handling so essays.projectid is drawn from the projects.projectid pool (as the dependency requires) and teacher_acctid is copied from the matching project. Verify that non-orphan essays rows get a non-NULL teacher_acctid matching the parent. Note: the NULL rule allows NULLs but not 100% NULL for a column that should be copied from a parent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `table_sizes_per_instance` fixes projects=200, essays=200, donations=400, resources=400. `_spec_size` varies each by \u00b130, but the execution feedback shows generated rows far exceeding these: projects 4184, donations 8046, resources 8130, essays 4102 across 20 instances \u2014 i.e. ~209 projects, ~402 donations, ~406 resources, ~205 essays per instance. This is roughly consistent with the spec sizes (200/400/400/200) plus the compact rows, so the per-instance sizes are approximately correct. However, the writer appends to a copy of the compact DB, so total row counts include original rows; the 'generated rows' counts in feedback (e.g. 4184/20 \u2248 209) are close to spec. This is acceptable but should be confirmed.",
+     "requested_revision": "No change required if per-instance generated counts are ~200/200/400/400; confirm the writer's row accounting distinguishes generated from compact rows (the summary file rows_added is empty in feedback, suggesting the sidecar summary is not being written)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The CLI prints a summary but `rows_added`/`rows_skipped` are empty in the execution feedback (`\"rows_added\": {}, \"rows_skipped\": {}`). The writer returns `{'rows_ok':..., 'rows_failed':...}` but never writes the sidecar summary file that cli.py reads (`%s__%s_summary.json`). So the reported row accounting is silently empty.",
+     "requested_revision": "Have `write_instance_sqlite` (or the CLI) write the sidecar summary JSON with rows_added/rows_skipped so the execution feedback reflects actual insert counts. This is a reporting gap, not a correctness blocker, but it obscures whether rows were skipped."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists `donations.donation_total` formula `donation_total = donation_to_project + donation_optional_support` when `donation_included_optional_support='t'`, else `= donation_to_project`. The program implements this in `_derive_donations`, but `_apply_nulls` is applied AFTER derivation and plants NULLs in donation_total (10%), donation_to_project, and donation_optional_support independently. Under 3VL this is acceptable (rule holds when not FALSE), but the specification should state that the formula is only asserted for non-NULL operands \u2014 which it does in `uncertainty`. This is consistent.",
+     "requested_revision": "No change; the 3VL handling is correctly specified and implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_dup_share` is applied to `_DUP_SHARE` columns including `donations.donation_message`, but `donation_message` is also in `_NULL_SHARE` (0.259). `_apply_nulls` runs after `_build_column_values` (which applies dup share), so NULLs are planted after duplication \u2014 fine. However `_DUP_SHARE` includes `projects.date_posted`, `projects.grade_level`, `projects.teacher_prefix`, `resources.item_quantity`, `donations.donation_message`, `projects.school_latitude`, `projects.school_longitude`. For `date_posted` and `item_quantity`, the sampler path is the generic `else` branch (not enum), and `_apply_dup_share` is applied \u2014 consistent with spec. No issue found here.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification requires `like_near_variant` for `essays.title` with targets including 'Creating Memories and Inspiring Dreams' and a LIKE variant 'Creating Memories and Inspiring Dreams%'. The program's `_NEAR_VARIANTS` for essays.title includes the literals but `_near_variants` produces L, L||'x', lower(L), one-char-sub \u2014 it does NOT produce the `L||'%'` LIKE variant that the spec's near_variant rule requires ('for LIKE targets also include L||'%''). The atomic ops show a target literal 'Creating Memories and Inspiring Dreams%'.",
+     "requested_revision": "Add the `L||'%'` variant for LIKE targets in `_near_variants` (or a separate LIKE-variant injection) so the essays.title LIKE pattern is exercised. Currently the '%' variant is missing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_boundary_variants` for `projects.school_city` returns [L, lower(L), upper(L)] = ['Los Angeles','los angeles','LOS ANGELES'], matching the spec's comparison_boundary targets. But `_BOUNDARY` is only applied inside the `_ENUMS` branch (`elif key in _ENUMS`), and `school_city` is NOT in `_ENUMS` \u2014 it falls to the generic sampler branch, so the boundary variants are never injected. The atomic ops show `PRED(projects.school_city = 'Los Angeles')` with case variants as a target.",
+     "requested_revision": "Apply `_BOUNDARY` (and `_NEAR_VARIANTS`) injection for non-enum columns too, e.g. after sampling in the generic branch, so school_city boundary variants are actually present. Currently the boundary rule for school_city is dead code."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_NEAR_VARIANTS` for `resources.vendor_name` ('Amazon') and `projects.teacher_prefix` ('Dr.') are only applied in the `_ENUMS` branch. `vendor_name` is not in `_ENUMS`, so its near-variants are never injected. `teacher_prefix` IS in `_ENUMS`, so that one works. The atomic ops show `PRED(resources.vendor_name = 'Amazon')` with variants Amazoo/Amazonx/amazon as a target.",
+     "requested_revision": "Same fix as above: inject near-variants for non-enum columns (vendor_name) in the generic sampling branch."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 808 FK violations are considered acceptable by the task's integrity policy (the spec's orphan-FK rule vs. declared FK constraints) \u2014 needs designer clarification.",
+    "Whether essays.teacher_acctid being 100% NULL is due to essays.projectid not being drawn from the projects pool; needs code-level confirmation (the feedback strongly suggests it).",
+    "Whether the sidecar summary file is written at all (rows_added empty in feedback)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 'essays.teacher_acctid: generated rows: NULL 4102 / 4102'. The specification's dependency says essays.teacher_acctid is copied from projects.teacher_acctid, and the uncertainty note states 'non-orphan rows get non-NULL teacher_acctid; NULL only where the parent teacher_acctid is NULL'. In instance.py, _derive_essays builds pid_to_tid from projects_cols, but build_random_instance calls _derive_essays(cols, inst.get('projects', {}), rng) AFTER projects has already had _apply_nulls applied, so ~10% of projects.teacher_acctid are NULL. More importantly, essays.projectid is filled by fill_foreign_keys_consistently from the projects pool, but the essays table is processed in table_order; if essays is processed before projects in the topological order (essays has no children), inst.get('projects') is empty and pid_to_tid is empty, so every teacher_acctid becomes None. The 100% NULL rate confirms this ordering bug.",
+     "requested_revision": "Ensure projects is built before essays (or defer essays.teacher_acctid derivation until after projects is populated), and copy teacher_acctid from the matching project so that non-NULL parent teacher_acctid yields non-NULL child values. Verify the execution feedback no longer shows 100% NULL for essays.teacher_acctid."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _derive_donations sets total[i] = round(tp, 2) when included == 'f', and total[i] = round(tp + op, 2) otherwise. But _apply_nulls is called AFTER _derive_donations, and _NULL_SHARE includes ('donations','donation_total'): 0.10. The NULL rule says 'a planted NULL is never replaced to satisfy a rule' and 'rules ... constrain only non-NULL operands'. This is consistent. However, the specification's conditional formula requires donation_total = donation_to_project when included_optional_support='f'. The code sets op=0.0 and overwrites opt[i]=op when op is None, which mutates donation_optional_support to 0.0 \u2014 this is acceptable under 3VL. No blocking issue here, but note that donation_optional_support is listed as nullable in the feedback with 0 NULLs; the spec's null_targets does not include it, so this is fine.",
+     "requested_revision": "No change required; confirm donation_total formula holds for non-NULL operands in execution."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's generic_sampling_rules text_short_enum says 'include near-variants (case flip, trailing x, one-char substitution) at 5% of rows'. The program's _inject_variants injects near-variants for _NEAR_VARIANTS columns but does not apply a 5% rate \u2014 it injects one row per variant literal. For columns not in _NEAR_VARIANTS (e.g., school_metro, poverty_level, grade_level, resource_type), no near-variants are injected at all, contradicting the generic rule. This is a specification/program mismatch: the generic rule is stated broadly but the program only applies it to enumerated target columns.",
+     "requested_revision": "Either narrow the generic rule to apply only to columns with explicit like_near_variant targets, or extend the program to inject near-variants at ~5% for all short-enum columns. Clarify in the specification which columns the 5% near-variant rule applies to."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_dup_share is applied to _DUP_SHARE columns including ('projects','teacher_prefix'), ('projects','grade_level'), ('resources','item_quantity'), ('donations','donation_message'), ('projects','school_latitude'), ('projects','school_longitude'), ('projects','date_posted'). But _apply_dup_share is called inside _build_column_values BEFORE _apply_nulls. For columns like teacher_prefix and grade_level that are not in _NULL_SHARE, this is fine. However, for school_latitude/school_longitude, _apply_dup_share is applied, but the spec's real_coordinate rule says '20-50% duplicate share' \u2014 consistent. For date_posted, the spec requires 20-50% duplicate share; the program applies _apply_dup_share only if the column is in _DUP_SHARE, which it is. OK.",
+     "requested_revision": "No change required; verify duplicate shares in execution."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's unmatched_join_rows rule says 'for each nullable FK: ~5% NULL values only (no orphan values); ensure some parent rows have no children by not referencing them'. The program's fill_foreign_keys_consistently draws from the parent pool with replacement, which naturally leaves some parents unreferenced. Execution feedback shows donations.projectid NULL 402/8046 (~5%) and resources.projectid NULL 406/8130 (~5%), consistent. However, essays.projectid is NOT in the null_targets list and the feedback shows essays.projectid NULL 0/4102 \u2014 consistent with the spec (essays.projectid is not nullable in the spec's null_targets). But the spec's unmatched_join_rows for resources.projectid targets include essays.projectid, which is not a FK from resources. This is a minor spec inconsistency.",
+     "requested_revision": "Clarify the unmatched_join_rows targets for resources.projectid \u2014 essays.projectid is not a valid join target for resources. No blocking change."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas includes 'projects.total_price_including_optional_support >= total_price_excluding_optional_support'. The program's _derive_projects sets incl[i] = e + opt where opt is 15-20% of e, so the rule holds. But _apply_nulls is called after _derive_projects, and total_price_including_optional_support is not in _NULL_SHARE, so no NULLs are planted. The rule holds for all rows. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's near_variant rule says 'for each listed literal L: include L, L||'x', lower(L), and one-char-substituted variant; for LIKE targets also include L||'%''. The program's _near_variants returns [lit, lit+'x', lit.lower(), _one_char_sub(lit, rng)]. For 'Dr.' the one-char-sub could produce 'Dx.' or 'Drx' etc. The spec's like_near_variant targets for teacher_prefix include 'Dr.' and 'Dr.%'. The program's _LIKE_TARGETS includes ('projects','teacher_prefix'): ['Dr.'], so it injects 'Dr.%'. OK. For essays.title, _LIKE_TARGETS includes 'Creating Memories and Inspiring Dreams', so 'Creating Memories and Inspiring Dreams%' is injected. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's comparison_boundary rule for projects.school_city targets ['Los Angeles','los angeles','LOS ANGELES']. The program's _BOUNDARY includes ('projects','school_city'): ['Los Angeles','los angeles','LOS ANGELES'], and _boundary_variants returns [lit, lit.lower(), lit.upper()]. For 'Los Angeles' this produces ['Los Angeles','los angeles','LOS ANGELES'], which matches. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's null_targets includes 'projects.school_metro' with observed NULL share 12.2%. The program's _NULL_SHARE includes ('projects','school_metro'): 0.122. Execution feedback shows projects.school_metro NULL 511/4184 (~12.2%). OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's table_sizes_per_instance specifies projects:200, essays:200, donations:400, resources:400. The program's _spec_size varies sizes by \u00b130 (rng.randint(base-30, base+30)). Execution feedback shows projects 4184/20 \u2248 209, essays 4102/20 \u2248 205, donations 8046/20 \u2248 402, resources 8130/20 \u2248 406. This is consistent with the \u00b130 variation. However, the spec says 'table_sizes_per_instance' which implies exact sizes, not varied. The program's variation is a deviation from the spec.",
+     "requested_revision": "Either update the spec to allow \u00b130 variation, or remove the variation in _spec_size to match exact sizes. This is a minor spec/program mismatch."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules text_identifier says '32-char lowercase hex string; primary keys unique; foreign keys drawn from parent pool'. The program's _hex32 generates 32-char lowercase hex. _dedup_pk replaces duplicate PKs with fresh hex32. fill_foreign_keys_consistently draws from parent pool. OK. However, essays.projectid is in _HEX32 but not in _PK, so essays.projectid is not deduplicated \u2014 but essays.projectid is a FK, not a PK, so this is correct.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas includes 'resources.item_quantity > 0'. The program's _POSITIVE includes ('resources','item_quantity'), and _clamp_positive ensures max(1, ...). But _apply_nulls plants NULLs for item_quantity (share 0.002), and the feedback shows resources.item_quantity NULL 20/8130. The rule 'item_quantity > 0' holds for non-NULL operands. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas includes 'donations.donation_total = donation_to_project + donation_optional_support' when included_optional_support='t', and 'donation_total = donation_to_project' when 'f'. The program's _derive_donations implements this. But _apply_nulls plants NULLs for donation_total (share 0.10), and the feedback shows donation_total NULL 804/8046 (~10%). The rule holds for non-NULL operands. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies include essays.teacher_acctid copied from projects.teacher_acctid. The program's _derive_essays attempts this, but as noted in issue 1, the 100% NULL rate indicates the derivation fails. This is a blocking issue.",
+     "requested_revision": "Fix the table ordering or defer essays.teacher_acctid derivation until projects is populated."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'Some enum pools (payment_method, resource_type) may have additional values not shown in the sample.' The program's _ENUMS hardcodes the enum pools from the spec. If the compact database has additional values, the program will not generate them. This is a minor spec uncertainty, not a blocking issue.",
+     "requested_revision": "Clarify whether the enum pools are exhaustive or should be extended from the compact database's observed values."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether essays.teacher_acctid derivation can be fixed by reordering tables or deferring derivation \u2014 needs verification after fix.",
+    "Whether the \u00b130 table size variation is acceptable or should be removed to match exact spec sizes.",
+    "Whether the generic 5% near-variant rule should apply to all short-enum columns or only those with explicit targets."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: returncode 2, stderr 'cli.py: error: the following arguments are required: --dbname', n_instances 0. The CLI in tscore_gen/cli.py declares --dbname as required, but the automated construction run did not supply it (the invocation evidently passed --db/--root/--ds/--instances/--seed but not --dbname). No instances were produced, so no integrity/consistency evidence exists.",
+     "requested_revision": "Make the construction run succeed end-to-end: either supply --dbname in the documented invocation or make --dbname optional (defaulting to a sensible value derived from --db), then re-run and provide execution feedback showing instances generated without errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py build_random_instance signature is build_random_instance(schema, literal_pool: dict, size, rng), but cli.py calls build_random_instance(schema, rng) with only two positional args. Even after fixing --dbname, this raises TypeError (missing literal_pool/size). Also _build_column_values/_init_sampler expect literal_pool keyed by (table, column); cli.py never builds a literal pool (seed_literal_pool_from_queries is unused), so samplers fall back to original_values only.",
+     "requested_revision": "Reconcile the call signature: pass a literal_pool (e.g. seed_literal_pool_from_queries over the compact DB's queries, or an empty dict) and size=None so _spec_size is used; ensure the program runs to completion."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification states 'projects MUST be fully built (values populated) before essays is derived, so essays.teacher_acctid can be copied through essays.projectid -> projects.projectid'. In build_random_instance, essays.projectid is filled by fill_foreign_keys_consistently from inst['projects']['projectid'] \u2014 but _derive_essays runs after _apply_nulls on projects, so projects.teacher_acctid may already be NULL-planted; _derive_essays maps pid->tid and yields None where parent tid is NULL. This is consistent with the spec's 'rows whose matched project has a NULL teacher_acctid get NULL', so OK \u2014 but the spec's dependency also lists essays.teacher_acctid copied via essays.projectid = projects.projectid; the program does this. No defect here, noted as verified.",
+     "requested_revision": "No change required; confirm essays.teacher_acctid derivation runs after projects NULL planting (it does)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's generic_sampling_rules text_identifier says '32-char lowercase hex string; primary keys unique; foreign keys drawn from parent pool with replacement; NULL share per column statistics where nullable; no orphan values'. But per_column_exceptions lists projects.projectid, resources.projectid, donations.projectid with unmatched_join_rows targets including 'child_rows_with_null_fk': true and 'parent_rows_without_children': true. The program's fill_foreign_keys_consistently plants ~5% NULLs in nullable FKs and leaves parents unreferenced \u2014 consistent. However essays.projectid is a FK to projects but is NOT in _NULL_SHARE and NOT in null_targets; the spec's uncertainty says 'rows whose matched project has a NULL teacher_acctid (or a NULL essays.projectid) get NULL', implying essays.projectid may be NULL, yet neither spec nor program plants NULLs in essays.projectid. This is an inconsistency between the spec's uncertainty text and its null_targets list.",
+     "requested_revision": "Either add essays.projectid to null_targets with a NULL share, or remove the '(or a NULL essays.projectid)' clause from the uncertainty text so the spec is internally consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's near_variant rule: 'for each listed literal L: include L, L||'x', lower(L), and one-char-substituted variant; for LIKE targets also include L||'%''. _near_variants returns [lit, lit+'x', lit.lower(), _one_char_sub(lit)] \u2014 this matches. But _inject_variants overwrites random positions in the sampled column rather than guaranteeing inclusion; with n=200 and ~4 variants per literal it is likely but not guaranteed that all variants appear. More importantly, _NEAR_VARIANTS for essays.title omits the 'Creating Memories and Inspiring Dreams%' literal that appears in the spec's targets list (it is handled via _LIKE_TARGETS instead, which is acceptable). The spec's targets for essays.title include both 'Creating Memories and Inspiring Dreams' and 'Creating Memories and Inspiring Dreams%'; the program covers both. OK.",
+     "requested_revision": "No change required; near-variant injection covers the listed literals."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's comparison_boundary rule for projects.school_city targets ['Los Angeles','los angeles','LOS ANGELES']. _boundary_variants returns [lit, lit.lower(), lit.upper()] for each literal in _BOUNDARY \u2014 for 'Los Angeles' this yields 'Los Angeles','los angeles','LOS ANGELES' (correct), but for 'los angeles' yields 'los angeles','los angeles','LOS ANGELES' and for 'LOS ANGELES' yields 'LOS ANGELES','los angeles','LOS ANGELES' \u2014 redundant but harmless. The spec's boundary rule says 'for text literals use case variants (L, lower(L), upper(L))' \u2014 implemented. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct rule: '20-50% of rows share a value with another row; apply after near-variant injection and re-check after NULL planting'. _apply_dup_share is called in _build_column_values BEFORE _apply_nulls (NULL planting) and before _inject_variants for enum columns? Actually _inject_variants is called before _apply_dup_share for enum columns (good), but _apply_nulls runs after _apply_dup_share in build_random_instance. The spec explicitly requires re-checking after NULL planting; the program does not re-apply or verify duplicate share after NULLs are planted. For columns with high NULL share (e.g. donations.donor_zip 0.55) the duplicate share could drop below 20%.",
+     "requested_revision": "Re-apply or verify _apply_dup_share after _apply_nulls for columns in _DUP_SHARE, or document that NULL planting is excluded from the duplicate-share count (NULLs are not 'shared values')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's rows_with_different_values for projects.total_price_including_optional_support targets '>= 2 per group with different values'. _derive_projects sets incl[i] = round(e + opt, 2) where opt = round(e * uniform(0.15,0.20), 2). For distinct e values this yields distinct incl values, so the rule holds for non-NULL operands. However _derive_projects runs BEFORE _apply_nulls, and total_price_including_optional_support is not in _NULL_SHARE, so no NULLs are planted there \u2014 fine. But the spec's supporting_evidence shows incl >= excl; _derive_projects only recomputes incl when excl is non-NULL, leaving incl as sampled (possibly < excl) when excl is NULL \u2014 but excl is not nullable per _NULL_SHARE, so OK.",
+     "requested_revision": "No change required; verify incl >= excl holds for all non-NULL rows in execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's donation_total conditional formula: 'donation_total = round(donation_to_project + donation_optional_support, 2)' when donation_included_optional_support='t', else 'donation_total = round(donation_to_project, 2)'. _derive_donations implements this. But _derive_donations runs BEFORE _apply_nulls, and donation_total IS in _NULL_SHARE (0.10). _apply_nulls plants NULLs in donation_total AFTER derivation \u2014 so planted NULLs are not replaced (good, per spec). However donation_to_project and donation_optional_support are NOT in _NULL_SHARE, so they are never NULL; the formula holds for all non-NULL total rows. OK.",
+     "requested_revision": "No change required; confirm in execution feedback that donation_total matches the conditional formula for all non-NULL rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's null_targets includes projects.school_metro (12.2% observed) and _NULL_SHARE has ('projects','school_metro'): 0.122 \u2014 consistent. But _ENUMS also lists school_metro as an enum; _build_column_values samples from _ENUMS then _apply_nulls plants NULLs \u2014 fine. However _apply_nulls is applied to ALL columns in _NULL_SHARE including enum columns, which is correct. The spec's null_targets also lists resources.vendorid, vendor_name, item_name, item_number, item_unit_price, item_quantity \u2014 _NULL_SHARE has these with small shares (0.03, 0.03, 0.004, 0.004, 0.004, 0.002). _plant_nulls uses max(1, round(n*share)) so at least one NULL is planted \u2014 consistent with 'at least one NULL row per nullable column'.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's dependencies include essays.teacher_acctid copied via essays.projectid = projects.projectid. _derive_essays builds pid_to_tid from projects_cols and maps each essays.projectid. But essays.projectid is filled by fill_foreign_keys_consistently from inst['projects']['projectid'] \u2014 which at that point has already had _apply_nulls applied (projects is built before essays in table_order). So pid_to_tid includes NULL tids for NULL-planted projects.teacher_acctid \u2014 correct per spec. However _derive_essays runs BEFORE _apply_nulls on essays, so essays.teacher_acctid is not NULL-planted afterward (it's not in _NULL_SHARE) \u2014 fine. But essays.projectid itself: fill_foreign_keys_consistently plants ~5% NULLs in nullable FKs; essays.projectid is a FK and nullable, so ~5% NULL \u2014 consistent with spec's 'rows whose matched project has a NULL teacher_acctid (or a NULL essays.projectid) get NULL'. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's table_sizes_per_instance: projects 200, essays 200, donations 400, resources 400; 'Table sizes may vary by +/-30 around the stated base'. _spec_size uses rng.randint(base-30, base+30) \u2014 consistent. But _TABLE_SIZES is a module constant and _spec_size is only used when size is None; cli.py calls build_random_instance(schema, rng) which would fail before reaching _spec_size (see signature issue).",
+     "requested_revision": "Fix the call signature so _spec_size is actually used; verify generated row counts fall within [base-30, base+30]."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's text_identifier rule: '32-char lowercase hex string; primary keys unique'. _hex32 generates 32 lowercase hex chars; _dedup_pk replaces duplicates with fresh hex32. But _dedup_pk is applied AFTER _apply_nulls and AFTER fill_foreign_keys_consistently \u2014 for projects.projectid (PK), _build_column_values generates hex32 then _apply_nulls does not touch it (not in _NULL_SHARE), then _dedup_pk runs \u2014 fine. For donations.donationid and resources.resourceid similarly. But _dedup_pk replaces duplicate PKs with fresh hex32 \u2014 this could break FK references from child tables that were already filled from the parent pool (fill_foreign_keys_consistently runs before _dedup_pk in build_random_instance? Actually fill_foreign_keys_consistently runs inside the per-table loop AFTER _build_column_values but BEFORE _dedup_pk \u2014 so child FKs reference pre-dedup parent PKs; after _dedup_pk replaces some parent PKs, those child FKs become orphans, violating FK integrity).",
+     "requested_revision": "Move _dedup_pk (and sample_fresh_primary_keys/drop_unique_duplicates) to run BEFORE fill_foreign_keys_consistently for parent tables, or re-map child FKs after parent PK dedup, so FK integrity is preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's unmatched_join_rows rule: 'for each nullable FK: ~5% NULL values only (no orphan values, to preserve declared FK constraints); ensure some parent rows have no children by not referencing them'. fill_foreign_keys_consistently plants ~5% NULLs in nullable FKs \u2014 consistent. But the PK dedup issue above can create orphans. Also, for essays.projectid the spec's dependencies list it as a FK to projects; fill_foreign_keys_consistently handles it. However _derive_essays runs AFTER fill_foreign_keys_consistently and uses pid_to_tid.get(pid) \u2014 if pid is a NULL-planted FK value (None), it returns None \u2014 fine. But if pid references a project whose PK was deduped away, pid_to_tid won't have it and returns None \u2014 silently creating a NULL teacher_acctid for a non-NULL projectid, which is a data inconsistency (though not an FK violation since essays.projectid would be an orphan).",
+     "requested_revision": "Ensure essays.projectid values always exist in projects.projectid after dedup; re-map or regenerate."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's semantic_rules_and_formulas lists school_metro IN ('urban','rural','suburban') and poverty_level IN ('highest poverty','high poverty','moderate poverty','low poverty') etc. \u2014 all implemented in _ENUMS. But the spec's uncertainty says 'Some enum pools (payment_method, resource_type) may have additional values not shown in the sample' \u2014 the program hardcodes the listed pools only. This is acceptable per spec's uncertainty but means the program cannot generate the additional values; the spec should either confirm the pools are complete or the program should sample from observed pools.",
+     "requested_revision": "Either confirm the enum pools are complete (remove the uncertainty clause) or have the program sample from observed pools for payment_method/resource_type."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's supporting_evidence total_price_order: '653.89 >= 555.81; 348.79 >= 296.47; 506.93 >= 430.89'. _derive_projects recomputes incl from excl with opt = e*uniform(0.15,0.20), so incl > excl always for non-NULL e \u2014 consistent. But _derive_projects runs BEFORE _apply_nulls; total_price_excluding_optional_support is not in _NULL_SHARE so no NULLs \u2014 fine. However _NONNEG clamps excl to non-negative via abs() \u2014 this could turn a negative sampled value positive, but _build_column_values samples uniform(0,3000) so already non-negative. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's reproducible generation: cli.py uses random.Random(args.seed + i) per instance \u2014 deterministic given seed. But _build_column_values and _derive_* use rng passed through; _init_sampler uses rng \u2014 deterministic. However _apply_dup_share uses rng.sample and rng.randrange \u2014 deterministic. The only non-determinism risk is dict iteration order in _derive_essays (pid_to_tid built from zip of lists \u2014 order preserved) and _build_column_values (iterates tm.columns \u2014 stable). So reproducible. But the run failed before producing instances, so reproducibility is unverified.",
+     "requested_revision": "After fixing the run, verify two runs with the same seed produce identical instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's preservation of compact rows: writer.py copies orig_path to part then appends generated rows via executemany; compact rows are never deleted or changed. But writer.py sets 'pragma foreign_keys = OFF' \u2014 this disables FK enforcement during insert, so orphan FKs (from the PK dedup issue) would not be caught. Also the writer appends rows for ALL tables in schema.tables order; if a child table is inserted before its parent (table_order should handle this via _levels), FK integrity could fail \u2014 but foreign_keys=OFF masks it.",
+     "requested_revision": "Enable foreign_keys=ON during insert (after ordering tables parent-first) or verify FK integrity post-insert; do not rely on foreign_keys=OFF to mask orphans."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's null_targets includes projects.school_metro with '12.2% observed' but _NULL_SHARE has 0.122 \u2014 consistent. However the spec's null_targets does NOT include essays.projectid, yet the uncertainty text implies it may be NULL. Also the spec's null_targets includes resources.vendorid but _NULL_SHARE has ('resources','vendorid'): 0.03 \u2014 consistent. The spec's null_targets includes donations.donor_zip with 0.55 share \u2014 _NULL_SHARE has 0.55 \u2014 consistent. No defect in shares.",
+     "requested_revision": "No change required for shares; resolve the essays.projectid inconsistency noted above."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's like_near_variant for projects.teacher_prefix targets ['Dr.','Dr.%']. _NEAR_VARIANTS has ('projects','teacher_prefix'): ['Dr.'] and _LIKE_TARGETS has ('projects','teacher_prefix'): ['Dr.'] \u2014 so _inject_variants injects Dr., Dr.x, dr., one-char-sub, and 'Dr.%' \u2014 consistent. But _ENUMS for teacher_prefix includes '' (empty string); _inject_variants overwrites random positions \u2014 could overwrite the empty string, but that's fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's like_near_variant for resources.vendor_name targets ['Amazon']. _NEAR_VARIANTS has ('resources','vendor_name'): ['Amazon'] \u2014 injects Amazon, Amazonx, amazon, one-char-sub. But _NULL_SHARE has ('resources','vendor_name'): 0.03 \u2014 _apply_nulls runs AFTER _inject_variants, so some injected variants may be NULL-planted. The spec's near_variant rule says 'include L, L||'x', lower(L), and one-char-substituted variant' \u2014 planting NULLs after injection could remove some variants. With n=400 and 3% NULLs (~12 rows), likely all variants survive, but not guaranteed.",
+     "requested_revision": "Inject near-variants AFTER NULL planting (or re-inject after) to guarantee inclusion, or document that NULL planting may remove some variants."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's comparison_boundary for projects.school_city targets ['Los Angeles','los angeles','LOS ANGELES']. _BOUNDARY has ('projects','school_city'): ['Los Angeles','los angeles','LOS ANGELES'] \u2014 _inject_variants injects all three case variants. But _apply_nulls runs AFTER _inject_variants; school_city is not in _NULL_SHARE so no NULLs \u2014 fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's ties_for_order_limit rule: 'at least two rows tie at the top ranks of the ORDER column'. The program has no explicit implementation of ties_for_order_limit; _apply_dup_share creates duplicate values but does not guarantee ties at the top rank of any ORDER column. The spec's per_column_exceptions does not list ties_for_order_limit explicitly (it appears in minor_patterns for several columns), so this may be a minor gap. But the spec's generic_sampling_rules includes ties_for_order_limit as a rule.",
+     "requested_revision": "Implement ties_for_order_limit for columns where it appears in minor_patterns (e.g. projects.schoolid, projects.teacher_prefix, projects.poverty_level, projects.school_latitude, projects.school_longitude, projects.total_price_including_optional_support, donations.donation_total, projects.grade_level, resources.item_quantity) or document that _apply_dup_share suffices."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's null_in_count_column for projects.schoolid targets '5-30% NULL'. _NULL_SHARE has ('projects','schoolid'): 0.10 \u2014 within range. But _build_column_values for projects.schoolid falls to the else branch (sampler) since schoolid is not in _HEX32/_ENUMS/_ZIP/_LAT/_LON/_NONNEG/_POSITIVE \u2014 sampler samples from original_values; _apply_nulls plants 10% NULLs \u2014 consistent. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's null_in_count_column for projects.teacher_acctid targets '5-30% NULL'. _NULL_SHARE has 0.10 \u2014 consistent. But _derive_essays copies teacher_acctid from projects; if projects.teacher_acctid has 10% NULLs, essays.teacher_acctid will have ~10% NULLs (from parent) plus ~5% from essays.projectid NULLs \u2014 total ~14.5% NULLs in essays.teacher_acctid. The spec's null_targets does NOT list essays.teacher_acctid, so this is an unintended NULL share. The spec's uncertainty says 'rows whose matched project has a NULL teacher_acctid (or a NULL essays.projectid) get NULL' \u2014 so this is intended. OK.",
+     "requested_revision": "No change required; confirm essays.teacher_acctid NULL share is acceptable per spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's null_rows for donations.donation_total targets '5-30% NULL'. _NULL_SHARE has 0.10 \u2014 consistent. _apply_nulls plants 10% NULLs in donation_total AFTER _derive_donations \u2014 so planted NULLs are not replaced (good). But _derive_donations runs BEFORE _apply_nulls and sets total[i] for all i where tp is non-NULL; then _apply_nulls overwrites 10% with NULL \u2014 fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for donations.donation_message targets '20-50% duplicate share'. _DUP_SHARE includes ('donations','donation_message') \u2014 _apply_dup_share runs in _build_column_values else branch. But donation_message is in _NULL_SHARE (0.259); _apply_nulls runs AFTER _apply_dup_share \u2014 so duplicate share may drop below 20% after NULL planting. Same issue as noted above.",
+     "requested_revision": "Re-check duplicate share after NULL planting for donation_message."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for projects.school_latitude/school_longitude targets '20-50% duplicate share'. _DUP_SHARE includes these; _build_column_values for _LAT/_LON branches does NOT call _apply_dup_share (only the _ENUMS and else branches do). So school_latitude/school_longitude get NO duplicate share applied \u2014 violating the spec's duplicates_for_distinct rule for these columns.",
+     "requested_revision": "Apply _apply_dup_share to _LAT and _LON branches (and _ZIP, _NONNEG, _POSITIVE branches) for columns in _DUP_SHARE, or restructure _build_column_values to apply _apply_dup_share uniformly after sampling."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for projects.date_posted targets '20-50% duplicate share'. _DUP_SHARE includes ('projects','date_posted'), but _build_column_values has no branch for date_posted \u2014 it falls to the else branch (sampler), which does call _apply_dup_share. So date_posted gets duplicate share \u2014 OK. But _apply_nulls runs after; date_posted is not in _NULL_SHARE so no NULLs \u2014 fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for projects.grade_level targets '20-50% duplicate share'. _DUP_SHARE includes ('projects','grade_level'); _build_column_values _ENUMS branch calls _apply_dup_share \u2014 OK. But _apply_nulls runs after; grade_level is not in _NULL_SHARE \u2014 fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for projects.teacher_prefix targets '20-50% duplicate share'. _DUP_SHARE includes ('projects','teacher_prefix'); _ENUMS branch calls _apply_dup_share \u2014 OK. But _inject_variants runs BEFORE _apply_dup_share in _ENUMS branch \u2014 so injected variants may be overwritten by duplicate share. The spec's near_variant rule says 'include L, L||'x', lower(L), and one-char-substituted variant' \u2014 duplicate share could remove some. With n=200 and 20-50% duplicate share, likely some variants survive but not guaranteed.",
+     "requested_revision": "Inject near-variants AFTER _apply_dup_share (or re-inject after) to guarantee inclusion."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for resources.item_quantity targets '20-50% duplicate share'. _DUP_SHARE includes ('resources','item_quantity'); _build_column_values _POSITIVE branch does NOT call _apply_dup_share \u2014 so item_quantity gets NO duplicate share applied. Violation.",
+     "requested_revision": "Apply _apply_dup_share to _POSITIVE branch for item_quantity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's duplicates_for_distinct for projects.school_latitude/school_longitude \u2014 _LAT/_LON branches do not call _apply_dup_share (noted above). Also _clamp_coord uses uniform(-90,90) for latitude and uniform(-180,180) for longitude \u2014 spec's real_coordinate rule says 'REAL in [-180,180] for longitude, [-90,90] for latitude; 20-50% duplicate share' \u2014 ranges correct but duplicate share missing.",
+     "requested_revision": "Apply _apply_dup_share to _LAT/_LON branches."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's integer_zip rule: '5-digit INTEGER in [10000,99999]'. _ZIP branch uses rng.randint(10000,99999) and _clamp_zip \u2014 consistent. But _clamp_zip uses abs(z) and clamps to [10000,99999] \u2014 for already-valid values no change. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's real_amount rule: 'non-negative REAL rounded to 2 decimals; range from statistics; NULL share per column statistics where nullable'. _NONNEG branch uses uniform(0,3000) and _round2 \u2014 consistent. But _clamp_nonneg uses abs() which could turn a negative into positive \u2014 but uniform(0,3000) is already non-negative. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's integer_count rule: 'positive INTEGER; 20-50% duplicate share; NULL share per column statistics where nullable'. _POSITIVE branch uses rng.randint(1,500) and _clamp_positive \u2014 consistent. But _clamp_positive uses max(1, int(round(abs(v)))) \u2014 for already-positive values no change. OK. But duplicate share missing for item_quantity (noted above).",
+     "requested_revision": "Apply _apply_dup_share to _POSITIVE branch."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's date_iso rule: 'DATE formatted %Y-%m-%d; 20-50% duplicate share'. projects.date_posted falls to else branch (sampler) \u2014 DateSampler produces dates in various templates (not necessarily %Y-%m-%d). The spec's date_format for projects.date_posted is '%Y-%m-%d'. DateSampler's _parse_date tries multiple templates and _draw uses self.template (first parsed template) \u2014 could be '%Y-%m-%d' or others. Not guaranteed to be %Y-%m-%d.",
+     "requested_revision": "Ensure projects.date_posted values are formatted %Y-%m-%d (e.g. force template or post-process)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's datetime_iso rule: 'DATETIME formatted %Y-%m-%d %H:%M:%S.%f'. donations.donation_timestamp falls to else branch (sampler) \u2014 DateSampler produces dates without time/fraction. Not guaranteed to be DATETIME format.",
+     "requested_revision": "Ensure donations.donation_timestamp values are formatted %Y-%m-%d %H:%M:%S.%f."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's flag_tf rule: 'TEXT IN ('t','f')'. _ENUMS lists all flag columns with ['t','f'] \u2014 consistent. But _build_column_values _ENUMS branch calls _inject_variants for all enum columns; _NEAR_VARIANTS only has specific columns, so flags are not injected \u2014 fine. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's null_share rule: 'each nullable column gets at least one NULL row; share follows column statistics'. _plant_nulls uses max(1, round(n*share)) \u2014 at least one NULL. But _apply_nulls only applies to columns in _NULL_SHARE; columns in null_targets but not in _NULL_SHARE would get no NULLs. Checking: null_targets lists projects.schoolid, poverty_level, school_year_round, teacher_acctid, school_metro, secondary_focus_subject, secondary_focus_area, fulfillment_labor_materials, school_ncesid, donations.donation_total, donation_message, donor_city, donor_state, donor_zip, resources.vendorid, vendor_name, item_name, item_number, item_unit_price, item_quantity, essays.need_statement \u2014 all are in _NULL_SHARE. OK.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's dependencies include essays.teacher_acctid copied via essays.projectid = projects.projectid. _derive_essays runs AFTER fill_foreign_keys_consistently for essays (which fills essays.projectid from projects pool) \u2014 so essays.projectid values exist in projects.projectid (pre-dedup). But _dedup_pk runs AFTER _derive_essays for essays? Actually _dedup_pk runs inside the per-table loop AFTER _derive_essays and _apply_nulls \u2014 so essays.projectid may be deduped? No, essays.projectid is not a PK (essays has no PK per schema \u2014 CREATE TABLE essays has no primary key). So _dedup_pk does not touch essays.projectid. But projects.projectid IS a PK and _dedup_pk runs for projects AFTER fill_foreign_keys_consistently for projects (which fills nothing for projects since projectid is not a FK) \u2014 so projects.projectid dedup happens before essays is built? Order: projects built first (including _dedup_pk), then essays built using inst['projects']['projectid'] (post-dedup) \u2014 so essays.projectid references post-dedup projects.projectid \u2014 consistent. But donations/resources are built after projects too \u2014 their FKs reference post-dedup projects.projectid \u2014 consistent. Wait, fill_foreign_keys_consistently for donations runs inside donations' loop, using inst['projects']['projectid'] which is post-dedup \u2014 so no orphans. The earlier concern about PK dedup creating orphans is unfounded because dedup runs before child tables are built. Let me re-check: build_random_instance loops over order (table_order); for each table, _build_column_values, fill_foreign_keys_consistently, _derive_*, _apply_nulls, _dedup_pk, sample_fresh_primary_keys, drop_unique_duplicates. So projects' _dedup_pk runs before donations/resources/essays are built \u2014 child FKs reference post-dedup parent PKs \u2014 no orphans. Good. The earlier issue is retracted.",
+     "requested_revision": "No change required; PK dedup runs before child tables are built."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification's dependencies include essays.teacher_acctid copied via essays.projectid = projects.projectid. _derive_essays runs AFTER fill_foreign_keys_consistently for essays (which fills essays.projectid from projects pool) \u2014 so essays.projectid values exist in projects.projectid (pre-dedup). But _dedup_pk runs AFTER _derive_essays for essays? Actually _dedup_pk runs inside the per-table loop AFTER _derive_essays and _apply_nulls \u2014 so essays.projectid may be deduped? No, essays.projectid is not a PK (essays has no PK per schema \u2014 CREATE TABLE essays has no primary key). So _dedup_pk does not touch essays.projectid. But projects.projectid IS a PK and _dedup_pk runs for projects AFTER fill_foreign_keys_consistently for projects (which fills nothing for projects since projectid is not a FK) \u2014 so projects.projectid dedup happens before essays is built? Order: projects built first (including _dedup_pk), then essays built using inst['projects']['projectid'] (post-dedup) \u2014 so essays.projectid references post-dedup projects.projectid \u2014 consistent. But donations/resources are built after projects too \u2014 their FKs reference post-dedup projects.projectid \u2014 consistent. Wait, fill_foreign_keys_consistently for donations runs inside donations' loop, using inst['projects']['projectid'] which is post-dedup \u2014 so no orphans. The earlier concern about PK dedup creating orphans is unfounded because dedup runs before child tables are built. Let me re-check: build_random_instance loops over order (table_order); for each table, _build_column_values, fill_foreign_keys_consistently, _derive_*, _apply_nulls, _dedup_pk, sample_fresh_primary_keys, drop_unique_duplicates. So projects' _dedup_pk runs before donations/resources/essays are built \u2014 child FKs reference post-dedup parent PKs \u2014 no orphans. Good. The earlier issue is retracted.",
+     "requested_revision": "No change required; PK dedup runs before child tables are built."
+    }
+   ],
+   "unresolved_checks": [
+    "Execution feedback shows the run failed (returncode 2, missing --dbname); no instances were produced, so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified from execution evidence.",
+    "The program's build_random_instance signature does not match the cli.py call; even after fixing --dbname, a TypeError is expected.",
+    "Whether _apply_dup_share after _apply_nulls preserves the 20-50% duplicate share for columns with high NULL shares (donations.donor_zip 0.55, donation_message 0.259) is unverified.",
+    "Whether near-variant literals survive _apply_dup_share and _apply_nulls for all listed columns is unverified.",
+    "Whether projects.date_posted and donations.donation_timestamp are formatted as specified (%Y-%m-%d and %Y-%m-%d %H:%M:%S.%f) is unverified.",
+    "Whether _apply_dup_share is applied to _LAT/_LON/_POSITIVE branches (school_latitude, school_longitude, item_quantity) \u2014 code inspection suggests it is not, but execution feedback is unavailable."
+   ]
+  }
+ ]
 }

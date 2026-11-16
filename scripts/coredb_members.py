@@ -1,13 +1,8 @@
-"""Locate CoRE-DB members and the official databases; download CoRE-DB from HF ``thanhdath/core-db``.
-
-CoRE-DB layout:  <coredb>/dbs/<bird|spider>/<db_id>/compact/<db_id>.sqlite  and  .../units/*.sqlite
-Usage (download only the databases you need):
-    python scripts/coredb_members.py --out data/core-db [--dbs airline allergy_1]
-"""
+"""Locate CoRE-DB members and the official databases; download CoRE-DB from HF ``griffith-bigdata/core-db-der215``."""
 import argparse
 from pathlib import Path
 
-COREDB_REPO = 'thanhdath/core-db'
+COREDB_REPO = 'griffith-bigdata/core-db-der215'
 
 
 def download_coredb(out, dbs=None, cache_dir=None):

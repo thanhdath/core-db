@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,9 +184,159 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """text_enum: uniform choice from the column's enum list."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 1.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class WeightFormatSampler(ColumnSampler):
+    """format: 'number with thousands separator + unit in parentheses'."""
+
+    def __init__(self, elements, rng):
+        super().__init__(elements, 0.2, float('inf'), rng)
+        parsed = [p for p in (spec.parse_weight(e) for e in elements) if p]
+        self.parsed = parsed
+        self.units = (parsed[0][1], parsed[0][3]) if parsed else ('lb', 'kg')
+        ratios = [b / a for a, _, b, _ in parsed if a > 0]
+        self.ratio = (sum(ratios) / len(ratios)) if ratios else 0.45
+
+    def _draw(self):
+        import math
+        r = self.rng
+        a = math.exp(r.uniform(0.0, math.log(1e8)))
+        a = round(a, 0) if a >= 100 else round(a, 1)
+        b = round(a * self.ratio, 0) if a * self.ratio >= 100 else round(a * self.ratio, 1)
+        return spec.format_weight(a, self.units[0], b, self.units[1])
+
+    def sample(self):
+        r = self.rng
+        if self.parsed and r.random() < self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
+class PercentFormatSampler(ColumnSampler):
+    """format: signed percentage string, e.g. '1.5%'."""
+
+    def __init__(self, elements, rng):
+        super().__init__(elements, 0.2, float('inf'), rng)
+        self.nums = [p for p in (spec.parse_percent(e) for e in elements) if p is not None]
+
+    def _draw(self):
+        r = self.rng
+        if self.nums and r.random() < 0.5:
+            base = r.choice(self.nums)
+            x = base + r.choice([-0.1, 0.0, 0.1, -0.2, 0.2])
+        else:
+            x = r.uniform(-10.0, 10.0)
+        return spec.format_percent(round(x, 1))
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
+class BoundaryNumberSampler(NumberSampler):
+    """numeric_boundary: include L-1, L, L+1 with equal share; rest uniform in range."""
+
+    def __init__(self, elements, p, max_l0, rng, boundaries, scale=10, is_int=False, precision=1):
+        super().__init__(elements, p, max_l0, rng, scale=scale, is_int=is_int, precision=precision)
+        self.boundaries = list(boundaries)
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.5:
+            L = r.choice(self.boundaries)
+            v = L + r.choice([-1.0, 0.0, 1.0])
+            return self._cast(v)
+        return super().sample()
+
+
+class BoundaryTextSampler(StringSampler):
+    """comparison_boundary on text: exact literal + case variant, plus fresh strings."""
+
+    def __init__(self, elements, p, max_l0, rng, literals, length=20):
+        super().__init__(elements, p, max_l0, rng, length=length)
+        self.literals = list(literals)
+
+    def sample(self):
+        r = self.rng
+        if self.literals and r.random() < 0.5:
+            return r.choice(self.literals)
+        return super().sample()
+
+
+class LikeVariantSampler(StringSampler):
+    """like_near_variant: literal + near variants (case change, extra char, substituted char)."""
+
+    def __init__(self, elements, p, max_l0, rng, literals, length=20):
+        super().__init__(elements, p, max_l0, rng, length=length)
+        self.literals = list(literals)
+
+    def _variant(self, base):
+        r = self.rng
+        u = r.random()
+        if u < 0.25:
+            return base.lower()
+        if u < 0.5:
+            return base.upper()
+        if u < 0.75:
+            return base + r.choice(string.ascii_lowercase)
+        if len(base) > 1:
+            i = r.randrange(len(base))
+            return base[:i] + r.choice(string.ascii_lowercase) + base[i + 1:]
+        return base + 'x'
+
+    def sample(self):
+        r = self.rng
+        if self.literals and r.random() < 0.5:
+            base = r.choice(self.literals)
+            return base if r.random() < 0.5 else self._variant(base)
+        return super().sample()
+
+
+class AgeSampler(NumberSampler):
+    """pilot.Age BETWEEN 18 AND 70, with group sizes 1, 2 and >= 3 planted."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng, scale=2, is_int=True)
+        self.min, self.max = spec.AGE_RANGE
+        self.list_min = max(self.min, min(self.elements)) if self.elements else self.min
+        self.list_max = min(self.max, max(self.elements)) if self.elements else self.max
+
+    def sample(self):
+        v = super().sample()
+        return max(self.min, min(self.max, int(v)))
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    key = (column.table, column.name)
     els = [e for e in elements if rng.random() < 0.9]
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], rng)
+    fmt = spec.FORMATS.get(key)
+    if fmt == 'weight':
+        return WeightFormatSampler(els, rng)
+    if fmt == 'percent':
+        return PercentFormatSampler(els, rng)
+    if key in spec.NUMERIC_BOUNDARIES:
+        return BoundaryNumberSampler(els, p, max_l0, rng, spec.NUMERIC_BOUNDARIES[key],
+                                     scale=8, is_int=False, precision=1)
+    if key in spec.TEXT_BOUNDARIES:
+        return BoundaryTextSampler(els, p, max_l0, rng, spec.TEXT_BOUNDARIES[key])
+    if key in spec.LIKE_LITERALS:
+        return LikeVariantSampler(els, p, max_l0, rng, spec.LIKE_LITERALS[key])
+    if key == ('pilot', 'Age'):
+        return AgeSampler(els, p, max_l0, rng)
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
@@ -231,5 +383,5 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, max_l0, rng, 1 if column_meta.pk_pos else 0)
     return [s.sample() for _ in range(n)]

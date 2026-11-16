@@ -11,21 +11,22 @@ def unit_path(root: str, ds: str, db: str, i: int, tag: str = 'gen') -> str:
     return os.path.join(root, ds, name, name + '.sqlite')
 
 
-def write_instance_sqlite(schema, instance: dict, path: str) -> dict:
-    """Empty DDL clone + row-by-row insert, failing rows skipped (writedb.py:292-319); atomic, mode 0644."""
+def write_instance_sqlite(schema, instance: dict, path: str, append: bool = False) -> dict:
+    """Append generated rows to the (copied) compact database; failing rows skipped and counted."""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    part = path + '.part'
-    if os.path.exists(part):
-        os.remove(part)
-    con = sqlite3.connect(part)
-    ok, bad = {}, {}
+    con = sqlite3.connect(path)
+    ok, bad, errors = {}, {}, {}
     try:
+        con.execute('pragma journal_mode = MEMORY')
+        con.execute('pragma synchronous = OFF')
+        con.execute('pragma temp_store = MEMORY')
         con.execute('pragma foreign_keys = OFF')
-        for s in schema.ddl:
-            try:
-                con.execute(s)
-            except sqlite3.Error:
-                pass
+        if not append:
+            for s in schema.ddl:
+                try:
+                    con.execute(s)
+                except sqlite3.Error:
+                    pass
         con.execute('begin')
         for t, tm in schema.tables.items():
             cols = instance.get(t, {})
@@ -33,15 +34,26 @@ def write_instance_sqlite(schema, instance: dict, path: str) -> dict:
             n = len(cols.get(names[0], [])) if names else 0
             sql = 'INSERT INTO %s VALUES (%s)' % (q(t), ','.join('?' * len(names)))
             ok[t] = bad[t] = 0
+            rows = []
             for i in range(n):
+                rows.append([cols.get(c, [None] * n)[i] for c in names])
+            if rows:
+                con.execute('savepoint sp')
                 try:
-                    con.execute(sql, [cols[c][i] for c in names])
-                    ok[t] += 1
-                except (sqlite3.Error, OverflowError):
-                    bad[t] += 1
+                    con.executemany(sql, rows)
+                    con.execute('release sp')
+                    ok[t] = len(rows)
+                except (sqlite3.Error, OverflowError) as e:
+                    con.execute('rollback to sp')
+                    con.execute('release sp')
+                    errors[t] = '%s: %s' % (t, e)
+                    for r in rows:
+                        try:
+                            con.execute(sql, r)
+                            ok[t] += 1
+                        except (sqlite3.Error, OverflowError):
+                            bad[t] += 1
         con.commit()
     finally:
         con.close()
-    os.chmod(part, 0o644)
-    os.replace(part, path)
-    return {'rows_ok': ok, 'rows_failed': bad}
+    return {'rows_ok': ok, 'rows_failed': bad, 'errors': errors}

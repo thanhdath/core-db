@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + compact-row snapshot."""
 import math
 import sqlite3
 import warnings
@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -76,7 +77,7 @@ def _first_token(line: str) -> str:
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
+    """Read tables, columns, keys, FKs, and compact original values read-only."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()

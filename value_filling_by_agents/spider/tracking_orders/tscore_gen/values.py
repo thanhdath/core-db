@@ -4,7 +4,7 @@ import re
 import string
 
 _MAX = 2 ** 31 - 1
-CHARSET = string.ascii_letters + ' ' + string.digits + '()'
+CHARSET = string.ascii_lowercase + ' ' + string.digits
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
 
@@ -79,16 +79,19 @@ class StringSampler(ColumnSampler):
         for e in els:
             if re.fullmatch(r'-?\d+', e):
                 extra += [str(int(e) + 1), str(int(e) - 1)]
+            if e and not re.fullmatch(r'-?\d+', e):
+                extra += [e.lower(), e.upper(), e.strip(), e + ' ', ' ' + e]
+                if len(e) > 1:
+                    extra += [e[:-1], e[1:]]
         super().__init__(els + extra, p, max_l0, rng)
-        self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
-                            if self.elements else (0, length))
+        self.lo, self.hi = 4, 12
 
     def _rand(self, k):
         return ''.join(self.rng.choice(CHARSET) for _ in range(k))
 
     def sample(self):
         r = self.rng
-        if not self.elements or r.random() < self.p:
+        if not self.elements or r.random() < 0.3:
             v = self._fresh_or_reuse(lambda: self._rand(r.randint(self.lo, self.hi)))
         else:
             v = r.choice(self.elements)
@@ -132,7 +135,7 @@ class DateSampler(ColumnSampler):
                 self.template = self.template or t
                 parsed.append(d)
         self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.full = (dt.datetime(1970, 1, 1), dt.datetime(2015, 12, 31, 23, 59, 59))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -182,11 +185,78 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+class EnumSampler(ColumnSampler):
+    """Uniform choice from the table's enum list; case variants allowed where listed."""
+
+    def __init__(self, elements, p, max_l0, rng, variants=None):
+        super().__init__(elements, p, max_l0, rng)
+        self.variants = list(variants or [])
+
+    def sample(self):
+        r = self.rng
+        if self.variants and r.random() < 0.25:
+            return r.choice(self.variants)
+        if self.elements:
+            return r.choice(self.elements)
+        return None
+
+
+class BoundaryDateSampler(DateSampler):
+    """DateSampler that plants the listed boundary literals (D-1, D, D+1) with a fixed share."""
+
+    def __init__(self, elements, p, max_l0, rng, boundaries=None):
+        super().__init__(elements, p, max_l0, rng)
+        self.boundaries = [str(b) for b in (boundaries or [])]
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.35:
+            return r.choice(self.boundaries)
+        return super().sample()
+
+
+class BoundaryNumberSampler(NumberSampler):
+    """NumberSampler that plants L-1, L, L+1 for each listed numeric literal."""
+
+    def __init__(self, elements, p, max_l0, rng, boundaries=None, **kw):
+        super().__init__(elements, p, max_l0, rng, **kw)
+        self.boundaries = []
+        for b in (boundaries or []):
+            try:
+                i = int(b)
+            except (TypeError, ValueError):
+                continue
+            self.boundaries += [i - 1, i, i + 1]
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.35:
+            return r.choice(self.boundaries)
+        return super().sample()
+
+
+class BoundaryStringSampler(StringSampler):
+    """StringSampler that plants the listed string literals (and their numeric neighbours)."""
+
+    def __init__(self, elements, p, max_l0, rng, boundaries=None, **kw):
+        super().__init__(elements, p, max_l0, rng, **kw)
+        self.boundaries = [str(b) for b in (boundaries or [])]
+
+    def sample(self):
+        r = self.rng
+        if self.boundaries and r.random() < 0.35:
+            return r.choice(self.boundaries)
+        return super().sample()
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, spec_col=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    spec_col = spec_col or {}
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+    if spec_col.get('enum'):
+        return EnumSampler(list(spec_col['enum']), p, max_l0, rng, spec_col.get('enum_case_variants'))
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
@@ -195,6 +265,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
             return NumberSampler(els, p, max_l0, rng, scale=4)
+        if spec_col.get('boundary_dates'):
+            return BoundaryDateSampler(els, p, max_l0, rng, spec_col['boundary_dates'])
         return DateSampler(els, p, max_l0, rng)
     if 'bool' in t:
         return BoolSampler(els, p, max_l0, rng)
@@ -208,15 +280,21 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
+        if spec_col.get('boundary_numbers'):
+            return BoundaryNumberSampler(els, p, max_l0, rng, spec_col['boundary_numbers'],
+                                         scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
         return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
     if any(k in t for k in ('char', 'text', 'blob')):
+        if spec_col.get('boundary_strings'):
+            return BoundaryStringSampler(els, p, max_l0, rng, spec_col['boundary_strings'],
+                                         length=args[0] if args else 20)
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), spec_col=None) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224 (spec literals merged into the pool)."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,11 +303,12 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, spec_col)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), spec_col=None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, spec_col)
     return [s.sample() for _ in range(n)]

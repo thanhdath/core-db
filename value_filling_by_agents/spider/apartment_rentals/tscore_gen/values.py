@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import specification as spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -182,6 +184,123 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform pick from a fixed enum list; canonical values only."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class BoundaryTextSampler(ColumnSampler):
+    """For each literal L include L and a case variant; fill with a small pool."""
+
+    def __init__(self, literals, rng, fill_pool=None):
+        pool = []
+        for L in literals:
+            pool.append(L)
+            pool.append(L.lower())
+            pool.append(L.upper())
+        if fill_pool:
+            pool.extend(fill_pool)
+        super().__init__(pool, 0.0, float('inf'), rng)
+        self.pool = pool
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class BoundaryNumericSampler(ColumnSampler):
+    """For each literal L include L-1, L, L+1; optionally clamp to a range."""
+
+    def __init__(self, literals, rng, lo=None, hi=None):
+        pool = []
+        for L in literals:
+            for d in (-1, 0, 1):
+                v = L + d
+                if lo is not None and v < lo:
+                    continue
+                if hi is not None and v > hi:
+                    continue
+                pool.append(v)
+        if not pool:
+            pool = list(literals)
+        super().__init__(pool, 0.0, float('inf'), rng)
+        self.pool = pool
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class RangeIntSampler(ColumnSampler):
+    """Uniform integer in [lo, hi]; boundary values included in the pool."""
+
+    def __init__(self, lo, hi, rng, boundary=None):
+        pool = list(range(lo, hi + 1))
+        if boundary:
+            for L in boundary:
+                for d in (-1, 0, 1):
+                    v = L + d
+                    if lo <= v <= hi:
+                        pool.append(v)
+        super().__init__(pool, 0.0, float('inf'), rng)
+        self.lo, self.hi = lo, hi
+        self.pool = pool
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class RoomCountSampler(ColumnSampler):
+    """CHAR(5) numeric strings in [3, 9]."""
+
+    def __init__(self, lo, hi, rng):
+        pool = [str(v) for v in range(lo, hi + 1)]
+        super().__init__(pool, 0.0, float('inf'), rng)
+        self.pool = pool
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class DatetimeSampler(ColumnSampler):
+    """Uniform timestamp in [lo, hi] formatted '%Y-%m-%d %H:%M:%S'."""
+
+    def __init__(self, lo, hi, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.lo = dt.datetime.strptime(lo, '%Y-%m-%d %H:%M:%S')
+        self.hi = dt.datetime.strptime(hi, '%Y-%m-%d %H:%M:%S')
+        self.span = int((self.hi - self.lo).total_seconds())
+
+    def sample(self):
+        d = self.lo + dt.timedelta(seconds=self.rng.randint(0, self.span))
+        return d.strftime('%Y-%m-%d %H:%M:%S')
+
+
+class BitSampler(ColumnSampler):
+    """Uniform in {0, 1}."""
+
+    def __init__(self, rng):
+        super().__init__([0, 1], 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.randint(0, 1)
+
+
+class LiteralPoolSampler(ColumnSampler):
+    """Pick from a fixed literal pool (e.g. building_manager)."""
+
+    def __init__(self, pool, rng):
+        super().__init__(list(pool), 0.0, float('inf'), rng)
+        self.pool = list(pool)
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +352,30 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def make_spec_sampler(table: str, column: str, column_meta, rng, literal_pool=None):
+    """Return a specification-driven sampler for (table, column), or None if no rule applies."""
+    key = (table, column)
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], rng)
+    if key in spec.BOUNDARY_TEXT:
+        fill = list(literal_pool or [])
+        return BoundaryTextSampler(spec.BOUNDARY_TEXT[key], rng, fill_pool=fill)
+    if key in spec.BOUNDARY_NUMERIC:
+        lo, hi = spec.NUMERIC_RANGES.get(key, (None, None))
+        return BoundaryNumericSampler(spec.BOUNDARY_NUMERIC[key], rng, lo=lo, hi=hi)
+    if key in spec.NUMERIC_RANGES:
+        lo, hi = spec.NUMERIC_RANGES[key]
+        return RangeIntSampler(lo, hi, rng, boundary=spec.BOUNDARY_NUMERIC.get(key))
+    if key == ('Apartments', 'room_count'):
+        lo, hi = spec.ROOM_COUNT_RANGE
+        return RoomCountSampler(lo, hi, rng)
+    if key in spec.LITERAL_POOLS:
+        return LiteralPoolSampler(spec.LITERAL_POOLS[key], rng)
+    t = (column_meta.type_str or '').lower()
+    if 'date' in t or 'timestamp' in t:
+        return DatetimeSampler(spec.DATETIME_LO, spec.DATETIME_HI, rng)
+    if 'bit' in t:
+        return BitSampler(rng)
+    return None

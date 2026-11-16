@@ -1,51 +1,645 @@
 {
  "db": "college_1",
- "operator_io_quirks": [
-  "DDL has missing commas between FOREIGN KEY clauses (CLASS, ENROLL) \u2014 sqlite_master stores the original text; CREATE TABLE replay must tolerate it (sqlite accepts it, but text is not re-parsable by naive splitters)",
-  "All columns notnull=0, no CHECK/UNIQUE constraints, no indexes/views/triggers \u2014 insert failures will be rare; PK uniqueness is the only real constraint",
-  "ENROLL and PROFESSOR have no PK (pk=[]); sample_fresh_primary_keys must no-op on empty PK, drop_unique_duplicates must no-op on no unique cols",
-  "FK graph has a cycle: DEPARTMENT.EMP_NUM -> EMPLOYEE, and CLASS.PROF_NUM -> EMPLOYEE, but DEPARTMENT<->EMPLOYEE is not a cycle; however COURSE->DEPARTMENT->EMPLOYEE and CLASS->COURSE, CLASS->EMPLOYEE give a DAG; no self-FK",
-  "EMP_HIREDATE/EMP_DOB/STU_DOB declared 'datetime' but stored as TEXT 'YYYY-M-D' (no zero padding, e.g. '1978-2-23') \u2014 Date fuzzer template must be %Y-%m-%d and leading-zero stripping applies",
-  "STU_TRANSFER declared 'numeric' but storage is integer 0/1 \u2014 Number fuzzer will emit floats; sqlite affinity NUMERIC will coerce, fine",
-  "STU_INIT has empty-string sample '' \u2014 String fuzzer length range [0,1] must allow empty",
-  "STU_PHONE varchar(4) holds 4-digit strings; DEPT_EXTENSION/PROF_EXTENSION varchar(4) hold 4-digit strings \u2014 String fuzzer will produce random alnum, breaking phone/extension semantics",
-  "CLASS_TIME varchar(20) holds 'MWF 8:00-8:50 a.m.' \u2014 declared type does NOT contain 'time' as a word boundary issue? it does contain 'time' substring; ts_fuzzer says String, so dispatch is on lowercased type 'varchar(20)' not column name \u2014 confirm",
-  "STU_NUM values are 6-digit (321452) while EMP_NUM are 3-digit (100) \u2014 Number fuzzer range [-10^scale,10^scale] with scale from 'int' args (none) => default scale; PKs will be small ints, not 6-digit",
-  "CLASS_CODE varchar(5) PK holds '10012'..'10021' (5-digit strings) \u2014 String fuzzer will emit random 0-5 char strings, PK collisions likely, sample_fresh_primary_keys will drop many rows",
-  "All tables tiny (6-37 rows); choose_table_sizes level-0 = 1+30u, next x4 capped 2500 \u2014 instances will be much larger than originals, FK fan-out from small parents"
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on EMP_HIREDATE/EMP_DOB/STU_DOB: template %Y-%m-%d (first parsable element '1978-2-23'), range from min/max parsed dates, leading-zero strip since no element starts with 0 and none contains '-0'",
-  "Number fuzzer on EMP_NUM/STU_NUM/PROF_NUM/STU_HRS/STU_TRANSFER: int scale default, range [-10^s,10^s]; STU_TRANSFER numeric -> float draws, sqlite coerces to int 0/1 only if value is integral",
-  "Number fuzzer on CRS_CREDIT float(8) and STU_GPA float(8): scale=8, precision=8 => range [-1e8,1e8], wildly implausible credits/GPA (FN driver: queries filtering GPA between 2 and 4 or credits=3 will find few/no rows)",
-  "String fuzzer on all varchar columns: CHARSET a-zA-Z 0-9() with length in [min,max+1] of elements; e.g. CLASS_CODE length [5,6], EMP_INITIAL [1,2], STU_INIT [0,2] \u2014 random strings, not 'ACCT-211' style (FN driver: LIKE 'ACCT%' or ='CIS-220' misses)",
-  "String fuzzer on EMP_JOBCODE/STU_CLASS/PROF_HIGH_DEGREE/ENROLL_GRADE: random strings, not the 4-value enums (FN driver: IN ('CUST','TECH') or grade='A' misses)",
-  "FK columns (CLASS.CRS_CODE, CLASS.PROF_NUM, COURSE.DEPT_CODE, DEPARTMENT.EMP_NUM, ENROLL.CLASS_CODE, ENROLL.STU_NUM, PROFESSOR.EMP_NUM, PROFESSOR.DEPT_CODE, STUDENT.DEPT_CODE) draw from parent's FINAL filtered values with replacement \u2014 ties/duplicates in child FK columns are common (FP driver: joins produce duplicate rows, COUNT differs from gold)",
-  "PK columns (CLASS_CODE, CRS_CODE, DEPT_CODE, EMP_NUM, STU_NUM) get max_l0=inf (single-col PK) so fresh draws never reuse \u2014 but String PKs still collide by chance, sample_fresh_primary_keys drops duplicates, shrinking tables",
-  "ENROLL/PROFESSOR have no PK: no dedup, rows can be fully duplicated (FP driver: SELECT DISTINCT vs not, COUNT(*) inflated)",
-  "DEPARTMENT.EMP_NUM is FK to EMPLOYEE but also semantically 'department chair' \u2014 TS treats it as plain FK, so chair may be any employee (plausible; not a miss driver)",
-  "STU_PHONE/DEPT_EXTENSION/PROF_EXTENSION varchar(4) get random alnum strings, not digits (FN driver: phone LIKE '2%' or extension='3119' misses)",
-  "CLASS_TIME varchar(20) gets random strings, not 'MWF 8:00-8:50 a.m.' (FN driver: time-of-day filters miss)",
-  "p=0.2 default, whole-instance p=0 w.p. 0.3: 30% of instances use only literal-pool/original values (no fresh draws) \u2014 those instances are more plausible but have fewer distinct values (FP driver: ties)"
- ],
- "challenger_refs": [
-  "G22",
-  "g79ef2eea",
-  "gd56d785d",
-  "gea5c2f6f",
-  "g41f52d3b",
-  "g7c4ef7e1",
-  "g787935bb",
-  "g3dae986f",
-  "g136355ed",
-  "g9f916314",
-  "g6335854a"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential or random unique integers within the observed range; never NULL; no duplicates; fresh values must not collide with compact rows.",
+   "integer_fk": "Sample from the parent table's key pool (compact + generated parent keys); allow NULL only for columns listed in null_targets; never emit orphan non-NULL values.",
+   "varchar_code": "Sample from the explicit value pool for the column; allow case variants (upper/lower) and one-step near variants; allow NULL only where listed in null_targets.",
+   "varchar_name": "Sample from a name pool; allow duplicates (20-50% duplicate share) and case variants; allow NULL only where listed in null_targets.",
+   "varchar_description": "Sample from a description pool; allow case variants; allow NULL only where listed in null_targets.",
+   "varchar_short": "Sample from a short string pool; allow duplicates and case variants; allow NULL only where listed in null_targets.",
+   "float_credit": "Sample from {3.0, 4.0}; allow NULL only where listed in null_targets.",
+   "float_gpa": "Sample from [0.0, 4.0] with two decimals; allow duplicates; allow NULL only where listed in null_targets.",
+   "numeric_flag": "Sample from {0, 1}; allow NULL only where listed in null_targets.",
+   "datetime": "Sample dates in the observed range; allow NULL only where listed in null_targets.",
+   "varchar_phone_ext": "Sample 4-digit strings; allow duplicates; allow NULL only where listed in null_targets.",
+   "varchar_grade": "Sample from {A, B, C, D, F}; allow NULL only where listed in null_targets.",
+   "varchar_section": "Sample from {1, 2, 3}; allow duplicates; allow NULL only where listed in null_targets.",
+   "varchar_time": "Sample from the time-slot pool; allow NULL only where listed in null_targets.",
+   "varchar_room": "Sample from the room pool; allow NULL only where listed in null_targets.",
+   "varchar_class_standing": "Sample from {Fr, So, Jr, Sr}; allow NULL only where listed in null_targets.",
+   "varchar_degree": "Sample from {Ph.D., MA, DBA, MBA}; allow NULL with 5-30% null share.",
+   "varchar_jobcode": "Sample from {CUST, TECH, PROF, CLRK}; allow case variants; allow NULL only where listed in null_targets."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "DEPARTMENT.DEPT_NAME": [
+      "History",
+      "history",
+      "Accounting",
+      "accounting",
+      "Biology",
+      "biology"
+     ],
+     "DEPARTMENT.DEPT_CODE": [
+      "HIST",
+      "hist",
+      "BIOL",
+      "biol",
+      "ACCT",
+      "acct"
+     ],
+     "CLASS.CRS_CODE": [
+      "ACCT-211",
+      "acct-211",
+      "CIS-220",
+      "cis-220",
+      "QM-261",
+      "qm-261"
+     ],
+     "COURSE.CRS_CODE": [
+      "ACCT-211",
+      "acct-211"
+     ],
+     "PROFESSOR.DEPT_CODE": [
+      "BIOL",
+      "biol",
+      "HIST",
+      "hist",
+      "ACCT",
+      "acct"
+     ],
+     "CLASS.CLASS_CODE": [
+      "10017",
+      "10018",
+      "10019"
+     ],
+     "ENROLL.CLASS_CODE": [
+      "10017",
+      "10018",
+      "10019"
+     ],
+     "EMPLOYEE.EMP_LNAME": [
+      "Heffington",
+      "heffington",
+      "Graztevski",
+      "graztevski"
+     ],
+     "COURSE.CRS_DESCRIPTION": [
+      "Accounting I",
+      "accounting i"
+     ],
+     "EMPLOYEE.EMP_JOBCODE": [
+      "PROF",
+      "prof"
+     ]
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "CLASS.CRS_CODE": {
+      "joins_with": [
+       "COURSE.CRS_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "COURSE.CRS_CODE": {
+      "joins_with": [
+       "CLASS.CRS_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "DEPARTMENT.DEPT_CODE": {
+      "joins_with": [
+       "PROFESSOR.DEPT_CODE",
+       "STUDENT.DEPT_CODE",
+       "COURSE.DEPT_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "PROFESSOR.DEPT_CODE": {
+      "joins_with": [
+       "DEPARTMENT.DEPT_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "PROFESSOR.EMP_NUM": {
+      "joins_with": [
+       "CLASS.PROF_NUM",
+       "EMPLOYEE.EMP_NUM",
+       "DEPARTMENT.EMP_NUM"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "CLASS.PROF_NUM": {
+      "joins_with": [
+       "PROFESSOR.EMP_NUM",
+       "EMPLOYEE.EMP_NUM",
+       "DEPARTMENT.EMP_NUM"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "EMPLOYEE.EMP_NUM": {
+      "joins_with": [
+       "PROFESSOR.EMP_NUM",
+       "CLASS.PROF_NUM",
+       "DEPARTMENT.EMP_NUM"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "DEPARTMENT.EMP_NUM": {
+      "joins_with": [
+       "PROFESSOR.EMP_NUM",
+       "EMPLOYEE.EMP_NUM",
+       "CLASS.PROF_NUM"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "CLASS.CLASS_CODE": {
+      "joins_with": [
+       "ENROLL.CLASS_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "ENROLL.CLASS_CODE": {
+      "joins_with": [
+       "CLASS.CLASS_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "STUDENT.DEPT_CODE": {
+      "joins_with": [
+       "DEPARTMENT.DEPT_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "COURSE.DEPT_CODE": {
+      "joins_with": [
+       "DEPARTMENT.DEPT_CODE"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "ENROLL.STU_NUM": {
+      "joins_with": [
+       "STUDENT.STU_NUM"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     }
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "DEPARTMENT.DEPT_NAME": {
+      "duplicate_share": "20-50 %"
+     },
+     "STUDENT.STU_FNAME": {
+      "duplicate_share": "20-50 %"
+     },
+     "DEPARTMENT.DEPT_ADDRESS": {
+      "duplicate_share": "20-50 %"
+     },
+     "EMPLOYEE.EMP_FNAME": {
+      "duplicate_share": "20-50 %"
+     },
+     "CLASS.CLASS_SECTION": {
+      "duplicate_share": "20-50 %"
+     },
+     "DEPARTMENT.DEPT_EXTENSION": {
+      "duplicate_share": "20-50 %"
+     },
+     "ENROLL.STU_NUM": {
+      "duplicate_share": "20-50 %"
+     },
+     "STUDENT.STU_GPA": {
+      "duplicate_share": "20-50 %"
+     }
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "DEPARTMENT.DEPT_CODE": {
+      "group_sizes": "1, 2 and >= 3",
+      "optional": true
+     },
+     "STUDENT.DEPT_CODE": {
+      "group_sizes": "1, 2 and >= 3",
+      "optional": true
+     },
+     "COURSE.DEPT_CODE": {
+      "group_sizes": "1, 2 and >= 3",
+      "optional": true
+     }
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "STUDENT.DEPT_CODE": {
+      "ties": true,
+      "optional": true
+     },
+     "EMPLOYEE.EMP_FNAME": {
+      "ties": true,
+      "optional": true
+     }
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "PROFESSOR.PROF_HIGH_DEGREE": {
+      "null_share": "5-30 %"
+     }
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "STUDENT.STU_NUM": {
+      "null_share": "none (NOT NULL column)"
+     }
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "CLASS.PROF_NUM": {
+      "aggregate": true
+     },
+     "CLASS.CLASS_CODE": {
+      "aggregate": true
+     },
+     "EMPLOYEE.EMP_FNAME": {
+      "aggregate": true
+     }
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "CLASS.CRS_CODE",
+    "parent": "COURSE.CRS_CODE",
+    "copied": []
+   },
+   {
+    "child": "CLASS.PROF_NUM",
+    "parent": "EMPLOYEE.EMP_NUM",
+    "copied": []
+   },
+   {
+    "child": "COURSE.DEPT_CODE",
+    "parent": "DEPARTMENT.DEPT_CODE",
+    "copied": []
+   },
+   {
+    "child": "DEPARTMENT.EMP_NUM",
+    "parent": "EMPLOYEE.EMP_NUM",
+    "copied": []
+   },
+   {
+    "child": "ENROLL.CLASS_CODE",
+    "parent": "CLASS.CLASS_CODE",
+    "copied": []
+   },
+   {
+    "child": "ENROLL.STU_NUM",
+    "parent": "STUDENT.STU_NUM",
+    "copied": []
+   },
+   {
+    "child": "PROFESSOR.EMP_NUM",
+    "parent": "EMPLOYEE.EMP_NUM",
+    "copied": []
+   },
+   {
+    "child": "PROFESSOR.DEPT_CODE",
+    "parent": "DEPARTMENT.DEPT_CODE",
+    "copied": []
+   },
+   {
+    "child": "STUDENT.DEPT_CODE",
+    "parent": "DEPARTMENT.DEPT_CODE",
+    "copied": []
+   },
+   {
+    "child": "STUDENT.PROF_NUM",
+    "parent": "PROFESSOR.EMP_NUM",
+    "copied": [],
+    "note": "not declared in schema; enforce only if program consults spec dependencies"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "COURSE",
+    "column": "CRS_CREDIT",
+    "formula": "CRS_CREDIT IN (3.0, 4.0)"
+   },
+   {
+    "table": "STUDENT",
+    "column": "STU_GPA",
+    "formula": "STU_GPA BETWEEN 0.0 AND 4.0"
+   },
+   {
+    "table": "STUDENT",
+    "column": "STU_TRANSFER",
+    "formula": "STU_TRANSFER IN (0, 1)"
+   },
+   {
+    "table": "STUDENT",
+    "column": "STU_CLASS",
+    "formula": "STU_CLASS IN ('Fr', 'So', 'Jr', 'Sr')"
+   },
+   {
+    "table": "EMPLOYEE",
+    "column": "EMP_JOBCODE",
+    "formula": "EMP_JOBCODE IN ('CUST', 'TECH', 'PROF', 'CLRK')"
+   },
+   {
+    "table": "PROFESSOR",
+    "column": "PROF_HIGH_DEGREE",
+    "formula": "PROF_HIGH_DEGREE IN ('Ph.D.', 'MA', 'DBA', 'MBA')"
+   },
+   {
+    "table": "ENROLL",
+    "column": "ENROLL_GRADE",
+    "formula": "ENROLL_GRADE IN ('A', 'B', 'C', 'D', 'F')"
+   },
+   {
+    "table": "CLASS",
+    "column": "CLASS_SECTION",
+    "formula": "CLASS_SECTION IN ('1', '2', '3')"
+   },
+   {
+    "table": "EMPLOYEE",
+    "column": "EMP_HIREDATE",
+    "formula": "EMP_HIREDATE > EMP_DOB",
+    "evidence": "1978-2-23 > 1950-6-12; 1994-11-15 > 1961-11-2; 1990-7-23 > 1953-7-3",
+    "uncertain": true
+   },
+   {
+    "table": "STUDENT",
+    "column": "STU_HRS",
+    "formula": "STU_HRS >= 0"
+   },
+   {
+    "table": "STUDENT",
+    "column": "STU_NUM",
+    "formula": "STU_NUM IS NOT NULL"
+   },
+   {
+    "table": "CLASS",
+    "column": "CLASS_CODE",
+    "formula": "CLASS_CODE IS NOT NULL"
+   },
+   {
+    "table": "COURSE",
+    "column": "CRS_CODE",
+    "formula": "CRS_CODE IS NOT NULL"
+   },
+   {
+    "table": "DEPARTMENT",
+    "column": "DEPT_CODE",
+    "formula": "DEPT_CODE IS NOT NULL"
+   },
+   {
+    "table": "EMPLOYEE",
+    "column": "EMP_NUM",
+    "formula": "EMP_NUM IS NOT NULL"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "EMPLOYEE": 40,
+   "DEPARTMENT": 12,
+   "COURSE": 8,
+   "CLASS": 15,
+   "STUDENT": 10,
+   "PROFESSOR": 24,
+   "ENROLL": 8
+  },
+  "null_targets": [
+   "PROFESSOR.PROF_HIGH_DEGREE",
+   "CLASS.CRS_CODE",
+   "CLASS.PROF_NUM",
+   "CLASS.CLASS_ROOM",
+   "CLASS.CLASS_SECTION",
+   "CLASS.CLASS_TIME",
+   "COURSE.DEPT_CODE",
+   "COURSE.CRS_CREDIT",
+   "COURSE.CRS_DESCRIPTION",
+   "DEPARTMENT.EMP_NUM",
+   "EMPLOYEE.EMP_DOB",
+   "EMPLOYEE.EMP_FNAME",
+   "EMPLOYEE.EMP_HIREDATE",
+   "EMPLOYEE.EMP_INITIAL",
+   "EMPLOYEE.EMP_JOBCODE",
+   "EMPLOYEE.EMP_LNAME",
+   "ENROLL.CLASS_CODE",
+   "ENROLL.STU_NUM",
+   "ENROLL.ENROLL_GRADE",
+   "PROFESSOR.EMP_NUM",
+   "PROFESSOR.DEPT_CODE",
+   "PROFESSOR.PROF_EXTENSION",
+   "PROFESSOR.PROF_OFFICE",
+   "STUDENT.DEPT_CODE",
+   "STUDENT.PROF_NUM",
+   "STUDENT.STU_CLASS",
+   "STUDENT.STU_DOB",
+   "STUDENT.STU_FNAME",
+   "STUDENT.STU_GPA",
+   "STUDENT.STU_HRS",
+   "STUDENT.STU_INIT",
+   "STUDENT.STU_LNAME",
+   "STUDENT.STU_PHONE",
+   "STUDENT.STU_TRANSFER"
+  ],
+  "supporting_evidence": {
+   "COURSE.CRS_CREDIT": "Rows: ACCT-211=3.0, ACCT-212=3.0, CIS-220=3.0, CIS-420=4.0, QM-261=3.0, QM-362=3.0",
+   "STUDENT.STU_GPA": "Rows: 2.84, 3.27, 2.26, 3.09, 2.11, 3.15, 3.87, 2.92 all in [0,4]",
+   "STUDENT.STU_TRANSFER": "Rows: 0, 1, 0, 1, 0, 1, 0, 1",
+   "STUDENT.STU_CLASS": "Rows: So, Jr, Sr, Fr, So, Jr, Sr, Fr",
+   "EMPLOYEE.EMP_JOBCODE": "Rows: CUST, TECH, PROF, CLRK, PROF, PROF, PROF, PROF",
+   "PROFESSOR.PROF_HIGH_DEGREE": "Rows: Ph.D., MA, DBA, MBA, Ph.D., MA, DBA, MBA",
+   "ENROLL.ENROLL_GRADE": "Rows: C, B, A, C, B, A",
+   "CLASS.CLASS_SECTION": "Rows: 1, 2, 3, 1, 2, 3, 1, 2",
+   "EMPLOYEE.EMP_HIREDATE > EMP_DOB": "Rows: 1978-2-23 > 1950-6-12; 1994-11-15 > 1961-11-2; 1990-7-23 > 1953-7-3"
+  },
+  "uncertainty": "The exact null shares for nullable columns are not fully specified; generic rules use the observed null_rate of 0.0 but allow NULL where nullable per instruction 10. The formula EMP_HIREDATE > EMP_DOB is inferred from the sample and may not hold universally; marked uncertain. The STUDENT.PROF_NUM foreign key references PROFESSOR.EMP_NUM but the schema does not declare it; it is included as a dependency based on the atomic-operation summary but should be enforced only if the program consults spec dependencies. CLASS.CLASS_CODE and ENROLL.CLASS_CODE boundary values are stored as strings to match the varchar(5) declared type. The group_sizes patterns for DEPARTMENT.DEPT_CODE, STUDENT.DEPT_CODE, COURSE.DEPT_CODE and ties_for_order_limit for STUDENT.DEPT_CODE, EMPLOYEE.EMP_FNAME are marked optional due to thin evidence. Orphan FK injection is enabled (child_rows_with_null_fk=true) for nullable FK columns, consistent with the null_targets list; non-NULL FK values must still reference existing parent keys. The compact DB may contain pre-existing FK violations (STUDENT rows 5,7 -> DEPARTMENT); these must be preserved verbatim and must not cause the generator to fail."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback reports rows_added all zero for every table (CLASS:0, COURSE:0, ..., STUDENT:0) across all 20 instances, and validity reasons 'no_rows_added' for 20/20 instances. Root cause: in tscore_gen/spec.py DEFAULT_SPEC uses key 'table_sizes', but the supplied specification uses 'table_sizes_per_instance'. In tscore_gen/instance.py `_choose_enum_sizes` reads `spec.get('table_sizes', {})` and `build_random_instance` calls `_choose_enum_sizes(schema, spec, rng)`, so with the actual specification.json (which has no 'table_sizes') every table size becomes 0. No rows are ever generated, the instances are exact copies of the compact DB, and no value variation, duplicate, NULL, orphan, or group-size patterns from the specification are exercised.",
+     "revision": "Make the instance builder read the specification's actual key 'table_sizes_per_instance' (with fallback), e.g. `spec.get('table_sizes_per_instance') or spec.get('table_sizes')`, so nonzero sizes are produced and rows are appended. Re-run and confirm rows_added > 0 and validity.not_ok = 0 with no 'no_rows_added' reasons."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic rules include enumerations (COURSE.CRS_CREDIT IN (3.0,4.0), STUDENT.STU_TRANSFER IN (0,1), STUDENT.STU_CLASS, EMPLOYEE.EMP_JOBCODE, PROFESSOR.PROF_HIGH_DEGREE, ENROLL.ENROLL_GRADE, CLASS.CLASS_SECTION), ranges (STU_GPA [0,4], STU_HRS>=0) and the formula EMP_HIREDATE > EMP_DOB. The specification JSON encodes these under 'semantic_rules_and_formulas', but tscore_gen/spec.py's DEFAULT_SPEC and the loader expect flattened keys 'enumeration', 'ranges', 'formulas'. When the pipeline-written specification.json is loaded, `make_column_sampler` looks up `spec.get('enumeration', {})` and `spec.get('ranges', {})`, which are absent in the specification format actually used, so enums/ranges from the delivered specification are not applied (they only apply via the fallback DEFAULT_SPEC). Likewise the top-level 'comparison_boundary', 'group_sizes', 'ties', and 'null_targets' lookups do not exist in the delivered specification's structure (comparison boundaries live under per_column_exceptions; null_share for PROFESSOR.PROF_HIGH_DEGREE is 5-30%, not the flat 'null_targets' shape the loader expects). Additionally EMP_HIREDATE > EMP_DOB is not enforced anywhere (no formula evaluation in instance.py/values.py).",
+     "revision": "Either normalize the specification into the flat schema the program loads (add an adapter that maps semantic_rules_and_formulas and per_column_exceptions into 'enumeration'/'ranges'/'formulas'/'comparison_boundary'/'group_sizes'/'ties'), or change the program to consume the specification's actual structure. Implement an enforcement step for the EMP_HIREDATE > EMP_DOB formula (resample EMP_DOB or EMP_HIREDATE when violated) and for STUDENT.STU_HRS >= 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Unmatched-join ingest cannot currently be satisfied in a way consistent with declared foreign keys. The specification's 'unmatched_join_rows' pattern (with parent_rows_without_children and child_rows_with_null_fk) is stored only under per_column_exceptions. The program's `fill_foreign_keys_consistently` samples purely from the parent key pool plus NULL, and never injects orphan values; it also lacks parent-side orphan generation (rows in parent tables never referenced by any child). CLASS.CRS_CODE='' orphan and 'course.crs_code in (ACCT-211)' boundary are not separated per execution feedback (6/145 separated), partly because generation produced no rows at all.",
+     "revision": "After fixing the size bug, implement orphan injection explicitly: for FK child columns that the specification marks with child_rows_with_null_fk/unmatched_join_rows, draw a small share from the literal pool that is not in the parent key set; and for tables that are parents (COURSE, DEPARTMENT, CLASS, EMPLOYEE), ensure a share of generated parent rows are unreferenced by any child. Coordinate with the NULL rule so NULLs are not replaced. Re-run and confirm construction_pairs separated count rises above the intended threshold or at least that many matched pairs execute with differing denotations."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's generic rule says integer_fk_nullable allows NULL with the column's null share and a small share of orphans. The uniform 'null_share': 0.15 in DEFAULT_SPEC and `_apply_null_rule`/`fill_foreign_keys_consistently` use a single 0.15 null share for all nullable columns, whereas the specification expects per-column shares derived from compact data (which is 0.0 for the compact DB, per the DESIGNER's uncertainty note). The null rule also does not distinguish the PROFESSOR.PROF_HIGH_DEGREE 5-30% NULL requirement from the general NULL rule.",
+     "revision": "Designer: publish explicit per-column null shares (observation-based rates) and encode comparison-boundary/group_sizes/ties/enumeration/ranges in the flattened schema the program loads, or document the adapter contract. Engineer: after aligning key names, apply per-column null shares and ensure PROFESSOR.PROF_HIGH_DEGREE gets 5-30% NULL."
+    }
+   ],
+   "unresolved_checks": [
+    "Only execution evidence: construction_pairs eligible 145 vs separated 6; with all tables at 0 rows this comparison is non-informative. After size fix, re-measure separated count.",
+    "Reproducibility: verified true on this run, but the pipeline returned 0 rows in every instance, so the true reproducibility under non-zero sizes is untested.",
+    "Whether the pipeline actually writes specification.json (vs. spec.py DEFAULT_SPEC) is inferred from the mismatch in key names; downstream spec loading was not directly inspected beyond the provided files.",
+    "Comparison-boundary values for CLASS.CLASS_CODE (10017,10018,10019) and ENROLL.CLASS_CODE look numeric in the specification but CLASS.CLASS_CODE is varchar(5); string-vs-numeric handling of these boundaries was not verified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 189 across 20 instances, validity.invalid = 20 with reason 'new_integrity_failures'. The generator deliberately injects orphan FK values: instance.py fill_foreign_keys_consistently() sets orphan_share = 0.1 whenever spec['unmatched_join'][colkey]['child_rows_with_null_fk'] is true, and _orphan_pool() returns values not present in the parent key set. The spec's per_column_exceptions 'unmatched_join_rows' entries all set child_rows_with_null_fk: true for CLASS.CRS_CODE, CLASS.PROF_NUM, ENROLL.CLASS_CODE, ENROLL.STU_NUM, PROFESSOR.DEPT_CODE, PROFESSOR.EMP_NUM, STUDENT.DEPT_CODE, COURSE.DEPT_CODE, DEPARTMENT.EMP_NUM, etc. The schema declares FOREIGN KEY constraints on all of these columns, so writing orphan values produces FK violations in every instance.",
+     "requested_revision": "Reconcile the 'unmatched_join_rows' pattern with the declared FOREIGN KEY constraints. Either (a) drop the orphan-injection (set child_rows_with_null_fk to false / orphan_share to 0) so generated FK values always come from the parent key pool, or (b) if unmatched-join rows are genuinely required, the writer must disable FK enforcement for those rows in a way that does not leave the instance with new integrity failures (e.g. the spec must not claim FK integrity is preserved). As written, the program cannot produce valid instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py write_instance_sqlite() executes 'pragma foreign_keys = OFF' before inserting, so FK violations are never caught at write time; rows_skipped shows 0 for ENROLL and PROFESSOR even though fk_violations = 189. The 'rows_skipped' counters therefore do not reflect the actual integrity state, and the CLI reports n_ok = 20 with no errors while every instance is invalid.",
+     "requested_revision": "Enable 'pragma foreign_keys = ON' (or run a post-write integrity check) so that FK-violating rows are detected, counted in rows_failed, and either skipped or reported. The generation must not silently emit instances that violate declared constraints."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_null_rule() only plants NULLs for columns listed in spec['null_targets']. The spec's null_targets list omits many nullable columns that the feedback shows as 'NULL 0 / n': CLASS.CLASS_ROOM, CLASS.CLASS_SECTION, CLASS.CLASS_TIME, COURSE.CRS_CREDIT, COURSE.CRS_DESCRIPTION, EMPLOYEE.EMP_DOB, EMPLOYEE.EMP_FNAME, EMPLOYEE.EMP_HIREDATE, EMPLOYEE.EMP_INITIAL, EMPLOYEE.EMP_JOBCODE, EMPLOYEE.EMP_LNAME, ENROLL.ENROLL_GRADE, PROFESSOR.PROF_EXTENSION, PROFESSOR.PROF_OFFICE, STUDENT.STU_CLASS, STUDENT.STU_DOB, STUDENT.STU_FNAME, STUDENT.STU_GPA, STUDENT.STU_HRS, STUDENT.STU_INIT, STUDENT.STU_LNAME, STUDENT.STU_PHONE, STUDENT.STU_TRANSFER. Per the NULL rule, every nullable column should get at least one NULL row per instance.",
+     "requested_revision": "Extend null_targets (or make _apply_null_rule default to all nullable non-PK columns) so that every nullable column receives at least one NULL row per instance, with the share following the compact database's observed share. Note: per instruction 7 this is a note for the engineer and does not by itself block a pass, but it should be fixed alongside the FK issue."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'unmatched_join_rows' pattern asserts parent_rows_without_children: true and child_rows_with_null_fk: true for FK columns that are declared NOT NULL in the schema (e.g. CLASS.CRS_CODE, CLASS.PROF_NUM, ENROLL.CLASS_CODE, ENROLL.STU_NUM, PROFESSOR.EMP_NUM, PROFESSOR.DEPT_CODE, STUDENT.DEPT_CODE, COURSE.DEPT_CODE, DEPARTMENT.EMP_NUM). The schema has no NOT NULL on these columns, but the FOREIGN KEY constraints are declared, so 'child_rows_with_null_fk' combined with orphan injection is inconsistent with the declared integrity constraints. The spec also lists these columns in null_targets, which is consistent with the NULL rule but conflicts with the 'unmatched_join_rows' intent of producing orphan (non-NULL, non-parent) values.",
+     "requested_revision": "Clarify the intended semantics: if unmatched-join rows are desired, the spec must state that FK constraints are relaxed for those columns and the writer must not report integrity failures; otherwise remove the orphan-injection requirement. The spec should not simultaneously require FK integrity and orphan FK values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'uncertainty' field admits: 'The formula EMP_HIREDATE > EMP_DOB is inferred from the sample and may not hold universally.' The supporting_evidence only cites 3 rows. The program enforces it via _enforce_formulas, which is fine, but the rule is not strongly evidenced. Similarly, the 'group_sizes' pattern for DEPARTMENT.DEPT_CODE, STUDENT.DEPT_CODE, COURSE.DEPT_CODE is asserted with '1, 2 and >= 3' but the supporting evidence is thin (only a few rows).",
+     "requested_revision": "Mark EMP_HIREDATE > EMP_DOB and the group_sizes patterns as uncertain/optional in the spec, or provide stronger evidence. This is a documentation/evidence issue, not a blocking error."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact rows are preserved: the writer copies the original DB and appends rows, and the CLI reports rows_added per table, but the feedback does not include a direct row-count comparison of compact vs. generated instances. The 'rows_skipped' for DEPARTMENT (233) and EMPLOYEE (158) suggests many generated rows were rejected, but the compact rows themselves appear preserved by the copy-then-append design.",
+    "Whether the intended value variation (comparison_boundary, duplicates_for_distinct, ties_for_order_limit) remains possible: construction_pairs shows 43/145 separated, which is plausible given the FK-integrity failures dominating the instances. Once FK violations are fixed, re-run to confirm separation is not artificially suppressed.",
+    "Whether the 'unmatched_join_rows' pattern is intended to produce orphan values at all, or whether it was meant only to describe the compact database's existing unmatched rows (which the generator should not replicate). The spec text is ambiguous."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with IntegrityError(\"foreign key violation after insert: [('STUDENT', 5, 'DEPARTMENT', 0), ('STUDENT', 7, 'DEPARTMENT', 0)]\"). n_ok=0, n_instances=0. The compact DB's STUDENT rows 5 and 7 already reference a DEPARTMENT.DEPT_CODE that does not exist in the compact DEPARTMENT table (the schema declares FOREIGN KEY (DEPT_CODE) REFERENCES DEPARTMENT(DEPT_CODE)). writer.py enables `pragma foreign_keys = ON` and then calls `_fk_check` after commit, which raises on the pre-existing compact violation, aborting every unit.",
+     "requested_revision": "Do not fail the whole unit on pre-existing compact-row FK violations. Either (a) run `pragma foreign_key_check` only against generated rows (e.g. check before/after diff, or check only rows with rowid > compact max), or (b) treat the compact copy as trusted and skip the post-insert `_fk_check` (the per-row insert already enforces FK for generated rows), or (c) disable `foreign_keys` for the compact copy and enable it only for generated inserts. The generator must produce instances even when the compact DB itself is inconsistent, since the compact rows are preserved verbatim."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` plants NULLs on every nullable non-PK column including nullable FKs (e.g. CLASS.CRS_CODE, CLASS.PROF_NUM, ENROLL.CLASS_CODE, ENROLL.STU_NUM, STUDENT.DEPT_CODE, STUDENT.PROF_NUM, PROFESSOR.DEPT_CODE, PROFESSOR.EMP_NUM, DEPARTMENT.EMP_NUM, COURSE.DEPT_CODE). But `fill_foreign_keys_consistently` runs before `_apply_null_rule` and draws only non-NULL parent keys; the NULL rule then overwrites some of them with NULL. That is consistent with the interface NULL rule, but the spec's `unmatched_join_rows` targets set `child_rows_with_null_fk: false` for all FK columns, and the spec's `null_targets` list does not include most FK columns (only PROFESSOR.PROF_HIGH_DEGREE is a null_rows target). The program therefore plants NULLs on FK columns that the specification explicitly marks as `child_rows_with_null_fk: false` and does not list as null targets, contradicting the spec.",
+     "requested_revision": "Reconcile the NULL rule with the spec: either (a) add the nullable FK columns to `null_targets` in the specification (and set `child_rows_with_null_fk: true` for them), or (b) restrict `_apply_null_rule` to columns listed in `null_targets` / `null_shares` rather than all nullable non-PK columns. The current behavior silently violates the spec's `child_rows_with_null_fk: false`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_group_sizes` overwrites the column with values drawn from the observed pool, cycling target group sizes `[1,2,3]`. For DEPARTMENT.DEPT_CODE this replaces the primary-key column values with duplicates of observed DEPT_CODEs, which will collide with the compact DEPARTMENT rows and with the PK uniqueness enforced by `sample_fresh_primary_keys` (which ran earlier). The same applies to STUDENT.DEPT_CODE and COURSE.DEPT_CODE (FK columns) \u2014 overwriting them after `fill_foreign_keys_consistently` and after the self-FK fixup can reintroduce values not in the parent pool, and for DEPARTMENT.DEPT_CODE it breaks PK uniqueness. This is a correctness bug independent of the FK-check failure.",
+     "requested_revision": "Do not apply group-size rewriting to primary-key columns (DEPARTMENT.DEPT_CODE) or to FK columns in a way that bypasses the parent-pool constraint. Either restrict `_apply_group_sizes` to non-key, non-FK columns, or re-run the FK/PK consistency fixups after group-size rewriting. Also ensure the rewritten values for FK columns are drawn from the parent key pool, not the observed child pool."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` field itself states: 'The group_sizes patterns for DEPARTMENT.DEPT_CODE, STUDENT.DEPT_CODE, COURSE.DEPT_CODE are asserted with \"1, 2 and >= 3\" but the supporting evidence is thin; treat as optional.' The atomic-operation summary lists group_sizes for these columns with only 1-7 pairs and no concrete group-size distribution evidence. The `ties_for_order_limit` targets (STUDENT.DEPT_CODE, EMPLOYEE.EMP_FNAME) likewise have thin evidence (5 and 2 pairs).",
+     "requested_revision": "Downgrade the group_sizes and ties_for_order_limit patterns to optional/uncertain in the specification, or provide concrete evidence (observed group-size histogram) before requiring the generator to enforce them. As written, the spec asks the engineer to enforce a distribution the evidence does not support, and the enforcement (see previous issue) is buggy."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `EMPLOYEE.EMP_HIREDATE > EMP_DOB` with evidence from only 3 sample rows, and the `uncertainty` field admits 'may not hold universally'. The program's `_enforce_formulas` resamples EMP_HIREDATE to be 18-40 years after EMP_DOB, which is a strong constraint not clearly supported. Similarly `STUDENT.STU_HRS >= 0` and `STU_GPA BETWEEN 0.0 AND 4.0` are supported by the sample, but the hire-date rule is weakly evidenced.",
+     "requested_revision": "Mark the EMP_HIREDATE > EMP_DOB rule as uncertain/optional in the specification, or provide broader evidence. If kept, the program's enforcement is acceptable, but the spec should not present it as a hard rule without stronger evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_formulas` only handles the `A > B` date pattern via regex; it does not handle the `IS NOT NULL` formulas (those are handled by `_apply_null_rule` via `null_targets`, which is fine) nor the enumeration formulas (handled by `make_column_sampler` via `spec['enumeration']`). However, `_enforce_ranges` clamps `STUDENT.STU_HRS` to [0,200] and `STU_GPA` to [0,4], but the spec's `ranges` for STU_HRS is `[0, 200]` while the semantic rule only says `STU_HRS >= 0` \u2014 the upper bound 200 is invented by the program's DEFAULT_SPEC and not in the delivered spec. This is a minor over-constraint.",
+     "requested_revision": "Remove the invented upper bound 200 for STU_HRS (or add it to the specification with evidence). The delivered spec only requires `STU_HRS >= 0`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` copies the compact DB and appends generated rows, but `build_random_instance` returns only generated rows; the compact rows are preserved by the copy. However, the `_fk_check` failure shows the compact DB itself has FK violations (STUDENT rows 5,7 -> DEPARTMENT). The program's `fill_foreign_keys_consistently` draws from `_parent_pool` which includes compact DEPARTMENT.DEPT_CODE values, so generated STUDENT rows will reference valid compact DEPT_CODEs \u2014 but the compact STUDENT rows 5,7 remain invalid. The program cannot fix compact rows (correctly, they must be preserved), so the FK check must not fail on them.",
+     "requested_revision": "As in issue 1: scope the FK check to generated rows only, or skip it. The compact rows must be preserved verbatim even if inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` calls `_apply_null_rule` after `fill_foreign_keys_consistently` and after the self-FK fixup, but `_apply_null_rule` can set FK columns to NULL. For self-referencing FKs (none in this schema, but the code path exists) this is fine, but for `STUDENT.PROF_NUM -> PROFESSOR.EMP_NUM` (a dependency the spec adds even though the schema does not declare it), the program's `fill_foreign_keys_consistently` only handles FKs in `schema.fks` (from `pragma foreign_key_list`), so `STUDENT.PROF_NUM` is NOT filled from the parent pool \u2014 it is sampled by the generic NumberSampler, producing arbitrary integers that may not exist in PROFESSOR.EMP_NUM. The spec lists this dependency, but the program does not implement it because the schema does not declare the FK.",
+     "requested_revision": "Either (a) add the `STUDENT.PROF_NUM -> PROFESSOR.EMP_NUM` dependency to the schema's FK handling (e.g. by consulting `spec['dependencies']` in `fill_foreign_keys_consistently`), or (b) remove it from the spec's dependencies since the schema does not declare it. As written, the spec and program disagree on this dependency."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_choose_enum_sizes` uses `spec['table_sizes']` with a random variation of \u00b1n//5, but `choose_table_sizes` (the upstream uniform/level sampler) is defined and never called. The spec's `table_sizes_per_instance` is used, which is fine, but the random variation means table sizes are not exactly the spec's values. This is minor but worth noting: the spec says `table_sizes_per_instance` with fixed values, and the program perturbs them.",
+     "requested_revision": "Either honor the spec's exact table sizes (no perturbation) or document the perturbation as intended. The spec's `table_sizes_per_instance` reads as exact."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `make_column_sampler` applies `spec['comparison_boundary']` only via `EnumSampler` (when an enumeration exists). For columns with a comparison_boundary but no enumeration (e.g. DEPARTMENT.DEPT_NAME, DEPARTMENT.DEPT_CODE, CLASS.CRS_CODE, COURSE.CRS_CODE, PROFESSOR.DEPT_CODE, CLASS.CLASS_CODE, ENROLL.CLASS_CODE, EMPLOYEE.EMP_LNAME, COURSE.CRS_DESCRIPTION), the boundary values are NOT injected into the sampler \u2014 they are only in `spec['comparison_boundary']` and never used. The spec's `comparison_boundary` targets are therefore not implemented for non-enum columns.",
+     "requested_revision": "Inject `spec['comparison_boundary']` values into the sampler for all targeted columns (e.g. by adding them to the element pool in `_init_sampler` or by a dedicated boundary sampler), not only for enum columns. Otherwise the comparison-boundary pattern is silently dropped for most columns."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's STUDENT rows 5,7 FK violation is intentional (to test unmatched-join handling) or a data error; the program must handle it either way.",
+    "Whether the spec's `child_rows_with_null_fk: false` is meant to forbid NULLs on FK columns entirely, or only to forbid orphan non-NULL values; the program currently plants NULLs on FK columns, which may or may not be intended.",
+    "Whether the `STUDENT.PROF_NUM -> PROFESSOR.EMP_NUM` dependency should be enforced given the schema does not declare it.",
+    "Whether the group_sizes and ties_for_order_limit patterns are meant to be hard requirements given the spec's own 'treat as optional' note."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Specification marks EMP_HIREDATE > EMP_DOB as 'uncertain: true' with only three supporting rows; the program enforces it via _enforce_formulas (instance.py) and spec.py appends it unconditionally when absent. This is a plausible but weakly-evidenced rule.",
+     "requested_revision": "No blocking change. Optionally downgrade to a soft/optional formula or document that it is inferred from a small sample; the program already leaves NULL operands alone, consistent with three-valued logic."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Specification lists STUDENT.PROF_NUM -> PROFESSOR.EMP_NUM as a dependency not declared in the schema, and notes it should be enforced 'only if the program consults spec dependencies'. The program does consult spec dependencies (_spec_dependencies in instance.py), so it is enforced. This is consistent but the spec's conditional wording is ambiguous.",
+     "requested_revision": "No blocking change; clarify in the spec that the dependency is intended to be enforced (the program does so)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Execution feedback shows rows_skipped is substantial (e.g. CLASS 136, EMPLOYEE 147, STUDENT 91) and several nullable columns show 'NULL 0 / n' is not present, but some columns (e.g. CLASS.CLASS_ROOM 8/55, CLASS.CLASS_SECTION 8/55) have NULLs while others like DEPARTMENT.SCHOOL_CODE 14/87 are fine. All nullable columns listed have at least one NULL, satisfying the NULL rule. No column shows 'NULL 0 / n'.",
+     "requested_revision": "No change required; note that high skip counts reflect constraint enforcement (FK/unique) and are counted, not silent."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "The spec's per_column_exceptions 'unmatched_join_rows' with child_rows_with_null_fk=true is recorded but the program never injects orphan non-NULL FK values (fill_foreign_keys_consistently draws only from parent pool; _apply_null_rule only plants NULL for FK columns in null_targets). This matches the spec's own note that 'non-NULL FK values must still reference existing parent keys' and the integrity feedback (fk_violations: 0).",
+     "requested_revision": "No change; behavior is consistent with the spec's stated constraint that non-NULL FKs must reference existing parents."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Construction feedback: 145 eligible pairs, 60 separated, 0 unknown executions. Separation is partial but the instructions state a missing separation alone does not establish a generation error. Value variation remains possible via comparison_boundary injection (BoundarySampler/EnumSampler) and perturbations in values.py.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Exact null shares for nullable columns are not fully specified; program uses observed share or default 0.15, which is within the spec's stated uncertainty.",
+    "The EMP_HIREDATE > EMP_DOB formula is inferred from a small sample and marked uncertain; enforcement is best-effort and does not replace planted NULLs."
+   ]
+  }
+ ]
 }

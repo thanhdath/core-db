@@ -3,8 +3,9 @@ import datetime as dt
 import re
 import string
 
-# fuzz/number.py:5 MAX = 9223372036854775807 - epsilon (int64, no 2^31 clamp)
-MAX = 9223372036854775807 - 1e-9
+from . import spec
+
+_MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
@@ -38,33 +39,33 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py: int64 MAX, list range [min, max+1] capped at MAX, type range [-10^scale, 10^scale]."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 bounds=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, MAX)) if unsigned else (-hi, hi)
-        if self.elements:
-            self.list_min = min(self.elements)
-            self.list_max = min(max(self.elements) + 1, MAX)
-        else:
-            self.list_min, self.list_max = self.min, self.max
+        hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if bounds is not None:
+            self.min, self.max = bounds
+        self.list_min = min(self.elements) if self.elements else self.min
+        self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        # number.py:88: integer columns truncate, float columns keep precision
-        return int(v) if self.is_int else (round(v, self.precision) if self.precision else v)
+        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
-    def _draw(self, lo, hi):
-        # number.py:79: random.random() * (end - start) + start
-        return self.rng.random() * (hi - lo) + lo
+    def _clamp(self, v):
+        if self.is_int:
+            v = int(round(v))
+        return max(self.min, min(self.max, v))
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: self._draw(lo, hi))
+            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
         d = 1 if self.is_int else 0.01
@@ -76,7 +77,7 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._clamp(self._cast(v))
 
 
 class StringSampler(ColumnSampler):
@@ -113,6 +114,51 @@ class StringSampler(ColumnSampler):
                 v = v[:-1]
             else:
                 v = v[1:]
+        return v
+
+
+class EnumSampler(ColumnSampler):
+    """Fixed enumeration (spec: Sex IN ('F','M','U'))."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 1.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class BoundaryStringSampler(ColumnSampler):
+    """String sampler that guarantees near-variants of a boundary literal (case changes, one-character edits) and a
+    duplicate share for DISTINCT columns."""
+
+    def __init__(self, elements, p, max_l0, rng, boundary, length=20, dup_share=spec.DUP_SHARE):
+        super().__init__(elements, p, max_l0, rng)
+        self.boundary = boundary
+        self.dup_share = dup_share
+        self.base = StringSampler(elements, p, max_l0, rng, length=length)
+        self.variants = self._variants(boundary)
+        self.last = None
+
+    def _variants(self, s):
+        out = [s, s.lower(), s.upper(), s.capitalize()]
+        if len(s) > 1:
+            out.append(s[:-1])
+            out.append(s[1:])
+            out.append(s[0] + s[2:] if len(s) > 2 else s)
+        out.append(s + 'x')
+        out.append('x' + s)
+        return sorted(set(out))
+
+    def sample(self):
+        r = self.rng
+        if self.last is not None and r.random() < self.dup_share:
+            return self.last
+        if r.random() < 0.35:
+            v = r.choice(self.variants)
+        else:
+            v = self.base.sample()
+        self.last = v
         return v
 
 

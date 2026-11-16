@@ -1,50 +1,656 @@
 {
  "db": "car_retails",
- "operator_io_quirks": [
-  "Table 'orderdetails' is declared with double quotes in DDL; sqlite_master name is 'orderdetails' (lowercase) \u2014 keep original spelling, quote on write.",
-  "orderdetails FKs use column-level 'references orders' / 'references products' with NULL parent column -> parent column = same name (orderNumber, productCode); pragma foreign_key_list returns NULL parent col.",
-  "employees has a self-FK reportsTo -> employees(employeeNumber); process_order must ignore the table self-edge or it cycles.",
-  "orders.orderDate/requiredDate/shippedDate and payments.paymentDate declared DATE but stored as TEXT 'YYYY-MM-DD'; ts_fuzzer dispatches to Date (first element not int-parsable) \u2014 Date template %Y-%m-%d.",
-  "productlines.image declared BLOB, all NULL, distinct=0; ts_fuzzer String (blob -> String) with empty element list -> p:=1, fresh random strings over a-zA-Z0-9() \u2014 will insert text into a BLOB column (sqlite affinity allows).",
-  "productlines.htmlDescription all NULL, distinct=0; String sampler with no elements -> always fresh random strings.",
-  "customers.creditLimit REAL, null_rate 0.0 but notnull=0; Number sampler may emit NULLs? No \u2014 Number never emits None; but original has no NULLs so NOT NULL not enforced in Python anyway.",
-  "customers.contactFirstName samples have trailing spaces ('Carine ', 'Janine ') \u2014 String sampler preserves them; equality/join tests may be sensitive.",
-  "offices.officeCode / employees.officeCode are TEXT holding digit strings ('1'..'7'); String sampler will produce non-numeric strings, breaking FK joins to offices if parent filtered \u2014 but FK fill copies parent values so consistent.",
-  "payments composite PK (customerNumber, checkNumber); orderdetails composite PK (orderNumber, productCode) \u2014 composite-PK members get max_l0=30 cap.",
-  "orderdetails has 2996 rows, largest table; still small, no rowid sampling needed (max_rows_per_table 300000).",
-  "customers.salesRepEmployeeNumber FK to employees, null_rate 0.18; employees.reportsTo null_rate 0.043 \u2014 FK fill draws with replacement from parent final values, may produce NULLs only if parent empty."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on orders/payments date columns: template %Y-%m-%d, range from min/max parsed originals (~2003-2005), fresh dates uniform in that range; p=0.2 means element returned w.p. 0.2 (inverted) so mostly fresh dates.",
-  "String fuzzer on names/cities/phones/emails: fresh random strings over a-zA-Z 0-9() length 0..20, plus contaminate suffix/prefix/drop \u2014 implausible values (e.g. 'aB3()x') drive FN on LIKE/equality predicates.",
-  "Number fuzzer on INTEGER PKs (employeeNumber, customerNumber, orderNumber): range [-10^scale,10^scale] with scale from type args (none -> default), perturb +-1/+-2 \u2014 PKs become huge/negative, breaking range predicates and joins to literal pools.",
-  "Number fuzzer on REAL (creditLimit, amount, buyPrice, MSRP, priceEach): float perturb +-0.01/+-0.02, range from type args; creditLimit originals ~21000-118200 but sampler range may be much wider -> implausible values.",
-  "String fuzzer on productCode ('S10_1678') and checkNumber ('HQ336336'): fresh random strings lose the prefix pattern; LIKE 'S%' predicates get FN.",
-  "productScale ('1:10') and territory ('NA','EMEA') are low-cardinality enums but String fuzzer emits random strings -> ENUM-like predicates (IN, =) get FN.",
-  "status ('Shipped','Resolved',...) low-cardinality; String fuzzer random -> status='Shipped' predicates FN.",
-  "FK fill copies parent final values with replacement, so joins survive; but parent PK filtering (sample_fresh_primary_keys) may drop rows, and child draws from filtered parent \u2014 consistent.",
-  "Self-FK employees.reportsTo draws from employees.employeeNumber final values; if employeeNumber PK filtered, some reportsTo may reference dropped rows -> FK violation at insert, row skipped (writedb counts).",
-  "Composite PK orderdetails/payments: sample_fresh_primary_keys drops duplicate (orderNumber,productCode) tuples; with small parent cardinality many rows dropped -> small tables, missing ties/duplicates -> FP on COUNT/GROUP BY.",
-  "Empty-element columns (image, htmlDescription) always fresh random strings; image BLOB gets text \u2014 queries filtering image IS NULL get FN (no NULLs generated).",
-  "String sampler adds str(i+1)/str(i-1) for int-like elements; officeCode '1'..'7' gets '2','0' etc. \u2014 may collide with other offices, but PK filter drops duplicates."
- ],
- "challenger_refs": [
-  "G9",
-  "g210b657f",
-  "G1",
-  "G8",
-  "G5",
-  "G4",
-  "G12",
-  "G6",
-  "G2",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential or random unique integers within the observed range; never NULL; no duplicates.",
+   "integer_fk": "Copy an existing parent key value; for nullable FKs include a NULL share per null_targets (5-30% NULL for customers.salesRepEmployeeNumber and employees.reportsTo).",
+   "integer_quantity": "Random integer > 0 within observed min/max.",
+   "integer_generic": "Random integer within observed min/max.",
+   "real_price": "Random REAL >= 0 within observed min/max, two decimals.",
+   "real_amount": "Random REAL >= 0 within observed min/max, two decimals.",
+   "real_generic": "Random REAL within observed min/max.",
+   "text_short": "Random short text from a small pool of plausible values; allow near-duplicate case variants.",
+   "text_name": "Random name-like text; allow case variants and duplicates.",
+   "text_address": "Random address-like text.",
+   "text_phone": "Random phone-like text with digits and separators.",
+   "text_email": "Random email-like text.",
+   "text_description": "Random longer descriptive text.",
+   "date_generic": "Random date formatted %Y-%m-%d within observed range; never strip leading zeros.",
+   "blob_nullable": "Always NULL.",
+   "null_rule": "For every nullable column, each instance contains at least one NULL row and non-NULL rows; NULL share follows the compact database share; NOT NULL columns never NULL; planted NULLs are never replaced to satisfy a rule.",
+   "boundary_rule": "For columns listed in per_column_exceptions with boundary targets, include the listed literal values and one step on each side (numbers by step, dates by one day).",
+   "near_variant_rule": "For columns listed with LIKE/equality near-variants, include the listed variants.",
+   "tie_rule": "For columns listed with tie targets, ensure at least two rows share the tie value at the listed rank.",
+   "duplicate_rule": "For columns listed with duplicate targets, ensure the stated duplicate share.",
+   "unmatched_join_rule": "For join columns listed, include parent rows without children; child rows must reference surviving parent keys only (no orphan children)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "customers.customerNumber",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      102,
+      103,
+      104,
+      185,
+      186,
+      187
+     ]
+    }
+   },
+   {
+    "column": "customers.customerNumber",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "payments.customerNumber",
+      "orders.customerNumber"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "customers.customerName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Atelier graphique",
+      "atelier graphique",
+      "ATELIER GRAPHIQUE",
+      "Cruz & Sons Co.",
+      "cruz & sons co."
+     ]
+    }
+   },
+   {
+    "column": "customers.customerName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "customers.creditLimit",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1,
+      219999,
+      220000,
+      220001
+     ]
+    }
+   },
+   {
+    "column": "customers.creditLimit",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "5-30 %"
+    }
+   },
+   {
+    "column": "orders.orderNumber",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      10099,
+      10100,
+      10101,
+      10251,
+      10252,
+      10253
+     ]
+    }
+   },
+   {
+    "column": "orders.orderNumber",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "orderdetails.orderNumber"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "orders.orderDate",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2005-04-07",
+      "2005-04-08",
+      "2005-04-09",
+      "2005-04-10",
+      "2005-04-11"
+     ]
+    }
+   },
+   {
+    "column": "orders.orderDate",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2003-%",
+      "2003-03-03"
+     ],
+     "variants": [
+      "2003-",
+      "2004-",
+      "2003- x",
+      "2003-03-04",
+      "2003-03-03x"
+     ]
+    }
+   },
+   {
+    "column": "orderdetails.orderNumber",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      10099,
+      10100,
+      10101,
+      10251,
+      10252,
+      10253
+     ]
+    }
+   },
+   {
+    "column": "orderdetails.orderNumber",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "orders.orderNumber"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "payments.paymentDate",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2003-12-31",
+      "2004-01-01",
+      "2004-12-31",
+      "2005-01-01"
+     ]
+    }
+   },
+   {
+    "column": "payments.paymentDate",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2004-%",
+      "2004%",
+      "2005%"
+     ],
+     "variants": [
+      "2004-",
+      "2005-",
+      "2004- x",
+      "2003-12-31",
+      "2004-01-01",
+      "2004-12-31",
+      "2005-01-01"
+     ]
+    }
+   },
+   {
+    "column": "payments.customerNumber",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      102,
+      103,
+      104
+     ]
+    }
+   },
+   {
+    "column": "payments.customerNumber",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "customers.customerNumber"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "employees.lastName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Patterson",
+      "patterson",
+      "a",
+      "A",
+      "Jones",
+      "jones"
+     ]
+    }
+   },
+   {
+    "column": "employees.firstName",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "William",
+      "william",
+      "Steve",
+      "steve",
+      "Patterson",
+      "patterson"
+     ]
+    }
+   },
+   {
+    "column": "orderdetails.quantityOrdered",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "expression": "orderdetails.quantityOrdered * orderdetails.priceEach",
+     "values": [
+      3999,
+      4000,
+      4001
+     ]
+    }
+   },
+   {
+    "column": "orderdetails.priceEach",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "orderdetails.quantityOrdered * orderdetails.priceEach"
+     ]
+    }
+   },
+   {
+    "column": "orderdetails.quantityOrdered",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      5
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "orderdetails.quantityOrdered * orderdetails.priceEach"
+     ]
+    }
+   },
+   {
+    "column": "orders.status",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Shipped",
+      "Resolved",
+      "Cancelled",
+      "On Hold",
+      "Disputed",
+      "In Process"
+     ]
+    }
+   },
+   {
+    "column": "employees.jobTitle",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "President",
+      "VP Sales",
+      "VP Marketing",
+      "Sales Manager (APAC)",
+      "Sale Manager (EMEA)",
+      "Sales Manager (NA)",
+      "Sales Rep"
+     ]
+    }
+   },
+   {
+    "column": "offices.territory",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "NA",
+      "EMEA",
+      "Japan",
+      "APAC"
+     ]
+    }
+   },
+   {
+    "column": "products.productScale",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "1:10",
+      "1:12",
+      "1:18",
+      "1:24",
+      "1:32",
+      "1:50",
+      "1:72",
+      "1:700"
+     ]
+    }
+   },
+   {
+    "column": "orders.orderDate",
+    "pattern": "date_format",
+    "targets": {
+     "format": "%Y-%m-%d"
+    }
+   },
+   {
+    "column": "payments.paymentDate",
+    "pattern": "date_format",
+    "targets": {
+     "format": "%Y-%m-%d"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "employees.officeCode",
+    "parent": "offices.officeCode",
+    "copied": []
+   },
+   {
+    "child": "employees.reportsTo",
+    "parent": "employees.employeeNumber",
+    "copied": []
+   },
+   {
+    "child": "customers.salesRepEmployeeNumber",
+    "parent": "employees.employeeNumber",
+    "copied": []
+   },
+   {
+    "child": "orders.customerNumber",
+    "parent": "customers.customerNumber",
+    "copied": []
+   },
+   {
+    "child": "payments.customerNumber",
+    "parent": "customers.customerNumber",
+    "copied": []
+   },
+   {
+    "child": "products.productLine",
+    "parent": "productlines.productLine",
+    "copied": []
+   },
+   {
+    "child": "orderdetails.orderNumber",
+    "parent": "orders.orderNumber",
+    "copied": []
+   },
+   {
+    "child": "orderdetails.productCode",
+    "parent": "products.productCode",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "offices",
+    "column": "officeCode",
+    "formula": "officeCode IS NOT NULL"
+   },
+   {
+    "table": "employees",
+    "column": "employeeNumber",
+    "formula": "employeeNumber IS NOT NULL"
+   },
+   {
+    "table": "employees",
+    "column": "reportsTo",
+    "formula": "reportsTo IS NULL OR reportsTo <> employeeNumber"
+   },
+   {
+    "table": "customers",
+    "column": "customerNumber",
+    "formula": "customerNumber IS NOT NULL"
+   },
+   {
+    "table": "customers",
+    "column": "creditLimit",
+    "formula": "creditLimit IS NULL OR creditLimit >= 0"
+   },
+   {
+    "table": "orders",
+    "column": "orderNumber",
+    "formula": "orderNumber IS NOT NULL"
+   },
+   {
+    "table": "orders",
+    "column": "requiredDate",
+    "formula": "requiredDate >= orderDate"
+   },
+   {
+    "table": "orders",
+    "column": "shippedDate",
+    "formula": "shippedDate IS NULL OR shippedDate >= orderDate"
+   },
+   {
+    "table": "orders",
+    "column": "status",
+    "formula": "status IN ('Shipped','Resolved','Cancelled','On Hold','Disputed','In Process')"
+   },
+   {
+    "table": "payments",
+    "column": "amount",
+    "formula": "amount >= 0"
+   },
+   {
+    "table": "payments",
+    "column": "paymentDate",
+    "formula": "paymentDate IS NOT NULL"
+   },
+   {
+    "table": "products",
+    "column": "quantityInStock",
+    "formula": "quantityInStock >= 0"
+   },
+   {
+    "table": "products",
+    "column": "buyPrice",
+    "formula": "buyPrice >= 0"
+   },
+   {
+    "table": "products",
+    "column": "MSRP",
+    "formula": "MSRP >= 0"
+   },
+   {
+    "table": "products",
+    "column": "productScale",
+    "formula": "productScale IN ('1:10','1:12','1:18','1:24','1:32','1:50','1:72','1:700')"
+   },
+   {
+    "table": "orderdetails",
+    "column": "quantityOrdered",
+    "formula": "quantityOrdered > 0"
+   },
+   {
+    "table": "orderdetails",
+    "column": "priceEach",
+    "formula": "priceEach >= 0"
+   },
+   {
+    "table": "orderdetails",
+    "column": "orderLineNumber",
+    "formula": "orderLineNumber > 0"
+   },
+   {
+    "table": "employees",
+    "column": "jobTitle",
+    "formula": "jobTitle IN ('President','VP Sales','VP Marketing','Sales Manager (APAC)','Sale Manager (EMEA)','Sales Manager (NA)','Sales Rep')"
+   },
+   {
+    "table": "offices",
+    "column": "territory",
+    "formula": "territory IN ('NA','EMEA','Japan','APAC')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "offices": 7,
+   "employees": 23,
+   "customers": 122,
+   "orders": 326,
+   "payments": 273,
+   "productlines": 7,
+   "products": 110,
+   "orderdetails": 2996
+  },
+  "null_targets": [
+   "customers.addressLine2",
+   "customers.state",
+   "customers.postalCode",
+   "customers.salesRepEmployeeNumber",
+   "customers.creditLimit",
+   "employees.reportsTo",
+   "offices.addressLine2",
+   "offices.state",
+   "orders.shippedDate",
+   "orders.comments",
+   "productlines.textDescription",
+   "productlines.htmlDescription",
+   "productlines.image"
+  ],
+  "supporting_evidence": {
+   "orders.requiredDate >= orders.orderDate": [
+    "10100: 2003-01-13 >= 2003-01-06",
+    "10101: 2003-01-18 >= 2003-01-09",
+    "10102: 2003-02-07 >= 2003-01-10"
+   ],
+   "orders.shippedDate >= orders.orderDate": [
+    "10100: 2003-01-10 >= 2003-01-06",
+    "10101: 2003-01-11 >= 2003-01-09",
+    "10102: 2003-01-14 >= 2003-01-10"
+   ],
+   "customers.creditLimit >= 0": [
+    "103: 21000.0",
+    "112: 71800.0",
+    "128: 0.0"
+   ],
+   "orderdetails.quantityOrdered > 0": [
+    "10100: 30",
+    "10101: 50",
+    "10102: 22"
+   ],
+   "orderdetails.priceEach >= 0": [
+    "10100: 136.0",
+    "10101: 55.09",
+    "10102: 75.46"
+   ],
+   "products.buyPrice >= 0": [
+    "S10_1678: 48.81",
+    "S10_1949: 98.58",
+    "S10_2016: 68.99"
+   ],
+   "products.MSRP >= 0": [
+    "S10_1678: 95.7",
+    "S10_1949: 214.3",
+    "S10_2016: 118.94"
+   ]
+  },
+  "uncertainty": "No calculated-column formula is supported by the shown rows; orderLineNumber is not derivable from other columns and is generated as a positive integer (unconstrained sequence). Enum values for status, jobTitle, territory and productScale are taken from the observed distinct values. NULL shares follow the compact statistics; exact per-instance counts may vary. Nullable FKs (customers.salesRepEmployeeNumber, employees.reportsTo) receive a 5-30% NULL share. Child FK values are re-filtered to surviving parent keys after PK/unique deduplication so no orphan children are produced."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "39d508cfb2e98d15"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `ModuleNotFoundError: No module named 'tscore_gen.spec'` raised from `tscore_gen/cli.py` line 13 (`from .spec import load_spec`). The program listing contains no `tscore_gen/spec.py` file, yet `cli._init` calls `load_spec(_G['schema'])` and `build_random_instance` is invoked with `_G['spec']`. The `__init__.py` also advertises `'spec'` in `__all__`.",
+     "requested_revision": "Add the missing `tscore_gen/spec.py` module implementing `load_spec(schema)` that returns the parsed generation specification (per-column exceptions, null targets, enum domains, dependencies, semantic rules). Without it the generator cannot run at all (n_instances = 0)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `per_column_exceptions` (boundary values, near-variants, tie targets, duplicate shares, unmatched-join parents, enum domains) and `null_targets` are never consumed by the code shown. `build_random_instance` only uses `schema`, `literal_pool`, `size`, `rng`; `_init_sampler`/`make_column_sampler` never read the spec. `fill_foreign_keys_consistently` draws uniformly from parent values with no NULL share, so nullable FKs (`customers.salesRepEmployeeNumber`, `employees.reportsTo`) get no NULLs, violating the NULL rule and the `null_targets` list. `choose_table_sizes` ignores `table_sizes_per_instance` (offices=7, employees=23, ...).",
+     "requested_revision": "Wire the spec into instance construction: enforce per-column boundary literals, near-variants, tie/duplicate targets, enum domains, unmatched-join parents, and NULL shares for every nullable column (including nullable FKs) with at least one NULL row per nullable column. Use `table_sizes_per_instance` (or a documented derivation) so compact row counts are preserved."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `orders.requiredDate >= orderDate`, `orders.shippedDate >= orderDate`, `customers.creditLimit >= 0`, `orderdetails.quantityOrdered > 0`, `orderdetails.orderLineNumber > 0`, `products.quantityInStock >= 0`, `payments.amount >= 0`, `employees.reportsTo <> employeeNumber`. The program's samplers (`NumberSampler` with `unsigned=False` default, `StringSampler` for TEXT, `DateSampler` drawing from full 1800\u20132100 range) do not enforce any of these; e.g. `creditLimit` can be negative, `requiredDate` can precede `orderDate`, `quantityOrdered` can be \u2264 0. The spec lists these as rules but provides no mechanism (post-processing, constrained sampling) for the generator to satisfy them.",
+     "requested_revision": "Either (a) add explicit constrained-sampling/post-fix steps in the spec and program for each semantic rule (e.g. draw `requiredDate` from `[orderDate, ...]`, `shippedDate` from `[orderDate, ...]` or NULL, non-negative numerics, positive quantities, `reportsTo <> employeeNumber`), or (b) mark these as uncertain/unsupported in the spec's `uncertainty` field and remove them from `semantic_rules_and_formulas`. As written the spec claims rules the program cannot honor."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `dependencies` lists all eight FKs with `\"copied\": []`, and `generic_sampling_rules.integer_fk` says \"Copy an existing parent key value; for nullable FKs include a NULL share per null_targets.\" The program's `fill_foreign_keys_consistently` copies parent values but never injects NULLs for nullable FKs, and `null_targets` includes `customers.salesRepEmployeeNumber` and `employees.reportsTo`. The spec's `null_targets` and the FK rule are therefore inconsistent with the program's behavior.",
+     "requested_revision": "Update the spec to state the NULL share for nullable FKs explicitly (e.g. \"5\u201330% NULL for customers.salesRepEmployeeNumber and employees.reportsTo\") and require the program to honor it; or remove nullable FKs from `null_targets` if NULLs are not intended. Align spec and program."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`values.NumberSampler.__init__` sets `self.list_max = min(self.max, _MAX)` and ignores `self.elements` for the upper bound, so the \"list_max overwrite quirk\" comment is not actually implemented as described (the quirk in upstream number.py:60,67 is that `list_max` is overwritten by `max`). More importantly, `NumberSampler.sample` can return values outside the observed min/max (full range `[-10^scale, 10^scale]`), which conflicts with `generic_sampling_rules.integer_quantity` (\"Random integer > 0 within observed min/max\") and `real_price` (\"Random REAL >= 0 within observed min/max\").",
+     "requested_revision": "Either constrain `NumberSampler` to the observed min/max for quantity/price columns (per spec), or update the spec to state that numeric columns may draw from the full type range. Also fix or remove the misleading `list_max` comment."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`values.DateSampler._draw` uses `self.full = (1800-01-01, 2100-01-01)` when `p` triggers or fewer than 2 distinct parsed dates, and `self.strip0` strips leading zeros, producing dates like `2003-3-3` that do not match the spec's `date_format: %Y-%m-%d`. The spec's `date_generic` rule says \"Random date in %Y-%m-%d within observed range\"; the program can emit non-`%Y-%m-%d` strings and dates outside the observed range.",
+     "requested_revision": "For DATE columns, always format with `%Y-%m-%d` and draw within the observed min/max (or document the wider range in the spec). Disable `strip0` for DATE-typed columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.build_random_instance` calls `sample_fresh_primary_keys` and `drop_unique_duplicates` after FK filling, which can drop rows and leave child rows referencing dropped parent PKs (FKs are inserted with `pragma foreign_keys = OFF` in `writer.write_instance_sqlite`). The spec's `unmatched_join_rule` requires parent rows without children, but the program can also produce child rows without parents, violating referential integrity.",
+     "requested_revision": "After PK/unique deduplication, re-filter child FK columns to only reference surviving parent values (or insert with FK enforcement on and skip violating rows). Ensure the `unmatched_join_rows` pattern is realized as parent-without-child, not child-without-parent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `supporting_evidence` cites concrete rows (e.g. `10100: 2003-01-13 >= 2003-01-06`) but the `uncertainty` field says \"No calculated-column formula is supported by the shown rows; orderLineNumber is not derivable from other columns.\" The spec does not state whether `orderLineNumber` should be sequential per order, and the program's `StringSampler`/`NumberSampler` for `orderLineNumber` (INTEGER, not in `per_column_exceptions`) will produce arbitrary integers, potentially violating the `orderLineNumber > 0` rule and the natural per-order sequence.",
+     "requested_revision": "Add an explicit rule for `orderLineNumber` (e.g. positive integer, unique per order, sequential) and implement it in the program; or document it as unconstrained in `uncertainty` and remove the `orderLineNumber > 0` formula if not enforced."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify reproducible generation (seed determinism) because the program failed to import before any instance was built.",
+    "Could not verify preservation of compact row counts (`table_sizes_per_instance`) because no instance was produced.",
+    "Could not verify integrity-constraint satisfaction (FK, PK, NOT NULL, CHECK) at runtime because no instance was produced.",
+    "Could not verify that boundary/near-variant/tie/duplicate targets are realized, since the spec-consuming code path is absent.",
+    "Could not verify NULL shares for nullable columns against the compact database, since no instance was produced."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: employees.reportsTo 'generated rows: NULL 0 / 10' and productlines.textDescription 'NULL 0 / 108'. The NULL rule requires at least one NULL row per nullable column per instance. In instance.py, _apply_null_rule is applied to all columns including nullable FKs, but fill_foreign_keys_consistently already assigns NULLs to nullable FKs; for employees.reportsTo the spec share is 0.043 (NULLABLE_FK_SHARE) and _apply_null_rule uses spec.null_share (NULL_SHARES) which is 0.043 for reportsTo, so it should plant >=1 NULL. The 0/10 line suggests the sampled rows for that column in the reported instance happened to be all non-NULL after dedup/re-filter, or the reported line aggregates a subset. This is a noted observation per instruction 7, not a blocker.",
+     "requested_revision": "No blocking change required. Optionally ensure _apply_null_rule is applied after FK re-filtering for nullable FK columns so the 'at least one NULL' guarantee is robust to row drops; and confirm productlines.textDescription share (0.0 in NULL_SHARES) still yields at least one NULL per the interface rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists customers.creditLimit boundary values [-1,0,1,219999,220000,220001] while semantic rule requires creditLimit >= 0. The -1 boundary is injected by _inject_boundary_and_variants then clamped to 0.0 by _enforce_rules, so the -1 literal never survives. This is consistent with the rule (rule holds when not FALSE) but means the boundary value -1 is effectively unreachable in generated data.",
+     "requested_revision": "No blocking change. If the -1 boundary is intended to be observable, the designer should clarify that it is constrained away by the non-negativity rule; otherwise the boundary list is harmless."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped is substantial (e.g. orderdetails 9512 skipped vs 29841 added; offices 65 skipped). writer.py inserts generated rows into a copy of the compact DB with foreign_keys=OFF and counts failures. Skips arise from PK/unique collisions with existing compact rows (e.g. offices.officeCode, productlines PKs) and NOT NULL/constraint failures. Integrity feedback shows fk_violations=0, not_null_violations=0, pk_duplicates=0, so skips do not corrupt integrity; they only reduce generated volume.",
+     "requested_revision": "No blocking change. Consider generating PKs that avoid collision with compact rows to reduce skip counts, but this does not violate the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _ensure_unmatched_parents only removes one child reference when every parent PK is referenced; it does not guarantee the parent-without-child property when child FK values are re-filtered later or when the removed reference is re-added. However, construction_pairs separated=89/289 and integrity checks pass; unmatched-join parents are attempted per spec. The mechanism is best-effort but consistent with the spec's 'include parent rows without children' intent.",
+     "requested_revision": "No blocking change. Optionally strengthen _ensure_unmatched_parents to run after all FK re-filtering and to verify at least one unreferenced parent PK remains."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 'NULL 0 / n' lines for employees.reportsTo and productlines.textDescription reflect a genuine per-instance violation of the at-least-one-NULL rule or an aggregation artifact; per instruction 7 this is noted, not blocking.",
+    "Whether boundary literal -1 for customers.creditLimit is intended to be observable given the non-negativity rule."
+   ]
+  }
+ ]
 }

@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    pk_max: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -116,13 +117,15 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 pc = None
                 if pt is not None:
                     pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
+                    if pc is None and tables[pt].primary_key:
+                        pc = tables[pt].primary_key[0]
                 if pt is None or pc is None or child is None:
                     warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
                     continue
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, pk_max = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -137,6 +140,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+            for pk in tables[t].primary_key:
+                try:
+                    mx = con.execute('select max(%s) from %s' % (q(pk), q(t))).fetchone()[0]
+                    pk_max[(t, pk)] = mx if isinstance(mx, (int, float)) else None
+                except sqlite3.Error:
+                    pk_max[(t, pk)] = None
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, pk_max)

@@ -1,58 +1,336 @@
 {
  "db": "network_2",
- "operator_io_quirks": [
-  "Tiny DB: Person=4 rows, PersonFriend=4 rows; read_schema sampling is trivial, no huge-table path exercised.",
-  "Person.name is varchar(20) PRIMARY KEY but declared NOT NULL=0; sqlite PK implies uniqueness but not NOT NULL in this DDL text.",
-  "PersonFriend has NO primary key (pk=[]); sample_fresh_primary_keys must handle empty PK (no dedup) without crashing.",
-  "PersonFriend has TWO FKs both to Person(name): name->Person.name and friend->Person.name; both must be filled from Person's final name column.",
-  "Self-ish structure: PersonFriend.name and .friend both reference the same parent column; FK fill draws with replacement from Person.name (4 values).",
-  "Column named 'year' (INTEGER) in PersonFriend: extract_typed_values replaces whole-word 'year' with placeholder before parsing; must strip placeholderrare and still map to column YEAR.",
-  "Column named 'name' appears in both tables; literal pool anchoring by column name will hit both Person.name and PersonFriend.name (and FK-root to Person.name).",
-  "Declared types: varchar(20) -> String fuzzer (char family, length=20); INTEGER -> Number; TEXT -> String (char family, length default 20).",
-  "No mixed-case/spaced identifiers here; all names simple ASCII, but keep double-quoting anyway.",
-  "Storage classes match declared types (text/integer); no contradicting storage.",
-  "No NULLs in original (null_rate 0.0 everywhere) but NOT NULL not declared, so TS may emit NULLs via empty-parent FK path only if parent empty (it won't be).",
-  "PersonFriend.year values are small ints (5,6,10,12) \u2014 Number fuzzer with scale from INTEGER (no args) will produce wide-range ints, not year-like."
- ],
- "operator_ts_expectations": [
-  "Person.name: String fuzzer, length range from elements (4-5 chars) up to 20; fresh random strings over a-zA-Z 0-9() plus contamination; PK single-column -> max_l0=inf so many fresh draws.",
-  "Person.age: Number fuzzer, INTEGER no args -> scale 0, range [-1,1] roughly (10^0), perturbed by +-1/+-2; will produce tiny ints unlike 25-45 originals.",
-  "Person.city: String fuzzer; fresh random strings dominate, original city names only via 5-element sample; likely FN on city predicates.",
-  "Person.gender: String fuzzer with only 2 distinct elements; p=0.2 fresh strings will inject implausible genders -> FN on gender='male'/'female'.",
-  "Person.job: String fuzzer, 3 distinct; same implausibility risk.",
-  "PersonFriend.name/friend: FK fill from Person.name final values (4 names) with replacement -> duplicates and ties likely; good for FP on join/group-by ties.",
-  "PersonFriend.year: Number fuzzer INTEGER -> tiny ints near 0, not 5-12; predicates like year>10 may flip.",
-  "PersonFriend has no PK so no PK dedup; duplicate (name,friend,year) rows possible -> ties/duplicates present, may cause FP on DISTINCT-less queries.",
-  "FK fill uses replacement so PersonFriend rows may repeat same friend many times -> cardinality skew vs original 4 distinct.",
-  "String contamination (suffix/prefix/drop char) on names may break equality joins between Person.name and PersonFriend.name? No \u2014 FK fill copies exact parent values, so joins hold.",
-  "Number fuzzer list_max quirk: with 4 elements, list range upper overwritten to full-range max (1), so fresh ints cluster near 0.",
-  "Date/Time/Bool fuzzers unused (no such declared types)."
- ],
- "challenger_refs": [
-  "G6",
-  "g24512cd7",
-  "g24512cd7",
-  "g24512cd7",
-  "g24512cd7",
-  "G9",
-  "g6407868b",
-  "G11",
-  "gf15c75b9",
-  "gf15c75b9",
-  "gf15c75b9",
-  "g892b85e7",
-  "g892b85e7",
-  "g892b85e7",
-  "g892b85e7",
-  "G4",
-  "G10",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "varchar": "Text columns: draw from the observed value pool; with probability 0.1 draw a fresh near-variant of a pool value (base drawn from the pool, not from the just-sampled value). Near-variants: case flip (upper/lower), one-char truncation from either end, one-char suffix, adjacent transposition, and arbitrary substring truncation (e.g. 'an' from 'Dan', 'lice' from 'Alice', 'Austi' from 'Austin', 's' from 'Austin'). Primary-key columns draw unique values from the pool without replacement (draw without reuse, then filter duplicates). Sampler element pools contain no None; NULLs are planted only by the NULL rule.",
+   "integer": "Integer columns: draw from the observed value pool; with probability 0.1 draw a fresh value near a pool value (+/-1, +/-2, 0, -1). Sampler element pools contain no None; NULLs are planted only by the NULL rule.",
+   "text": "Text columns: draw from the observed value pool; with probability 0.1 draw a fresh near-variant (base drawn from the pool) of a pool value: case flip, one-char truncation from either end, one-char suffix, adjacent transposition, or arbitrary substring truncation. Sampler element pools contain no None; NULLs are planted only by the NULL rule.",
+   "null_share": "For each nullable column, plant at least k = max(1, round(null_rate * n)) NULL rows per instance, where null_rate is the compact database's null_rate for that column (0.0 here) and n is the generated row count. When null_rate = 0.0 the floor of 1 NULL per nullable column is the intended behavior (interface rule: at least one NULL row per nullable column). samplers never inject NULL independently. NOT NULL and primary-key columns never receive NULL. Plant NULLs AFTER ties and duplicates so that a NULL is never overwritten by a tie/duplicate; after all planting, verify every nullable column still has at least one NULL and at least one non-NULL per instance.",
+   "fresh_share": "Fresh (non-pool) values are drawn with probability 0.1 per value for every column type (p = 0.1).",
+   "tie": "For ORDER BY columns, ensure at least one tie at the listed LIMIT rank (rank 1) by duplicating the value that sorts to that rank: for ASC duplicate the minimum, for DESC duplicate the maximum (duplicate both to cover both directions). Plant ties BEFORE NULL/duplicate planting and skip NULL positions and positions already holding a required value. After planting, verify at least two occurrences of the rank-1 value exist and at least 2 distinct non-NULL values remain per column per instance.",
+   "distinct_duplicates": "For DISTINCT columns, ensure at least one duplicate value (20-50% share) is present. Plant duplicates BEFORE NULL planting and skip NULL positions and positions already holding a required value. Primary-key columns are excluded (they cannot have duplicates). After planting, verify the 20-50% share survives and that each nullable column retains at least one NULL.",
+   "unmatched_join": "For join columns, ensure at least one parent row has no matching child row (parent_rows_without_children) and at least one child row has a NULL foreign key (child_rows_with_null_fk) where the FK is nullable. Verify per instance after all planting."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "Person.name",
+     "PersonFriend.name",
+     "PersonFriend.friend"
+    ]
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Person.name",
+     "PersonFriend.name",
+     "Person.age",
+     "PersonFriend.friend",
+     "Person.gender",
+     "Person.job",
+     "Person.city"
+    ]
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "PersonFriend.name",
+     "PersonFriend.friend"
+    ]
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "Person.age",
+     "PersonFriend.year"
+    ]
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": [
+     "Person.age",
+     "PersonFriend.year"
+    ]
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": [
+     "PersonFriend.friend"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "PersonFriend.name",
+    "parent": "Person",
+    "parent_column": "name",
+    "copied_columns": []
+   },
+   {
+    "child": "PersonFriend.friend",
+    "parent": "Person",
+    "parent_column": "name",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Person",
+    "column": "age",
+    "formula": "age >= 0",
+    "evidence": "Person.age values 25, 35, 45, 26 all >= 0"
+   },
+   {
+    "table": "Person",
+    "column": "gender",
+    "formula": "lower(gender) IN ('female','male')",
+    "evidence": "Person.gender values female, male; case-insensitive to allow MALE/FEMALE near-variants"
+   },
+   {
+    "table": "Person",
+    "column": "job",
+    "formula": "lower(job) IN ('student','engineer','doctor')",
+    "evidence": "Person.job values student, engineer, doctor; case-insensitive to allow ENGINEER/STUDENT/DOCTOR near-variants"
+   },
+   {
+    "table": "PersonFriend",
+    "column": "year",
+    "formula": "year >= 0",
+    "evidence": "PersonFriend.year values 10, 12, 5, 6 all >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Person": 4,
+   "PersonFriend": 4
+  },
+  "null_targets": [
+   "PersonFriend.name",
+   "PersonFriend.friend",
+   "PersonFriend.year"
+  ],
+  "supporting_evidence": [
+   "Person.age values: 25, 35, 45, 26 (all >= 0)",
+   "Person.gender values: female, male",
+   "Person.job values: student, engineer, doctor",
+   "PersonFriend.year values: 10, 12, 5, 6 (all >= 0)",
+   "PersonFriend.name and PersonFriend.friend reference Person.name (FK integrity observed, fk_violations=0)",
+   "Compact null_rate is 0.0 for all columns; NULLs are planted at the minimum one row per nullable column, after PK/unique filtering and after tie/duplicate planting",
+   "Person.name is a PRIMARY KEY and is excluded from duplicates_for_distinct targets",
+   "Person.age comparison_boundary target -1 is dropped because the semantic rule age >= 0 forbids it; boundary values 0, 1, 6, 7, 8, 29, 30, 31 remain",
+   "Person.city near-variants (Austi, Autin, s, S, AUSTIN) covered by generic near-variant sampler",
+   "Person.name near-variants (An, AN, bob, dan, zach, alice) covered by generic near-variant sampler",
+   "PersonFriend.name near-variants (lice, LICE, zach, bob) covered by generic near-variant sampler",
+   "PersonFriend.friend near-variants (alice, dan) covered by generic near-variant sampler",
+   "Person.gender boundary values male/female, MALE/FEMALE covered by case-insensitive enum rule",
+   "Person.job boundary values engineer/engineer, student/student, doctor/doctor covered by case-insensitive enum rule",
+   "Person.age boundary values 1, 6, 7, 8, 29, 30, 31 covered by integer near-variant sampler",
+   "PersonFriend.year boundary values 5, 6, 10, 12 covered by integer near-variant sampler"
+  ],
+  "uncertainty": "No formulas were provided; the original data has no calculated columns. Semantic rules are based on observed statistics and the atomic-operation summary. Person.city has no semantic rule; its comparison_boundary near-variants are covered by the extended generic near-variant sampler. table_sizes_per_instance denotes generated rows appended to the compact database; compact rows are preserved unchanged and the +/-2 variation is intended. The comparison_boundary target -1 for Person.age is dropped to stay consistent with the age >= 0 semantic rule. The fresh_share is 0.1 per the program (p=0.1). Ties and duplicates are planted before NULLs so that NULLs are never overwritten. The unmatched_join_rows pattern is explicitly verified for each instance. Parent-child generation order: Person before PersonFriend; FK values are drawn from the parent's compact + generated values."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "cb176a32bef2af2c"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.null_share states: 'For a nullable column, generate NULL rows with NULL share equal to the observed null_rate (0.0 here) but at least one NULL row per nullable column'. The execution feedback shows generated NULL shares far above 0.0: Person.age 16/64 (25%), Person.city 12/64 (19%), Person.gender 13/64 (20%), Person.job 16/64 (25%), PersonFriend.friend 21/74 (28%), PersonFriend.name 20/74 (27%), PersonFriend.year 28/74 (38%). In instance.py, _plant_nulls is called with null_rate computed from schema.original_values, but the compact database has no NULLs (null_rate=0.0), so k = max(1, round(0.0*n)) = 1 should be planted. Yet the observed shares are ~20-38%, meaning NULLs are also being produced by the samplers themselves (StringSampler/NumberSampler draw from elements that include None-derived values, and _init_sampler passes original_values that may contain None; also the p=0.2 fresh-draw path can yield NULL via _plant_nulls being applied on top of sampler output). The net effect is that the NULL share does not follow the compact share (0.0) as specified.",
+     "requested_revision": "Make the NULL share match the compact null_rate (0.0 here) with exactly the minimum one NULL row per nullable column, and ensure the samplers do not independently inject NULLs beyond that. Either (a) strip None from sampler element pools and rely solely on _plant_nulls with k = max(1, round(null_rate*n)), or (b) update the specification to state the intended NULL share explicitly (e.g. 'at least one NULL row, share up to X%') so the program and spec agree. The current mismatch between spec (0.0 share) and observed (20-38%) must be resolved."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's table_sizes_per_instance sets Person=4 and PersonFriend=4, and the program's choose_table_sizes adds rng.randint(-2,2) variation. Execution feedback shows rows_added Person=64 and PersonFriend=74 over 20 instances, i.e. ~3.2 and ~3.7 generated rows per instance on average, which is consistent with base 4 \u00b1 2. However, the specification's generic_sampling_rules and per_column_exceptions reference patterns like 'duplicates_for_distinct' with 'duplicate_share: 20-50%' and 'ties_for_order_limit' with 'tie_at_rank: [1]', but with only ~4 rows per table these patterns are barely exercisable. More importantly, the specification does not state whether the compact rows count toward the table size or whether generated rows are appended (the program appends, per its docstring). The spec should clarify that table_sizes_per_instance refers to generated rows appended to the compact database, not total table size.",
+     "requested_revision": "Clarify in the specification that table_sizes_per_instance denotes the number of generated (appended) rows per instance, and that compact rows are preserved unchanged. Also confirm whether the \u00b12 variation is intended or whether exact sizes are required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'Person.gender IN (female,male)' and 'Person.job IN (student,engineer,doctor)'. The program's _enforce_rules lowercases gender/job values and re-draws invalid ones, which is correct. However, the specification's comparison_boundary targets for Person.gender include values 'male','MALE','female','FEMALE' and for Person.job 'engineer','ENGINEER','student','STUDENT','doctor','DOCTOR'. The program's _enforce_rules forces all gender/job values to lowercase, so the uppercase near-variants (MALE, ENGINEER, etc.) that the comparison_boundary pattern intends to exercise are never generated. This means the boundary pattern for these columns is not actually implemented.",
+     "requested_revision": "Either (a) allow case-variant values (MALE, ENGINEER, etc.) to be generated for gender/job while still satisfying the semantic rule under case-insensitive comparison, or (b) update the specification to remove the uppercase near-variants from the comparison_boundary targets for Person.gender and Person.job, since the semantic rule constrains them to lowercase. The current spec and program are inconsistent on this point."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies list PersonFriend.name -> Person.name and PersonFriend.friend -> Person.name with copied_columns: []. The program's fill_foreign_keys_consistently draws FK values from the parent's compact + generated values with replacement, which is correct. However, the program then applies _plant_nulls to PersonFriend.name and PersonFriend.friend (both nullable FKs), which can set FK values to NULL. The specification's null_targets includes PersonFriend.name and PersonFriend.friend, so NULL FKs are intended. But the program's _plant_nulls is applied AFTER fill_foreign_keys_consistently, and the FK values drawn from the parent pool are non-NULL, so the NULL planting is the only source of NULL FKs. This is consistent with the spec. No issue here on FK consistency (integrity feedback shows fk_violations=0).",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.fresh_share states 'generate a small share of fresh values (e.g., 10%) that are not in the observed pool'. The program's _init_sampler uses p=0.0 or 0.2 (from build_random_instance: p = 0.0 if rng.random() < 0.3 else 0.2), and the samplers draw fresh values with probability p. This is roughly consistent with a 10-20% fresh share, but the spec says 'e.g., 10%' while the program uses 0% or 20% depending on a coin flip. This is a minor inconsistency but not blocking.",
+     "requested_revision": "Align the fresh_share probability in the program with the specification (e.g., use 0.1 consistently, or update the spec to state '0% or 20% depending on instance')."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty field states 'No formulas were provided; the original data has no calculated columns. The rules are based on observed statistics and the atomic-operation summary.' The semantic rules (age >= 0, gender IN (...), job IN (...), year >= 0) are supported by the supporting_evidence (Person.age values 25,35,45,26 all >= 0; gender female,male; job student,engineer,doctor; year 10,12,5,6 all >= 0). These are well-supported. However, the comparison_boundary patterns for Person.city include values 'Austi','austi','Autin','autin','s','S','AUSTIN' which are near-variants of 'Austin' and 'new york city'. The specification does not state a semantic rule for city, so these are uncertain patterns. The program's StringSampler generates near-variants via _str_variants (case, prefix/suffix, dropped char), which can produce 'Austi' (dropped char) and 'AUSTIN' (uppercase), but not 'Autin' (transposition) or 's'/'S' (single char). The comparison_boundary pattern for city is only partially implemented.",
+     "requested_revision": "Either (a) add transposition and single-character variants to _str_variants to cover 'Autin' and 's'/'S', or (b) update the specification to remove these specific near-variants from the comparison_boundary targets for Person.city, since they are not generated by the current program. The spec should distinguish supported rules (age, gender, job, year) from uncertain patterns (city near-variants)."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 36/77 separated, 0 unknown executions. This is a partial separation; the remaining 41 pairs are not separated. Per instruction 4, a missing separation alone does not establish a generation error, but it is unclear whether the unseparated pairs are due to insufficient value variation (e.g., the NULL share issue, the case-variant issue for gender/job, or the city near-variant issue) or due to query equivalence. This should be investigated by the engineer, but it does not block a pass on its own.",
+    "The specification's per_column_exceptions lists 'null_count' targeting PersonFriend.friend, but the atomic operations summary uses 'null_in_count_column' for PersonFriend.friend. The naming is inconsistent; the engineer should confirm these refer to the same pattern.",
+    "The specification's generic_sampling_rules.tie states 'ensure at least one tie at the listed LIMIT rank by generating a duplicate value in the same column'. The program's _plant_ties duplicates a random value, which may not be at the LIMIT rank (rank 1). With only ~4 rows, the tie may not be at rank 1. This is a minor issue but should be verified."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.null_share states: 'For each nullable column, plant exactly k = max(1, round(null_rate * n)) NULL rows per instance, where null_rate is the compact database's null_rate for that column (0.0 here)'. With null_rate = 0.0, k = max(1, 0) = 1 NULL row per nullable column per instance. However, execution feedback shows far more NULLs than one per column per instance: e.g. Person.age NULL 14/64, Person.city NULL 12/64, PersonFriend.friend NULL 21/74 across 20 instances. That is ~0.7 NULLs per instance per column, not 1 per instance. The cause is in instance.py: `_plant_nulls` is called with `null_rate` computed from `schema.original_values`, but the samplers in values.py already produce NULLs indirectly? No \u2014 samplers drop None. The real cause: `_plant_nulls` is applied to the *generated* column list, but then `sample_fresh_primary_keys`/`drop_unique_duplicates` filter rows, and more importantly the NULL planting happens per-column independently, so a row can have NULLs in multiple columns; but the count per column should still be k=max(1,round(0*n))=1 per instance. The observed 14/64 over 20 instances (~0.7/instance) is below 1/instance, meaning some instances get 0 NULLs in a column. This happens because `_plant_nulls` uses `rng.sample(range(len(values)), k)` with k=1, but then `sample_fresh_primary_keys` and `drop_unique_duplicates` may drop the NULL row (NULL is treated as 'not in seen' in drop_unique_duplicates, so it's kept; but PK dedup could drop it if the PK tuple collides). More critically, `_plant_nulls` is applied before PK/unique filtering, so a planted NULL row can be removed by `sample_fresh_primary_keys` when its PK duplicates an earlier row. The spec requires 'at least one NULL row per nullable column' per instance; the program does not guarantee this after filtering.",
+     "requested_revision": "Move NULL planting to after PK/unique filtering, or re-plant NULLs after filtering so each nullable column has at least one NULL row per instance. Alternatively, ensure the row carrying the planted NULL is never dropped by PK/unique dedup (e.g., plant NULLs on rows that survive filtering)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.tie states: 'For ORDER BY columns, ensure at least one tie at the listed LIMIT rank by duplicating the value that sorts to that rank (rank 1) in the same column.' The program's `_plant_ties` (instance.py) picks `target = min(values) if rng.random() < 0.5 else max(values)` and then sets a random position to target. This does not guarantee a tie at rank 1: if target is min and the random position already holds min, no new tie is created; if target is max and the sort is ASC, rank 1 is min, not max. The spec says 'the value that sorts to that rank (rank 1)' \u2014 for ASC that is the minimum, for DESC the maximum. The program randomly chooses min or max regardless of the actual ORDER BY direction, and does not verify a tie was actually created. Also, `_plant_ties` is applied before PK/unique filtering, so the tie can be removed.",
+     "requested_revision": "Make `_plant_ties` deterministic about rank 1: for ASC duplicate the minimum, for DESC duplicate the maximum (or duplicate both to cover both directions), and verify at least two occurrences of the rank-1 value exist after planting. Apply after filtering, or ensure the tied row survives."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.distinct_duplicates states: 'For DISTINCT columns, ensure at least one duplicate value (20-50% share) is present.' The program's `_plant_duplicates` (instance.py) copies one random value to another random position, creating exactly one duplicate pair. With n=4 rows, one duplicate pair gives a 2/4 = 50% share, which is at the boundary; but after `sample_fresh_primary_keys` and `drop_unique_duplicates` filtering, the duplicate may be removed (e.g., for Person.name, the PK dedup drops the second occurrence of a duplicated name). The spec targets Person.name, PersonFriend.name, PersonFriend.friend for duplicates_for_distinct, but Person.name is a PRIMARY KEY \u2014 duplicating it will always be removed by `sample_fresh_primary_keys`. This is a contradiction: the spec asks for duplicates on a PK column, but the program (correctly) enforces PK uniqueness. The spec's duplicates_for_distinct target list includes Person.name, which cannot have duplicates under the PK constraint.",
+     "requested_revision": "Designer: remove Person.name from the duplicates_for_distinct targets (it is a PRIMARY KEY and cannot have duplicates). Engineer: for PersonFriend.name and PersonFriend.friend, plant duplicates after filtering and verify a 20-50% share survives."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions lists comparison_boundary targets including Person.name, PersonFriend.name, Person.age, PersonFriend.friend, Person.gender, Person.job, Person.city. The atomic operations show comparison_boundary values like 'an', 'AN', 'lice', 'LICE', 'Austi', 'Autin', 's', 'S' \u2014 these are truncations/suffixes of pool values. The generic near-variant sampler (values.py `_str_variants`) produces case flips, prefix/suffix 'x', dropped first/last char, transposition, and LIKE patterns. It does NOT produce the specific truncations like 'an' (from 'Dan'), 'lice' (from 'Alice'), 'Austi' (from 'Austin'), 'Autin' (transposition of 'Austin' \u2014 actually covered), 's'/'S' (single char). The spec's uncertainty note acknowledges this: 'its comparison_boundary near-variants (Austi, Autin, s, S, AUSTIN) are uncertain and only partially covered by the generic near-variant sampler'. However, the spec still lists these as targets without adjusting the sampler to cover them.",
+     "requested_revision": "Designer: either (a) narrow the comparison_boundary target values to those the generic sampler can produce (case flips, one-char truncation from either end, one-char suffix, adjacent transposition), or (b) extend the generic_sampling_rules.varchar near-variant definition to include arbitrary substring truncations (e.g., 'an' from 'Dan', 'lice' from 'Alice') and single-character values. The current spec is internally inconsistent: it lists targets the sampler cannot reach."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include 'Person.age: age >= 0' and 'PersonFriend.year: year >= 0'. The program's `_enforce_rules` clamps negative values to 0 via `max(0, int(v))`. However, the atomic operations for Person.age comparison_boundary list target values including -1, 0, 1, 6, 7, 8, 29, 30, 31 \u2014 i.e., the boundary values around 0 and 30. The spec's semantic rule age >= 0 forbids -1, but the comparison_boundary pattern wants values at -1 (one step below the boundary). These are in tension: the semantic rule says age >= 0, but the comparison_boundary pattern wants to test age < 30 and age < 7 with values at -1, 0, 1, 6, 7, 8. The program clamps -1 to 0, so the -1 boundary value is never generated. This means the comparison_boundary pattern for Person.age cannot be fully exercised.",
+     "requested_revision": "Designer: reconcile the semantic rule age >= 0 with the comparison_boundary target -1. Either drop -1 from the comparison_boundary targets (since the semantic rule forbids it), or relax the semantic rule to allow -1 (if the original data actually had -1, which the evidence 'Person.age values 25, 35, 45, 26 all >= 0' does not support). The current spec is contradictory."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's table_sizes_per_instance is {Person: 4, PersonFriend: 4}. The program's `choose_table_sizes` applies `rng.randint(-2, 2)` variation, giving 2-6 rows per table. Execution feedback shows rows_added Person: 64 over 20 instances = 3.2/instance, PersonFriend: 74/20 = 3.7/instance. This is consistent with the variation. However, the spec's uncertainty note says 'the +/-2 variation is intended', so this is acceptable. No issue here \u2014 noting for completeness.",
+     "requested_revision": "None; this is consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies state PersonFriend.name and PersonFriend.friend reference Person.name. The program's `fill_foreign_keys_consistently` draws from `compact.get((pt, pc), []) + instance.get(pt, {}).get(pc)`. But `instance.get(pt, {})` at the time PersonFriend is processed \u2014 Person is processed first (table_order), so Person's generated values are available. However, `fill_foreign_keys_consistently` is called with `schema.original_values` as `compact`, and `instance` is the partially-built dict. For PersonFriend, `instance['Person']` exists. Good. But then `_plant_nulls` is applied to PersonFriend.name and PersonFriend.friend AFTER FK filling, which can set FK values to NULL. The spec's null_targets include PersonFriend.name and PersonFriend.friend, so NULL FKs are allowed. Execution feedback shows fk_violations: 0, so FK integrity holds. No issue.",
+     "requested_revision": "None; FK integrity is preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.varchar states: 'Primary-key columns draw fresh values from the pool without reuse.' The program's `sample_fresh_primary_keys` deduplicates PK tuples against compact rows and earlier generated rows. However, the sampler for Person.name (a PK) uses `_init_sampler` with `max_l0 = float('inf') if n_pk == 1 else 30` when `rng.random() < 0.5`. With max_l0 = inf, the sampler can draw unlimited fresh values, but the pool is small (Person.name pool from original values + literals). The dedup then drops duplicates. This is consistent with 'without reuse'. No issue.",
+     "requested_revision": "None; PK uniqueness is enforced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.integer states: 'with probability 0.1 draw a fresh value near a pool value (+/-1, +/-2, 0, -1)'. The program's NumberSampler applies +/-1, +/-2 with probabilities 1/6, 1/5, 1/4, 1/3 (cumulative ~0.95), which is much higher than 0.1. The spec says 'with probability 0.1 draw a fresh value near a pool value', but the program applies near-variants with ~95% probability. This over-generates near-variants and under-generates exact pool values.",
+     "requested_revision": "Engineer: adjust NumberSampler to apply near-variants with probability 0.1 (matching the spec), not ~0.95. Similarly for StringSampler, which applies variants with probability 0.5 (spec says 0.1)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules.varchar/text states: 'with probability 0.1 draw a fresh near-variant'. The program's StringSampler applies variants with probability 0.5 (`if r.random() < 0.5:`). This is 5x the specified rate. The spec's fresh_share rule says 'Fresh (non-pool) values are drawn with probability 0.1 per value for every column type', but the program's `_init_sampler` sets p=0.1 only for the fresh draw, while the variant application is separate and at 0.5.",
+     "requested_revision": "Engineer: change StringSampler's variant application probability from 0.5 to 0.1 to match the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 39/77 separated, 0 unknown executions. The remaining 38 pairs are not separated, but per instruction 4, a missing separation alone does not establish a generation error. However, the NULL planting and tie/duplicate issues above may contribute to non-separation and should be fixed before re-evaluating.",
+    "The spec's comparison_boundary for Person.gender lists 'male', 'MALE', 'female', 'FEMALE' \u2014 the program's `_enforce_rules` keeps case (only checks lower()), so MALE/FEMALE survive. Good. But the spec's comparison_boundary for Person.job lists 'engineer', 'ENGINEER', etc. \u2014 same, survives. No issue.",
+    "The spec's null_in_count_column target is PersonFriend.friend. The program plants NULLs in PersonFriend.friend (nullable), so COUNT(friend) vs COUNT(*) will differ. Execution feedback shows PersonFriend.friend NULL 21/74, so this is exercised. Good.",
+    "The spec's rows_with_different_values for Person.age and PersonFriend.year requires '>= 2 per group with different values'. The program's samplers draw from pools with variation, so this is likely satisfied, but not explicitly verified in the feedback."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` is called for every nullable column with `_null_rate(schema, t, cm.name)`, which returns 0.0 for all columns (compact null_rate is 0.0 per the specification). The rule then computes `k = max(1, int(round(0.0 * len(values)))) = 1`, so exactly one NULL is planted per nullable column per instance. Execution feedback confirms this: e.g. Person.age NULL 19/71, Person.city NULL 20/71, PersonFriend.year NULL 16/74 \u2014 roughly one NULL per instance, not a share following the compact database. The specification's `null_share` rule says 'plant exactly k = max(1, round(null_rate * n)) NULL rows per instance, where null_rate is the compact database's null_rate for that column (0.0 here)'. With null_rate 0.0 the formula yields k=1, which the program does implement. However, the interface rule (instruction 7) requires 'rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The program satisfies the 'at least one NULL' and 'non-NULL present' parts, and the compact share is 0.0, so the observed ~1/4 share is a consequence of the max(1,...) floor, not a deviation from the stated formula. This is consistent with the specification as written; no change required, but the specification's null_share wording should be reconciled with the interface rule (the floor of 1 dominates when null_rate=0).",
+     "requested_revision": "No program change required. Optionally clarify in the specification that when null_rate=0.0 the floor of 1 NULL per nullable column is the intended behavior, matching the interface rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `tie` rule requires 'at least one tie at the listed LIMIT rank (rank 1) by duplicating the value that sorts to that rank: for ASC duplicate the minimum, for DESC duplicate the maximum (duplicate both to cover both directions). Verify at least two occurrences of the rank-1 value exist after planting.' `_plant_ties` in instance.py duplicates both min and max, but it overwrites arbitrary positions (`for i in range(len(values)): if values[i] != target: values[i] = target; break`). This can overwrite a value that was just planted as a NULL or a duplicate, and more importantly it can overwrite the only occurrence of a value needed for another rule. More critically, `_plant_ties` is applied to Person.age and PersonFriend.year, but the tie targets in the atomic operations are `Person.age` (ties_for_order_limit, tie_at_rank [1], direction ASC and DESC) and `PersonFriend.year` (LIMIT(1), tie_at_rank [1]). The program does plant ties for both, which is correct. However, the overwrite can destroy the NULL planted earlier (since NULLs are planted before ties in the loop order: NULL rule loop runs, then ties/duplicates loop). If a NULL position is overwritten by a tie value, the 'at least one NULL per nullable column' guarantee is broken. Execution feedback shows NULL counts are still >= 1 per column per instance aggregate, but per-instance this is not verified. The order in `build_random_instance` is: NULL planting, then ties, then duplicates \u2014 so ties/duplicates can overwrite planted NULLs.",
+     "requested_revision": "Reorder so that ties and duplicates are planted BEFORE NULL planting, or make `_plant_ties`/`_plant_duplicates` skip NULL positions and positions already holding a required value. Verify per-instance that each nullable column retains at least one NULL after all planting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `distinct_duplicates` rule requires 'at least one duplicate value (20-50% share) is present. Plant duplicates after primary-key/unique filtering and verify the 20-50% share survives.' `_plant_duplicates` computes `lo = max(1, int(round(0.2 * n)))` and `hi = max(lo, int(round(0.5 * n)))`, then overwrites positions to reach `want` occurrences of a target. With n=4 (table size 4), lo=1, hi=2, so it plants 1-2 duplicates. This is within 20-50% (0.8-2.0 for n=4). However, `_plant_duplicates` is applied to PersonFriend.name and PersonFriend.friend, which are foreign keys referencing Person.name. Overwriting these with a duplicate value is fine for FK integrity (the value still references a Person), but the overwrite can also destroy the NULL planted earlier (same ordering issue as ties). Additionally, the duplicate target is chosen from non-NULL values, and overwriting can reduce the NULL count below 1 per instance.",
+     "requested_revision": "Same as the tie issue: plant duplicates before NULLs, or skip NULL positions. Verify per-instance NULL retention."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `comparison_boundary` targets for Person.name include values 'Bob','bob','Dan','dan','Zach','zach','Alice','alice','an','AN'. The generic varchar rule says near-variants include 'arbitrary substring truncation (e.g. 'an' from 'Dan', 'lice' from 'Alice', 'Austi' from 'Austin', 's' from 'Austin')'. The program's `_str_variants` in values.py does generate all proper substrings, including 'an' from 'Dan' and 'lice' from 'Alice'. However, the specification's `fresh_share` rule says 'Fresh (non-pool) values are drawn with probability 0.1 per value for every column type' and the varchar rule says 'with probability 0.1 draw a fresh near-variant of a pool value'. The program applies VARIANT_SHARE=0.1 for near-variants, which matches. But the near-variant is applied to the sampled value (which may itself be a fresh random string), not specifically to a pool value. This is a minor deviation: the specification says 'near-variant of a pool value', while the program applies near-variants to any sampled value including fresh random strings. This reduces the probability that a specific pool-derived near-variant (like 'an' from 'Dan') appears.",
+     "requested_revision": "In StringSampler.sample, when applying a near-variant, draw the base from the pool (self.elements) rather than from the just-sampled value, to match 'near-variant of a pool value'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `unmatched_join_rows` pattern for Person.name and PersonFriend.name/friend requires 'parent_rows_without_children: true' and 'child_rows_with_null_fk: true'. The program's `fill_foreign_keys_consistently` draws FK values from the parent's compact + generated values with replacement, and `_plant_nulls` plants NULLs in nullable FK columns (PersonFriend.name, PersonFriend.friend). This produces child rows with NULL FK (satisfying child_rows_with_null_fk). However, 'parent_rows_without_children' requires some Person rows to have no matching PersonFriend rows. Since FK values are drawn with replacement from the parent pool, and table sizes are small (4 rows each), it is possible but not guaranteed that some parent has no child. The program does not explicitly ensure this. Execution feedback shows construction_pairs separated 48/77, but does not break down by pattern. This is a soft pattern (unmatched_join_rows) and the specification lists it as a per_column_exception target, but the program does not have an explicit construction step for 'parent_rows_without_children'.",
+     "requested_revision": "Add an explicit construction step (or verify) that at least one Person row has no matching PersonFriend.name/friend row per instance, to satisfy the unmatched_join_rows pattern's parent_rows_without_children target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `rows_with_different_values` pattern for Person.age and PersonFriend.year requires '>= 2 per group with different values' under `SELECT(MAX(...))`. The program's `_plant_ties` overwrites values to duplicate min and max, which can reduce the number of distinct values. With table size 4 and ties planted for both min and max, the number of distinct values could drop to 2, which still satisfies '>= 2 per group with different values'. However, if the sampler produces only 2 distinct values and ties overwrite one, it could drop to 1 distinct value. The program does not verify this after planting. Execution feedback does not report distinct-value counts per column.",
+     "requested_revision": "After planting ties, verify that at least 2 distinct non-NULL values remain in Person.age and PersonFriend.year per instance; if not, re-draw or adjust."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Person.age: age >= 0` with evidence 'Person.age values 25, 35, 45, 26 all >= 0'. The program's `_enforce_rules` clamps age to max(0, int(v)). This is consistent. However, the specification's `comparison_boundary` targets for Person.age include -1, 0, 1, 6, 7, 8, 29, 30, 31, and the supporting_evidence says 'Person.age comparison_boundary target -1 is dropped because the semantic rule age >= 0 forbids it; boundary values 0, 1, 6, 7, 8, 29, 30, 31 remain'. The program's NumberSampler near-variant logic can produce -1 (via `v -= 1` when v=0, or `v -= 2*d` when v=1), but `_enforce_rules` clamps it to 0. So -1 is never generated, which matches the specification's decision to drop it. This is consistent.",
+     "requested_revision": "No change required; the specification and program agree on dropping -1."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `table_sizes_per_instance` is {Person: 4, PersonFriend: 4}. The program's `choose_table_sizes` uses `base + rng.randint(-2, 2)`, so sizes range from 2 to 6. Execution feedback shows rows_added Person 71 over 20 instances (avg 3.55) and PersonFriend 74 (avg 3.7), consistent with the +/-2 variation. The specification says 'table_sizes_per_instance denotes generated rows appended to the compact database; compact rows are preserved unchanged and the +/-2 variation is intended.' This matches. However, the specification's `table_sizes_per_instance` is stated as exactly 4, and the program's variation is documented in the specification's uncertainty note. This is consistent.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `dependencies` lists PersonFriend.name -> Person.name and PersonFriend.friend -> Person.name with copied_columns []. The program's `fill_foreign_keys_consistently` draws FK values from the parent's compact + generated values, and `_plant_nulls` plants NULLs in these nullable FK columns. Execution feedback shows fk_violations: 0, so FK integrity is maintained. However, the program's `_plant_duplicates` overwrites PersonFriend.name and PersonFriend.friend values with a duplicate target chosen from non-NULL values. This target is drawn from the current column values, which are FK values (already valid references), so FK integrity is preserved. This is consistent.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `null_targets` lists PersonFriend.name, PersonFriend.friend, PersonFriend.year. The program's `_plant_nulls` is applied to all nullable columns (not just these three), including Person.age, Person.city, Person.gender, Person.job. Execution feedback shows NULLs in all seven nullable columns. The specification's `null_targets` is a subset of nullable columns, but the interface rule (instruction 7) says 'for every nullable column (including nullable foreign keys), each instance contains generated rows with NULL and rows with non-NULL values'. The program plants NULLs in all nullable columns, which satisfies the interface rule. The specification's `null_targets` may be intended as the columns where NULLs are semantically meaningful, but the program's broader planting is consistent with the interface rule.",
+     "requested_revision": "No change required; the program's broader NULL planting is consistent with the interface rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `fresh_share` rule says 'Fresh (non-pool) values are drawn with probability 0.1 per value for every column type.' The program's `_init_sampler` sets `p` from the caller (0.0 or 0.2 in `build_random_instance`: `p = 0.0 if rng.random() < 0.3 else 0.2`). This means the fresh share is 0.0 or 0.2, not 0.1. The specification's `fresh_share` rule is not implemented as stated. The program's docstring in values.py says 'fresh_share: fresh (non-pool) values are drawn with probability 0.1 per value for every column type (p = 0.1)', but the actual code uses p=0.0 or 0.2. This is a discrepancy between the program's docstring and its behavior, and between the specification and the program.",
+     "requested_revision": "Set p = 0.1 in `build_random_instance` (or in `_init_sampler`) to match the specification's fresh_share rule, or update the specification to reflect the 0.0/0.2 behavior."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's `varchar` rule says 'Primary-key columns draw fresh values from the pool without reuse.' The program's `sample_fresh_primary_keys` drops rows whose PK tuple repeats, but the PK values themselves are drawn by the sampler (which may draw from the pool with reuse, then filtered). The program does not ensure PK values are drawn 'without reuse' from the pool; it only ensures the final PK tuples are unique. This is a minor deviation: the specification says 'draw fresh values from the pool without reuse', which could mean each PK value is used at most once. The program's filtering achieves uniqueness but not the 'without reuse' drawing semantics. For a single-column PK like Person.name, the filtering ensures uniqueness, which is the practical effect.",
+     "requested_revision": "Clarify in the specification whether 'without reuse' means the drawing process or the final uniqueness; if the former, adjust the sampler to draw PK values without replacement from the pool."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance verification that each nullable column retains at least one NULL after tie/duplicate planting (the program's ordering allows overwrites).",
+    "Per-instance verification that Person.age and PersonFriend.year retain at least 2 distinct non-NULL values after tie planting.",
+    "Per-instance verification that at least one Person row has no matching PersonFriend row (unmatched_join_rows parent_rows_without_children).",
+    "The fresh_share discrepancy (p=0.0/0.2 vs specified 0.1) needs resolution: either the program or the specification should be changed."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's semantic rule 'Person.age >= 0' and 'PersonFriend.year >= 0' are stated to be based on 'all >= 0' observations, but the atomic-operation summary lists Person.age boundary targets including -1 and 0, and distinct-execution evidence does not constrain the database to reject negative ages. The generic integer sampling rule also produces near-variants via '-1' (values.py NumberSampler, u >= 0.9 branch subtracts 1), which can go below a pool minimum. Evidence: values.py NumberSampler.sample applies v += 0 / v -= 1; the age semantic rule clamps to max(0,...) in _enforce_rules. This is coherent, but the reported 'unmatched_join_rows' atomic op for Person.name also lists child_rows_with_null_fk for PersonFriend.name which is not NULLable in the original (it is a FK, not declared NOT NULL) \u2014 the program does handle it via _plant_nulls.",
+     "supporting_rule_status": "supported",
+     "requested_revision": "None required; optionally document that the -1 boundary is intentionally unreachable for age/year to match the >= 0 semantic rule."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "In _ensure_unmatched_join (instance.py), the guard is `not cm.notnull and cm.pk_pos == 0` for setting a child FK to NULL. PersonFriend.name and PersonFriend.friend are both FK columns; the FK is nullable per schema. It then additionally forces a parent to be unreferenced by NULLing another child FK if none is unreferenced. This can over-NULL child FK values, but null planting already runs first; the unmatched_join construction still satisfies 'at least one parent without child' and 'at least one child with NULL FK'. FK integrity is preserved (writer disables foreign_keys pragma but rows still reference valid parents since generation draws FK from parent values; execution feedback fk_violations=0).",
+     "requested_revision": "None blocking; the unmatched-join and NULL constructions both appear correct and the run reports fk_violations=0, so no change requested."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Null planting order: spec requires plant NULLs after ties/duplicates; instance.py does PK/unique filtering -> ties -> duplicates -> NULLs. Null planting overwrites the earliest randomly sampled indices and could overwrite a planted tie/duplicate value. The spec says 'a NULL is never overwritten by a tie/duplicate' (that ordering is honored), but does not forbid NULL replacing a duplicate. _plant_nulls uses rng.sample over all positions including the duplicated ones, so a planted duplicate could be nulled; the verify step only checks >=1 NULL and >=1 non-NULL. The execution feedback shows duplicated-share participation is 'unknown' (construction_pairs separated 47/77), so duplicate share surviving could be partially undermined.",
+     "requested_revision": "Optional: in _plant_nulls, prefer NULL positions that are not the planted tie/duplicate ranks, or re-verify the DISTINCT/tie post-conditions after planting NULLs. Not blocking because tie/duplicate rules only need >=1 duplicate and >=2 distinct non-NULL which the retries/samples make unlikely to be fully destroyed at small n; the run shows separated pairs 47/77 with 0 unknown executions."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction-based separation: 47 of 77 eligible pairs separated, 30 not separated with 0 'unknown' \u2014 many are 'not separated' likely because the compact + appended data cannot distinguish queries at this small table size. Since fast-mode values were used for evaluation, this is reported as separation rate, not a hard failure; it does not by itself prove equivalence or a generation error.",
+    "PersonFriend.year near-variants include 5,6,10,12 via NumberSampler scale=4, but 'year >= 0' clamp means integer near-variants below 0 are re-clamped to 0, which is acceptable under three-valued logic rules."
+   ],
+   "notes": "Program ran cleanly (20/20 ok, FK/PK/NOT NULL violations all 0), reproducible, compact rows preserved, NULL rules satisfied for every nullable column with >=1 NULL and non-NULL (feedback shows NULL counts per nullable column >0 and <n). Fresh share is consistently 0.1 (FRESH_SHARE, p passed to samplers). Semantic rules (age>=0, gender/job case-insensitive enums, year>=0) are enforced in Python via clamping/re-draw and match specification evidence. Dependencies (PersonFriend.name/friend reference Person.name) are honored via fill_foreign_keys_consistently drawing from parent compact+generated values. The issues raised are minor implementation robustness notes rather than blocking errors."
+  }
+ ]
 }

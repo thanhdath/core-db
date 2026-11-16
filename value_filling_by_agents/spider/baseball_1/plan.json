@@ -1,53 +1,1412 @@
 {
  "db": "baseball_1",
- "operator_io_quirks": [
-  "No PRIMARY KEY declared on ANY table (pk=[] everywhere); sample_fresh_primary_keys/drop_unique_duplicates are no-ops here, so TS row counts survive unfiltered.",
-  "fielding_postseason has a dangling FK: team_id -> player(team_id) (parent col exists but is not a key of player); parent_exists=true so it is NOT dropped, and FK filling will draw player.team_id values (which don't exist) into fielding_postseason.team_id.",
-  "Many NUMERIC columns store mixed storage classes: integer, real AND text (e.g. pitching.baopp/era, team.fp is real-only, player_award_vote.points_won integer+real). Empty-string '' appears as a value in NUMERIC columns (gp, gs, g_dh, ibb, hbp, sh, sf, g_idp, death_*, ballots, needed, attendance, dp, cs, hbp, sf).",
-  "Empty string '' is a real value in many TEXT columns (league_id, div_id, tie, notes, park_alias, bats, throws, death_*, inducted-adjacent, active, na_assoc, div_win/wc_win/lg_win/ws_win).",
-  "Text-stored dates: player.debut, player.final_game, home_game.span_first, home_game.span_last are TEXT with format YYYY-MM-DD (e.g. '2004-04-06'); declared TEXT so TS dispatches String, not Date.",
-  "player_id is TEXT and is the de-facto key of player (distinct=18846=rows) but has no PK/unique constraint; child FKs to player.player_id are non-unique-parent-safe only because values are distinct.",
-  "team.team_id is TEXT, distinct=149 over 2805 rows (non-unique parent: same team_id across years); FK children (appearances, batting, home_game, manager, etc.) reference a NON-UNIQUE parent column.",
-  "Large tables: fielding 170526, batting 101332, appearances 100951, pitching 44139, salary 25575 \u2014 all under 300000 so full read is fine, but read once per worker.",
-  "Column named 'double' (batting, batting_postseason, team) and 'rank', 'year', 'round', 'a', 'e', 'r', 'h', 'w', 'l', 'g' \u2014 short/reserved-ish names; must be double-quoted in generated SQL.",
-  "pitching_postseason.baopp is TEXT (not NUMERIC like pitching.baopp) \u2014 same logical column, different declared type across tables.",
-  "manager_award.notes is NUMERIC but only value is '' (distinct=1); player_award.notes is TEXT with 29 distinct values \u2014 same name, different type.",
-  "No views/triggers/indexes mentioned in DDL; all tables plain CREATE TABLE with inline FK clauses (no named constraints)."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns -> String fuzzer: random strings over a-zA-Z 0-9() with contamination; player_id/team_id/college_id/park_id get implausible random strings, breaking joins to real-looking ids -> likely FN on queries filtering by specific id patterns.",
-  "All INTEGER columns -> Number fuzzer (is_int, scale 0): values in [-1,1] perturbed by +-1/+-2; year columns get tiny values (0,1,-1) instead of 1871-2015 -> FN for year-range predicates, FP for year=0/1 ties.",
-  "All NUMERIC columns -> Number fuzzer scale 0 (no args): same tiny integer range; era/fp/baopp (real-valued) get integers 0/1/-1 -> FN for era<3.0 style predicates, FP from mass ties at 0/1.",
-  "String fuzzer on league_id/div_id/tie/inducted/bats/throws produces random strings, not the small enum sets (AL/NL, Y/N, R/L) -> FN for league_id='NL' predicates, FP from random collisions.",
-  "Text-stored dates (debut, span_first/last) get String fuzzer random strings, not YYYY-MM-DD -> FN for date-range/format predicates; no Date fuzzer fires on this DB.",
-  "FK filling: child player_id/team_id/park_id/college_id drawn with replacement from parent's generated values; parent player has 18846 distinct random strings so child gets plausible-looking-but-random ids -> joins mostly match (good for join queries) but values implausible.",
-  "fielding_postseason.team_id filled from player.team_id (dangling FK) -> values are player_id-like strings, never match team.team_id -> FN on fielding_postseason JOIN team.",
-  "No PK/unique constraints -> no row dropping; TS keeps all generated rows, so duplicate-heavy tables (year, league_id) get many ties -> FP for DISTINCT/COUNT(DISTINCT) and GROUP BY queries.",
-  "Empty-string values in original are sampled as elements (5 originals + pool) so '' survives in league_id/div_id/tie -> some queries filtering league_id='' may still match.",
-  "Number fuzzer list-range quirk (upper end overwritten to full range) means even with original elements, fresh draws dominate -> implausible magnitudes.",
-  "String fuzzer adds str(i+1)/str(i-1) for int-like strings and %-stripped variants -> some numeric-looking text (baopp '0.23') gets near-miss variants."
- ],
- "challenger_refs": [
-  "G2",
-  "G4",
-  "gb59a9695",
-  "gb59a9695",
-  "gb59a9695",
-  "g3b9288d6",
-  "g3b9288d6",
-  "g3b9288d6",
-  "g50a0d105",
-  "G3",
-  "g9aefc831",
-  "G1",
-  "G5",
-  "gb4c1718d"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_id": "Sample from a pool of realistic short identifiers (3-5 uppercase letters/digits for team/league/park ids, 8-10 lowercase letters+digits for player ids). Include near-variants (case changes, one-char edits) at ~5% share.",
+   "text_name": "Sample from a pool of realistic names; include near-duplicate variants (case, spacing) at ~5% share.",
+   "text_code": "Sample from the enum pool defined in per_column_exceptions; otherwise short uppercase codes.",
+   "integer_count": "Sample integers in [0, 200] with a long tail; include boundary values 0,1,2,3 and one step around each listed literal.",
+   "integer_year": "Sample years in [1871, 2015]; include boundary values at each listed literal and one step on each side.",
+   "numeric_measure": "Sample non-negative numerics in [0, 1000] with decimals where the column is NUMERIC; include 0 and small values.",
+   "numeric_rate": "Sample numerics in [0, 1] with 2-3 decimals.",
+   "date_text": "Sample ISO dates 'YYYY-MM-DD' in [1871-01-01, 2015-12-31].",
+   "nullable": "Each nullable column gets NULL in ~2% of rows (at least one NULL row per instance); non-NULL values follow the column rule.",
+   "fresh_values": "For DISTINCT-target columns, ensure at least 20-50% duplicate share by drawing from a small pool; for tie-target ORDER columns, plant at least two groups sharing the top aggregate value.",
+   "planting_order": "Apply near-variants and clamping first, then plant boundary/literal/enum values last so required values survive in the final instance; protect planted values from perturbation.",
+   "fk_null_rule": "For FK columns, non-NULL values are drawn from the parent's generated values; NULL is allowed only where the column is nullable. When the parent is empty, all child FK values are NULL (never 0)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "team.team_id",
+    "pattern": "unmatched_join_rows, group_sizes, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "home_game.team_id",
+      "salary.team_id",
+      "all_star.team_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "AVG(home_game.attendance)"
+     ]
+    }
+   },
+   {
+    "column": "home_game.team_id",
+    "pattern": "unmatched_join_rows, group_sizes, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "team.team_id",
+      "team.team_id_br"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "AVG(home_game.attendance)"
+     ]
+    }
+   },
+   {
+    "column": "home_game.year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "ops": [
+      "PRED(home_game.year = 2014)"
+     ],
+     "values": [
+      2013,
+      2014,
+      2015
+     ]
+    }
+   },
+   {
+    "column": "team.year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "ops": [
+      "PRED(team.year = 2014)",
+      "PRED(team.year = 1998)"
+     ],
+     "values": [
+      1997,
+      1998,
+      1999,
+      2013,
+      2014,
+      2015
+     ]
+    }
+   },
+   {
+    "column": "park.park_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "salary.year",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "ops": [
+      "PRED(salary.year BETWEEN 1985 AND 1990)",
+      "PRED(salary.year IN (2001, 2010))"
+     ],
+     "values": [
+      1984,
+      1985,
+      1986,
+      1989,
+      1990,
+      1991
+     ]
+    }
+   },
+   {
+    "column": "team.attendance",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "park.state",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "ops": [
+      "HAVING(COUNT(*) > 2)"
+     ],
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "player.name_first",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "player.name_last",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "player.player_id",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(DISTINCT all_star.game_id)"
+     ]
+    }
+   },
+   {
+    "column": "postseason.ties",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "ops": [
+      "PRED(postseason.ties = 1)",
+      "PRED(postseason.ties >= 1)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "column": "salary.salary",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "salary.team_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "team.team_id",
+      "manager.team_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "team.team_id_br",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "home_game.team_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "all_star.game_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "all_star.player_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "player.player_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "all_star.team_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "team.team_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "college.college_id",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "yale",
+      "YALE"
+     ]
+    }
+   },
+   {
+    "column": "college.name_full",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Yale University",
+      "yale university"
+     ]
+    }
+   },
+   {
+    "column": "hall_of_fame.yearid",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC",
+     "tie_on": [
+      "COUNT(DISTINCT hall_of_fame.player_id)"
+     ]
+    }
+   },
+   {
+    "column": "manager.rank",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "ops": [
+      "PRED(manager.rank = 3)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "manager.team_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "salary.team_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "park.city",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "player.birth_country",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      3
+     ],
+     "direction": "ASC",
+     "tie_on": [
+      "COUNT(player.birth_country)"
+     ]
+    }
+   },
+   {
+    "column": "salary.player_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "team.h",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "all_star.year",
+    "pattern": "literal_pool",
+    "targets": {
+     "literals": [
+      1998
+     ]
+    }
+   },
+   {
+    "column": "park.park_name",
+    "pattern": "literal_pool",
+    "targets": {
+     "literals": [
+      "Columbia Park"
+     ]
+    }
+   },
+   {
+    "column": "postseason.year",
+    "pattern": "literal_pool",
+    "targets": {
+     "literals": [
+      1885
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "all_star.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "appearances.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "appearances.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "manager_award.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "player_award.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "player_award_vote.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "batting.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "batting_postseason.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "batting_postseason.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "player_college.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "player_college.college_id",
+    "parent": "college.college_id",
+    "copied": []
+   },
+   {
+    "child": "fielding.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "fielding_outfield.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "fielding_postseason.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "fielding_postseason.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "hall_of_fame.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "home_game.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "home_game.park_id",
+    "parent": "park.park_id",
+    "copied": []
+   },
+   {
+    "child": "manager.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "manager_half.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "team.franchise_id",
+    "parent": "team_franchise.franchise_id",
+    "copied": []
+   },
+   {
+    "child": "salary.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   },
+   {
+    "child": "salary.player_id",
+    "parent": "player.player_id",
+    "copied": []
+   },
+   {
+    "child": "team_half.team_id",
+    "parent": "team.team_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "player",
+    "column": "player_id",
+    "formula": "length(player_id) BETWEEN 6 AND 10"
+   },
+   {
+    "table": "player",
+    "column": "birth_year",
+    "formula": "birth_year BETWEEN 1800 AND 2000"
+   },
+   {
+    "table": "player",
+    "column": "birth_month",
+    "formula": "birth_month BETWEEN 1 AND 12"
+   },
+   {
+    "table": "player",
+    "column": "birth_day",
+    "formula": "birth_day BETWEEN 1 AND 31"
+   },
+   {
+    "table": "player",
+    "column": "weight",
+    "formula": "weight BETWEEN 100 AND 300"
+   },
+   {
+    "table": "player",
+    "column": "height",
+    "formula": "height BETWEEN 60 AND 90"
+   },
+   {
+    "table": "player",
+    "column": "bats",
+    "formula": "bats IN ('R','L','B','')"
+   },
+   {
+    "table": "player",
+    "column": "throws",
+    "formula": "throws IN ('R','L','')"
+   },
+   {
+    "table": "player",
+    "column": "debut",
+    "formula": "debut <= final_game"
+   },
+   {
+    "table": "team",
+    "column": "year",
+    "formula": "year BETWEEN 1871 AND 2015"
+   },
+   {
+    "table": "team",
+    "column": "g",
+    "formula": "g > 0"
+   },
+   {
+    "table": "team",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "team",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "team",
+    "column": "w",
+    "formula": "w + l <= g"
+   },
+   {
+    "table": "team",
+    "column": "rank",
+    "formula": "rank BETWEEN 1 AND 12"
+   },
+   {
+    "table": "team",
+    "column": "div_win",
+    "formula": "div_win IN ('Y','N','')"
+   },
+   {
+    "table": "team",
+    "column": "wc_win",
+    "formula": "wc_win IN ('Y','N','')"
+   },
+   {
+    "table": "team",
+    "column": "lg_win",
+    "formula": "lg_win IN ('Y','N','')"
+   },
+   {
+    "table": "team",
+    "column": "ws_win",
+    "formula": "ws_win IN ('Y','N','')"
+   },
+   {
+    "table": "team",
+    "column": "fp",
+    "formula": "fp BETWEEN 0 AND 1"
+   },
+   {
+    "table": "team",
+    "column": "attendance",
+    "formula": "attendance >= 0"
+   },
+   {
+    "table": "home_game",
+    "column": "year",
+    "formula": "year BETWEEN 1871 AND 2015"
+   },
+   {
+    "table": "home_game",
+    "column": "games",
+    "formula": "games >= 0"
+   },
+   {
+    "table": "home_game",
+    "column": "openings",
+    "formula": "openings >= 0"
+   },
+   {
+    "table": "home_game",
+    "column": "attendance",
+    "formula": "attendance >= 0"
+   },
+   {
+    "table": "home_game",
+    "column": "span_first",
+    "formula": "span_first <= span_last"
+   },
+   {
+    "table": "park",
+    "column": "country",
+    "formula": "country IN ('US','MX','CA','PR','AU','JP')"
+   },
+   {
+    "table": "salary",
+    "column": "year",
+    "formula": "year BETWEEN 1984 AND 2015"
+   },
+   {
+    "table": "salary",
+    "column": "salary",
+    "formula": "salary >= 0"
+   },
+   {
+    "table": "postseason",
+    "column": "ties",
+    "formula": "ties >= 0"
+   },
+   {
+    "table": "postseason",
+    "column": "wins",
+    "formula": "wins >= 0"
+   },
+   {
+    "table": "postseason",
+    "column": "losses",
+    "formula": "losses >= 0"
+   },
+   {
+    "table": "manager",
+    "column": "rank",
+    "formula": "rank BETWEEN 1 AND 12"
+   },
+   {
+    "table": "manager",
+    "column": "plyr_mgr",
+    "formula": "plyr_mgr IN ('Y','N')"
+   },
+   {
+    "table": "manager",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "manager",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "manager",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "manager",
+    "column": "w",
+    "formula": "w + l <= g"
+   },
+   {
+    "table": "all_star",
+    "column": "year",
+    "formula": "year BETWEEN 1933 AND 2015"
+   },
+   {
+    "table": "all_star",
+    "column": "game_num",
+    "formula": "game_num BETWEEN 0 AND 2"
+   },
+   {
+    "table": "all_star",
+    "column": "league_id",
+    "formula": "league_id IN ('AL','NL')"
+   },
+   {
+    "table": "all_star",
+    "column": "gp",
+    "formula": "gp IN (0,1)"
+   },
+   {
+    "table": "all_star",
+    "column": "starting_pos",
+    "formula": "starting_pos BETWEEN 1 AND 9"
+   },
+   {
+    "table": "hall_of_fame",
+    "column": "inducted",
+    "formula": "inducted IN ('Y','N')"
+   },
+   {
+    "table": "hall_of_fame",
+    "column": "category",
+    "formula": "category IN ('Player','Manager','Pioneer/Executive','Umpire')"
+   },
+   {
+    "table": "hall_of_fame",
+    "column": "votes",
+    "formula": "votes >= 0"
+   },
+   {
+    "table": "hall_of_fame",
+    "column": "ballots",
+    "formula": "ballots >= 0"
+   },
+   {
+    "table": "hall_of_fame",
+    "column": "needed",
+    "formula": "needed >= 0"
+   },
+   {
+    "table": "player_award",
+    "column": "tie",
+    "formula": "tie IN ('Y','')"
+   },
+   {
+    "table": "manager_award",
+    "column": "tie",
+    "formula": "tie IN ('Y','')"
+   },
+   {
+    "table": "player_award_vote",
+    "column": "points_won",
+    "formula": "points_won >= 0"
+   },
+   {
+    "table": "player_award_vote",
+    "column": "points_max",
+    "formula": "points_max > 0"
+   },
+   {
+    "table": "player_award_vote",
+    "column": "votes_first",
+    "formula": "votes_first >= 0"
+   },
+   {
+    "table": "manager_award_vote",
+    "column": "points_won",
+    "formula": "points_won >= 0"
+   },
+   {
+    "table": "manager_award_vote",
+    "column": "points_max",
+    "formula": "points_max > 0"
+   },
+   {
+    "table": "manager_award_vote",
+    "column": "votes_first",
+    "formula": "votes_first >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "ab",
+    "formula": "ab >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "h",
+    "formula": "h >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "h",
+    "formula": "h <= ab"
+   },
+   {
+    "table": "batting",
+    "column": "double",
+    "formula": "double >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "triple",
+    "formula": "triple >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "hr",
+    "formula": "hr >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "rbi",
+    "formula": "rbi >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "sb",
+    "formula": "sb >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "cs",
+    "formula": "cs >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "bb",
+    "formula": "bb >= 0"
+   },
+   {
+    "table": "batting",
+    "column": "so",
+    "formula": "so >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "gs",
+    "formula": "gs >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "gs",
+    "formula": "gs <= g"
+   },
+   {
+    "table": "pitching",
+    "column": "cg",
+    "formula": "cg >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "sho",
+    "formula": "sho >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "sv",
+    "formula": "sv >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "ipouts",
+    "formula": "ipouts >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "h",
+    "formula": "h >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "er",
+    "formula": "er >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "hr",
+    "formula": "hr >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "bb",
+    "formula": "bb >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "so",
+    "formula": "so >= 0"
+   },
+   {
+    "table": "pitching",
+    "column": "era",
+    "formula": "era >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "gs",
+    "formula": "gs >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "inn_outs",
+    "formula": "inn_outs >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "po",
+    "formula": "po >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "a",
+    "formula": "a >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "e",
+    "formula": "e >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "dp",
+    "formula": "dp >= 0"
+   },
+   {
+    "table": "fielding",
+    "column": "pos",
+    "formula": "pos IN ('P','C','1B','2B','3B','SS','LF','CF','RF','OF','DH')"
+   },
+   {
+    "table": "appearances",
+    "column": "g_all",
+    "formula": "g_all >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "gs",
+    "formula": "gs >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_batting",
+    "formula": "g_batting >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_defense",
+    "formula": "g_defense >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_p",
+    "formula": "g_p >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_c",
+    "formula": "g_c >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_1b",
+    "formula": "g_1b >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_2b",
+    "formula": "g_2b >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_3b",
+    "formula": "g_3b >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_ss",
+    "formula": "g_ss >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_lf",
+    "formula": "g_lf >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_cf",
+    "formula": "g_cf >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_rf",
+    "formula": "g_rf >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_of",
+    "formula": "g_of >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_dh",
+    "formula": "g_dh >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_ph",
+    "formula": "g_ph >= 0"
+   },
+   {
+    "table": "appearances",
+    "column": "g_pr",
+    "formula": "g_pr >= 0"
+   },
+   {
+    "table": "batting_postseason",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "batting_postseason",
+    "column": "ab",
+    "formula": "ab >= 0"
+   },
+   {
+    "table": "batting_postseason",
+    "column": "h",
+    "formula": "h >= 0"
+   },
+   {
+    "table": "batting_postseason",
+    "column": "h",
+    "formula": "h <= ab"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "gs",
+    "formula": "gs >= 0"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "gs",
+    "formula": "gs <= g"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "ipouts",
+    "formula": "ipouts >= 0"
+   },
+   {
+    "table": "pitching_postseason",
+    "column": "era",
+    "formula": "era >= 0"
+   },
+   {
+    "table": "fielding_postseason",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "fielding_postseason",
+    "column": "gs",
+    "formula": "gs >= 0"
+   },
+   {
+    "table": "fielding_postseason",
+    "column": "inn_outs",
+    "formula": "inn_outs >= 0"
+   },
+   {
+    "table": "fielding_postseason",
+    "column": "pos",
+    "formula": "pos IN ('P','C','1B','2B','3B','SS','LF','CF','RF','OF','DH')"
+   },
+   {
+    "table": "fielding_outfield",
+    "column": "glf",
+    "formula": "glf >= 0"
+   },
+   {
+    "table": "fielding_outfield",
+    "column": "gcf",
+    "formula": "gcf >= 0"
+   },
+   {
+    "table": "fielding_outfield",
+    "column": "grf",
+    "formula": "grf >= 0"
+   },
+   {
+    "table": "team_half",
+    "column": "half",
+    "formula": "half IN (1,2)"
+   },
+   {
+    "table": "team_half",
+    "column": "rank",
+    "formula": "rank BETWEEN 1 AND 12"
+   },
+   {
+    "table": "team_half",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "team_half",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "team_half",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "team_half",
+    "column": "w",
+    "formula": "w + l <= g"
+   },
+   {
+    "table": "manager_half",
+    "column": "half",
+    "formula": "half IN (1,2)"
+   },
+   {
+    "table": "manager_half",
+    "column": "rank",
+    "formula": "rank BETWEEN 1 AND 12"
+   },
+   {
+    "table": "manager_half",
+    "column": "g",
+    "formula": "g >= 0"
+   },
+   {
+    "table": "manager_half",
+    "column": "w",
+    "formula": "w >= 0"
+   },
+   {
+    "table": "manager_half",
+    "column": "l",
+    "formula": "l >= 0"
+   },
+   {
+    "table": "team_franchise",
+    "column": "active",
+    "formula": "active IN ('Y','N','')"
+   },
+   {
+    "table": "college",
+    "column": "country",
+    "formula": "country IN ('USA')"
+   },
+   {
+    "table": "player_college",
+    "column": "year",
+    "formula": "year BETWEEN 1871 AND 2015"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "player": 230,
+   "team": 230,
+   "team_franchise": 120,
+   "park": 230,
+   "college": 230,
+   "home_game": 230,
+   "salary": 230,
+   "all_star": 230,
+   "appearances": 230,
+   "batting": 230,
+   "pitching": 230,
+   "fielding": 230,
+   "fielding_outfield": 230,
+   "batting_postseason": 230,
+   "pitching_postseason": 230,
+   "fielding_postseason": 230,
+   "hall_of_fame": 230,
+   "manager": 230,
+   "manager_half": 93,
+   "manager_award": 177,
+   "manager_award_vote": 230,
+   "player_award": 230,
+   "player_award_vote": 230,
+   "player_college": 230,
+   "postseason": 230,
+   "team_half": 52
+  },
+  "null_targets": [
+   "all_star.player_id",
+   "all_star.team_id",
+   "appearances.team_id",
+   "appearances.player_id",
+   "manager_award.player_id",
+   "player_award.player_id",
+   "player_award_vote.player_id",
+   "batting.player_id",
+   "batting_postseason.player_id",
+   "batting_postseason.team_id",
+   "player_college.player_id",
+   "player_college.college_id",
+   "fielding.player_id",
+   "fielding_outfield.player_id",
+   "fielding_postseason.player_id",
+   "hall_of_fame.player_id",
+   "home_game.team_id",
+   "home_game.park_id",
+   "manager.team_id",
+   "manager_half.team_id",
+   "salary.team_id",
+   "salary.player_id",
+   "team_half.team_id"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "player.debut <= player.final_game",
+    "rows": [
+     "aardsda01 2004-04-06 2015-08-23",
+     "aaronha01 1954-04-13 1976-10-03",
+     "aaronto01 1962-04-10 1971-09-26"
+    ]
+   },
+   {
+    "formula": "team.w + team.l <= team.g",
+    "rows": [
+     "BS1 1871 g=31 w=20 l=10",
+     "CH1 1872 g=28 w=19 l=9",
+     "CL1 1873 g=29 w=10 l=19"
+    ]
+   },
+   {
+    "formula": "batting.h <= batting.ab",
+    "rows": [
+     "addybo01 ab=118 h=32",
+     "allisar01 ab=137 h=40",
+     "allisdo01 ab=133 h=44"
+    ]
+   },
+   {
+    "formula": "pitching.gs <= pitching.g",
+    "rows": [
+     "brainas01 g=30 gs=30",
+     "fishech01 g=24 gs=24",
+     "mackde01 g=29 gs=25"
+    ]
+   },
+   {
+    "formula": "home_game.span_first <= home_game.span_last",
+    "rows": [
+     "BS1 1871-05-16 1871-10-07",
+     "CH1 1871-05-27 1871-05-27",
+     "CL1 1871-05-08 1871-09-29"
+    ]
+   },
+   {
+    "formula": "manager.w + manager.l <= manager.g",
+    "rows": [
+     "wrighha01 g=31 w=20 l=10",
+     "woodji01 g=28 w=19 l=9",
+     "paborch01 g=29 w=10 l=19"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "Exact enum pools for league_id, round, votedby, award_id are sampled from observed distinct values; not all values are enumerated.",
+   "Numeric ranges are broad approximations from statistics; exact min/max per column not enforced beyond stated bounds.",
+   "Composite primary keys (e.g., batting player_id+year+stint+team_id) are enforced by generation order, not by a UNIQUE rule row.",
+   "fielding_postseason.team_id is declared in the schema as referencing player.team_id (a schema bug); the specification treats it as a team reference and the program must enforce the intended team dependency.",
+   "unmatched_join_rows is implemented as: a controlled share of child FK values are non-NULL but absent from the parent, and some parent rows have no children; NULL FK values are allowed only where the column is nullable.",
+   "ties_for_order_limit is planted at the level of the derived/aggregate expression (e.g., two groups share the top AVG attendance or top COUNT(DISTINCT ...)), not merely on raw column values.",
+   "group_sizes and duplicates_for_distinct are enforced by construction (planting) for the listed columns; other columns' group sizes and duplicate shares are emergent.",
+   "salary.year range is widened to 1984-2015 so the boundary values 1984 and 1991 survive clamping; boundary planting happens after clamping."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with AttributeError(\"'Schema' object has no attribute 'orig_path'\"). In writer.py, write_instance_sqlite does `src = schema.orig_path`, but schema.py's Schema dataclass (fields: tables, fks, ddl, table_order, column_order, original_values, original_sizes, unique_from_index) never defines orig_path, and read_schema never sets it. n_ok=0, n_instances=0.",
+     "requested_revision": "Add an orig_path field to Schema (populated in read_schema from the orig_path argument) or pass the original database path into write_instance_sqlite explicitly, so the compact database can be copied before appending generated rows. Re-run generation and confirm n_ok>0 with no AttributeError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit raised before writing, there is no execution evidence for integrity constraints, dependent-value consistency, preservation of compact rows, or reproducible generation. The construction_pairs_by_group list is empty and n_instances=0.",
+     "requested_revision": "After fixing the orig_path error, provide execution feedback showing successful instance creation, row counts per table, FK/NULL behavior, and that compact rows are preserved (copy-then-append)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists per_column_exceptions for team.team_id, home_game.team_id, salary.team_id, all_star.team_id, team.team_id_br, manager.team_id, all_star.player_id, etc. with 'unmatched_join_rows' targets (parent_rows_without_children, child_rows_with_null_fk). The program's fill_foreign_keys_consistently draws child FK values only from parent values (or NULL if parent empty), and the self-FK repair loop forces child values into the parent set. This makes 'parent_rows_without_children' and 'child_rows_with_null_fk' only partially achievable (NULL only when parent empty), and never plants orphan child rows with non-NULL FK values that don't match a parent. The unmatched_join_rows pattern is therefore not implemented as specified.",
+     "requested_revision": "Either (a) implement unmatched_join_rows by allowing a controlled share of child FK values that are non-NULL but absent from the parent (and parent rows with no children), or (b) revise the specification to state that FK columns are always drawn from parent values (referential integrity enforced) and drop the unmatched_join_rows targets that require orphan non-NULL children."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's ties_for_order_limit targets reference tie_on expressions like AVG(home_game.attendance), COUNT(DISTINCT all_star.game_id), COUNT(DISTINCT hall_of_fame.player_id), COUNT(player.birth_country). The program's _plant_tie only plants two equal top values in a single column's raw values; it does not ensure ties in the aggregate/derived expression used by the ORDER BY (e.g., two teams with equal AVG attendance, two players with equal distinct all-star game counts). The tie_on semantics are not implemented.",
+     "requested_revision": "Specify tie planting at the level of the derived/aggregate expression (e.g., ensure two groups share the top aggregate value), or relax the specification to 'at least two rows share the top raw column value' and align the tie_on descriptions accordingly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's group_sizes targets (e.g., team.team_id, player.name_first, park.city, salary.player_id, team.h) require group sizes 1, 2 and >=3. The program's _plant_group_sizes exists but is never called in build_random_instance (only BOUNDARY_VALUES, LITERAL_POOLS, ENUMS are planted). So group_sizes patterns are not enforced by construction.",
+     "requested_revision": "Either wire _plant_group_sizes (and _plant_duplicates, _plant_tie) into build_random_instance for the listed columns, or remove those patterns from the specification if they are not intended to be enforced."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's duplicates_for_distinct targets (park.park_id, salary.salary, all_star.game_id) require 20-50% duplicate share. The program defines _plant_duplicates but never calls it; also drop_unique_duplicates in instance.py actively removes duplicate values for columns marked unique. For non-unique columns the duplicate share is not controlled.",
+     "requested_revision": "Call _plant_duplicates for the listed columns (ensuring they are not treated as unique), or state that duplicate share is emergent and remove the explicit target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification's comparison_boundary targets for salary.year include values 1984 and 1991 (outside the stated salary.year range 1985-2015 in semantic_rules_and_formulas). BOUNDARY_VALUES plants 1984 and 1991, but _apply_value_rules clamps salary.year to (1985,2015), so 1984/1991 boundary values are destroyed. Similarly home_game.year boundary 2013/2014/2015 is within range, but the salary case is contradictory.",
+     "requested_revision": "Reconcile the salary.year range with the boundary values (either widen the range to include 1984/1991 or drop those boundary values), and ensure boundary planting happens after clamping or is not clamped away."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In build_random_instance, planting (BOUNDARY_VALUES/LITERAL_POOLS/ENUMS) replaces the entire column with planted values, then _apply_value_rules, _apply_near_variants, and _apply_null_rule run. _apply_near_variants perturbs ~5% of values including planted boundary/literal values, and _apply_value_rules may clamp them. This can remove the required boundary/literal values from the final column, undermining the comparison_boundary and literal_pool patterns.",
+     "requested_revision": "Apply near-variants and clamping before planting boundary/literal/enum values, or protect planted values from perturbation/clamping, so the required boundary and literal values survive in the final instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule: _apply_null_rule uses rules.null_share from original_values and at least one NULL. However, for FK columns filled by fill_foreign_keys_consistently, the NULL rule is applied afterward in the per-column loop only if the column is in cols and nullable. For columns where the parent is empty, fill sets all NULL; then _apply_null_rule may replace some NULLs with 0 (non-NULL) via `[None]*n_null + [0]*(n-n_null)`, producing 0 values that are not valid FK references. This can create invalid FK values (0) in child columns.",
+     "requested_revision": "When applying the NULL rule to FK columns, draw non-NULL values from the parent's generated values rather than the literal 0, so non-NULL FK values remain valid references."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty notes fielding_postseason.team_id references player.team_id in schema (a schema bug) and is treated as a team reference. The program's read_schema drops dangling FKs with a warning; if fielding_postseason.team_id FK points to player.team_id, it may be dropped or mis-resolved, so the intended team dependency is not enforced. This is a schema/spec inconsistency.",
+     "requested_revision": "Correct the schema FK for fielding_postseason.team_id to reference team.team_id, or explicitly document in the specification how this FK is to be handled, and ensure the program enforces the intended team dependency."
+    }
+   ],
+   "unresolved_checks": [
+    "No execution evidence exists for integrity constraints, dependent-value consistency, compact-row preservation, or reproducibility because all units failed with AttributeError before writing.",
+    "Whether unmatched_join_rows, ties_for_order_limit (aggregate tie_on), group_sizes, and duplicates_for_distinct patterns are actually achievable under the current program cannot be verified without successful runs.",
+    "Whether the salary.year boundary contradiction (1984/1991 vs range 1985-2015) is intended cannot be resolved from the provided materials."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` list already flags that `fielding_postseason.team_id` is declared in the schema as referencing `player.team_id` (a schema bug) and that the program must enforce the intended team dependency. The program does this in `schema.py` (rewrites the FK to `team.team_id`), but the execution feedback shows the warning 'dropping dangling FK fielding_postseason.team_id -> player.team_id' \u2014 i.e. the FK is dropped before the rewrite branch can fire, because `player` has no `team_id` column so `pc` is None and the FK is dropped at the `warnings.warn` line. The intended team dependency is therefore NOT enforced for `fielding_postseason.team_id`.",
+     "requested_revision": "Designer: state explicitly in the specification that the schema's `fielding_postseason.team_id` FK is to be treated as `team.team_id` (already noted in uncertainty, but should be a normative rule, not an uncertainty). Engineer: in `schema.py`, apply the `fielding_postseason.team_id -> team.team_id` rewrite BEFORE the dangling-FK drop (or special-case it), so the intended dependency is actually enforced rather than silently dropped. This is a correctness gap in dependency enforcement, not a blocker for the run (integrity checks pass because the FK is simply absent), but it should be fixed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.py` `_plant_column` uses an `elif` chain: BOUNDARY_VALUES, then LITERAL_POOLS, then ENUMS, then DUPLICATE_COLUMNS, then TIE_COLUMNS, then GROUP_SIZE_COLUMNS. For `team.team_id` the spec requires both `group_sizes` (1,2,>=3) and `unmatched_join_rows` and `ties_for_order_limit` on AVG(home_game.attendance). `team.team_id` is in GROUP_SIZE_COLUMNS, so group sizes are planted. However `team.attendance` is in TIE_COLUMNS and `home_game.attendance` is in TIE_COLUMNS, but the spec's tie target is on `AVG(home_game.attendance)` grouped by `team.team_id` \u2014 a derived/aggregate expression, not a raw column. The program plants ties only on raw `attendance` values, which does not guarantee two `team.team_id` groups share the top AVG(home_game.attendance). The spec's own uncertainty note acknowledges ties must be planted at the derived/aggregate level, but the program does not do this.",
+     "requested_revision": "Engineer: implement tie planting at the derived/aggregate level for `team.team_id`/`home_game.team_id` on AVG(home_game.attendance) (e.g. after FK fill, assign attendance values so at least two team groups share the top average), and for `player.player_id` on COUNT(DISTINCT all_star.game_id) and `hall_of_fame.yearid` on COUNT(DISTINCT player_id). Alternatively, designer should relax the spec to raw-column-level ties if aggregate-level planting is out of scope. As written, the spec and program are inconsistent on this point."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.py` `_apply_null_rule` sets `values[i] = 0` as fallback when a nullable non-FK column slot is NULL and must become non-NULL. The spec's `fk_null_rule` says 'never 0' only for FK columns, but the general `nullable` rule says non-NULL values follow the column rule. For a column like `player.bats` (enum R/L/B/'') a fallback of 0 violates the enum; for `team.div_win` (Y/N/'') 0 violates the enum. The execution feedback shows NULL 20/n for all nullable columns, so the fallback path is rarely hit, but it is a latent rule violation.",
+     "requested_revision": "Engineer: in `_apply_null_rule`, when a non-FK nullable slot must become non-NULL, draw from the column's enum/range sampler (or the planted pool) rather than literal 0. This keeps non-NULL values within the declared domain."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `table_sizes_per_instance` lists fixed sizes (e.g. player 230, team 230, manager_half 93, team_half 52), but `instance.py` `choose_table_sizes` ignores these and uses the upstream random sizing (uniform rand_lin or level sizes x4 capped at 2500). The execution feedback shows generated row counts like 1020/20=51 per instance for player, 830/20=41.5 for team, etc., which do not match the specified 230/230. The spec's `table_sizes_per_instance` is therefore not implemented.",
+     "requested_revision": "Designer: either remove `table_sizes_per_instance` from the spec (since the program uses upstream random sizing) or make it normative. Engineer: if the sizes are intended, pass them into `build_random_instance` as the `size` argument instead of calling `choose_table_sizes`. As written, spec and program disagree on table sizes."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `generic_sampling_rules.text_id` says '3-5 uppercase letters/digits for team/league/park ids, 8-10 lowercase letters+digits for player ids', but the program's `StringSampler` uses a generic CHARSET (letters + space + digits + parens) with length derived from original values, and `_init_sampler` mixes original values with literal pool. There is no per-column id-format enforcement. The `player.player_id` length rule (6-10) is enforced via `_player_id_len`, but the 8-10 lowercase+digits format is not. This is a soft inconsistency.",
+     "requested_revision": "Designer: either make the id-format rule normative and precise, or mark it as a soft guideline. Engineer: if normative, add a per-column id sampler that respects the format (uppercase 3-5 for team/league/park, lowercase+digits 8-10 for player)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.py` `_apply_near_variants` is applied to ALL columns including FK columns and enum columns, AFTER `_apply_value_rules` but BEFORE `_plant_column`. For enum columns like `player.bats`, a near-variant (e.g. 'r' instead of 'R') would violate the enum, and since `_plant_column` for enum columns replaces the whole column with `_plant_enum`, the near-variant is overwritten \u2014 so enum columns are fine. But for FK columns, near-variants are applied before the orphan planting and before NULL rule; a near-variant on an FK value would create an orphan, which is then partially overwritten by the orphan planting. This is mostly benign but the ordering means near-variants on FK columns are not controlled.",
+     "requested_revision": "Engineer: skip `_apply_near_variants` for FK columns and enum columns (or apply it only to free-text columns), to avoid unintended orphan creation and enum violations. This is a minor robustness fix."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `comparison_boundary` for `salary.year` lists values [1984, 1985, 1986, 1989, 1990, 1991] but the ops include `PRED(salary.year IN (2001, 2010))`. The BOUNDARY_VALUES in `rules.py` includes 2001 and 2010, which is correct for the IN predicate, but the spec's `values` list omits 2001 and 2010. The program includes them, so the program is more complete than the spec's stated values. This is a spec incompleteness, not a program error.",
+     "requested_revision": "Designer: add 2001 and 2010 to the `salary.year` comparison_boundary `values` list in the spec to match the IN predicate and the program's BOUNDARY_VALUES."
+    }
+   ],
+   "unresolved_checks": [
+    "Aggregate-level tie planting (AVG(home_game.attendance) by team, COUNT(DISTINCT all_star.game_id) by player, COUNT(DISTINCT player_id) by hall_of_fame.yearid) is not verifiable from the execution feedback alone; the program plants raw-column ties only, so the derived tie target may not be satisfied. This is flagged as an issue but not proven to fail.",
+    "The `unmatched_join_rows` pattern requires both 'parent rows without children' and 'child rows with null FK'. The program plants orphan FK values (ORPHAN prefix) and NULLs, but does not explicitly guarantee parent rows without children (it relies on random FK draw with replacement, which may leave some parents childless). This is likely satisfied by construction but not explicitly verified.",
+    "The `group_sizes` pattern for `team.team_id` and `home_game.team_id` requires group sizes 1, 2, and >=3. The program plants this for `team.team_id` (in GROUP_SIZE_COLUMNS) but NOT for `home_game.team_id` (which is in GROUP_SIZE_COLUMNS? \u2014 checking: GROUP_SIZE_COLUMNS includes ('home_game','team_id'), yes). So both are planted. However, the FK fill for `home_game.team_id` draws from `team.team_id` with replacement, and then `_plant_column` overwrites the whole column with `_plant_group_sizes`, which generates random integers NOT drawn from `team.team_id` \u2014 this would break the FK! Wait: `_plant_column` for `home_game.team_id` returns `_plant_group_sizes` values (random ints 0-1000), which are then subject to `_apply_null_rule` and orphan planting, but NOT re-validated against the parent. This is a potential FK violation. However, the execution feedback reports fk_violations: 0, so either the FK is not enforced (foreign_keys=OFF in writer) or the values happen to match. The writer sets `pragma foreign_keys = OFF`, so FK violations are not caught at write time. The integrity check `fk_violations: 0` must be from a separate check. This needs verification: does `_plant_group_sizes` on `home_game.team_id` produce values not in `team.team_id`? If so, the integrity check should have caught it. Since it reports 0, perhaps the integrity check is lenient or the planting is overridden. This is an unresolved check."
+   ]
+  }
+ ]
 }

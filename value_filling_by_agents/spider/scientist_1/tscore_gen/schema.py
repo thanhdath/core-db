@@ -1,5 +1,6 @@
 """Schema reading (upstream sql_util/dbinfo.py)."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_groups: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +60,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,8 +77,24 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _collect_unique_groups(con, t: str, create_sql: str, low_names: dict) -> list:
+    """Return list of composite UNIQUE groups from indexes and CREATE TABLE."""
+    groups = []
+    for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
+        cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+        names = [c[2] for c in cols if c[2]]
+        if len(names) >= 2:
+            groups.append(tuple(names))
+    for m in re.finditer(r'unique\s*\(([^)]*)\)', create_sql, re.I):
+        inner = m.group(1)
+        names = [x.strip().strip('"`[]').lower() for x in inner.split(',') if x.strip()]
+        if len(names) >= 2 and all(n in low_names for n in names):
+            groups.append(tuple(low_names[n] for n in names))
+    return groups
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
+    """Read tables, columns, keys, FKs and original values read-only."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
@@ -85,6 +103,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         create = {n: s for ty, n, s in master if ty == 'table'}
         tables: dict = {}
         from_index = []
+        unique_groups: dict = {}
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
@@ -106,6 +125,9 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
+            g = _collect_unique_groups(con, t, create[t], low)
+            if g:
+                unique_groups[t] = g
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -139,4 +161,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_groups)

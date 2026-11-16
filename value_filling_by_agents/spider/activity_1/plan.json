@@ -1,49 +1,460 @@
 {
  "db": "activity_1",
- "operator_io_quirks": [
-  "Mixed-case identifiers: tables Activity/Participates_in/Faculty_Participates_in/Student/Faculty; columns StuID, LName, Fname, FacID, actid, city_code \u2014 case-insensitive lookup + double-quoted output required.",
-  "FK child column spelled 'FacID' (Faculty_Participates_in) vs parent 'FacID' (Faculty) \u2014 case differs from 'stuid'/'StuID' pattern; pragma FK list gives parent_col explicitly.",
-  "FK child 'stuid' -> parent 'Student.StuID': child lowercase, parent mixed case; must match case-insensitively when resolving parent column.",
-  "Participates_in and Faculty_Participates_in have NO primary key (pk=[]) \u2014 sample_fresh_primary_keys must no-op; drop_unique_duplicates also no-op (no unique cols).",
-  "All columns notnull=0, no CHECK, no UNIQUE indexes \u2014 nothing to enforce; TS insert failures unlikely here.",
-  "DDL has tabs inside Faculty column defs ('FacID\\t       INTEGER') \u2014 line-based unique/check scan must tolerate whitespace.",
-  "Tiny tables (16/70/40/34/58 rows) \u2014 original_values fully read, no rowid sampling needed; original_sizes exact.",
-  "Activity.actid samples start at 770 (not 1) \u2014 PK values are non-contiguous, non-sequential; fresh PKs from Number fuzzer will be far from originals.",
-  "Student.Advisor values (1121, 7712, 7792, 8423) look like Faculty.FacID but there is NO declared FK \u2014 TS treats Advisor as plain Number, not FK.",
-  "Student.Major values (600,520,540,550,100) are department codes, no FK \u2014 plain Number.",
-  "Faculty.Phone INTEGER but semantically a phone number (2424,3593) \u2014 Number fuzzer will produce arbitrary ints, not phone-shaped.",
-  "Room values mix numeric and alphanumeric ('224','224B') stored as text \u2014 String fuzzer, VARCHAR(5) length cap not enforced by sqlite."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER columns (actid, StuID, FacID, Age, Major, Advisor, Phone, stuid): range [-10^0,10^0] default scale=0 -> ints in [-1,1] perturbed, OR list-range from 5 sampled originals; produces implausible ages/IDs far from 18-26 or 1001-3457.",
-  "String fuzzer on VARCHAR(n) columns: length range from sampled originals, CHARSET a-zA-Z0-9() \u2014 names become random strings, Sex becomes multi-char garbage (VARCHAR(1) not enforced), city_code loses 3-letter shape.",
-  "Sex VARCHAR(1) with 2 distinct values (F/M): String fuzzer will emit random strings, breaking 'Sex=F' predicates -> likely FN (no rows match) and FP (garbage matches nothing but joins still work).",
-  "Rank VARCHAR(15) 4 distinct (Instructor/Professor/AssocProf/AsstProf): String fuzzer randomizes -> 'Rank=Professor' queries return empty -> FN.",
-  "Building 3 distinct (NEB/Barton/Krieger): same randomization -> FN on Building predicates.",
-  "FK columns (Participates_in.stuid/actid, Faculty_Participates_in.FacID/actid) draw from parent's FINAL filtered values with replacement -> duplicates and ties preserved, good for join/aggregate queries; but parent PK filtering may shrink parent below child size -> many duplicate FK values.",
-  "Activity.actid PK: single-column PK -> max_l0=inf, so fresh PKs never reused -> 16 distinct fresh actids, but child FK draws from these 16 -> joins still work; original actids (770+) never appear -> queries with literal actid=770 return empty -> FN.",
-  "Student.StuID PK fresh values in [-1,1] range (scale=0) -> tiny ints, collide with nothing; Advisor/Major also tiny -> 'Advisor=1121' FN.",
-  "No NOT NULL/CHECK -> no insert failures; all rows land, so row counts match chosen sizes (up to 2500) \u2014 good for COUNT queries but sizes differ from original 16-70.",
-  "Empty PK tables (Participates_in) get full random rows with FK-consistent values -> join cardinality plausible; but no dedup -> duplicate (stuid,actid) pairs possible, affecting DISTINCT/COUNT(DISTINCT) queries.",
-  "Age INTEGER scale=0 -> values in [-1,1] perturbed, so 'Age>20' returns empty (FN) and 'Age<20' returns all (FP on selectivity)."
- ],
- "challenger_refs": [
-  "G10",
-  "G11",
-  "G12",
-  "G4",
-  "G8",
-  "G2",
-  "G7",
-  "G14",
-  "G6",
-  "G15"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "fresh sequential integers, no NULL, unique per table; PK columns are exempt from duplicate-share targets (uniqueness enforced)",
+   "integer_fk": "sample from parent table's generated key values; NULLable FK columns get a NULL share per null_share rule; never emit keys absent from the parent table (FK integrity enforced)",
+   "integer_range": "uniform integer within the range rule; no NULL unless the column is in null_targets, then NULL share per null_share rule",
+   "text": "short ASCII names from a small pool; 20-50% duplicate share (target midpoint 0.35) for non-key columns; nullable columns get NULL share per null_share rule",
+   "text_enum": "single value from the listed enum; nullable columns get NULL share per null_share rule",
+   "char": "single letter from the enum; nullable columns get NULL share per null_share rule",
+   "text_code": "3-letter uppercase code from a small pool; nullable columns get NULL share per null_share rule",
+   "near_variant": "for each listed equality literal, generate a variant by case change, one-character edit, or a single-character typo; these are literal column values, not LIKE patterns",
+   "like_pattern": "for each listed '%'-prefixed target, treat it as a LIKE-pattern operand only; do NOT store the '%'-prefixed string as a literal column value",
+   "boundary": "for each listed numeric boundary, include the value, value-1, and value+1",
+   "tie": "for ORDER BY columns with a tie, include at least two rows with the same value at the listed rank",
+   "null_share": "NULL is generated ONLY for columns listed in null_targets; each such column gets at least one NULL row and at least one non-NULL row per instance; share: 5-30% for Faculty_Participates_in.FacID/actid, 0-5% for Participates_in.stuid/actid and Student.Advisor; apply the NULL rule exactly once per column (single Bernoulli draw per row, no double planting); NOT NULL and primary-key columns never get NULL; planted NULLs are never replaced to satisfy a rule",
+   "duplicate_share": "for non-key columns with a duplicate-share target, aim for 20-50% duplicate share (midpoint 0.35); report achieved share per column; PK columns are exempt"
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Activity",
+    "column": "activity_name",
+    "pattern": "varchar(25)",
+    "targets": [
+     "Canoeing",
+     "canoeing",
+     "Kayaking",
+     "kayaking",
+     "Kayakg",
+     "kayakg",
+     "LIKE:%Canoeing",
+     "LIKE:%canoeing"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Rank",
+    "pattern": "varchar(15)",
+    "targets": [
+     "Professor",
+     "professor",
+     "Proor",
+     "proor",
+     "ofessor",
+     "OFESSOR",
+     "ssor",
+     "SSOR"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Sex",
+    "pattern": "varchar(1)",
+    "targets": [
+     "F",
+     "f",
+     "LIKE:%F",
+     "LIKE:%f"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Building",
+    "pattern": "varchar(13)",
+    "targets": [
+     "NEB",
+     "Barton",
+     "Krieger",
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "FacID",
+    "pattern": "integer",
+    "targets": [
+     "1, 2, >=3 group sizes",
+     "PK exempt from duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Fname",
+    "pattern": "varchar(15)",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Lname",
+    "pattern": "varchar(15)",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Phone",
+    "pattern": "integer",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty",
+    "column": "Room",
+    "pattern": "varchar(5)",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Faculty_Participates_in",
+    "column": "FacID",
+    "pattern": "integer",
+    "targets": [
+     "5-30% NULL rows",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Faculty_Participates_in",
+    "column": "actid",
+    "pattern": "integer",
+    "targets": [
+     "5-30% NULL rows",
+     "Canoeing",
+     "canoeing",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Participates_in",
+    "column": "stuid",
+    "pattern": "integer",
+    "targets": [
+     "0-5% NULL rows",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Participates_in",
+    "column": "actid",
+    "pattern": "integer",
+    "targets": [
+     "0-5% NULL rows",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Student",
+    "column": "StuID",
+    "pattern": "integer",
+    "targets": [
+     "PK exempt from duplicate share",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Student",
+    "column": "Age",
+    "pattern": "integer",
+    "targets": [
+     "19",
+     "20",
+     "21"
+    ]
+   },
+   {
+    "table": "Student",
+    "column": "Advisor",
+    "pattern": "integer",
+    "targets": [
+     "0-5% NULL rows",
+     "unmatched join rows via NULL only"
+    ]
+   },
+   {
+    "table": "Student",
+    "column": "Fname",
+    "pattern": "varchar(12)",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "table": "Student",
+    "column": "LName",
+    "pattern": "varchar(12)",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Participates_in.stuid",
+    "parent": "Student.StuID",
+    "copied_from_parent": []
+   },
+   {
+    "child": "Participates_in.actid",
+    "parent": "Activity.actid",
+    "copied_from_parent": []
+   },
+   {
+    "child": "Faculty_Participates_in.FacID",
+    "parent": "Faculty.FacID",
+    "copied_from_parent": []
+   },
+   {
+    "child": "Faculty_Participates_in.actid",
+    "parent": "Activity.actid",
+    "copied_from_parent": []
+   },
+   {
+    "child": "Student.Advisor",
+    "parent": "Faculty.FacID",
+    "copied_from_parent": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Activity",
+    "column": "actid",
+    "formula": "actid > 0"
+   },
+   {
+    "table": "Faculty",
+    "column": "FacID",
+    "formula": "FacID > 0"
+   },
+   {
+    "table": "Faculty",
+    "column": "Rank",
+    "formula": "Rank IN ('Instructor', 'Professor', 'AssocProf', 'AsstProf')"
+   },
+   {
+    "table": "Faculty",
+    "column": "Sex",
+    "formula": "Sex IN ('M', 'F')"
+   },
+   {
+    "table": "Faculty",
+    "column": "Phone",
+    "formula": "Phone > 0"
+   },
+   {
+    "table": "Student",
+    "column": "StuID",
+    "formula": "StuID > 0"
+   },
+   {
+    "table": "Student",
+    "column": "Age",
+    "formula": "Age BETWEEN 16 AND 30"
+   },
+   {
+    "table": "Student",
+    "column": "Sex",
+    "formula": "Sex IN ('M', 'F')"
+   },
+   {
+    "table": "Student",
+    "column": "Major",
+    "formula": "Major > 0"
+   },
+   {
+    "table": "Student",
+    "column": "city_code",
+    "formula": "length(city_code) = 3"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Activity": 8,
+   "Faculty": 16,
+   "Student": 16,
+   "Participates_in": 16,
+   "Faculty_Participates_in": 16
+  },
+  "null_targets": [
+   "Faculty_Participates_in.FacID",
+   "Faculty_Participates_in.actid",
+   "Participates_in.stuid",
+   "Participates_in.actid",
+   "Student.Advisor"
+  ],
+  "supporting_evidence": [
+   {
+    "row": "Activity: 770, 771, 772, 773, 776, 777, 778, 779",
+    "formula": "actid > 0"
+   },
+   {
+    "row": "Faculty: 1082, 1121, 1148, 1172, 1177, 1193, 1823, 2028",
+    "formula": "FacID > 0"
+   },
+   {
+    "row": "Faculty Rank: Instructor, Professor, AssocProf, AsstProf",
+    "formula": "Rank IN ('Instructor', 'Professor', 'AssocProf', 'AsstProf')"
+   },
+   {
+    "row": "Faculty Sex: M, F",
+    "formula": "Sex IN ('M', 'F')"
+   },
+   {
+    "row": "Faculty Phone: 2424, 3593, 3402, 3121, 3571, 3550, 5629, 6073",
+    "formula": "Phone > 0"
+   },
+   {
+    "row": "Student StuID: 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008",
+    "formula": "StuID > 0"
+   },
+   {
+    "row": "Student Age: 18, 19, 21, 20, 26, 17, 22, 16",
+    "formula": "Age BETWEEN 16 AND 30"
+   },
+   {
+    "row": "Student Sex: F, M",
+    "formula": "Sex IN ('M', 'F')"
+   },
+   {
+    "row": "Student Major: 600, 520, 540, 550, 100, 50",
+    "formula": "Major > 0"
+   },
+   {
+    "row": "Student city_code: BAL, HKG, WAS, CHI, YYZ, PIT, HOU, PHL",
+    "formula": "length(city_code) = 3"
+   }
+  ],
+  "uncertainty": [
+   "No numeric formula was derived from the sample; no calculated columns were present.",
+   "Student.Age upper bound 30 is an assumption; the sample shows 16-26 and 9 distinct values.",
+   "Duplicate-share target 20-50% (midpoint 0.35) applies only to non-key columns; PK columns are exempt because uniqueness is enforced.",
+   "NULL share: 5-30% for Faculty_Participates_in.FacID/actid; 0-5% for Participates_in.stuid/actid and Student.Advisor. The compact database's actual NULL share is not reported; these ranges are inferred from the atomic-operation summary.",
+   "Near-variant/typo targets (e.g. 'Kayakg', 'Proor', 'ofessor') are literal column values; '%'-prefixed targets are LIKE-pattern operands only and are not stored as literal values.",
+   "Unmatched join rows are produced only through NULL foreign keys (nullable FK columns), never through dangling keys, so declared FK constraints remain satisfied.",
+   "table_sizes_per_instance counts generated rows appended per instance; compact rows are copied unchanged and never deleted.",
+   "Construction separation (33/99) was low; after fixing the NULL-rule and duplicate-share issues, boundary and target values must be emitted with sufficient frequency to separate the corresponding atomic operations."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 897 across 20 instances; validity.reasons.new_integrity_failures = 20/20. The program deliberately plants unmatched FK keys: instance.py `fill_foreign_keys_consistently` appends `_unmatched_key(pv, rng)` (base + randint(1,1000)) for columns whose exception has `unmatched: True`, and spec.py `_BUILTIN_EXCEPTIONS` sets `unmatched: True` for Participates_in.stuid, Participates_in.actid, Student.Advisor, Faculty_Participates_in.FacID/actid. The writer opens the DB with `pragma foreign_keys = OFF` (writer.py), so these dangling keys are committed, producing FK violations in every instance.",
+     "requested_revision": "Reconcile the unmatched-FK rule with the integrity requirement. Either (a) keep unmatched rows only in a way that does not violate declared FK constraints (e.g. do not emit keys absent from the parent table when the FK is enforced, or restrict unmatched generation to columns/tables where the schema permits it), or (b) if unmatched rows are genuinely required by the spec, the spec must be revised to state that FK integrity is intentionally relaxed and the validity checker must be adjusted accordingly. As written, the program cannot produce valid instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons.no_rows_added = 20/20 and compact_rows_missing = 20/20. In writer.py `write_instance_sqlite`, the copy branch is `if orig_path and os.path.exists(orig_path): shutil.copyfile(orig_path, part)`, but the CLI (`cli.py _one`) calls `write_instance_sqlite(_G['schema'], inst, p)` without passing `orig_path`. So the compact DB is never copied; instead the code creates a fresh DB from `schema.ddl` and inserts only generated rows. The feedback confirms compact rows are missing and no rows are added relative to the compact baseline.",
+     "requested_revision": "Pass the original database path through to `write_instance_sqlite` (e.g. add `orig_path` to the worker args and forward it in `_one`), so each instance starts as a copy of the compact database and generated rows are appended. This is required by the stated round-1 design ('every instance is a copy of the compact database plus appended generated rows') and by the validity check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows many nullable columns with 'generated rows: NULL 0 / n' (Activity.activity_name, Faculty.Building/Fname/Lname/Phone/Rank/Room/Sex, Student.Advisor/Age/Fname/LName/Major/Sex/city_code). The spec's generic_sampling_rules say text/char/text_enum columns get '0-5% NULL', and the interface NULL rule requires each nullable column to contain NULL and non-NULL generated rows. The StringSampler/NumberSampler never emit None (ColumnSampler drops None elements; sample() returns a value), and `fill_foreign_keys_consistently` only plants NULLs for FK columns. Non-FK nullable columns therefore never receive NULLs.",
+     "requested_revision": "Implement the NULL rule for all nullable columns, not just FK columns: in the samplers or in instance construction, with probability following the compact share (or spec null_share), emit None for nullable non-PK columns, guaranteeing at least one NULL row per nullable column per instance. Note this is a non-blocking observation per the instructions, but it is a genuine spec deviation and should be fixed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for Faculty_Participates_in.FacID and .actid request '5-30% NULL rows' and 'unmatched join rows', and null_targets lists Participates_in.stuid/actid and Student.Advisor. But the schema declares these as FOREIGN KEY columns with no NOT NULL relaxation, and the integrity checker counts FK violations as failures. The spec simultaneously demands unmatched FK rows and (via the validity check) zero FK violations \u2014 these are contradictory.",
+     "requested_revision": "Clarify the intended semantics: either unmatched FK rows are allowed (and the integrity/validity criteria must permit them, or the FK columns must be nullable and the unmatched rows must be NULL rather than dangling keys), or unmatched rows must be produced only through NULLs. Update the spec's null_targets/unmatched targets to be consistent with the declared FK constraints."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's table_sizes_per_instance gives Activity=8, Faculty=16, Student=16, Participates_in=16, Faculty_Participates_in=16. The execution feedback reports generated row counts like Activity 10, Faculty 26, Student 27, Participates_in 48 \u2014 larger than the spec sizes, and the 'no_rows_added' reason suggests the appended rows did not land as expected. The spec's sizes are per-instance totals, but the program's `table_size` jitters by \u00b125% and the writer's copy path is broken, so the observed counts do not match the spec.",
+     "requested_revision": "Confirm whether table_sizes_per_instance means total rows per instance (including compact rows) or appended rows only. Align the spec wording with the program's interpretation and with the validity check's expectation of 'rows added'."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 897 FK violations are entirely from the intentional unmatched-key rule or also from other causes (e.g. parent keys generated after child rows due to ordering) could not be fully separated from the summary alone.",
+    "The construction_pairs feedback shows 21/99 separated pairs; this is not by itself evidence of a generation error, but the low separation rate combined with the broken copy path means value variation could not be confirmed as effective.",
+    "Whether the compact database actually contains rows for all five tables (the 'compact_rows_missing' reason fires for all 20 instances, consistent with the copy path never being taken, but the compact row counts were not independently verified)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "NULL rule applied to NOT NULL / non-nullable columns, contradicting the interface rule",
+     "evidence": "Execution feedback lists NULLs in generated rows for columns that are NOT declared nullable in the schema: Activity.activity_name (3/10), Faculty.Rank (2/28), Faculty.Sex (2/28), Faculty.Fname/Lname/Phone/Room/Building, Student.Age (5/27), Student.Sex (3/27), Student.Major (6/27), Student.city_code (5/27). The schema declares none of these as nullable (no NOT NULL is shown, but the interface rule says 'NOT NULL / primary-key columns never get NULL' and the spec's null_targets list only Faculty_Participates_in.FacID/actid, Participates_in.stuid/actid, Student.Advisor). In values.py `_init_sampler` sets `nullable = (not column.notnull) and column.pk_pos == 0`, so every column without an explicit NOT NULL becomes nullable and gets a 2% NULL share; instance.py `_plant_nulls` then plants at least one NULL per such column. This directly violates the stated NULL rule and the spec's null_targets.",
+     "requested_revision": "Restrict NULL generation to the columns listed in spec null_targets (the nullable FK columns). In `_init_sampler`/`build_random_instance`, only mark a column nullable if it is in `spec['null_targets']` (or, if the compact DB genuinely has NULLs there, per the compact share). Do not plant NULLs in Activity.activity_name, Faculty.Rank/Sex/Fname/Lname/Phone/Room/Building, Student.Age/Sex/Major/city_code/Fname/LName. Re-run and confirm the nullable_columns feedback shows NULLs only for the five FK columns."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL share for FK columns far exceeds the specified 5-30% / 0-5% bounds",
+     "evidence": "Spec per_column_exceptions give Faculty_Participates_in.FacID/actid null_share 5-30% and Participates_in.stuid/actid, Student.Advisor 0-5% (compact share). Execution feedback: Faculty_Participates_in.FacID NULL 69/305 (~23%, within 5-30% but high), Faculty_Participates_in.actid 51/305 (~17%), Participates_in.actid 26/324 (~8%), Participates_in.stuid 21/324 (~6.5%), Student.Advisor 5/27 (~18%). The 0-5% targets for Participates_in and Student.Advisor are exceeded (6.5% and 18%). The spec's `null_share` rule says 'NULL share follows the compact database's share for that column (0-5% when the compact share is 0)'. The built-in exceptions in spec.py set Participates_in.stuid/actid and Student.Advisor to (0.02, 0.10), i.e. up to 10%, and `_null_share` uses the midpoint (6%), which is above the 0-5% bound. Additionally `_plant_nulls` and `fill_foreign_keys_consistently` each independently plant a NULL, so the effective share is the union of two Bernoulli draws plus a forced NULL, inflating the observed share.",
+     "requested_revision": "Align the built-in null_share ranges with the specification (0-5% for Participates_in.stuid/actid and Student.Advisor; 5-30% for Faculty_Participates_in). Apply the NULL rule once per column (either in the sampler or in `_plant_nulls`, not both), and compute the share so the observed fraction stays within the stated bound. Re-run and verify the nullable_columns feedback shares fall inside the spec ranges."
+    },
+    {
+     "agent": "engineer",
+     "title": "Duplicate-share targets (20-50%) not demonstrably met; DISTINCT columns may be over-deduplicated",
+     "evidence": "Spec requires 20-50% duplicate share for Faculty.FacID/Fname/Lname/Phone/Room, Student.StuID/Fname/LName, Faculty.Building. The program applies `dup_share` in the samplers (values.py `sample` returns a fresh value with probability `dup_share[0]` = 0.2), but then `sample_fresh_primary_keys` and `drop_unique_duplicates` in instance.py remove rows whose PK or unique-column value repeats. For Faculty.FacID and Student.StuID (primary keys) the duplicate rows are dropped entirely, so the 20-50% duplicate share target for those columns cannot be observed in the generated rows. For non-unique columns the sampler's 0.2 lower bound is used, which is at the edge of the 20-50% range and may fall below it after the `_fit`/mutation step. No execution evidence reports the achieved duplicate share, so the target is unverified.",
+     "requested_revision": "Either (a) clarify in the specification that duplicate-share targets apply only to non-key columns and that PK columns are exempt (since PK uniqueness is enforced), or (b) implement the duplicate share for non-key columns with a target inside 20-50% (e.g. midpoint 0.35) and add a post-generation check that reports the achieved duplicate share per column. Do not rely on `dup_share[0]` alone."
+    },
+    {
+     "agent": "designer",
+     "title": "Uncertain / unsupported semantic rules and value domains",
+     "evidence": "The specification's `uncertainty` section admits: Student.Age upper bound 30 is an assumption (sample shows 16-26); duplicate share 20-50% is an assumption; NULL share 0-5% is inferred. The atomic-operation summary shows comparison-boundary targets for Activity.activity_name including '%Canoeing'/'%canoeing' (LIKE patterns) and near-variants 'Kayakg'/'kayakg', and for Faculty.Rank 'Proor'/'ofessor'/'ssor' \u2014 these are near-variant/typo targets, not values that appear in the compact DB. The spec lists them as targets but does not state whether they are intended to be generated as literal values or only as LIKE patterns. The program's `StringSampler._build_pool` adds both the raw target and (if `like`) the LIKE patterns, so '%Canoeing' is generated as a literal string value, which is a different semantic from a LIKE pattern.",
+     "requested_revision": "Clarify in the specification whether near-variant/typo targets (e.g. 'Kayakg', 'Proor', 'ofessor') and '%'-prefixed targets are intended as literal column values or as LIKE-pattern operands. If they are LIKE patterns, the program should not store them as literal values in the column; if they are literal values, state that explicitly. Also state the intended Student.Age range and duplicate-share target as confirmed rules rather than assumptions, or mark them as optional."
+    },
+    {
+     "agent": "engineer",
+     "title": "Construction separation low (33/99) \u2014 value variation may be insufficient, but not conclusive",
+     "evidence": "Execution feedback: construction_pairs eligible 99, separated 33, unknown_executions 0. This means only one third of the atomic-operation pairs are separated by the generated instances. The spec's `supporting_evidence` and `uncertainty` note that no numeric formula was derived and that near-variant targets are generic. The low separation is consistent with the NULL-rule and duplicate-share issues above (e.g. NULLs in non-nullable columns can mask boundary comparisons; over-deduplication removes duplicate-share evidence). Per instruction 4, a missing separation alone does not establish a generation error, but combined with the NULL-rule violation it is a signal that the intended value variation is not fully realized.",
+     "requested_revision": "After fixing the NULL-rule and duplicate-share issues, re-run and report construction_pairs separated. If separation remains low, investigate whether the boundary values (Student.Age 19/20/21, Faculty.Rank 'Professor'/'Proor', Activity.activity_name 'Canoeing'/'Kayaking') are actually being emitted in the generated rows (the samplers add them to `_pool` but `sample` only picks from `_pool` with probability 0.5, and the mutation step can alter them). Ensure boundary and target values are emitted with sufficient frequency to separate the corresponding atomic operations."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual NULL share for each nullable column matches the spec's 0-5% / 5-30% ranges (the spec says 'follows the compact database's share' but the compact share is not reported in the feedback).",
+    "Whether the 20-50% duplicate-share targets are achieved for non-key columns (no per-column duplicate-share report in the feedback).",
+    "Whether the near-variant/typo targets are intended as literal values or LIKE patterns (spec ambiguity).",
+    "Whether the low construction separation (33/99) is due to the NULL-rule/duplicate-share issues or to an independent value-variation gap; requires re-run after fixes."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Execution feedback 'nullable_columns' shows many nullable non-target columns with 'NULL 0 / n' (e.g. Activity.activity_name, Faculty.Building, Student.Age, Student.Major). This is consistent with the specification's null_targets list, which restricts NULL generation to the five FK columns (Faculty_Participates_in.FacID/actid, Participates_in.stuid/actid, Student.Advisor). The program's `_init_sampler`/`make_column_sampler` only set `nullable=True` when `is_null_target(...)` is true (instance.py build_random_instance), so non-target nullable columns never receive NULL. Per instruction 7 this is a note, not a blocker.",
+     "requested_revision": "No change required for pass. If the interface's broader NULL rule (NULL for every nullable column) is later adopted, extend null_targets to all nullable columns and set nullable accordingly; otherwise document that the specification intentionally restricts NULL to FK columns."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Construction separation is low: 33/99 eligible pairs separated (construction_pairs). The specification's own 'uncertainty' entry flags this ('Construction separation (33/99) was low'). The program does emit boundary values (NumberSampler._build_pool with value, value-1, value+1), near-variant targets (StringSampler._build_pool via near_variants), and duplicate shares (dup_mid = 0.35), so value variation remains possible; low separation alone does not establish a generation error (instruction 4).",
+     "requested_revision": "No blocking change. Optionally raise emission probability of boundary/target values (currently 0.6 pool draw) to improve separation in a later round."
+    },
+    {
+     "agent": "designer",
+     "severity": "note",
+     "evidence": "Specification lists near-variant/typo targets (e.g. 'Kayakg', 'Proor', 'ofessor', 'OFESSOR', 'ssor', 'SSOR') as literal values and '%'-prefixed targets as LIKE operands only. The program implements this split: spec.py `_split_targets` separates LIKE:/%-prefixed into `like_patterns`, and StringSampler._build_pool never stores LIKE patterns as literals (comment and code confirm). This is consistent.",
+     "requested_revision": "None; recorded as a resolved check."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Integrity feedback: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0, valid 20/20, reproducible true. FK columns draw from parent values (compact + generated) via `_parent_values` and `fill_foreign_keys_consistently`; unmatched join rows are produced only through NULLs, never dangling keys. Compact rows are preserved (writer copies orig DB and only appends; rows_skipped all 0).",
+     "requested_revision": "None; recorded as a resolved check."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "NULL shares observed: Faculty_Participates_in.FacID 47/305 (~15%), actid 56/305 (~18%) within 5-30%; Participates_in.actid 21/324 (~6.5%), stuid 23/324 (~7%) slightly above the 0-5% target range. `_null_share` uses midpoint of the spec range (0.025 for 0-5%), but the Bernoulli draw plus the 'guarantee at least one NULL' fallback can push the realized share above 5% on small n. This is a minor deviation from the stated 0-5% range, not an integrity or validity failure.",
+     "requested_revision": "Optionally tighten the 0-5% columns by using a lower midpoint (e.g. 0.02) or capping the number of NULLs to floor(0.05*n) to keep realized share within range. Not blocking."
+    }
+   ],
+   "unresolved_checks": [
+    "Realized NULL share for Participates_in.stuid/actid and Student.Advisor slightly exceeds the 0-5% target on some instances; whether this matters depends on downstream query sensitivity.",
+    "Construction separation (33/99) is low; whether the remaining unseparated pairs are due to insufficient value variation or genuine query equivalence cannot be determined without held-out labels (not requested)."
+   ]
+  }
+ ]
 }

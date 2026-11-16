@@ -47,7 +47,7 @@ def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, r
 
 
 def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+    """Uniform rand_lin sizes w.p."""
     sizes = {}
     if rng.random() < 0.5:
         for lvl in schema.table_order:

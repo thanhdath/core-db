@@ -127,8 +127,7 @@ def _add_regex(out: list, qual: str, col: str, v: str) -> None:
 
 
 def extract_typed_values(sql: str) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped)."""
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -204,7 +203,8 @@ def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> di
 
     def vals(k):
         if k not in cache:
-            cache[k] = {str(x) for x in schema.original_values.get(k, []) if x is not None}
+            cache[k] = set(schema.original_sets.get(k, set())) if hasattr(schema, 'original_sets') else {
+                str(x) for x in schema.original_values.get(k, []) if x is not None}
         return cache[k]
 
     for sql in sqls:

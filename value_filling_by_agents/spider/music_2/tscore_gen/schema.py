@@ -1,5 +1,6 @@
 """Schema reading (upstream sql_util/dbinfo.py)."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ class TableMeta:
     name: str
     columns: list
     primary_key: list
+    unique_tuples: list = field(default_factory=list)
 
 
 @dataclass
@@ -58,7 +60,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +75,17 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _composite_unique_from_ddl(create_sql: str, low: dict) -> list:
+    """Table-level UNIQUE(a, b) / PRIMARY KEY(a, b) tuples with >1 column (lower-cased names)."""
+    out = []
+    for m in re.finditer(r'(?:unique|primary\s+key)\s*\(([^)]*)\)', create_sql, re.I):
+        names = [x.strip().strip('"`[]').lower() for x in m.group(1).split(',') if x.strip()]
+        names = [low.get(n, n) for n in names]
+        if len(names) > 1:
+            out.append(tuple(names))
+    return out
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -105,7 +118,14 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
-            tables[t] = TableMeta(t, cols, pk)
+            utuples = _composite_unique_from_ddl(create[t], low)
+            for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
+                if idx[2]:
+                    icols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                    names = [low.get(str(r[2]).lower(), r[2]) for r in icols if r[2]]
+                    if len(names) > 1:
+                        utuples.append(tuple(names))
+            tables[t] = TableMeta(t, cols, pk, utuples)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:

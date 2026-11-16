@@ -1,49 +1,593 @@
 {
  "db": "codebase_comments",
- "operator_io_quirks": [
-  "Mixed-case table names: \"Method\", \"MethodParameter\", \"Repo\", \"Solution\" \u2014 must be double-quoted in generated SQL; column lookup case-insensitive.",
-  "Huge tables: Method 3.5M rows, MethodParameter 5.1M rows \u2014 read_schema must rowid-sample (max_rows_per_table) not full-scan; original_sizes via count(*).",
-  "No declared FKs at all (all fks lists empty) \u2014 process_order yields all tables at level 0; no FK consistency work.",
-  "MethodParameter.MethodId is TEXT but holds integer-looking strings ('1','2','3') and is a de-facto FK to Method.Id (INTEGER) \u2014 no declared FK, so TS will not link them; storage class text vs integer target.",
-  "Method.SolutionId INTEGER is a de-facto FK to Solution.Id but undeclared; Solution.RepoId INTEGER de-facto FK to Repo.Id undeclared.",
-  "Method.SampledAt / Repo.ProcessedTime / Solution.ProcessedTime are INTEGER holding .NET ticks (~6.36e17) \u2014 huge integers, not dates; Number fuzzer will treat as ints.",
-  "Method.Id, MethodParameter.Id, Solution.Id have distinct=200000 < rows (3.5M/5.1M/338k) \u2014 PK values repeat in the sampled original_values; but PK is INTEGER PRIMARY KEY AUTOINCREMENT so inserts auto-assign; sample_fresh_primary_keys must still drop dup PK tuples.",
-  "Method.Summary and Method.Lang have null_rate 0.13 (NULLs present) though notnull=0; other TEXT columns null_rate 0.0.",
-  "Method.FullComment contains embedded newlines and XML (' <summary>\\n /// ...') \u2014 String fuzzer charset a-zA-Z0-9() will not reproduce; contaminate may add junk.",
-  "Method.Lang distinct=38, values like 'en','fr','fi' \u2014 small enum-like; TS String fuzzer will emit random strings, not language codes.",
-  "CommentIsXml and WasCompiled are INTEGER with distinct=2 (0/1) \u2014 boolean-like but declared INTEGER, so Number fuzzer (not Bool) is dispatched.",
-  "Method.NameTokenized is lowercased space-joined tokens of Name \u2014 derived column, no constraint; TS treats as free String."
- ],
- "operator_ts_expectations": [
-  "All columns dispatch to Number (INTEGER) or String (TEXT); no Date/Time/Bool/Bit fuzzers fire \u2014 no date templates, no boolean 0/1 discipline.",
-  "Number fuzzer on Id/SolutionId/RepoId draws uniform ints in [-10^scale,10^scale] (scale from no args -> default) then perturbs \u00b11/\u00b12 \u2014 values far outside the real 1..N range, driving FN on range/join predicates.",
-  "Number fuzzer on SampledAt/ProcessedTime (ticks ~6e17) draws small ints, not tick-magnitude \u2014 any query comparing these to real tick values will miss.",
-  "String fuzzer emits random a-zA-Z0-9() strings of length ~[0,20] for Name/Url/Path/Type/Lang \u2014 real values are dotted identifiers, URLs, Windows paths, language codes; implausible values cause FN on LIKE/equality.",
-  "String fuzzer contaminate (0.5) adds/removes chars \u2014 further degrades Url/Path/Type realism.",
-  "CommentIsXml/WasCompiled (distinct 2) get Number fuzzer ints, not restricted to {0,1} \u2014 FP risk if a query filters =1 and random ints happen to equal 1, FN if it expects only 0/1.",
-  "No FKs declared -> fill_foreign_keys_consistently does nothing; MethodParameter.MethodId and Solution.RepoId get independent random values, so joins Method\u22c8MethodParameter and Solution\u22c8Repo produce few/no matches -> FN on join queries.",
-  "PK Id columns: INTEGER PRIMARY KEY AUTOINCREMENT \u2014 writer inserts explicit values; sample_fresh_primary_keys drops duplicate PK tuples; with distinct<rows in original_values the 5 sampled originals may repeat.",
-  "Method.Summary/Lang NULLs (0.13) \u2014 String sampler drops None elements (base.py) so fresh draws are non-null; original 5-sample may include NULL, giving some NULLs.",
-  "Small tables (Repo 141k, Solution 338k) vs huge (Method 3.5M, MethodParameter 5.1M): choose_table_sizes caps at 2500 or ~230 \u2014 generated units are tiny relative to originals, so cardinality-sensitive queries (COUNT, GROUP BY) diverge.",
-  "Lang enum (38 values) and Type (13k dotted types) get random strings \u2014 ENUM/IN-list queries on these will mostly miss -> FN."
- ],
- "challenger_refs": [
-  "G5",
-  "G6",
-  "G13",
-  "G4",
-  "G2",
-  "G3",
-  "G1",
-  "G11",
-  "G8",
-  "G10"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "sequential unique integers starting at 1; never NULL; reserved boundary ids are computed at generation time as max(existing_id)+1..+k from the compact DB so they never collide with existing primary keys",
+   "integer_fk": "sample from parent key pool; 5-30% NULL where nullable; reserve at least one parent key never sampled to guarantee a parent row without children; include child rows with NULL FK where nullable",
+   "integer_numeric": "uniform over [0, max(observed_max, 1000)]; include boundary values from per_column_exceptions; never negative unless exception",
+   "text_short": "sample from a small pool of realistic strings; 5-30% NULL where nullable; include near-variants of equality literals (case variants, empty string, one-character variant)",
+   "text_long": "concatenate 1-5 short text fragments; 5-30% NULL where nullable",
+   "flag_01": "Bernoulli(0.5) over {0,1}; never NULL unless nullable; boundary probing values must not violate declared IN-domain rules",
+   "timestamp_ticks": "uniform integer in [636430000000000000, 636480000000000000]; group-level variation guaranteed by drawing independent values per row",
+   "fresh_value_share": "0.3 of text values are fresh random strings; 0.7 drawn from the pool"
+  },
+  "per_column_exceptions": [
+   {
+    "columns": [
+     "Solution.RepoId"
+    ],
+    "patterns": {
+     "null_in_count_column": {
+      "null_share": "0.15"
+     },
+     "unmatched_join_rows": {
+      "joins_with": [
+       "Repo.Id",
+       "Method.SolutionId"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "group_sizes": {
+      "group_sizes": "1, 2 and >= 3"
+     },
+     "ties_for_order_limit": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC and unordered",
+      "tie_on": [
+       "COUNT(solution.repoid)"
+      ]
+     },
+     "comparison_boundary": {
+      "values": [
+       1,
+       2,
+       3,
+       149,
+       150,
+       151
+      ],
+      "equal_and_one_step_from": [
+       "Repo.Id"
+      ]
+     }
+    }
+   },
+   {
+    "columns": [
+     "Solution.Id"
+    ],
+    "patterns": {
+     "comparison_boundary": {
+      "values": [
+       1,
+       2,
+       17,
+       18,
+       19
+      ],
+      "equal_and_one_step_from": [
+       "Method.SolutionId"
+      ],
+      "rejected": [
+       0
+      ],
+      "rejected_reason": "0 is out of domain for an autoincrement PK"
+     },
+     "unmatched_join_rows": {
+      "joins_with": [
+       "Method.SolutionId",
+       "Method.CommentIsXml",
+       "Method.Id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": false
+     }
+    }
+   },
+   {
+    "columns": [
+     "Method.SolutionId"
+    ],
+    "patterns": {
+     "null_in_count_column": {
+      "null_share": "0.15"
+     },
+     "comparison_boundary": {
+      "values": [
+       0,
+       1,
+       2,
+       149,
+       150,
+       151
+      ],
+      "equal_and_one_step_from": [
+       "Solution.Id"
+      ]
+     },
+     "unmatched_join_rows": {
+      "joins_with": [
+       "Solution.Id",
+       "Repo.Id",
+       "Solution.RepoId"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     }
+    }
+   },
+   {
+    "columns": [
+     "Repo.Stars"
+    ],
+    "patterns": {
+     "comparison_boundary": {
+      "values": [
+       1998,
+       1999,
+       2000,
+       2001
+      ]
+     },
+     "rows_with_different_values": {
+      "qualifying_rows": ">= 2 per group with different values"
+     },
+     "ties_for_order_limit": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC and unordered",
+      "construction": "deterministic heavy value 2000 assigned to at least two Repo rows so the DESC rank-1 tie is guaranteed"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Repo.Forks"
+    ],
+    "patterns": {
+     "comparison_boundary": {
+      "values": [
+       2,
+       3,
+       4,
+       999,
+       1000,
+       1001
+      ]
+     }
+    }
+   },
+   {
+    "columns": [
+     "Repo.Watchers"
+    ],
+    "patterns": {
+     "rows_with_different_values": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Repo.Id"
+    ],
+    "patterns": {
+     "unmatched_join_rows": {
+      "joins_with": [
+       "Solution.RepoId",
+       "Method.SolutionId",
+       "Solution.Id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": false
+     },
+     "group_sizes": {
+      "group_sizes": "1, 2 and >= 3"
+     },
+     "ties_for_order_limit": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC and unordered",
+      "tie_on": [
+       "COUNT(solution.repoid)"
+      ]
+     },
+     "comparison_boundary": {
+      "values": [
+       1,
+       2,
+       3,
+       149,
+       150,
+       151
+      ],
+      "equal_and_one_step_from": [
+       "Solution.RepoId"
+      ]
+     }
+    }
+   },
+   {
+    "columns": [
+     "Repo.Url"
+    ],
+    "patterns": {
+     "ties_for_order_limit": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "ASC and DESC and unordered",
+      "tie_on": [
+       "COUNT(solution.repoid)"
+      ]
+     }
+    }
+   },
+   {
+    "columns": [
+     "Solution.Path"
+    ],
+    "patterns": {
+     "duplicates_for_distinct": {
+      "duplicate_share": "0.3"
+     },
+     "null_in_count_column": {
+      "null_share": "0.15"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Solution.ProcessedTime"
+    ],
+    "patterns": {
+     "rows_with_different_values": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Solution.WasCompiled"
+    ],
+    "patterns": {
+     "comparison_boundary": {
+      "values": [
+       0,
+       1
+      ],
+      "rejected": [
+       -1,
+       18,
+       19,
+       20
+      ],
+      "rejected_reason": "out-of-domain probes violate the declared IN (0,1) semantic rule; reachable boundary set is {0,1}"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Method.Lang"
+    ],
+    "patterns": {
+     "null_in_count_column": {
+      "null_share": "0.15"
+     },
+     "null_rows": {
+      "null_share": "0.15"
+     },
+     "comparison_boundary": {
+      "values": [
+       "en",
+       "EN",
+       "it",
+       "IT",
+       "",
+       "x"
+      ]
+     }
+    }
+   },
+   {
+    "columns": [
+     "Method.CommentIsXml"
+    ],
+    "patterns": {
+     "comparison_boundary": {
+      "values": [
+       0,
+       1
+      ],
+      "rejected": [
+       -1,
+       2
+      ],
+      "rejected_reason": "out-of-domain probes violate the declared IN (0,1) semantic rule; reachable boundary set is {0,1}"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Method.Name"
+    ],
+    "patterns": {
+     "null_in_count_column": {
+      "null_share": "0.15"
+     }
+    }
+   },
+   {
+    "columns": [
+     "Method.Summary"
+    ],
+    "patterns": {
+     "null_rows": {
+      "null_share": "0.175"
+     }
+    }
+   },
+   {
+    "columns": [
+     "MethodParameter.Name",
+     "MethodParameter.Type"
+    ],
+    "patterns": {
+     "null_in_count_column": {
+      "null_share": "0.15"
+     }
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Solution.RepoId",
+    "parent": "Repo.Id",
+    "copied": []
+   },
+   {
+    "child": "Method.SolutionId",
+    "parent": "Solution.Id",
+    "copied": []
+   },
+   {
+    "child": "MethodParameter.MethodId",
+    "parent": "Method.Id",
+    "copied": [],
+    "note": "declared TEXT; stored as string of parent integer id; FK not enforced by SQLite writer; post-generation check required that every non-NULL value parses to an existing Method.Id"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Repo",
+    "column": "Stars",
+    "formula": "Stars >= 0 OR Stars IS NULL"
+   },
+   {
+    "table": "Repo",
+    "column": "Forks",
+    "formula": "Forks >= 0 OR Forks IS NULL"
+   },
+   {
+    "table": "Repo",
+    "column": "Watchers",
+    "formula": "Watchers >= 0 OR Watchers IS NULL"
+   },
+   {
+    "table": "Solution",
+    "column": "WasCompiled",
+    "formula": "WasCompiled IN (0, 1)"
+   },
+   {
+    "table": "Method",
+    "column": "CommentIsXml",
+    "formula": "CommentIsXml IN (0, 1)"
+   },
+   {
+    "table": "Method",
+    "column": "Lang",
+    "formula": "Lang IS NULL OR Lang IN ('en','fr','fi','it','af','ca','ro','de','EN','IT','','x')"
+   },
+   {
+    "table": "Method",
+    "column": "SampledAt",
+    "formula": "SampledAt > 0"
+   },
+   {
+    "table": "Solution",
+    "column": "ProcessedTime",
+    "formula": "ProcessedTime > 0"
+   },
+   {
+    "table": "Repo",
+    "column": "ProcessedTime",
+    "formula": "ProcessedTime > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Repo": 40,
+   "Solution": 120,
+   "Method": 200,
+   "MethodParameter": 400
+  },
+  "null_targets": [
+   "Solution.RepoId",
+   "Solution.Path",
+   "Method.SolutionId",
+   "Method.Lang",
+   "Method.Summary",
+   "Method.Name",
+   "Method.FullComment",
+   "MethodParameter.MethodId",
+   "MethodParameter.Name",
+   "MethodParameter.Type"
+  ],
+  "supporting_evidence": {
+   "Repo.Stars >= 0": "sample rows 1-8 all non-negative (14,6,3,1,5,2,63,19)",
+   "Repo.Forks >= 0": "sample rows 1-8 all non-negative (2,3,0,1,32,12,15,483)",
+   "Repo.Watchers >= 0": "sample rows 1-8 all non-negative and equal to Stars",
+   "Solution.WasCompiled IN (0,1)": "sample rows 1-8 values 1,0",
+   "Method.CommentIsXml IN (0,1)": "sample rows values 0,1",
+   "Method.Lang enum": "sample rows en,fr,fi,it,af,ca,ro,de",
+   "SampledAt > 0": "sample rows all positive tick values",
+   "ProcessedTime > 0": "sample rows all positive tick values"
+  },
+  "uncertainty": "MethodParameter.MethodId declared TEXT but references Method.Id INTEGER; treated as FK with implicit cast, nullable with NULL share 0.15. FK enforcement is disabled in the writer; a post-generation check must verify every non-NULL MethodParameter.MethodId string parses to an existing Method.Id. Boundary values for Lang include 'x' which is outside the observed enum but required by comparison_boundary; the semantic rule explicitly allows 'x'. WasCompiled and CommentIsXml boundary targets outside {0,1} are rejected because they violate the declared IN (0,1) rules; reachable boundary set is {0,1}. Repo.Id and Solution.RepoId boundary values 149/150/151 require parent keys beyond nominal table sizes (40/120); the generator computes reserved ids as max(existing_id)+1..+k from the compact DB at generation time so they never collide with existing primary keys, and a matching Solution.RepoId pool is reserved so those boundary literals are reachable while preserving FK references to existing Repo.Id values. Solution.Id boundary 0 is out of domain for an autoincrement PK and cannot be generated without violating uniqueness/positivity; targets realized for 1,2,17,18,19 only. Unmatched-join parent-without-children is enforced by reserving at least one parent key never sampled as FK. Ties at ORDER rank 1 for Repo.Stars are guaranteed by assigning a deterministic heavy value 2000 to at least two Repo rows. Group sizes 1/2/>=3 enforced by constructing a lookup distribution over reserved parent ids rather than uniform sampling. The writer must report skipped rows as an error rather than silently ignoring them, since silent skips indicate the reachability claim is false."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARES sets ('Method','Lang'): 0.15 and instance.py applies _maybe_null(lang, 0.15) to sample_lang(rng), which draws only from LANG_ENUM = ['en','fr','fi','it','af','ca','ro','de','EN','IT','']. The spec's per_column_exceptions for Method.Lang comparison_boundary requires values ['en','EN','it','IT','','x'] and the semantic rule Lang IN ('en','fr','fi','it','af','ca','ro','de','EN','IT',''). sample_lang_boundary() exists in sampler.py but is never called from instance.py, so the boundary value 'x' (and the boundary-only variants) are never generated. The comparison_boundary pattern for Method.Lang is therefore not implemented.",
+     "requested_revision": "In _build_method, mix in sample_lang_boundary(rng) (or otherwise inject the LANG_BOUNDARY values, including 'x') so the Method.Lang comparison_boundary target ['en','EN','it','IT','','x'] is realized, while keeping the enum domain for the semantic rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py WAS_COMPILED_BOUNDARY = [-1,0,1,18,19,20] and COMMENT_IS_XML_BOUNDARY = [-1,0,1,2] are defined, but instance.py calls sample_was_compiled(rng) and sample_comment_is_xml(rng), which in sampler.py return rng.choice([0,1]) only. The per_column_exceptions comparison_boundary targets for Solution.WasCompiled ([-1,0,1,18,19,20]) and Method.CommentIsXml ([-1,0,1,2]) are never produced. This also conflicts with the semantic rules WasCompiled IN (0,1) and CommentIsXml IN (0,1), which the boundary values -1, 2, 18, 19, 20 would violate.",
+     "requested_revision": "Reconcile the specification: either drop the out-of-domain boundary values (-1, 2, 18, 19, 20) from the comparison_boundary targets for WasCompiled/CommentIsXml (since they contradict the IN (0,1) semantic rules), or, if boundary probing is intended, generate them only in a way that does not violate the declared formulas. As written, the program silently ignores these boundary targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_solution and _build_method pick FK values with rng.choice(repo_ids)/rng.choice(solution_ids) and 15% NULL, but never guarantee 'parent rows without children' (unmatched_join_rows target: parent_rows_without_children=true). With 40 Repo rows and 120 Solution rows each drawing uniformly, every Repo.Id is very likely to have at least one child; the execution feedback shows 0 FK violations but does not demonstrate parent rows without children. Similarly Solution.Id -> Method.SolutionId with 120 vs 200 rows. The unmatched_join_rows pattern for Solution.RepoId, Method.SolutionId, Repo.Id, Solution.Id is not explicitly enforced.",
+     "requested_revision": "Add explicit construction so that at least one parent row in Repo (and Solution) has no child rows, and at least one child row has a NULL FK, per the unmatched_join_rows targets. E.g. reserve a subset of parent ids that are never sampled as FK values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _sample_text ignores the fresh_value_share rule: both branches return rng.choice(pool) (the 'if rng.random() < 0.3' and the fallback are identical). The generic_sampling_rules state 'fresh_value_share: 0.3 of text values are fresh random strings; 0.7 drawn from pool'. No fresh random strings are ever produced for text columns, so text variation is limited to the fixed pools.",
+     "requested_revision": "Implement the fresh_value_share: with probability 0.3 return a fresh random string (e.g. via _fresh_short in sampler.py), otherwise draw from the pool. Apply consistently to Url, Path, Name, FullComment, Summary, ApiCalls, NameTokenized, Type, and parameter Name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The comparison_boundary targets for Solution.Id ([0,1,2,17,18,19]) and Method.SolutionId ([0,1,2,149,150,151]) and Solution.RepoId ([1,2,3,149,150,151]) and Repo.Id ([149,150,151]) are defined in spec.py, but instance.py builds these PK/FK columns purely sequentially (Id = i+1) or by rng.choice(parent_ids). Since parent pools are 1..40 (Repo) and 1..120 (Solution), values 149/150/151 are never generated for Repo.Id or Solution.RepoId, and 0 is never generated for Solution.Id/Method.SolutionId. The boundary targets are not realized.",
+     "requested_revision": "Either adjust the boundary target values to be reachable given the table sizes (Repo=40, Solution=120), or explicitly inject the boundary values into the relevant columns (e.g. include 149/150/151 in the Repo.Id pool and 0/1/2/17/18/19 in Solution.Id) while preserving PK uniqueness and FK consistency."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas declare WasCompiled IN (0,1) and CommentIsXml IN (0,1), but the per_column_exceptions comparison_boundary targets for the same columns include -1, 2, 18, 19, 20. These are mutually inconsistent: a generator that satisfies the boundary targets would violate the semantic rules, and vice versa. The program resolves the conflict by ignoring the boundary targets, which is not a documented decision.",
+     "requested_revision": "Resolve the contradiction in the specification: state explicitly whether boundary probing may exceed the declared domain (and if so, relax the IN (0,1) formulas to allow the boundary values), or remove the out-of-domain boundary values. Document the intended behavior so the engineer can implement it unambiguously."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty note says 'MethodParameter.MethodId declared TEXT but references Method.Id INTEGER; treated as FK with implicit cast.' The program stores MethodId as str(mid) (instance.py) and the execution feedback shows MethodParameter.MethodId NULL 0 / 4000, i.e. no NULLs are generated for this nullable FK. The null_targets list does not include MethodParameter.MethodId, and no null share is specified for it, so the program's behavior (no NULLs) is consistent with the spec but the spec is silent on whether this column should be nullable. The feedback line 'MethodParameter.MethodId: generated rows: NULL 0 / 4000' is noted per instruction 7.",
+     "requested_revision": "Clarify in the specification whether MethodParameter.MethodId is nullable and, if so, add it to null_targets with a share; otherwise state explicitly that it is always non-NULL. This is a documentation gap, not a blocking error."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the unmatched_join_rows 'parent_rows_without_children' target is actually satisfied cannot be confirmed from the execution feedback (only fk_violations=0 is reported); the construction code does not enforce it.",
+    "The construction_pairs feedback reports 37/316 separated with no per-group breakdown; it is not possible to confirm which patterns remain unseparated or whether that is due to missing boundary values (issues above) versus inherent query equivalence.",
+    "The 'ties_for_order_limit' targets (tie_at_rank [1] on COUNT(solution.repoid), direction DESC/ASC/unordered) are not explicitly constructed; with uniform FK sampling ties are likely but not guaranteed, and no evidence confirms them.",
+    "The 'group_sizes' target ('1, 2 and >= 3') for Solution.RepoId and Repo.Id is not explicitly enforced; uniform sampling over 40 parents with 120 children likely yields a mix but is not verified.",
+    "The 'rows_with_different_values' targets for Repo.Stars/Forks/Watchers and Solution.ProcessedTime are not explicitly constructed; sample_stars/sample_forks use a 50% boundary draw which may produce many equal values within groups."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py defines REPO_RESERVED_IDS = [149, 150, 151] and SOLUTION_RESERVED_IDS = [1, 2, 17, 18, 19], and instance.py `_seq_ids_with_reserved` appends these to the sequential id list. But the execution feedback shows rows_skipped: Repo 306, Solution 436, Method 440 across 20 instances. The writer uses `insert or ignore`, so the reserved ids collide with the compact DB's existing primary keys (the compact DB already contains rows with those ids), and the generated rows are silently dropped. This means the boundary literals 149/150/151 (Repo.Id, Solution.RepoId) and 17/18/19 (Solution.Id) are not actually reachable in the generated data, contradicting the spec's stated intent ('the generator reserves an id range {149,150,151} in Repo.Id ... so those boundary literals are reachable').",
+     "requested_revision": "Either (a) compute reserved ids as max(existing_id)+1..+k from the compact DB at generation time (read via schema.original_values / a max query) so they never collide, or (b) drop the reserved-id mechanism and document that boundary literals 149/150/151 and 17/18/19 are not reachable. Also make the writer report skipped rows as an error rather than silently ignoring them, since the current 306/436/440 skips indicate the spec's reachability claim is false."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py sets NULL_SHARES for ('MethodParameter','MethodId') = 0.15 and lists MethodParameter.MethodId in null_targets, but the execution feedback shows 'MethodParameter.MethodId: generated rows: NULL 1073 / 7054' (\u224815%, OK) while 'MethodParameter.Name: NULL 0 / 7054' and 'MethodParameter.Type: NULL 0 / 7054'. The schema declares Name and Type as nullable TEXT (no NOT NULL), and the generic_sampling_rules say 'text_short: ... 5-30% NULL where nullable'. The program never applies a null share to MethodParameter.Name/Type, so the generic rule is not implemented for these columns.",
+     "requested_revision": "Add ('MethodParameter','Name') and ('MethodParameter','Type') to NULL_SHARES (e.g. 0.15) and apply `_maybe_null` in `_build_method_parameter`, or explicitly document in the spec that these columns are exempt from the generic text_short null rule. Per instruction 7 this is a note, not a blocker, but it should be reconciled."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for Solution.WasCompiled and Method.CommentIsXml list comparison_boundary values [0,1] only, and the uncertainty note says out-of-domain probes (-1,2,18,19,20) are not generated. However the extracted atomic operations for these columns explicitly list targets values [-1,0,1,2] (CommentIsXml) and [-1,0,1,18,19,20] (WasCompiled). The spec silently drops these targets. This is a defensible reconciliation (IN (0,1) rule), but the spec should state it as a deliberate domain restriction rather than leaving the extracted targets unaddressed.",
+     "requested_revision": "In the spec, explicitly record that the extracted boundary targets for WasCompiled/CommentIsXml outside {0,1} are rejected because they violate the declared IN (0,1) semantic rule, and that the reachable boundary set is {0,1}. This is already partially in the uncertainty note; promote it to a per_column_exceptions annotation so the reconciliation is auditable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_repo` computes `heavy_star = max(ids) * 0 + 2000 + rng.randint(0, 5)`, i.e. a value in [2000,2005]. `sample_stars` returns this heavy value with prob 0.30, and STARS_BOUNDARY [1998,1999,2000,2001] with prob 0.40. The spec's ties_for_order_limit target for Repo.Stars is 'tie_at_rank [1], direction DESC and unordered'. With 30% mass on a single heavy value plus 40% mass on a 4-value boundary set, ties at rank 1 are likely, but the spec does not state how the tie is guaranteed (the heavy value is random per instance, so two instances may not tie). The construction_pairs feedback shows only 38/316 separated, which is consistent with weak tie construction but does not by itself prove failure.",
+     "requested_revision": "Make the heavy tie value deterministic per instance (e.g. fixed 2000) and ensure at least two Repo rows receive it, so the DESC rank-1 tie is guaranteed rather than probabilistic. Document this in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies list MethodParameter.MethodId -> Method.Id, and the uncertainty note says MethodId is 'declared TEXT but references Method.Id INTEGER; treated as FK with implicit cast'. instance.py `_build_method_parameter` stores `str(fk[idx])`, so the stored value is a string. The writer inserts into a TEXT column, so no cast error occurs, but the FK is not enforced by SQLite (foreign_keys=off in writer). The execution feedback reports fk_violations: 0, but this is because FK enforcement is disabled, not because the values are valid. The spec's claim of 'implicit cast' is not verified.",
+     "requested_revision": "Either enable `pragma foreign_keys=on` in the writer and confirm the TEXT->INTEGER comparison works, or explicitly document that MethodParameter.MethodId is not FK-enforced and that the 'implicit cast' is a spec assumption. Add a post-generation check that every non-NULL MethodParameter.MethodId string parses to an existing Method.Id."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include 'Method.Lang IS NULL OR Lang IN (...)' and separately allow 'x'. The uncertainty note says the rule is 'relaxed to allow x explicitly'. But the extracted atomic operations for Method.Lang list comparison_boundary targets ['en','EN','it','IT','','x'] and the spec's LANG_BOUNDARY includes 'x'. The program's `sample_lang` draws from LANG_DOMAIN which includes 'x', so 'x' is generated. This is consistent, but the spec should state the relaxed rule as the authoritative rule rather than as an uncertainty.",
+     "requested_revision": "Move the 'x' allowance from the uncertainty note into the semantic_rules_and_formulas entry for Method.Lang, so the rule and the generator agree without relying on an uncertainty caveat."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 38/316 separated construction pairs is due to weak tie/group-size construction or to query semantics; the feedback does not break this down by group, so the cause cannot be attributed.",
+    "Whether the compact DB already contains rows with ids 149/150/151 and 17/18/19 (the 306/436/440 skips strongly suggest it does), which would make the reserved-id mechanism ineffective; this needs a direct check of the compact DB's max ids.",
+    "Whether MethodParameter.MethodId TEXT values actually match Method.Id under SQLite's implicit cast when foreign_keys=on; not tested because the writer disables FK enforcement."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "writer.py inserts rows with `insert or ignore`, and the execution summary reports errors {\"skipped_Repo\": 306, \"skipped_Solution\": 436, \"skipped_Method\": 440} while integrity checks show 0 pk_duplicates and 0 not_null_violations. The skipped rows are produced because instance.py generates sequential PK ids 1..N (`_seq_ids_with_reserved`) plus reserved ids computed as max_existing_id+1..+k, but the compact DB is copied first, so ids 1..N collide with existing compact PKs and are silently dropped by `insert or ignore`. This eliminates most generated rows (only 517/823 Repo, 1755/2191 Solution, 3562/4002 Method actually inserted).",
+     "requested_revision": "Generate new-row primary keys starting strictly above max_existing_id of the compact DB (e.g. offset all assigned ids by `_max_existing_id(schema, table)`), so that sequential/reserved ids never collide with compact rows. Then verify rows_skipped is 0 for all tables, preserving the spec's claim that 'the writer must report skipped rows as an error rather than silently ignoring them' while not skipping any legitimate rows. Column-level original values are unaffected since the compact rows are preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction execution feedback shows construction_pairs: eligible 316, separated 37, meaning only ~12% of the eligible query-pair mutations were actually separated by the generated instances. Instance sizes (Repo ~26, Solution ~88, Method ~178 after skips) are much smaller than nominal TABLE_SIZES (40/120/200/400) due to the pk-collision skipping above; this reduces variation reachability. Some specific minimizations from the atomic-op statistics are also unlikely to be exercised: e.g. group-size distribution 1/2/>=3 via `_fk_lookup` uses `heavy = pool[0]`, `singles`, `doubles`, `others` constructed from parent ids, but because `repo_ids`/`sol_ids` are themselves truncated by skipping, the constructed group distribution may not include >=3-child groups for the requested GROUP BY columns reliably.",
+     "requested_revision": "After fixing PK collisions so all generated rows are inserted, recheck construction_pairs separation. Also audit `_fk_lookup` to guarantee that for each targeted FK parent column (Solution.RepoId, Method.SolutionId) at least one parent id receives >=3 children, at least one exactly 2, at least one exactly 1, and at least one receives 0 (in addition to the explicitly reserved 'childless' id), and that the heavy id is never among the reserved childless ids. Report group-size histograms per instance in the run summary so the construction coverage can be verified."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec claims boundary literals 149/150/151 for Repo.Id and Solution.RepoId and 17/18/19 for Solution.Id are reachable via reserved ids. However, since the compact DB is copied first and original values may already include those ids (or be below them), the spec's 'computed at generation time as max(existing_id)+1..+k' is correct in intent, but the program places those reserved ids inside the 1..N sequential range (see issue 1), causing the collision and skipping. Additionally, the instance construction does not explicitly assign a subset of Repo rows with Id in {149,150,151} and corresponding Solution rows referencing them; the relationship between reserved boundary targets and matching child rows is only claimed, not implemented.",
+     "requested_revision": "Specify explicitly that boundary-target parent rows (Ids 149/150/151 for Repo, 17/18/19 for Solution) must be created as additional rows alongside the sequential ones, and that at least one child row must reference each such boundary parent (Solution.RepoId = 149/150/151 present; Method.SolutionId = 17/18/19 present), while also reserving one additional Repo id that is never referenced. Reflect this construction in the program (both instance.py and spec.py) so the boundary comparison coverage is guaranteed by design."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's uncertainty note states `MethodParameter.MethodId` is declared TEXT but references Method.Id INTEGER and requires a post-generation FK check; writer.py implements `_check_method_parameter_fk` which counts violations but reports them only as an error key, and nothing in the instance builder prevents FK values that are out-of-range. Execution feedback shows nullable_columns include MethodId NULL 1084/7054 with no reported methodparameter_fk_violations in this run, but this is only because the child pool is derived from method_rows that happened to exist; with the current pk-collision skips the situation is fragile.",
+     "requested_revision": "Elevate the MethodParameter.MethodId integrity check from a reported count to a hard error in write_instance (raise/refuse to commit if bad_fk > 0), and additionally generate values from `fk` only over Method ids that are actually inserted (post-filtering the method row list before MethodParameter FK sampling). This avoids relying on a coincidence and aligns with the spec's stated requirement that skipped rows indicate a false reachability claim."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Sampling rules are largely honored: integer_fk 15% NULL shares in spec and instance (confirmed via nullable_columns: Solution.RepoId NULL 9/100, MethodParameter.MethodId NULL 1084/7054), flag_01 restricted to {0,1} consistent with WasCompiled/CommentIsXml IN (0,1), Lang boundary 'x' allowed, ticks in TICK_LO..TICK_HI, duplicates_for_distinct for Solution.Path via `path_heavy` at 30% share, ties via `heavy_rows` on Repo.Stars. However, `instance.py` `_build_repo` applies STARS_HEAVY to 2 rows via `heavy_rows` only when ids has >=2 entries; the spec says 'at least two Repo rows' \u2014 safe for n>=2, but with the pk collision issue sizes remain above 2, so not a blocker. `FRESH_VALUE_SHARE=0.3` in spec matches sample_text. Concrete unintended deviation: `sample_watchers` uses `rng.random() < 0.6` to reuse stars or a boundary value, meaning Watchers != Stars roughly 40% of the time, but the spec evidence states 'Watchers = Stars' in sample rows; this is not enforced by semantic rules though, and Watchers is generic integer \u2014 noting for clarity.",
+     "requested_revision": "No blocking change required for sampling. Optional: document in spec.py that Watchers correlation with Stars is not a semantic rule and remove the 'equal to Stars' implication from supporting_evidence to avoid misreading. Optionally tighten `sample_watchers` to guarantee at least some Watchers equal to Stars (already the case)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.semantic_rules_and_formulas lists `Method.Lang IS NULL OR Lang IN ('en','fr','fi','it','af','ca','ro','de','EN','IT','','x')`. spec.LANG_ENUM excludes 'x' but LANG_DOMAIN includes it via `LANG_ENUM + ['x']`, matching the rule. `sample_lang` returns from LANG_DOMAIN, `sample_lang_boundary` returns from LANG_BOUNDARY which includes 'x' and the enum members required by extraction. Consistent.",
+     "requested_revision": "No change."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Nullability interface rule: 'each instance contains generated rows with NULL and rows with non-NULL values' for every nullable column. Execution feedback nullable_columns shows `Repo.Forks`, `Repo.ProcessedTime`, `Repo.Stars`, `Repo.Url`, `Repo.Watchers`, `Solution.ProcessedTime`, `Solution.WasCompiled` with NULL 0/n in the test run. These columns appear nullable in the schema (no NOT NULL constraint shown for them). GENERIC rule and interface require at least one NULL row per nullable column per instance (via null_targets listing). The spec's `null_targets` list omits these columns entirely, so the program does not plant NULLs in them.",
+     "requested_revision": "Either (a) add these columns to spec.null_targets and NULL_SHARES so the instance builder plants NULL rows per interface rule, or (b) explicitly document in spec.py that these columns are excluded from the NULL rule (with justification such as the compact DB having no NULLs and the column being a numeric metric that is not central to a query rule). The current execution feedback note is permitted by instruction 7 but the divergence from the stated interface should be acknowledged in the spec rather than left implicit."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Method.FullComment nullable column has NULL 0 rows in execution feedback (not in nullable_columns list because FullComment not generally exercised by the construction). `_build_method` applies full_share = 0.15 to FullComment via `_maybe_null`, and `_build_solution` applies path_share and repoid share. `unmatched_join_rows` for Solution.Id requires parent-without-children and child-with-null-fk for Method \u2014 `_fk_lookup` reserves `pids[-1]` as childless (parent without children) and `sid = None if rng.random() < 0.15` supplies child with NULL FK \u2014 implemented. `unmatched_join_rows` for Solution.RepoId to Repo.Id requires parent Repo without children (the childless id) and Solution with NULL RepoId \u2014 implemented. `unmatched_join_rows` for Repo.Id -> Solution.RepoId also satisfied via childless id. Consistent.",
+     "requested_revision": "No change."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Construction run reports reproducible: true, n_ok: 20, n_fail: 0, valid: 20, invalid: 0, no stderr. Integrity checks: fk_violations 0, not_null_violations 0, pk_duplicates 0. Compact-row preservation is satisfied via `shutil.copyfile` then append (`insert or ignore`). Reproducibility via `random.Random(seed_base*100003 + i)`.",
+     "requested_revision": "No change (aside from issue 1, which changes the id scheme but not reproducibility)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "REJECTED boundary probes for Solution.WasCompiled and Method.CommentIsXml are not implemented as rejected in code in a way that could silently violate semantics: `sample_flag` returns 0/1 only, and `sample_was_compiled`/`sample_comment_is_xml` call `sample_flag`, so out-of-domain probes are not generated. Consistent with spec. However, spec's uncertainty note states that `MethodParameter.MethodId` post-generation check must verify every non-NULL value parses to an existing Method.Id \u2014 this is implemented as a reporter (`_check_method_parameter_fk` adds an error count but does not abort), see issue 4.",
+     "requested_revision": "As in issue 4, make the FK check a hard failure."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the requested group-size distribution (1, 2 and >=3 children per targeted parent) is actually realized per instance; the run summary does not include histograms, and pk-collision skipping removes a large fraction of rows.",
+    "Whether boundary literals 149/150/151 (Repo) and 17/18/19 (Solution) are reachable per instance after the pk-collision fix; the spec claims reachability but the current program does not tie those specific ids to the inserted parent rows.",
+    "Whether child-with-NULL-FK and parent-without-children for `Method.SolutionId` and `Solution.RepoId` remain simultaneously satisfied per instance after the pk-collision fix.",
+    "Construction separation (37/316) is low; it does not by itself prove query equivalence, but combined with the pk-collision skipping there is a real risk that reachability claims are not sustained across instances."
+   ]
+  }
+ ]
 }

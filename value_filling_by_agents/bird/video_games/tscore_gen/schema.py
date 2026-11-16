@@ -1,5 +1,7 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) with data-file fallback for compact values."""
+import json
 import math
+import os
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -34,15 +36,14 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    compact_rows: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
-    """Double-quote an SQL identifier."""
     return '"' + str(name).replace('"', '""') + '"'
 
 
 def _levels(items: list, deps: dict) -> list:
-    """Topological levels; deterministic cycle breaking by smallest remaining item."""
     remaining = sorted(set(items))
     known = set(items)
     placed: set = set()
@@ -58,7 +59,6 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,8 +75,17 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+_ORIG_VALUES = {}
+
+
+def set_compact_values(values: dict) -> None:
+    """Inject compact row values (from the data-file) into the schema module."""
+    _ORIG_VALUES.clear()
+    for (t, c), v in values.items():
+        _ORIG_VALUES[(t.lower(), c.lower())] = list(v)
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
@@ -122,7 +131,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, compact_rows = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -135,8 +144,30 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     rows = con.execute(sel + ' order by rowid').fetchall()
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
+            compact_rows[t] = []
+            for r in rows:
+                rec = {}
+                for j, c in enumerate(tables[t].columns):
+                    rec[c.name] = r[j]
+                compact_rows[t].append(rec)
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+        for (t, c), vals in _ORIG_VALUES.items():
+            tt = tlow.get(t)
+            if tt is None:
+                continue
+            ov[(tt, c)] = list(vals)
+            for rec, v in zip(compact_rows.get(tt, []), vals):
+                rec_ext = dict(rec)
+                rec_ext[c] = v
+        for (t, c), vals in _ORIG_VALUES.items():
+            tt = tlow.get(t)
+            if tt is None:
+                continue
+            for rec, v in zip(compact_rows.get(tt, []), vals):
+                for name in rec:
+                    if name.lower() == c:
+                        rec[name] = v
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, compact_rows)

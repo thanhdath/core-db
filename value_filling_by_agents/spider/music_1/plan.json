@@ -1,53 +1,377 @@
 {
  "db": "music_1",
- "operator_io_quirks": [
-  "All tables tiny (6 rows each); original_values lists are complete, no rowid sampling needed.",
-  "Declared types are Oracle-style: varchar2(N), number(10), Date. 'varchar2' is NOT in the char family list (char,text,blob) -> falls to the final 'otherwise' branch = String fallback (upstream returns None/crashes).",
-  "number(10) -> number family, args (10) => scale=10, precision=None, is_int False ('int' not in 'number(10)'); so Number with scale 10, range [-1e10,1e10], float perturbation (+-0.01/0.02), NOT int. Storage is integer but fuzzer emits floats.",
-  "releasedate declared 'Date' (capital D): lower-cased contains 'date' -> Date branch; first element '28-AUG-2011' does not parse as int -> Date fuzzer, not Number.",
-  "releasedate stored as TEXT with format 'D-MON-YYYY' (e.g. '28-AUG-2011','7-APR-2001'): single-digit day, month names JAN..DEC, no leading zeros. Date template must be the month-name template; leading-zero stripping applies (no element starts with 0 or contains '-0').",
-  "song.rating has CHECK(rating>0 and rating<11) and declared number(10): checked=True -> p=0 for that column (always fresh Number draws, no element reuse).",
-  "song.song_name is PK but declared NOT NULL=0 (nullable PK); genre.g_name, artist.artist_name, files.f_id are NOT NULL PKs.",
-  "FKs all resolve to existing parents (genre, artist, files); no dangling FKs, no self-references, no composite keys.",
-  "song has 3 FKs (artist_name, f_id, genre_is) to 3 different parents; table order must place genre, artist, files before song.",
-  "genre.rating is varchar2 storing numeric strings '7','8','9' -> String fuzzer; int-like strings get str(i+1)/str(i-1) added to elements.",
-  "files.file_size '3.78 MB', duration '3:45', formats 'mp4'/'mp3' are free-text varchar2 -> String fuzzer with contamination; no format semantics.",
-  "genre.most_popular_in has comma-joined multi-values ('Sylhet,Chittagong,Kustia') -> String fuzzer treats as opaque text."
- ],
- "operator_ts_expectations": [
-  "String fuzzer (fallback for varchar2) emits random a-zA-Z0-9() strings + contamination; genre/artist/country names become implausible -> likely FN on equality/join predicates over names.",
-  "Number fuzzer on number(10) with scale 10 emits huge floats in [-1e10,1e10] and +-0.01 perturbations; f_id, resolution, rating become non-integer, out-of-domain -> FN on f_id joins and rating range predicates.",
-  "song.rating CHECK(rating>0 and rating<11) with p=0: fresh Number draws mostly violate the CHECK -> rows dropped at insert (writedb skip), shrinking song; may leave song empty-ish -> FP/FN on rating aggregates.",
-  "Date fuzzer with month-name template %d-%b-%Y (or %d-MON-%Y) over 1800..2100 range: releasedate values plausible format but random years -> FN on year/date-range predicates.",
-  "FK fill draws from parent's FINAL filtered values with replacement: song.artist_name/f_id/genre_is consistent with parents, but parent PKs are random strings/numbers -> joins still match, ties/duplicates from replacement.",
-  "Small tables (6 rows) and choose_table_sizes (30..2500) inflate sizes; PK dedup keeps first occurrence -> many duplicate FK draws, few distinct parents -> FP on COUNT(DISTINCT)/ties.",
-  "genre.rating varchar2 '7','8','9' String fuzzer: numeric-looking strings get +-1 variants, so '8'->'7'/'9' plausible; but random strings also appear -> FN on rating comparisons.",
-  "No NOT NULL/CHECK enforcement in Python: song.song_name nullable PK and rating CHECK cause insert-time row drops -> table sizes uneven, possible empty song -> FP on 'no rows' queries.",
-  "files.file_size/duration/formats String fuzzer: '3.78 MB','3:45' formats not preserved -> FN on LIKE '%MB' or duration parsing predicates.",
-  "country columns (artist, song) String fuzzer: 'India','USA' replaced by random strings -> FN on country='India' style predicates; ties across artist/song country lost."
- ],
- "challenger_refs": [
-  "g09a3c866",
-  "g7ea29037",
-  "g1a071d6d",
-  "g1a071d6d",
-  "g1a071d6d",
-  "gd70ea33f",
-  "gd70ea33f",
-  "g146a1117",
-  "gf0c2e334",
-  "g49763ac3",
-  "g727191e4",
-  "g0419a807",
-  "g5347c5a1",
-  "G5",
-  "G4"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short": "Sample from a small pool of realistic short strings; 20-50% duplicate share on DISTINCT-targeted columns; allow case variants (lower/upper) for equality-targeted columns; NULL share 0 unless column nullable.",
+   "text_name": "Sample from a pool of person/entity names; ensure 1, 2 and >=3 group sizes for GROUP-targeted columns; allow NULL when nullable.",
+   "numeric_int": "Sample integers within the column's range rule; include boundary values and one step on each side for comparison-targeted columns; NULL share 0 unless nullable.",
+   "numeric_rating": "Sample integers 1..10 inclusive; include 6,7,8,9 for boundary targets; ties at rank 1 for ORDER targets.",
+   "date": "Sample dates in DD-MON-YYYY format; keep any order rules; NULL share 0 unless nullable.",
+   "varchar_size": "Sample strings like 'N.NN MB' with N in 1..9; 20-50% duplicate share on DISTINCT-targeted columns.",
+   "varchar_duration": "Sample strings 'M:SS' with M in 1..9, SS in 00..59; include near-variants '3:', '4:', '3: x', '5:', '4: x' for LIKE targets; ties at rank 1 for ORDER targets.",
+   "varchar_format": "Sample from {'mp3','mp4'} with case variants 'MP3','MP4' for equality targets; 20-50% duplicate share on DISTINCT-targeted columns; ties at rank 1 for ORDER targets.",
+   "varchar_language": "Sample from {'bangla','english'} with case variants 'ENGLISH' for equality targets; group sizes 1,2,>=3 for GROUP targets.",
+   "varchar_country": "Sample from {'India','Bangladesh','USA','UK'} with case variants 'india','bangladesh','uk' for equality targets; 20-50% duplicate share on DISTINCT-targeted columns.",
+   "varchar_genre": "Sample from {'blues','folk','modern','nazrul','pop','tagore'} with case variants 'BLUES','MODERN' for equality targets.",
+   "varchar_gender": "Sample from {'Male','Female'}.",
+   "varchar_resolution": "Sample integers from {320,512,720,1080}; include boundary values 498,499,500,501,799,800,801,999,1000,1001 for comparison targets.",
+   "null_rule": "For every nullable column, each instance contains at least one NULL row and non-NULL rows; NULL share follows compact database share (0% observed, so use small share e.g. 1 row per instance)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "artist.artist_name",
+    "pattern": "duplicates_for_distinct, unmatched_join_rows, group_sizes, aggregate_boundary, ties_for_order_limit",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "group_sizes": "1, 2 and >= 3",
+     "aggregate_values": [
+      0,
+      1,
+      2
+     ],
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "tie_on": "COUNT(song.song_name)"
+    }
+   },
+   {
+    "column": "song.artist_name",
+    "pattern": "unmatched_join_rows, group_sizes, aggregate_boundary, duplicates_for_distinct, ties_for_order_limit",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "group_sizes": "1, 2 and >= 3",
+     "aggregate_values": [
+      0,
+      1,
+      2
+     ],
+     "duplicate_share": "20-50 %",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "song.genre_is",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "blues",
+      "BLUES",
+      "modern",
+      "MODERN"
+     ]
+    }
+   },
+   {
+    "column": "genre.g_name",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "values": [
+      "blues",
+      "BLUES",
+      "modern",
+      "MODERN"
+     ]
+    }
+   },
+   {
+    "column": "song.languages",
+    "pattern": "comparison_boundary, group_sizes",
+    "targets": {
+     "values": [
+      "english",
+      "ENGLISH"
+     ],
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "artist.country",
+    "pattern": "comparison_boundary, duplicates_for_distinct",
+    "targets": {
+     "values": [
+      "Bangladesh",
+      "bangladesh",
+      "UK",
+      "uk",
+      "India",
+      "india"
+     ],
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "files.formats",
+    "pattern": "comparison_boundary, duplicates_for_distinct, ties_for_order_limit, group_sizes",
+    "targets": {
+     "values": [
+      "mp3",
+      "MP3",
+      "mp4",
+      "MP4"
+     ],
+     "duplicate_share": "20-50 %",
+     "tie_at_rank": [
+      1
+     ],
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "files.f_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "song.f_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "files.duration",
+    "pattern": "like_near_variant, ties_for_order_limit, rows_with_different_values",
+    "targets": {
+     "literals": [
+      "3:45",
+      "3:%",
+      "%4:%",
+      "4:%"
+     ],
+     "variants": [
+      "3:",
+      "4:",
+      "3: x",
+      "5:",
+      "4: x"
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "song.rating",
+    "pattern": "comparison_boundary, ties_for_order_limit, rows_with_different_values",
+    "targets": {
+     "values": [
+      6,
+      7,
+      8,
+      9
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "song.resolution",
+    "pattern": "comparison_boundary, rows_with_different_values",
+    "targets": {
+     "values": [
+      498,
+      499,
+      500,
+      501,
+      799,
+      800,
+      801,
+      999,
+      1000,
+      1001
+     ],
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "files.file_size",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "song.song_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "artist.preferred_genre",
+    "parent_table": "genre",
+    "parent_column": "g_name",
+    "copied_columns": []
+   },
+   {
+    "child_column": "files.artist_name",
+    "parent_table": "artist",
+    "parent_column": "artist_name",
+    "copied_columns": []
+   },
+   {
+    "child_column": "song.artist_name",
+    "parent_table": "artist",
+    "parent_column": "artist_name",
+    "copied_columns": []
+   },
+   {
+    "child_column": "song.f_id",
+    "parent_table": "files",
+    "parent_column": "f_id",
+    "copied_columns": []
+   },
+   {
+    "child_column": "song.genre_is",
+    "parent_table": "genre",
+    "parent_column": "g_name",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "song",
+    "column": "rating",
+    "formula": "rating > 0 AND rating < 11"
+   },
+   {
+    "table": "song",
+    "column": "resolution",
+    "formula": "resolution > 0"
+   },
+   {
+    "table": "files",
+    "column": "f_id",
+    "formula": "f_id > 0"
+   },
+   {
+    "table": "artist",
+    "column": "gender",
+    "formula": "gender IN ('Male','Female')"
+   },
+   {
+    "table": "files",
+    "column": "formats",
+    "formula": "formats IN ('mp3','mp4','MP3','MP4')"
+   },
+   {
+    "table": "song",
+    "column": "languages",
+    "formula": "languages IN ('bangla','english','ENGLISH')"
+   },
+   {
+    "table": "genre",
+    "column": "g_name",
+    "formula": "g_name IN ('blues','folk','modern','nazrul','pop','tagore')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "genre": 6,
+   "artist": 6,
+   "files": 6,
+   "song": 6
+  },
+  "null_targets": [
+   "artist.country",
+   "artist.gender",
+   "artist.preferred_genre",
+   "files.artist_name",
+   "files.file_size",
+   "files.duration",
+   "files.formats",
+   "genre.rating",
+   "genre.most_popular_in",
+   "song.artist_name",
+   "song.country",
+   "song.f_id",
+   "song.genre_is",
+   "song.rating",
+   "song.languages",
+   "song.releasedate"
+  ],
+  "supporting_evidence": {
+   "song.rating": "Rows: 8,5,7,6,10 all satisfy 0<rating<11",
+   "song.resolution": "Rows: 1080,512,320,720 all >0",
+   "files.f_id": "Rows: 1,2,3,4,5,6 all >0",
+   "artist.gender": "Rows: Male,Female only",
+   "files.formats": "Rows: mp4,mp3 only",
+   "song.languages": "Rows: bangla,english only",
+   "genre.g_name": "Rows: blues,folk,modern,nazrul,pop,tagore only"
+  },
+  "uncertainty": "NULL shares observed as 0% in compact database; small NULL share (1 row per instance) used to satisfy NULL generation requirement. Case variants added for equality targets per atomic summary. No formulas found beyond range/enum rules."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "spec.py NULL_TARGETS includes 'song.f_id' and 'song.genre_is' (nullable FKs) and the null_rule says 'each instance contains at least one NULL row and non-NULL rows'. Execution feedback shows every nullable column got NULL 20/121 (or 20/118/119) \u2014 i.e. exactly one NULL per instance, consistent with the 'small share e.g. 1 row per instance' note. However, the compact database observed 0% NULL share, so the 'NULL share follows the compact database's share' clause is only satisfied via the explicit 'at least one NULL row' override. This is documented in the spec's 'uncertainty' field, so it is acceptable, but the spec should state explicitly that the 1-row-per-instance share is the intended interpretation of the 0%-observed share.",
+     "requested_revision": "Add a sentence to null_rule clarifying that when the compact share is 0%, the 'at least one NULL row' requirement takes precedence and the per-instance share is 1 row."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "instance.py `_apply_null_rule` plants NULLs only for columns in spec.NULL_TARGETS and skips columns where `cm.pk_pos > 0 or cm.notnull`. This correctly protects NOT NULL / PK columns. But `_apply_range_rules` runs *before* `_apply_null_rule` and does `max(int(v), spec.RESOLUTION_MIN)` on song.resolution without a None guard (unlike the rating branch which has `None if v is None else ...`). Since resolution is NOT NULL in the schema this is currently safe, but the asymmetry is fragile if the schema changes.",
+     "requested_revision": "Add a None guard to the resolution branch of `_apply_range_rules` for symmetry with the rating branch (defensive, not blocking)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec.py GROUP_TARGETS lists 'song.f_id' and 'song.resolution' as group-size targets, but the atomic summary only reports group_sizes for artist.artist_name, song.artist_name, song.languages, files.formats (and minor for song.f_id). song.resolution has only a minor group_sizes pattern. The samplers (ResolutionSampler, FK fill) do not explicitly enforce 1/2/>=3 group sizes for these columns; they rely on random draws. With 6 rows per instance this is likely but not guaranteed.",
+     "requested_revision": "Either drop song.resolution from GROUP_TARGETS (it is only a minor pattern) or add a post-sampling check that reshapes values to guarantee 1/2/>=3 group sizes for the listed columns."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec.py TIE_TARGETS includes 'artist.artist_name' with tie_at_rank [1,3] on COUNT(song.song_name), but the NameSampler only enforces a 30% duplicate share; it does not guarantee a tie at rank 1 and rank 3 of the per-artist song count. Similarly files.duration ties at rank 1 are only probabilistic via DurationSampler's 30% reuse. The construction feedback shows 51/96 pairs separated, which is consistent with these being probabilistic rather than guaranteed.",
+     "requested_revision": "Document that tie targets are satisfied probabilistically (not by construction), or add explicit tie construction for the rank-1/rank-3 targets."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Execution feedback: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, valid=20/20, reproducible=true, rows_skipped=0. Dependencies (artist.preferred_genre, files.artist_name, song.artist_name, song.f_id, song.genre_is) are resolved by `fill_foreign_keys_consistently` drawing from parent values (compact + generated), and `_parent_values` filters None. Compact rows are preserved because writer.py copies the original file and only appends. This all checks out.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Semantic rules (rating 1..10, resolution>0, f_id>0, gender enum, formats enum, languages enum, genre enum) are all supported by the 'supporting_evidence' field and by the schema CHECK constraint on rating. The enum domains in spec.py match the semantic_rules_and_formulas exactly. Case variants (BLUES, MODERN, ENGLISH, MP3, MP4, india, bangladesh, uk) match the atomic comparison_boundary targets.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Tie-at-rank targets (artist.artist_name rank 1 and 3; files.duration rank 1; song.rating rank 1) are not verified by construction \u2014 only probabilistically sampled. No execution evidence confirms ties actually occur in generated instances.",
+    "Group-size targets for song.f_id and song.resolution (listed in GROUP_TARGETS) are not explicitly enforced and not confirmed in the construction feedback.",
+    "The 'NULL share follows the compact database's share' clause is interpreted as 1 row per instance given the 0% observed share; this interpretation is documented but not formally reconciled with the interface rule."
+   ]
+  }
+ ]
 }

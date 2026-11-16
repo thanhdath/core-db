@@ -1,50 +1,684 @@
 {
  "db": "superstore",
- "operator_io_quirks": [
-  "Identifiers contain spaces and mixed case: \"Customer ID\", \"Order Date\", \"Row ID\", \"Sub-Category\"; all generated SQL must double-quote and double embedded quotes.",
-  "Composite PKs: people(\"Customer ID\",Region), product(\"Product ID\",Region); PK members are TEXT with distinct<rows (people 793<2501, product 1862<5298) so PK tuples repeat only via Region pairing.",
-  "Composite FKs: central/east/south/west_superstore have TWO FKs each sharing the Region column: (\"Customer ID\",Region)->people and (\"Product ID\",Region)->product. Region is a child column of two FKs simultaneously; upstream fks dict keyed by (child_t,child_c) will collide on Region (last wins) - must survive without crashing.",
-  "Region in each fact table has distinct=1 (Central/East/South/West) but the parent people/product Region has 4 values; FK draw from parent will produce cross-region values, breaking the intended partition - upstream does not care.",
-  "Declared type DATE on \"Order Date\"/\"Ship Date\" but storage class is text 'YYYY-MM-DD'; ts_fuzzer dispatch is 'Date|Number(int elements)' - first element '2013-01-03' does not parse as int so Date fuzzer with template %Y-%m-%d.",
-  "Postal Code declared INTEGER, storage integer, but semantically a 5-digit code (78664); Number fuzzer will produce arbitrary ints in [-10^0,10^0] scale 0 -> tiny values, not 5-digit.",
-  "Row ID INTEGER PK per fact table, distinct=rows, contiguous ranges per table (central 1..4646, east 4647.., south 10343.., west 13583..); Number fuzzer with scale 0 gives values in [-1,1] plus perturbation, so PK collisions are frequent and sample_fresh_primary_keys will drop most rows.",
-  "No NOT NULL anywhere (notnull=0 on every column), no CHECK, no UNIQUE indexes; only PKs and FKs. Insert failures will be rare; row loss comes from PK/unique dedup, not constraints.",
-  "All null_rate=0.0 in original; TS Base drops None elements and p=1 if empty, so NULLs essentially never appear in generated instances.",
-  "Tables are small (2501..6406 rows) - no huge-table sampling concern; read_schema max_rows_per_table irrelevant here.",
-  "people.Customer ID distinct=793 but rows=2501: same customer appears in multiple regions; product.Product ID distinct=1862<5298 similarly. Parent PK is (ID,Region) so (ID,Region) is unique but ID alone is not.",
-  "Product Name samples contain commas and apostrophes (\"O'Sullivan ...\", trailing comma) - String fuzzer charset a-zA-Z 0-9() excludes both, so generated names lose punctuation; literal pool from train SQL may reintroduce them."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on Order Date/Ship Date: template %Y-%m-%d, range from min/max of 5 sampled originals (~2013-01..2014-12), so fresh dates stay in 2013-2014 window; plausible for date filters but no year-2011/2012 values unless in pool.",
-  "Number fuzzer on Row ID (INTEGER, scale 0): full range [-1,1] plus +-1/+-2 perturbation -> almost all rows collide on PK, sample_fresh_primary_keys keeps ~2-3 rows per fact table. Massive row loss -> many queries return empty or tiny results (FN risk on aggregates/counts).",
-  "Number fuzzer on Postal Code (INTEGER scale 0): values in {-2..2} roughly, never 5-digit; any query filtering Postal Code by real code returns empty (FN).",
-  "Number fuzzer on Sales/Profit/Discount (REAL, no args -> scale 0, precision 0): range [-1,1] plus +-0.01/+-0.02; Discount originals are 0.0-0.8 so plausible-ish, but Sales/Profit originals are 3..2573 -> generated values far too small (FN on Sales>X thresholds, FP on Profit<0 always true).",
-  "Number fuzzer on Quantity (INTEGER scale 0): values in {-2..2}+perturb, originals 1..14; queries Quantity>5 return empty (FN), Quantity>=1 mostly true (FP).",
-  "String fuzzer on Segment/Category/Ship Mode/Region (distinct 3-4): 5 original samples + pool literals, p=0.2 fresh random strings from a-zA-Z 0-9(); fresh draws are implausible ('x7Q(' etc.) -> equality filters on 'Consumer'/'Furniture' mostly hit pool values, but fresh contamination creates FP/FN on LIKE and != filters.",
-  "String fuzzer on Customer ID/Product ID/Order ID (structured codes like 'AA-10315','FUR-BO-10000112','CA-2011-103800'): fresh strings lose the code shape; LIKE 'CA-2011%' or 'FUR-%' filters will miss fresh values (FN) and match random strings rarely.",
-  "String fuzzer on Customer Name/City/State/Product Name: fresh random strings are not name-like; queries with LIKE '%a%' or State='Texas' rely on pool; pool from train SQL likely contains many real values so equality filters may still work.",
-  "FK fill: child Region drawn from parent people/product Region (4 values) with replacement, ignoring the per-table single-region semantics; joins on Region still work but partition queries (WHERE Region='Central' on central_superstore) will return rows with other regions (FP).",
-  "Composite FK collision: upstream fks dict keyed by (child_t,child_c) means Region maps to only one parent (people or product, last pragma wins); the other FK's ID column still draws from its parent but Region is drawn once - join on (Customer ID,Region) to people may fail to match (FN on join queries).",
-  "Row ID PK dedup happens AFTER FK draw; child fact tables draw Customer ID/Product ID from parent FINAL filtered columns (people/product PK dedup keeps ~most rows since 793/1862 distinct), so FK values are mostly valid but sparse.",
-  "Empty parent risk: if people/product PK dedup drops to few rows, fact tables draw from tiny parent sets -> heavy repetition of Customer ID/Product ID (FP on COUNT(DISTINCT))."
- ],
- "challenger_refs": [
-  "G5",
-  "G2",
-  "G12",
-  "G3",
-  "G10",
-  "G7",
-  "G1",
-  "G13",
-  "G14",
-  "G11"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_short_enum": "Sample from the explicit enum pool for the column; include near-variants (case changes, trailing space) only for columns listed in per_column_exceptions; otherwise exact enum values only.",
+   "text_identifier": "Generate fresh unique identifiers matching the column's observed format (prefix pattern + zero-padded number); never reuse a value across rows of the same table.",
+   "text_free": "Sample from a small pool of plausible strings; allow near-duplicates (case/whitespace variants) at ~5% share when the column is not a key.",
+   "integer_key": "Sequential or random unique integers within [1, 100000]; never NULL for primary keys; when appending to a copied compact database, exclude integers already present in the compact table.",
+   "integer_quantity": "Uniform integer in [1, 14]; never 0 or negative.",
+   "integer_postal": "Uniform integer in [10000, 99999].",
+   "real_amount": "Uniform real in [0, 10000], rounded to 3 decimals; allow negative only where a profit column permits it.",
+   "real_discount": "Sample from {0.0, 0.1, 0.15, 0.2, 0.3, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8}; never outside [0, 1].",
+   "real_profit": "Uniform real in [-5000, 5000], rounded to 4 decimals; sign free.",
+   "date": "Uniform date in [2013-01-01, 2014-12-31] formatted YYYY-MM-DD.",
+   "null_share": "For each nullable column, ~2% of generated rows get NULL (at least one NULL row per nullable column per instance); NOT NULL and PK columns never NULL; planted boundary/tie/duplicate rows are excluded from NULL sampling; a NULL in any column of a composite FK makes the constraint satisfied (SQLite semantics) and is permitted.",
+   "boundary_and_tie": "Planting is deterministic and last: sample all columns first, then plant boundary/tie/duplicate values on dedicated protected rows, then enforce semantics without touching protected rows, then apply NULL excluding protected rows, then deduplicate. For comparison_boundary, plant values at each listed literal and one step on each side; for ties_for_order_limit, plant at least two rows sharing the listed rank value, where the shared value is the actual rank-k value under the stated direction (for rank 1 DESC, the maximum; no other row exceeds it); for duplicates_for_distinct, plant duplicate values at the listed share. Assert planted values survive."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "product.Region",
+     "central_superstore.Region",
+     "south_superstore.Region",
+     "east_superstore.Region",
+     "west_superstore.Region",
+     "people.Region"
+    ],
+    "targets": {
+     "values": [
+      "Central",
+      "central",
+      "South",
+      "south",
+      "West",
+      "west",
+      "East",
+      "east"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "people.Segment"
+    ],
+    "targets": {
+     "values": [
+      "Consumer",
+      "consumer",
+      "Corporate",
+      "Home Office"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "west_superstore.Sales"
+    ],
+    "targets": {
+     "values": [
+      4999.999,
+      5000,
+      5000.001
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "east_superstore.Sales",
+     "east_superstore.Discount",
+     "east_superstore.Quantity"
+    ],
+    "targets": {
+     "expression": "sales / (1 - discount) * quantity",
+     "values": [
+      79999,
+      80000,
+      80001
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "columns": [
+     "central_superstore.Discount"
+    ],
+    "targets": {
+     "values": [
+      0,
+      0.01
+     ],
+     "note": "negative -0.01 dropped: conflicts with Discount BETWEEN 0 AND 1; boundary planted at 0 and 0.01 only"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "west_superstore.Quantity"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "shared_value": "maximum quantity in the table"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "central_superstore.Profit"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "shared_value": "maximum profit in the table"
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "columns": [
+     "central_superstore.Sales"
+    ],
+    "targets": {
+     "tie_at_rank": [
+      1,
+      10
+     ],
+     "direction": "DESC",
+     "shared_value": "rank-1 and rank-10 sales values, each shared by at least two rows"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "columns": [
+     "product.Category"
+    ],
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "people.Customer ID",
+     "central_superstore.Customer ID",
+     "south_superstore.Customer ID",
+     "east_superstore.Customer ID",
+     "west_superstore.Customer ID"
+    ],
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "guarantee": "reserve at least one parent row per FK excluded from the child FK draw pool"
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "columns": [
+     "product.Product ID",
+     "central_superstore.Product ID",
+     "south_superstore.Product ID",
+     "east_superstore.Product ID",
+     "west_superstore.Product ID"
+    ],
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "guarantee": "reserve at least one parent row per FK excluded from the child FK draw pool"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "central_superstore.Customer ID",
+    "parent_table": "people",
+    "parent_column": "Customer ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Customer ID, Region) from people rows whose Region = 'Central'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "central_superstore.Product ID",
+    "parent_table": "product",
+    "parent_column": "Product ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Product ID, Region) from product rows whose Region = 'Central'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "east_superstore.Customer ID",
+    "parent_table": "people",
+    "parent_column": "Customer ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Customer ID, Region) from people rows whose Region = 'East'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "east_superstore.Product ID",
+    "parent_table": "product",
+    "parent_column": "Product ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Product ID, Region) from product rows whose Region = 'East'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "south_superstore.Customer ID",
+    "parent_table": "people",
+    "parent_column": "Customer ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Customer ID, Region) from people rows whose Region = 'South'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "south_superstore.Product ID",
+    "parent_table": "product",
+    "parent_column": "Product ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Product ID, Region) from product rows whose Region = 'South'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "west_superstore.Customer ID",
+    "parent_table": "people",
+    "parent_column": "Customer ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Customer ID, Region) from people rows whose Region = 'West'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "child": "west_superstore.Product ID",
+    "parent_table": "product",
+    "parent_column": "Product ID",
+    "copied": [
+     "Region"
+    ],
+    "rule": "draw whole composite tuple (Product ID, Region) from product rows whose Region = 'West'; copy both columns together; never overwrite copied Region"
+   },
+   {
+    "fresh_key": "people",
+    "columns": [
+     "Customer ID",
+     "Region"
+    ],
+    "rule": "unique composite tuple; Customer ID format XX-NNNNN"
+   },
+   {
+    "fresh_key": "product",
+    "columns": [
+     "Product ID",
+     "Region"
+    ],
+    "rule": "unique composite tuple; Product ID format XXX-XX-NNNNNNNN"
+   },
+   {
+    "fresh_key": "central_superstore",
+    "columns": [
+     "Row ID"
+    ],
+    "rule": "unique integer; avoid compact Row IDs"
+   },
+   {
+    "fresh_key": "east_superstore",
+    "columns": [
+     "Row ID"
+    ],
+    "rule": "unique integer; avoid compact Row IDs"
+   },
+   {
+    "fresh_key": "south_superstore",
+    "columns": [
+     "Row ID"
+    ],
+    "rule": "unique integer; avoid compact Row IDs"
+   },
+   {
+    "fresh_key": "west_superstore",
+    "columns": [
+     "Row ID"
+    ],
+    "rule": "unique integer; avoid compact Row IDs"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "people",
+    "column": "Region",
+    "formula": "Region IN ('Central','East','South','West')"
+   },
+   {
+    "table": "people",
+    "column": "Segment",
+    "formula": "Segment IN ('Consumer','Corporate','Home Office')"
+   },
+   {
+    "table": "people",
+    "column": "Country",
+    "formula": "Country = 'United States'"
+   },
+   {
+    "table": "product",
+    "column": "Region",
+    "formula": "Region IN ('Central','East','South','West')"
+   },
+   {
+    "table": "product",
+    "column": "Category",
+    "formula": "Category IN ('Furniture','Office Supplies','Technology')"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Region",
+    "formula": "Region = 'Central'"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Region",
+    "formula": "Region = 'East'"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Region",
+    "formula": "Region = 'South'"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Region",
+    "formula": "Region = 'West'"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Ship Mode",
+    "formula": "Ship Mode IN ('Standard Class','First Class','Second Class','Same Day')"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Ship Mode",
+    "formula": "Ship Mode IN ('Standard Class','First Class','Second Class','Same Day')"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Ship Mode",
+    "formula": "Ship Mode IN ('Standard Class','First Class','Second Class','Same Day')"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Ship Mode",
+    "formula": "Ship Mode IN ('Standard Class','First Class','Second Class','Same Day')"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Ship Date",
+    "formula": "Ship Date >= Order Date"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Ship Date",
+    "formula": "Ship Date >= Order Date"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Ship Date",
+    "formula": "Ship Date >= Order Date"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Ship Date",
+    "formula": "Ship Date >= Order Date"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Quantity",
+    "formula": "Quantity > 0 AND Quantity <= 14"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Quantity",
+    "formula": "Quantity > 0 AND Quantity <= 14"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Quantity",
+    "formula": "Quantity > 0 AND Quantity <= 14"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Quantity",
+    "formula": "Quantity > 0 AND Quantity <= 14"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Discount",
+    "formula": "Discount BETWEEN 0 AND 1"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Discount",
+    "formula": "Discount BETWEEN 0 AND 1"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Discount",
+    "formula": "Discount BETWEEN 0 AND 1"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Discount",
+    "formula": "Discount BETWEEN 0 AND 1"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Sales",
+    "formula": "Sales >= 0"
+   },
+   {
+    "table": "east_superstore",
+    "column": "Sales",
+    "formula": "Sales >= 0"
+   },
+   {
+    "table": "south_superstore",
+    "column": "Sales",
+    "formula": "Sales >= 0"
+   },
+   {
+    "table": "west_superstore",
+    "column": "Sales",
+    "formula": "Sales >= 0"
+   },
+   {
+    "table": "central_superstore",
+    "column": "Profit",
+    "formula": "Profit IS NOT NULL",
+    "evidence": "no exact formula holds on shown rows; profit sampled freely"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "people": 200,
+   "product": 200,
+   "central_superstore": 200,
+   "east_superstore": 200,
+   "south_superstore": 200,
+   "west_superstore": 200
+  },
+  "null_targets": [
+   "central_superstore.Order ID",
+   "central_superstore.Order Date",
+   "central_superstore.Ship Date",
+   "central_superstore.Ship Mode",
+   "central_superstore.Customer ID",
+   "central_superstore.Region",
+   "central_superstore.Product ID",
+   "central_superstore.Sales",
+   "central_superstore.Quantity",
+   "central_superstore.Discount",
+   "central_superstore.Profit",
+   "east_superstore.Order ID",
+   "east_superstore.Order Date",
+   "east_superstore.Ship Date",
+   "east_superstore.Ship Mode",
+   "east_superstore.Customer ID",
+   "east_superstore.Region",
+   "east_superstore.Product ID",
+   "east_superstore.Sales",
+   "east_superstore.Quantity",
+   "east_superstore.Discount",
+   "east_superstore.Profit",
+   "south_superstore.Order ID",
+   "south_superstore.Order Date",
+   "south_superstore.Ship Date",
+   "south_superstore.Ship Mode",
+   "south_superstore.Customer ID",
+   "south_superstore.Region",
+   "south_superstore.Product ID",
+   "south_superstore.Sales",
+   "south_superstore.Quantity",
+   "south_superstore.Discount",
+   "south_superstore.Profit",
+   "west_superstore.Order ID",
+   "west_superstore.Order Date",
+   "west_superstore.Ship Date",
+   "west_superstore.Ship Mode",
+   "west_superstore.Customer ID",
+   "west_superstore.Region",
+   "west_superstore.Product ID",
+   "west_superstore.Sales",
+   "west_superstore.Quantity",
+   "west_superstore.Discount",
+   "west_superstore.Profit",
+   "people.Customer Name",
+   "people.Segment",
+   "people.Country",
+   "people.City",
+   "people.State",
+   "people.Postal Code",
+   "product.Product Name",
+   "product.Category",
+   "product.Sub-Category"
+  ],
+  "supporting_evidence": {
+   "region_enums": "people.Region distinct=4; product.Region distinct=4; each superstore table Region distinct=1 matching its name (central rows 1-8 all 'Central', east rows 4647-4654 all 'East', south rows 10343-10350 all 'South', west rows 13583-13590 all 'West').",
+   "ship_mode_enum": "All four superstore tables show Ship Mode values in {Standard Class, First Class, Second Class, Same Day} (central rows 1-8, east 4647-4654, south 10343-10350, west 13583-13590).",
+   "ship_after_order": "central row1 2013-01-03<=2013-01-07; east row4647 2013-01-05<=2013-01-12; south row10343 2013-01-06<=2013-01-07; west row13583 2013-01-06<=2013-01-08.",
+   "quantity_range": "Quantity distinct=14 in all superstore tables; shown values 1-14.",
+   "discount_range": "Discount distinct 5-9, shown values 0.0-0.8, all within [0,1].",
+   "sales_nonneg": "All shown Sales values positive (16.448, 11.784, 272.736, ...).",
+   "profit_formula_rejected": "central row1: 16.448*(1-0.2)*0.3=3.9475 != 5.5512; row2: 11.784*0.2*0.3=0.707 != 4.2717; row4: 3.54*1*0.3=1.062 != -5.487. No constant-rate formula holds; profit sampled freely.",
+   "discount_boundary_reconciled": "central_superstore.Discount boundary target -0.01 removed because it contradicts Discount BETWEEN 0 AND 1; boundary planted at 0 and 0.01 only.",
+   "tie_rank_definition": "Tie values are the actual rank-k values under the stated direction (max for rank 1 DESC); no other row exceeds the rank-1 tie value.",
+   "region_fk_reconciliation": "Per-table Region rule is reconciled with the copied-Region dependency by restricting the parent draw pool per superstore table to parent rows of the matching region and copying Region from the parent (option a). The copied value therefore equals the fixed region, and non-NULL composite FK tuples always exist in the parent.",
+   "fk_integrity": "FK columns are generated as whole composite tuples drawn from the in-memory parent; non-NULL composite FK tuples always reference an existing parent tuple; NULL in any FK column satisfies the composite constraint (SQLite semantics).",
+   "planting_order": "Planting is deterministic and last: sample all columns, plant boundary/tie/duplicate values on protected rows, enforce semantics without touching protected rows, apply NULL excluding protected rows, deduplicate; assertions confirm planted values survive."
+  },
+  "uncertainty": "Profit has no verified closed-form formula on the shown rows; it is sampled freely within [-5000,5000]. The expression sales/(1-discount)*quantity boundary at 80000 is a construction target only, not a semantic rule. NULL shares are set to ~2% since observed null_rate is 0 but nullable columns must exercise NULL. Exact identifier formats inferred from samples (XX-NNNNN for Customer ID, XXX-XX-NNNNNNNN for Product ID). Lowercase Region boundary variants for superstore tables are listed as targets but the per-table Region semantic rule forces exact 'Central'/'East'/'South'/'West'; the program plants lowercase variants only where the rule permits (i.e., not in superstore Region columns) or relaxes the rule for those planted rows."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "cli.py line 18: `from .spec import load_specification, default_specification`. spec.py defines only `default_specification` and `spec_get`; there is no `load_specification`. Execution feedback confirms: `ImportError: cannot import name 'load_specification' from 'tscore_gen.spec'`, returncode 1, n_instances 0.",
+     "requested_revision": "Either add a `load_specification(path, db)` function to spec.py (loading the JSON specification and falling back to `default_specification`), or change the import in cli.py to only import `default_specification` and inline the JSON loading already present in `_load_spec`. The program must import and run to produce instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_semantics` clamps `Discount` to [0,1] and `_plant_expression_boundary` sets discount from {0.0..0.5}, but the specification's `central_superstore.Discount` comparison_boundary targets are [-0.01, 0, 0.01]. The boundary planting in values.py `_build_planted` adds -0.01 and 0.01 to `planted`, but `_enforce_semantics` then clamps -0.01 to 0.0, destroying the planted boundary value. The spec's own semantic rule `Discount BETWEEN 0 AND 1` conflicts with the boundary target -0.01.",
+     "requested_revision": "Designer: reconcile the `central_superstore.Discount` boundary targets with the `Discount BETWEEN 0 AND 1` semantic rule (either drop -0.01 or relax the rule for that column). Engineer: ensure `_enforce_semantics` does not overwrite planted boundary values, or apply boundary planting after semantic enforcement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` is called before `sample_fresh_primary_keys` and `drop_unique_duplicates`, and `_enforce_semantics` runs before `_apply_null_rule`. The NULL rule sets `cols[cm.name][i] = None` for nullable columns including FK columns (e.g. `central_superstore.Customer ID`). However `fill_foreign_keys_consistently` and the copied-column dependency loop run before `_apply_null_rule`, so copied `Region` values are computed from non-NULL FK values; after NULLing the FK, the copied Region remains non-NULL, which is acceptable. But `_enforce_semantics` for `Region` (superstore_region) runs before NULLing, so a NULLed Region is fine. The real issue: `_apply_null_rule` uses `_null_share` from `schema.original_values`, which for the compact DB has null_rate 0 (per supporting_evidence), so `share = 0.0` and `k = max(1, 0) = 1` \u2014 only one NULL per column, not the ~2% the spec's `null_share` intends. The spec says 'NULL share following the compact database's share ... and at least one NULL row'; with compact share 0 this yields exactly 1 NULL, which is defensible but the spec's `null_share: 0.02` is never used because `ov` is non-empty.",
+     "requested_revision": "Engineer: when the compact share is 0 but the column is a NULL target, use the spec's `null_share` (0.02) as a floor so the intended ~2% NULL share is realized, rather than only 1 row. This is a minor consistency fix; document the choice."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_expression_boundary` sets `cols['Sales'][j] = round(max(0.0, s), 3)` where `s = target*(1-d)/q`. For target 79999, d up to 0.5, q up to 14, s can be large but positive; fine. However `_enforce_semantics` runs after and clamps Sales to >=0 and Discount to [0,1] \u2014 consistent. But the expression boundary is planted only for the first `len(targets)` rows (j < n), and `_apply_null_rule` may NULL those Sales/Discount/Quantity rows afterward, destroying the planted boundary. Since NULL targets include east_superstore.Sales/Discount/Quantity, the planted expression boundary rows can be NULLed.",
+     "requested_revision": "Engineer: exclude rows carrying planted boundary/tie/duplicate values from the NULL sampling in `_apply_null_rule`, or apply NULL rule before planting. The spec requires boundary values to be present in generated rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `ties_for_order_limit` for `central_superstore.Profit` and `central_superstore.Sales` and `west_superstore.Quantity` are planted via `_tie_value` in values.py, but `_tie_value` for real types returns `round(uniform(0,10000),3)` and for int returns `randint(1,14)` \u2014 these are random values, not guaranteed to be the actual rank-1 (or rank-10) value under DESC ordering. The spec says 'plant at least two rows sharing the listed rank value'. The program plants two rows with the same random value, but that value may not be the maximum (rank 1) or 10th. This does not guarantee a tie at the specified rank.",
+     "requested_revision": "Designer: clarify whether 'tie at rank' requires the shared value to actually be the rank-k value (e.g., the maximum for rank 1). Engineer: if so, plant the tie value as the extreme (max for DESC rank 1) and ensure at least two rows share it, and that no other row exceeds it for rank-1 ties."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` is called from cli.py `_one` as `write_instance_sqlite(_G['schema'], inst, p)` \u2014 only 3 args, so `orig_path` defaults to None. The docstring says 'Copy the compact database, append generated rows', but with `orig_path=None` the function creates a fresh DB from `schema.ddl` and inserts only generated rows. The compact rows are NOT preserved. The spec/round-1 adaptation states 'instances are copies of the compact database plus appended generated rows; compact rows are never deleted or changed.'",
+     "requested_revision": "Engineer: pass `orig_path` (the `--orig` argument) through to `write_instance_sqlite` in cli.py `_one` (store it in `_G['args']` and forward), so the compact database is copied and generated rows appended, preserving compact rows as the specification requires."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` builds `inst[t]` with generated rows only (n = spec size, e.g. 200). It does not include the compact rows. Combined with the writer issue above, the resulting instance contains only generated rows, not compact+generated. Also `sample_fresh_primary_keys` and `drop_unique_duplicates` operate only on generated rows, so PK uniqueness against compact rows is not checked \u2014 generated `Row ID` values (random 1..100000) could collide with compact `Row ID`s when appended.",
+     "requested_revision": "Engineer: when appending to a copied compact DB, seed the `taken` sets for PK columns from `schema.original_values` (already done for people/product via `_fresh_key_values`, but not for superstore `Row ID` which uses `_fresh_key_values` with no format \u2192 random ints; ensure these avoid compact Row IDs). Verify no PK collision on append."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `unmatched_join_rows` targets require `parent_rows_without_children: true` and `child_rows_with_null_fk: true`. The program's `fill_foreign_keys_consistently` draws FK values from parent values with replacement, and `_apply_null_rule` NULLs some FK rows (child_rows_with_null_fk satisfied). But `parent_rows_without_children` requires some parent rows to have no matching child. With 200 parents and 200 children drawn with replacement, some parents will be unmatched by chance, but this is not guaranteed or controlled. The spec lists this as a target pattern.",
+     "requested_revision": "Designer: confirm whether probabilistic unmatched parents suffice or whether the program must guarantee at least one unmatched parent per FK. Engineer: if guaranteed, reserve some parent rows to be excluded from the FK draw pool."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not execute the program to verify integrity constraints, dependent-value consistency, or reproducible generation because the import error blocks execution (n_instances 0).",
+    "Whether the compact database's actual NULL shares are 0 for all nullable columns (supporting_evidence says null_rate 0) \u2014 if so, the ~2% NULL share is only realized via the max(1,...) floor, giving 1 NULL per column rather than 2%.",
+    "Whether `_enforce_semantics` Region override for superstore tables conflicts with the boundary targets that include lowercase variants ('central','south','west','east') \u2014 the override forces exact 'Central' etc., so lowercase boundary variants for superstore Region columns are never emitted, though the spec lists them as boundary targets."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Foreign-key integrity is broken: 30,733 FK violations across all 20 instances",
+     "evidence": "Execution feedback: integrity.fk_violations = 30733, validity.invalid = 20 with reason 'new_integrity_failures'. The schema declares FOREIGN KEY (\"Customer ID\", Region) REFERENCES people and FOREIGN KEY (\"Product ID\", Region) REFERENCES product on all four superstore tables. The program disables enforcement (writer.py: 'pragma foreign_keys = OFF') and never guarantees that generated child FK tuples exist in the parent.",
+     "detail": "Root cause is in instance.py. (1) fill_foreign_keys_consistently draws each FK column independently from the parent column values, so the composite (Customer ID, Region) / (Product ID, Region) tuple is not guaranteed to exist in the parent. (2) The copied Region column is then overwritten by _enforce_semantics to the table's fixed region ('Central'/'East'/'South'/'West'), while the parent people/product rows carry all four regions; a child Customer ID drawn from a parent row whose Region is 'East' but forced to 'Central' produces a dangling composite key. (3) The NULL rule sets FK columns to NULL on ~2% of rows, which is allowed by the interface, but the non-NULL rows still violate the composite FK. (4) The spec's unmatched_join_rows exception ('reserve at least one parent row per FK excluded from the child FK draw pool') is not implemented at all.",
+     "requested_revision": "Generate FK columns as whole composite tuples: pick a parent row (Customer ID, Region) / (Product ID, Region) from the in-memory parent and copy both columns together, so the copied Region equals the parent's Region. Do not overwrite the copied Region with the table's fixed region in a way that breaks the FK; instead restrict the parent draw pool to parent rows whose Region matches the superstore table's region (or relax the per-table Region rule for FK rows). Implement the unmatched_join_rows guarantee (reserve at least one parent row excluded from the child draw pool). Keep NULL FK rows only where the interface permits, and ensure non-NULL FK rows always reference an existing parent tuple. Re-run and confirm fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "title": "Per-table Region semantic rule conflicts with the FK/copied-Region dependency",
+     "evidence": "spec.py SUPERSTORE_REGION forces central_superstore.Region='Central', east='East', etc. instance.py _enforce_semantics overwrites cols['Region'] with that fixed value after the copied Region was computed from the parent. The specification's own 'uncertainty' note flags this: 'the per-table Region semantic rule forces exact Central/East/South/West; the program should plant lowercase variants only where the rule permits ... or relax the rule for those planted rows.'",
+     "detail": "The dependency list says central_superstore.Region is copied from people.Region via Customer ID, and product.Region via Product ID. Forcing a single region per table is only consistent if the parent rows referenced by that table all share that region. The current code does neither: it copies from arbitrary parents and then overwrites, producing the FK violations above and also making the copied-Region dependency meaningless.",
+     "requested_revision": "Reconcile the two rules in the specification and program: either (a) restrict the parent draw pool per superstore table to parent rows of the matching region and copy Region from the parent (so the copied value equals the fixed region), or (b) drop the per-table fixed-Region rule and let Region follow the parent. Update spec.py and instance.py consistently and document the choice."
+    },
+    {
+     "agent": "engineer",
+     "title": "Boundary/tie/duplicate planting is not actually realized in the generated data",
+     "evidence": "SpecSampler._build_planted appends boundary literals, tie values and enum pools to self.planted and emits them first, but instance.py then calls _enforce_semantics, _apply_null_rule, sample_fresh_primary_keys and drop_unique_duplicates, which can drop or overwrite planted rows. More importantly, _plant_ties in instance.py computes ties from the already-sampled column values, but the SpecSampler already emitted its own 'tie' values into the column, so the actual rank-1/rank-10 values are not controlled. The construction feedback shows construction_pairs.separated = 69 of 159 eligible, with no per-group breakdown, so the boundary/tie/duplicate patterns are not demonstrably separated.",
+     "detail": "For west_superstore.Sales the boundary targets 4999.999/5000/5000.001 are planted by the sampler, but _enforce_semantics clamps Sales to >=0 and the expression-boundary planting in _plant_expression_boundary overwrites Sales/Discount/Quantity on the first rows, potentially clobbering the west Sales boundary rows. For central_superstore.Sales ties at rank 1 and 10, _plant_ties overwrites arbitrary rows to the shared value but does not ensure no other row exceeds the rank-1 value after later sampling. For product.Category duplicates_for_distinct (20-50% share), the sampler sets dup_value and dup_share but the enum pool is also planted, so the duplicate share is not controlled.",
+     "requested_revision": "Make planting deterministic and last: sample all columns first, then plant boundary/tie/duplicate values on dedicated protected rows, then enforce semantics without touching protected rows, then apply NULL excluding protected rows, then deduplicate. For ties, compute the shared value as the actual rank-k value after all other rows are fixed and assert no other row exceeds it. For duplicates_for_distinct, control the duplicate share explicitly. Add assertions or stats that the planted values survive."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule applied to FK columns breaks referential integrity and is applied inconsistently",
+     "evidence": "nullable_columns feedback shows NULLs in central_superstore.Customer ID (73/3816), Product ID (74/3816), Region (76/3816), etc. The interface permits NULL FK rows, but the non-NULL FK rows still violate the composite FK (see issue 1). Also _apply_null_rule uses _null_share = max(compact share, 0.02); the compact share is 0 for all columns, so the floor 0.02 is used, which is acceptable per the interface but should be documented as intentional.",
+     "detail": "The NULL rule itself is implemented (at least one NULL per nullable column, NOT NULL/PK excluded, protected rows excluded). The problem is that NULLing one column of a composite FK (e.g. Customer ID) while leaving Region non-NULL, or NULLing Region while leaving Customer ID non-NULL, is fine for SQL FK semantics (a NULL in any FK column makes the constraint not enforced), but the non-NULL rows must still be valid. The current code does not ensure that.",
+     "requested_revision": "After fixing issue 1, verify that every non-NULL composite FK tuple exists in the parent. Keep the NULL rule as is (it matches the interface), but add a check that NULLing FK columns does not leave partially-NULL composite keys that the engine would reject (SQLite treats a composite FK with any NULL column as satisfied, so this is acceptable, but document it)."
+    },
+    {
+     "agent": "designer",
+     "title": "Semantic rules have uneven evidence; some are supported, some uncertain",
+     "evidence": "Supported by supporting_evidence: Region enums (distinct=4 in people/product, distinct=1 per superstore table), Ship Mode enum, Ship Date >= Order Date, Quantity in [1,14], Discount in [0,1], Sales >= 0, Country='United States'. Uncertain: Profit has no closed-form formula (profit_formula_rejected) and is sampled freely in [-5000,5000]; the expression boundary sales/(1-discount)*quantity at 80000 is planted but its semantic meaning is not established; the per-table Region rule conflicts with the copied-Region dependency (see issue 2).",
+     "detail": "The specification correctly marks Profit as uncertain and samples it freely, which is acceptable. The expression boundary at 80000 is a construction target, not a semantic rule, and is fine. The main design gap is the unresolved conflict between the per-table Region rule and the copied-Region dependency, which the specification's own 'uncertainty' note acknowledges but does not resolve.",
+     "requested_revision": "Resolve the Region rule conflict in the specification (choose option (a) or (b) from issue 2) and state it explicitly. Keep Profit as a free sample. Document that the expression boundary is a construction target only."
+    },
+    {
+     "agent": "engineer",
+     "title": "Reproducibility and compact-row preservation are fine; no issue",
+     "evidence": "Execution feedback: reproducible = true, n_ok = 20, n_fail = 0, rows_skipped = 0 for all tables, not_null_violations = 0, pk_duplicates = 0. writer.py copies the compact database and appends rows in one transaction, never deleting or changing compact rows.",
+     "detail": "This is a positive check, not an issue. The program ran without errors and produced 20 instances reproducibly.",
+     "requested_revision": "None."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the construction_pairs.separated = 69/159 reflects the intended boundary/tie/duplicate separation cannot be verified without per-group breakdown; the feedback shows construction_pairs_by_group = [] (empty).",
+    "Whether the expression boundary sales/(1-discount)*quantity at 80000 is actually realized after _enforce_semantics clamps Sales/Discount/Quantity is not confirmed by the feedback.",
+    "Whether the unmatched_join_rows guarantee (reserve at least one parent row per FK excluded from the child draw pool) is implemented is not confirmed; the code does not appear to implement it."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Semantic rules are well-supported: Region enums (people/product distinct=4, each superstore table distinct=1 matching its name), Ship Mode enum, Ship Date >= Order Date, Quantity in [1,14], Discount in [0,1], Sales >= 0 all have direct row evidence in supporting_evidence. Profit has no closed-form formula (profit_formula_rejected) and is correctly left as a free sample with only 'Profit IS NOT NULL'.",
+     "requested_revision": "None required. The uncertain pattern (Profit formula) is already flagged as uncertainty and handled by free sampling; this is the correct treatment."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "The comparison_boundary target for central_superstore.Discount originally included -0.01, which contradicts the semantic rule Discount BETWEEN 0 AND 1. The spec explicitly drops -0.01 and plants at 0 and 0.01 only (per_column_exceptions note; discount_boundary_reconciled).",
+     "requested_revision": "None required; the conflict is resolved in favor of the semantic rule, which is the correct precedence."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Lowercase Region variants ('central','east',...) are listed as comparison_boundary targets for superstore Region columns, but the per-table Region semantic rule forces exact 'Central'/'East'/'South'/'West'. The spec acknowledges this in uncertainty and reconciles via option (a): parent draw pool restricted to matching region, Region copied from parent. The program's _enforce_semantics overwrites non-NULL Region with the fixed region, so lowercase variants in superstore Region columns are not preserved.",
+     "requested_revision": "None blocking. The reconciliation is documented and consistent; the lowercase boundary variants are effectively only realizable in people.Region and product.Region, which is acceptable given the semantic rule takes precedence. If the designer wants lowercase variants in superstore Region columns, the semantic rule would need relaxing \u2014 but that is a design choice, not an error."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Value domains implemented by construction: SpecSampler._enum_pool returns fixed region for superstore tables, enums for Segment/Category/Sub-Category/Ship Mode/Country/City/State/Discount; Postal Code in [10000,99999]; Quantity in [1,14]; Sales in [0,10000]; Profit in [-5000,5000]; dates in [2013-01-01,2014-12-31]. _enforce_semantics clamps Quantity, Discount, Sales and fixes Ship Date >= Order Date. Dependencies drawn as whole composite tuples from region-filtered parent pools (fill_foreign_keys_consistently + _parent_pool), with copied Region from the same parent row.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Integrity feedback: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0; validity 20/20; reproducible=true; rows_added 4000 per table with 0 skipped. NULL rule satisfied: every nullable column shows NULL > 0 in generated rows (~2% share, e.g. 76/3822). Compact rows preserved (writer copies orig then appends; foreign_keys=OFF during append but FK tuples are drawn from in-memory parents so integrity holds).",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Construction pairs: eligible=159, separated=31, unknown_executions=0. Separation is partial but the instructions state a missing separation alone does not establish a generation error. The planted boundary/tie/duplicate values are protected from NULL and semantic overwrite (protected set threaded through _plant_* and _apply_null_rule), and assertions are described in planting_order. No evidence of a blocking defect.",
+     "requested_revision": "None blocking. The engineer may optionally investigate why only 31/159 pairs separated (e.g. whether some planted boundaries are being overwritten by _enforce_semantics for non-protected rows or by dedup), but this does not block a pass."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Minor: _plant_boundary plants v-1 and v+1 for numeric targets, but for central_superstore.Discount the target 0 with v-1=-1 would violate Discount BETWEEN 0 AND 1. However _enforce_semantics clamps Discount to [0,1] for non-protected rows, and the planted row index is in `protected` so it is NOT clamped \u2014 meaning a planted -1 could survive. This is a latent inconsistency between the boundary planting and the semantic rule.",
+     "requested_revision": "Engineer should confirm whether _plant_boundary for central_superstore.Discount can plant -1 (v-1 of 0) on a protected row that _enforce_semantics then skips, which would violate Discount BETWEEN 0 AND 1. If so, restrict the boundary sequence for that column to non-negative steps (e.g. skip v-1 when v==0) or exclude it from protection for the clamp. This is a correctness concern for the semantic rule, though execution feedback shows 0 integrity violations, suggesting it may not have triggered in the sampled instances \u2014 worth verifying."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether _plant_boundary can plant a negative Discount (-1) on a protected row for central_superstore.Discount, bypassing the [0,1] clamp; execution feedback shows no violation but the code path appears to allow it.",
+    "Why only 31/159 construction pairs separated; not blocking but worth a diagnostic."
+   ]
+  }
+ ]
 }

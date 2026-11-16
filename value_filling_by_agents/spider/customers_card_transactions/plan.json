@@ -1,53 +1,947 @@
 {
  "db": "customers_card_transactions",
- "operator_io_quirks": [
-  "All table/column names are mixed-case CamelCase/snake_case; generated SQL must double-quote them (\"Accounts\", \"account_id\").",
-  "DDL uses backtick quoting; sqlite_master stores it verbatim; clone must replay CREATE TABLE text as-is.",
-  "Financial_Transactions has NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there, and drop_unique_duplicates has no unique columns to enforce.",
-  "transaction_id is NOT NULL but not PK; previous_transaction_id is a self-referencing-looking int with no declared FK (values 457..947, not in 1..15) \u2014 no FK edge, so no parent draw.",
-  "Two FKs on Financial_Transactions (account_id->Accounts.account_id, card_id->Customers_Cards.card_id) both point to existing single-column PKs; no dangling/non-unique parents here.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, seconds, no T, no timezone); first element is not int-parseable so TS dispatches to Date, not Number.",
-  "date_valid_from/date_valid_to/transaction_date are declared DATETIME but storage class is text \u2014 declared type contradicts storage; affinity is NUMERIC-ish but values are strings.",
-  "transaction_amount is DOUBLE with storage 'real' (floats like 1701.23); Number fuzzer with scale from 'double' (no args) \u2014 check scale default.",
-  "Three columns are 100% NULL in the original (other_customer_details, transaction_comment, other_transaction_details); distinct=0, samples empty \u2014 literal pool contributes nothing, original_values are all None.",
-  "card_number and other_card_details hold long digit strings (13-16 chars) that look like card numbers; String fuzzer will treat them as int-like and add +-1 variants.",
-  "customer_phone has formats '(673)872-5338', '679-845-8645x94312', '1-511-656-6664' \u2014 mixed punctuation, extension suffix; String fuzzer's CHARSET lacks '-', '(', ')', 'x' so fresh values won't match format.",
-  "customer_address contains embedded newlines ('\\n') and commas; String fuzzer CHARSET has no newline/comma, so fresh addresses lose structure.",
-  "Tables are tiny (15 rows each); read_schema sampling is trivial, no huge-table path exercised.",
-  "account_name holds zero-padded numeric strings ('038', '162'); String fuzzer int-like branch will produce '039'/'037' etc."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template inferred from first parsable element = '%Y-%m-%d %H:%M:%S' (space, seconds); fresh dates formatted with that template.",
-  "Date range = [min,max] of parsed elements per column; date_valid_from spans 2009-2015, date_valid_to ~2018-03, transaction_date ~2018-03 \u2014 narrow ranges, so fresh dates cluster tightly (likely FN on range predicates outside these windows).",
-  "Number fuzzer on INTEGER PKs (account_id, customer_id, card_id, transaction_id): scale from 'integer' (no args) -> default scale; fresh ints perturbed by +-1/+-2, so PKs stay near 1..15 and collide often -> sample_fresh_primary_keys drops many rows.",
-  "Number fuzzer on transaction_amount (DOUBLE): scale from 'double' default; range [-10^s,10^s]; fresh floats perturbed by +-0.01/+-0.02 \u2014 plausible amounts, but original amounts are 100s-1000s so fresh draws may be too small (FN on amount thresholds).",
-  "String fuzzer on card_type_code / transaction_type (2 distinct values 'Credit'/'Debit', 'Payment'/'Refund'): p=0.2 fresh random strings over a-zA-Z0-9() will inject garbage values -> FP on equality/IN filters, FN on 'Credit'/'Debit' grouping.",
-  "String fuzzer on customer_first_name/last_name: fresh random strings, not name-like; original names are Faker-style \u2014 TS will produce implausible names (FN on LIKE 'A%' style predicates).",
-  "String fuzzer on customer_email: fresh random strings lack '@' and '.', so email-format predicates (LIKE '%@%') will match nothing -> FN.",
-  "String fuzzer on customer_phone: fresh strings lack '-', '(', ')', 'x' -> phone-format predicates FN.",
-  "String fuzzer on card_number: int-like branch adds +-1 variants; fresh random strings over CHARSET produce non-numeric garbage -> card-number length/format predicates FN.",
-  "FK columns account_id/card_id in Financial_Transactions draw from parent's FINAL filtered values with replacement -> duplicates common; original has 13/10 distinct out of 15, so ties are plausible (not a miss).",
-  "100%-NULL columns: original_values all None -> Base drops None -> no elements -> p:=1 -> always fresh random strings; original has only NULLs, so any IS NULL predicate will FP (fresh non-null values).",
-  "No PK on Financial_Transactions: no PK dedup, no unique dedup -> duplicate transaction_id rows possible; original has distinct=15 so duplicates are a new behaviour (FP on COUNT(DISTINCT transaction_id)).",
-  "previous_transaction_id has no FK and values 457..947 (not in 1..15): Number fuzzer will draw near 1..15 (perturbation of sampled elements) -> loses the 'points to another transaction' semantics (FN on self-join predicates)."
- ],
- "challenger_refs": [
-  "G3",
-  "g2c032b37",
-  "G4",
-  "G7",
-  "G5",
-  "G11",
-  "G2",
-  "G12",
-  "G1",
-  "G10"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1, unique, NOT NULL; generated PKs start at max(existing_pk)+1 and increment; never NULL.",
+   "integer_fk": "Planned multiplicity: for each FK column, after the parent table is final, assign child rows to parent keys so that at least one parent has exactly 1 child, one has exactly 2, one has >=3, and exactly one parent key (chosen deterministically, not the last key) has 0 children; remaining children are distributed uniformly over the other parent keys. Plan is applied after PK/UNIQUE dedup of the child table and the appended row count is sized to leave room for the plan. NULL only if the column is nullable (5% of rows).",
+   "integer_numeric": "Uniform integer in [1, 10000]; boundary values at listed literals +/-1 when a per_column_exception names the column.",
+   "varchar_short": "Random token of 3-12 alphanumeric chars; 10% near-duplicate variants (case flip, one-char edit) of an existing value.",
+   "varchar_text": "Random sentence-like string up to 200 chars; 10% near-duplicate variants; when a per_column_exception names a duplicate_share, that share of values are exact duplicates of an existing value.",
+   "varchar_enum": "Uniform pick from the enum list in per_column_exceptions; no boundary or near-variant values are inserted into enum columns.",
+   "varchar_numeric_string": "Zero-padded 3-digit string '000'-'999'; boundary values at listed literals +/-1 as strings.",
+   "varchar_card_number": "16-digit numeric string; boundary values at listed literals +/-1 as strings.",
+   "varchar_phone": "Formats like '(###)###-####', '###-###-####x#####', '1-###-###-####', '+##(#)##########'; 20-50% duplicate share.",
+   "varchar_email": "first.last@example.com style; unique per row.",
+   "varchar_address": "Multi-line US-style address with street, city, state, ZIP.",
+   "datetime": "Uniform timestamp in [2009-01-01, 2018-12-31]; boundary values at listed literals +/-1 day.",
+   "double_amount": "Uniform in [0.01, 5000.00], 2 decimals; boundary values at listed literals +/-0.01.",
+   "null_share": "For nullable columns, NULL share follows the compact database's share for that column (fallback 5% when unknown), with at least one NULL row per nullable column per instance; NOT NULL and primary-key columns never get NULL; rules and formulas constrain only non-NULL operands and a planted NULL is never replaced to satisfy a rule. NULL planting for amount/date columns runs BEFORE tie and different-values construction; the applied share per column is recorded in the output for audit.",
+   "construction_order": "1) fill parent tables (PKs, then non-FK columns, then plant NULLs); 2) fill child tables' non-FK columns and plant NULLs; 3) apply FK multiplicity plans after child PK/UNIQUE dedup; 4) apply ties_for_order_limit and rows_with_different_values jointly on the final non-NULL amount values; 5) apply semantic rules; 6) verify all constructed properties and report per-instance checks."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Accounts",
+    "column": "account_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "337",
+      "338",
+      "339"
+     ]
+    }
+   },
+   {
+    "table": "Accounts",
+    "column": "other_account_details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Accounts",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Accounts",
+    "column": "customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.customer_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Accounts",
+    "column": "account_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Financial_Transactions.account_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers_Cards.customer_id",
+      "Accounts.customer_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_first_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Art",
+      "art"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_last_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Turcotte",
+      "turcotte"
+     ]
+    }
+   },
+   {
+    "table": "Customers",
+    "column": "customer_phone",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Financial_Transactions.card_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_id",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT card_id)",
+      "COUNT(card_id)"
+     ],
+     "values": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_type_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Credit",
+      "Debit"
+     ]
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_type_code",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      3,
+      4,
+      5,
+      6
+     ]
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "customer_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.customer_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_number",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "4560596484841",
+      "4560596484842",
+      "4560596484843"
+     ]
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "account_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "account_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Accounts.account_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "card_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers_Cards.card_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_type",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Payment",
+      "Refund"
+     ]
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_type",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "SUM(transaction_amount)"
+     ]
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_amount",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_id",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Accounts",
+    "child_column": "customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Customers_Cards",
+    "child_column": "customer_id",
+    "parent_table": "Customers",
+    "parent_column": "customer_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Financial_Transactions",
+    "child_column": "account_id",
+    "parent_table": "Accounts",
+    "parent_column": "account_id",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Financial_Transactions",
+    "child_column": "card_id",
+    "parent_table": "Customers_Cards",
+    "parent_column": "card_id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customers_Cards",
+    "column": "date_valid_to",
+    "formula": "date_valid_to >= date_valid_from",
+    "evidence": "Customers_Cards rows 1-8"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_amount",
+    "formula": "transaction_amount >= 0",
+    "evidence": "Financial_Transactions rows 1-8"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_type",
+    "formula": "transaction_type IN ('Payment', 'Refund')",
+    "evidence": "Financial_Transactions rows 1-8"
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_type_code",
+    "formula": "card_type_code IN ('Credit', 'Debit')",
+    "evidence": "Customers_Cards rows 1-8"
+   },
+   {
+    "table": "Accounts",
+    "column": "account_id",
+    "formula": "account_id > 0"
+   },
+   {
+    "table": "Customers",
+    "column": "customer_id",
+    "formula": "customer_id > 0"
+   },
+   {
+    "table": "Customers_Cards",
+    "column": "card_id",
+    "formula": "card_id > 0"
+   },
+   {
+    "table": "Financial_Transactions",
+    "column": "transaction_id",
+    "formula": "transaction_id > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 20,
+   "Accounts": 24,
+   "Customers_Cards": 24,
+   "Financial_Transactions": 40
+  },
+  "null_targets": [
+   "Customers.other_customer_details",
+   "Financial_Transactions.transaction_comment",
+   "Financial_Transactions.other_transaction_details",
+   "Financial_Transactions.previous_transaction_id"
+  ],
+  "supporting_evidence": {
+   "date_valid_to >= date_valid_from": [
+    "Customers_Cards rows 1-8"
+   ],
+   "transaction_amount >= 0": [
+    "Financial_Transactions rows 1-8"
+   ],
+   "transaction_type IN ('Payment','Refund')": [
+    "Financial_Transactions rows 1-8"
+   ],
+   "card_type_code IN ('Credit','Debit')": [
+    "Customers_Cards rows 1-8"
+   ],
+   "id > 0 (all four PKs)": [
+    "Accounts rows 1-8",
+    "Customers rows 1-8",
+    "Customers_Cards rows 1-8",
+    "Financial_Transactions rows 1-8"
+   ]
+  },
+  "uncertainty": "previous_transaction_id has no FK declared; treated as nullable free integer. other_customer_details, transaction_comment, other_transaction_details are 100% NULL in sample; generated with compact-share NULLs (fallback 5%) and random text otherwise. LIKE-pattern and substring boundary variants ('%Art%', '%art%', 'cott', 'u', 'U', '%Credit%', 'credit') are query-side variants and are not inserted as data values; only literal boundary values ('Art', 'art', 'Turcotte', 'turcotte', 'Credit', 'Debit') are inserted. table_sizes_per_instance refers to total rows per instance (compact rows plus generated rows); the program computes appended = target - compact_size. Enum columns contain only enum values. group_sizes, aggregate_boundary and unmatched_join_rows are constructed by the FK multiplicity planner (exactly one childless parent per dependency, plus parents with 1, 2 and >=3 children) applied after child PK dedup; aggregate_boundary on COUNT(*)/COUNT(DISTINCT card_id) is realized by the same planner. ties_for_order_limit and rows_with_different_values are constructed jointly: within each tying transaction_type group the target SUM is split into two distinct amounts per group so both the SUM tie and the >=2-distinct-amounts property hold; an assertion reports both per instance. NULL planting for amount/date columns precedes tie/different-values construction; applied NULL shares are recorded in the output. Rules date ordering and duplicate shares (20-50%) rest on only 8 sample rows and are weakly supported."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "cb176a32bef2af2c"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_semantic_rules` enforces `transaction_amount >= 0` via `max(0.0, float(v))` and `date_valid_to >= date_valid_from` by shifting dates, but the NULL rule states 'a planted NULL is never replaced to satisfy a rule' and 'rules ... constrain only non-NULL operands'. More importantly, `_plant_nulls` is applied AFTER `_apply_semantic_rules` for every nullable column, so it can plant NULLs into `transaction_amount` and `date_valid_to`/`date_valid_from` \u2014 which is fine per the NULL rule \u2014 but the execution feedback shows `Financial_Transactions.transaction_amount: NULL 40 / 786` and `Customers_Cards.date_valid_to: NULL 20 / 200`, meaning the semantic rules are only guaranteed on non-NULL rows. That part is consistent. However, the spec's `null_targets` list explicitly enumerates only `Customers.other_customer_details`, `Financial_Transactions.transaction_comment`, `Financial_Transactions.other_transaction_details`, `Financial_Transactions.previous_transaction_id`. The program ignores `null_targets` entirely (spec.py defines `null_targets()` but instance.py never calls it) and instead plants NULLs in EVERY nullable column at 5%. This contradicts the specification's intent that NULLs be concentrated in the listed targets, and it also plants NULLs in columns like `transaction_amount`, `date_valid_from`, `date_valid_to`, `card_number`, `customer_email`, `customer_first_name`, `customer_last_name`, `customer_phone`, `customer_address`, `account_name`, `other_account_details`, `other_card_details` \u2014 none of which are in `null_targets`. The spec's `generic_sampling_rules.null_share` says 'For nullable columns, 5% NULL unless a per_column_exception or null_targets overrides', which is ambiguous, but the explicit `null_targets` list is the override and is not honored.",
+     "requested_revision": "Either (a) honor `null_targets` in instance.py: plant NULLs only in the listed columns (plus any per_column_exception that names a NULL share), or (b) update the specification to state that all nullable columns receive 5% NULLs and remove/repurpose `null_targets`. The current mismatch between spec and program must be resolved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_aggregate_boundary` is a no-op: it computes `targets` and `cnt` but the only branch is `pass  # best-effort`. The spec has explicit `group_sizes` targets ('1, 2 and >= 3') for `Customers.customer_id`, `Accounts.customer_id`, `Customers_Cards.customer_id`, `Financial_Transactions.account_id`, and `aggregate_boundary` targets for `Customers.customer_id` (COUNT(*) values 1,2,3), `Customers_Cards.card_id` (COUNT(DISTINCT card_id) and COUNT(card_id) values 1,2,3), and `Customers_Cards.card_type_code` (COUNT(*) values 3,4,5,6). None of these are enforced. The construction feedback shows only 32/132 pairs separated, and `construction_pairs_by_group` is empty, consistent with these aggregate-boundary patterns not being constructed. The spec's `group_sizes` and `aggregate_boundary` exceptions are therefore not implemented.",
+     "requested_revision": "Implement `_apply_aggregate_boundary` to actually enforce group-size targets (e.g., by controlling FK value multiplicity so that groups of size 1, 2, and >=3 exist for each targeted FK column) and aggregate-boundary targets (e.g., ensuring COUNT(*) values 1,2,3 exist for Customers.customer_id groups, and COUNT(*) values 3,4,5,6 exist for card_type_code groups). Alternatively, remove these exceptions from the specification if they are not intended to be constructed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_ensure_parent_without_children` is a no-op (`return` with a comment). The spec has `unmatched_join_rows` exceptions with `parent_rows_without_children: true` for `Customers.customer_id` (joins with Customers_Cards.customer_id, Accounts.customer_id, Customers_Cards.card_id), `Accounts.customer_id`, `Accounts.account_id`, `Customers_Cards.card_id`, `Customers_Cards.customer_id`, `Financial_Transactions.account_id`, `Financial_Transactions.card_id`. The program relies on random FK draws to leave some parents unreferenced, but with table sizes like Customers=20 and Accounts=24, Customers_Cards=24, Financial_Transactions=40, random draws may or may not leave every parent table with an unreferenced row. This is not guaranteed by construction.",
+     "requested_revision": "Implement `_ensure_parent_without_children` to deterministically reserve at least one parent row per parent table that is not referenced by any child row (e.g., by excluding one parent key from the FK draw pool)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Customers.customer_first_name` targets values `['Art', 'art', '%Art%', '%art%']` and for `Customers.customer_last_name` targets `['Turcotte', 'turcotte', 'cott', 'COTT', 'u', 'U']`. The `StringSampler` in samplers.py includes boundary values with 20% probability (`if bstr and u < 0.2`), but the boundary values are drawn from `_boundary_values` which reads `comparison_boundary` exceptions. However, the `%Art%` and `%art%` values are LIKE patterns, not literal values; inserting them as literal strings into `customer_first_name` would produce rows containing the literal text `%Art%`, which is not what the boundary pattern intends (the pattern is about queries using LIKE). Similarly `cott`, `u`, `U` for last_name are substrings, not full values. The spec's `like_near_variant` example shows `PRED(customers_cards.card_type_code LIKE '%Credit%')` as a variant of `= 'Credit'`, confirming these are query-side variants, not data values. The program inserts them as data values, which is a misinterpretation.",
+     "requested_revision": "Distinguish literal boundary values (e.g., 'Art', 'art', 'Turcotte', 'turcotte', 'Credit', 'credit') from LIKE-pattern variants ('%Art%', '%art%', '%Credit%') and substring variants ('cott', 'u', 'U'). Only insert the literal values as data; the LIKE/substring variants are query-side and should not be inserted as data values. Update the specification to separate these, or update the sampler to filter out pattern-like values."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `transaction_amount >= 0` with evidence 'all shown rows positive', and `date_valid_to >= date_valid_from` with evidence 'all shown rows satisfy'. These are supported by the compact database. However, the spec also lists `transaction_type IN ('Payment', 'Refund')` and `card_type_code IN ('Credit', 'Debit')` as semantic rules, but the atomic operations show `comparison_boundary` targets for `card_type_code` include `'Credit'` and `'credit'` (lowercase), and the `like_near_variant` example shows `LIKE '%Credit%'`. If the enum is strictly `('Credit', 'Debit')`, then `'credit'` (lowercase) would violate the enum. The spec's `per_column_exceptions` for `card_type_code` has both an `enum` pattern with `['Credit', 'Debit']` and a `comparison_boundary` pattern with `['Credit', 'credit', '%Credit%']`. These are inconsistent: the enum says only 'Credit' and 'Debit' are valid, but the comparison boundary wants 'credit' and '%Credit%' as data values. The program's `EnumSampler` includes boundary values with 20% probability, so it will insert 'credit' and '%Credit%' into `card_type_code`, violating the enum rule `card_type_code IN ('Credit', 'Debit')`.",
+     "requested_revision": "Resolve the inconsistency: either the enum should include 'credit' (and the semantic rule should be `card_type_code IN ('Credit', 'Debit', 'credit')`), or the comparison_boundary values should be restricted to the enum values. The LIKE pattern '%Credit%' should not be a data value. Update the specification accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Financial_Transactions.transaction_type` targets `tie_at_rank: [1]`, `direction: 'ASC and DESC'`, `tie_on: ['SUM(transaction_amount)']`. This requires that when grouping by transaction_type and summing transaction_amount, at least two groups tie at rank 1 in both ASC and DESC order. The program does not implement this: `transaction_type` is sampled by `EnumSampler` (uniform from ['Payment', 'Refund']), and `transaction_amount` is sampled independently by `AmountSampler`. There is no mechanism to ensure the SUMs tie. With only two transaction types and random amounts, a tie is unlikely. The construction feedback shows 32/132 pairs separated, and this pattern is not among the separated groups.",
+     "requested_revision": "Implement the `ties_for_order_limit` pattern for transaction_type: after sampling, adjust transaction_amount values so that SUM(transaction_amount) per transaction_type ties at rank 1 (e.g., by setting one group's amounts to sum to the same total as the other). Alternatively, remove this exception from the specification if it is not intended to be constructed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `rows_with_different_values` for `Financial_Transactions.transaction_amount` targets `qualifying_rows: '>= 2 per group with different values'`. The program samples transaction_amount independently per row, so within any group (e.g., by account_id or transaction_type) there will almost certainly be at least two different values. This is likely satisfied by construction, but not explicitly enforced. The construction feedback does not show this pattern among the separated pairs, but that may be because the pattern is about row-level variation, not query separation. This is a minor concern.",
+     "requested_revision": "Optionally add an explicit check/assertion that each group has at least two distinct transaction_amount values, or document that random sampling satisfies this with high probability."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_in_count_column` for `Financial_Transactions.transaction_id` targets `null_share: 'none (NOT NULL column)'`. The schema declares `transaction_id INTEGER NOT NULL`, and the program's `_plant_nulls` only plants NULLs in nullable columns (`if cm.name in cols and not cm.notnull and cm.pk_pos == 0`). So transaction_id never gets NULL. This is correctly implemented. However, the spec's `null_in_count_column` for `Customers.customer_id` (from the atomic operations: `null_in_count_column: 1` with `null_share: 'none (NOT NULL column)'`) is also correctly handled since customer_id is a PK. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Accounts.other_account_details` and `Customers.customer_phone` targets `duplicate_share: '20-50%'`. The `PhoneSampler` implements this (`lo, hi = self.dup if self.dup else (0.2, 0.5)`), but `other_account_details` is a VARCHAR(255) column that falls through to `TextSampler` (since length > 80), which does NOT implement the duplicate share. `TextSampler` samples from base with 40% probability and near-duplicates with 10% of those, but does not enforce a 20-50% duplicate share. The execution feedback shows `Accounts.other_account_details: generated rows: NULL 20 / 206` but does not report duplicate share. This is a gap.",
+     "requested_revision": "Implement duplicate-share enforcement in `TextSampler` (or a dedicated sampler for `other_account_details`) to ensure 20-50% of generated values are duplicates of existing values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Accounts.account_name` targets `['337', '338', '339']` and the atomic operations show `PRED(accounts.account_name = 338)` and `PRED(accounts.account_name = '338')` (both integer and string forms). The program uses `NumericStringSampler` for `account_name` (via `_is_account_name`), which produces zero-padded 3-digit strings '000'-'999' and boundary values \u00b11 as strings. This means it will produce '337', '338', '339' as strings, but NOT as integers (338). The atomic operations show both `PRED(accounts.account_name = 338)` (integer) and `PRED(accounts.account_name = '338')` (string). Since `account_name` is VARCHAR(50), storing '338' as a string is correct, but the query `account_name = 338` would compare a string column to an integer, which SQLite handles by type affinity. This is likely fine, but the spec's `varchar_numeric_string` rule says 'boundary values at listed literals \u00b11 as strings', which the program follows. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Customers_Cards.card_number` targets both string and integer forms: `['4560596484841', '4560596484842', '4560596484843', 4560596484841, 4560596484842, 4560596484843]`. The `CardNumberSampler` converts boundary values to int and back to string (`iv = int(b); out.append(str(iv + r.choice([-1, 0, 1])))`), so it produces string forms only. Since `card_number` is VARCHAR(80), storing as string is correct. The integer forms in the spec are for query-side comparison (`card_number = 4560596484842`), which SQLite handles via type affinity. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `table_sizes_per_instance` specifies exact sizes: Customers=20, Accounts=24, Customers_Cards=24, Financial_Transactions=40. The program's `table_size` function jitters these sizes: `lo = max(0, base - max(2, base // 4)); hi = base + max(2, base // 4); return rng.randint(lo, hi)`. For Customers=20, this gives lo=15, hi=25. The execution feedback shows `rows_added: {Accounts: 206, Customers: 179, Customers_Cards: 201, Financial_Transactions: 786}` over 20 instances, which averages to ~10.3, ~9.0, ~10.1, ~39.3 per instance \u2014 much lower than the specified 20, 24, 24, 40. This is because the program appends generated rows to the compact database, and the compact database already has some rows. The `rows_added` counts only appended rows, not total. The total per instance would be compact_size + appended. The spec's `table_sizes_per_instance` likely refers to total rows per instance, not appended rows. The program's `table_size` returns the number of appended rows, not total. This is a mismatch: the spec says Customers=20 total, but the program generates ~10 appended rows on top of the compact database's existing rows.",
+     "requested_revision": "Clarify whether `table_sizes_per_instance` refers to total rows or appended rows. If total, the program should compute appended = target - compact_size. If appended, the spec should say so. Update either the specification or the program to be consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `dependencies` list includes FK relationships: Accounts.customer_id -> Customers.customer_id, Customers_Cards.customer_id -> Customers.customer_id, Financial_Transactions.account_id -> Accounts.account_id, Financial_Transactions.card_id -> Customers_Cards.card_id. The program's `_fill_fk` draws from parent values (compact + generated), which correctly implements these dependencies. The execution feedback shows `fk_violations: 0`, confirming FK integrity. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_targets` includes `Financial_Transactions.previous_transaction_id`, which has no FK declared. The program treats it as a nullable free integer (via `IntSampler` since it's INTEGER and not in `schema.fks`), and `_plant_nulls` plants NULLs in it. The execution feedback shows `Financial_Transactions.previous_transaction_id: generated rows: NULL 40 / 786`, which is ~5%. This is consistent with the spec's uncertainty note: 'previous_transaction_id has no FK declared; treated as nullable free integer.' No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `account_id > 0`, `customer_id > 0`, `card_id > 0`, `transaction_id > 0`. The program's `_apply_semantic_rules` handles `> 0` rules for `_id` columns via `max(1, int(v))`. However, this is applied to ALL `_id` columns, including FK columns like `customer_id`, `account_id`, `card_id` in child tables. For FK columns, the values are drawn from parent values, which are already > 0 (since parent PKs are sequential from 1). So this is redundant but harmless. For `transaction_id`, which is NOT NULL and not a PK (the schema says `transaction_id INTEGER NOT NULL` but no PRIMARY KEY), the program samples it via `IntSampler` (uniform [1, 10000]) and then `max(1, int(v))` ensures > 0. This is correct. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.integer_pk` says 'Sequential from 1, unique, NOT NULL; never NULL.' The program's `sample_fresh_primary_keys` deduplicates PKs against existing keys, but the PK values themselves are sampled by `IntSampler` (uniform [1, 10000]), not sequentially from 1. This means generated PKs are random integers, not sequential. The spec says 'Sequential from 1', which the program does not follow. However, the execution feedback shows `pk_duplicates: 0`, so uniqueness is maintained. The 'sequential from 1' rule is not implemented.",
+     "requested_revision": "Either implement sequential PK generation (e.g., start from max(existing_pk) + 1 and increment) or update the specification to say PKs are random unique integers in [1, 10000]."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.integer_fk` says 'Uniformly pick an existing parent key; ~5% of rows get NULL only if the column is nullable; ensure at least one parent row without children per parent table.' The program's `_fill_fk` does uniform pick and 5% NULL for nullable FKs, but does NOT ensure at least one parent row without children (as noted in issue 3). Also, the spec says '~5% of rows get NULL only if the column is nullable', but the program's `_plant_nulls` is applied AFTER `_fill_fk` and plants NULLs in ALL nullable columns at 5%, including FK columns. This means FK columns get NULLs from both `_fill_fk` (5%) and `_plant_nulls` (5%), potentially resulting in more than 5% NULLs. The execution feedback shows `Accounts.customer_id` is NOT NULL (schema says `customer_id INTEGER NOT NULL`), so no NULLs there. `Customers_Cards.customer_id` is NOT NULL. `Financial_Transactions.account_id` is NOT NULL. `Financial_Transactions.card_id` is NOT NULL. So no nullable FK columns exist in this schema. The `_fill_fk` NULL logic is never triggered. No issue here for this schema, but the double-NULL-planting could be an issue for other schemas.",
+     "requested_revision": "Ensure `_plant_nulls` does not double-plant NULLs in FK columns that already got NULLs from `_fill_fk`. For this schema, no action needed, but the code should be robust."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_short` says 'Random token of 3-12 alphanumeric chars; 10% near-duplicate variants (case flip, one-char edit) of an existing value.' The `StringSampler` implements this: `_rand_token(r)` produces 3-12 chars, and `_near_dup` is applied with 10% probability when sampling from base. However, the `StringSampler` also includes boundary values with 20% probability, which may override the 10% near-duplicate rule. This is a minor deviation but likely acceptable.",
+     "requested_revision": "None; this is acceptable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_text` says 'Random sentence-like string up to 200 chars; 10% near-duplicate variants.' The `TextSampler` implements this: `_rand_text(r, maxlen=200)` produces 20-120 chars, and `_near_dup` is applied with 10% probability when sampling from base. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_email` says 'first.last@example.com style; unique per row.' The `EmailSampler` implements this with a `seen` set to ensure uniqueness. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_address` says 'Multi-line US-style address with street, city, state, ZIP.' The `AddressSampler` implements this via `_rand_address`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.datetime` says 'Uniform timestamp in [2009-01-01, 2018-12-31]; boundary values at listed literals \u00b11 day.' The `DateTimeSampler` implements this with `LO = dt.datetime(2009, 1, 1)` and `HI = dt.datetime(2018, 12, 31, 23, 59, 59)`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.double_amount` says 'Uniform in [0.01, 5000.00], 2 decimals; boundary values at listed literals \u00b10.01.' The `AmountSampler` implements this with `round(r.uniform(0.01, 5000.00), 2)`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_phone` says 'Formats like ...; 20-50% duplicate share.' The `PhoneSampler` implements this with `lo, hi = self.dup if self.dup else (0.2, 0.5)`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_card_number` says '16-digit numeric string; boundary values at listed literals \u00b11 as strings and as integers.' The `CardNumberSampler` implements this with `_rand_card_number` (16 digits) and boundary values as strings. The integer forms are not stored as integers (since the column is VARCHAR), but the spec says 'as strings and as integers' \u2014 the program only does strings. This is a minor deviation.",
+     "requested_revision": "Optionally store some boundary values as integers (e.g., by inserting the integer directly, which SQLite will convert to string due to column affinity). Or update the spec to say 'as strings' only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_numeric_string` says 'Zero-padded 3-digit string '000'-'999'; boundary values at listed literals \u00b11 as strings.' The `NumericStringSampler` implements this. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.varchar_enum` says 'Uniform pick from the enum list in per_column_exceptions.' The `EnumSampler` implements this, but also includes boundary values with 20% probability, which may violate the enum (as noted in issue 5 for card_type_code). This is a deviation.",
+     "requested_revision": "Ensure enum columns only contain enum values (plus any explicitly allowed boundary variants that are also in the enum). Update the spec or the sampler to be consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `generic_sampling_rules.integer_numeric` says 'Uniform integer in [1, 10000]; boundary values at listed literals \u00b11 when a per_column_exception names the column.' The `IntSampler` implements this. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_share` rule says 'For nullable columns, 5% NULL unless a per_column_exception or null_targets overrides; at least one NULL row per nullable column per instance.' The program's `_plant_nulls` implements 5% NULL and at least one NULL per nullable column. However, it does not honor `null_targets` (as noted in issue 1). This is a deviation.",
+     "requested_revision": "Honor `null_targets` as described in issue 1."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `uncertainty` note says 'other_customer_details, transaction_comment, other_transaction_details are 100% NULL in sample; generated with 5% NULL share and random text otherwise.' The program's `TextSampler` generates random text for these columns, and `_plant_nulls` plants 5% NULLs. This is consistent with the spec's uncertainty note. No issue here.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `supporting_evidence` lists `date_valid_to >= date_valid_from` for Customers_Cards rows 1-8, `transaction_amount >= 0` for Financial_Transactions rows 1-8, `transaction_type IN ('Payment','Refund')` for Financial_Transactions rows 1-8, `card_type_code IN ('Credit','Debit')` for Customers_Cards rows 1-8. These are supported by the compact database. The program enforces these rules (except for the enum boundary issue noted in issue 5). This is mostly correctly implemented.",
+     "requested_revision": "Fix the enum boundary issue (issue 5)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `validity: {valid: 20, invalid: 0, reasons: {}}`, `integrity: {fk_violations: 0, not_null_violations: 0, pk_duplicates: 0, not_ok: 0}`, and `reproducible: true`. This confirms that the program ran successfully, produced valid instances, and is reproducible. The integrity constraints are satisfied. This is a positive result.",
+     "requested_revision": "None; this is a positive result."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs: {eligible: 132, separated: 32, unknown_executions: 0}`. This means 32 out of 132 eligible query pairs were separated by the generated instances. The spec's atomic operations list 132 pairs, and the program separated 32. This is a moderate separation rate. The `construction_pairs_by_group` is empty, which may indicate that the separation is not grouped by pattern. This is not necessarily an error, but it suggests that some patterns (like aggregate_boundary, group_sizes, ties_for_order_limit) are not being constructed (as noted in issues 2, 3, 6).",
+     "requested_revision": "Implement the missing patterns (issues 2, 3, 6) to improve separation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `table_sizes_per_instance` specifies Customers=20, Accounts=24, Customers_Cards=24, Financial_Transactions=40. The program's `table_size` jitters these sizes, and the execution feedback shows `rows_added` averages of ~10.3, ~9.0, ~10.1, ~39.3 per instance. This is inconsistent with the spec (as noted in issue 12).",
+     "requested_revision": "Clarify and fix the table size semantics (issue 12)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `dependencies` list is correctly implemented via `_fill_fk`. The execution feedback shows `fk_violations: 0`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `transaction_type IN ('Payment', 'Refund')` and `card_type_code IN ('Credit', 'Debit')`. The program's `_apply_semantic_rules` enforces these via regex matching `IN (...)` and replacing invalid values with a random allowed value. However, this is applied AFTER sampling, and the `EnumSampler` may have already inserted boundary values like 'credit' or '%Credit%' (as noted in issue 5). The `_apply_semantic_rules` would then replace these with 'Credit' or 'Debit', but this happens before `_plant_nulls`, so the final data may still have 'credit' if `_plant_nulls` doesn't touch it. Actually, `_apply_semantic_rules` is called before `_plant_nulls`, so it would fix the enum values. But the `EnumSampler`'s boundary values are inserted during sampling, and `_apply_semantic_rules` would replace them. So the final data should be enum-compliant. However, the `EnumSampler`'s boundary values are still a deviation from the spec's enum rule. This is a minor issue.",
+     "requested_revision": "Ensure `EnumSampler` does not insert non-enum boundary values, or rely on `_apply_semantic_rules` to fix them (which it does). Update the spec to clarify."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Customers.customer_first_name` and `Customers.customer_last_name` includes LIKE patterns and substrings (as noted in issue 4). The program inserts these as data values, which is a misinterpretation.",
+     "requested_revision": "Fix issue 4."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `aggregate_boundary` for `Customers.customer_id` targets `COUNT(*)` values [1, 2, 3]. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `aggregate_boundary` for `Customers_Cards.card_id` targets `COUNT(DISTINCT card_id)` and `COUNT(card_id)` values [1, 2, 3]. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `aggregate_boundary` for `Customers_Cards.card_type_code` targets `COUNT(*)` values [3, 4, 5, 6]. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` for `Customers.customer_id`, `Accounts.customer_id`, `Customers_Cards.customer_id`, `Financial_Transactions.account_id` targets '1, 2 and >= 3'. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for various columns targets `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Financial_Transactions.transaction_type` targets `tie_at_rank: [1]`, `direction: 'ASC and DESC'`, `tie_on: ['SUM(transaction_amount)']`. The program does not implement this (as noted in issue 6).",
+     "requested_revision": "Fix issue 6."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `rows_with_different_values` for `Financial_Transactions.transaction_amount` targets `qualifying_rows: '>= 2 per group with different values'`. The program likely satisfies this by random sampling, but does not explicitly enforce it (as noted in issue 7).",
+     "requested_revision": "Optionally add explicit enforcement (issue 7)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Accounts.other_account_details` targets `duplicate_share: '20-50%'`. The program does not implement this for `other_account_details` (as noted in issue 9).",
+     "requested_revision": "Fix issue 9."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers.customer_phone` targets `duplicate_share: '20-50%'`. The program implements this via `PhoneSampler`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Accounts.account_name` targets `['337', '338', '339']`. The program implements this via `NumericStringSampler`. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Customers_Cards.card_number` targets both string and integer forms. The program implements string forms only (as noted in issue 11).",
+     "requested_revision": "Optionally fix issue 11."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_in_count_column` for `Financial_Transactions.transaction_id` targets `null_share: 'none (NOT NULL column)'`. The program correctly never plants NULLs in NOT NULL columns. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_in_count_column` for `Customers.customer_id` targets `null_share: 'none (NOT NULL column)'`. The program correctly never plants NULLs in PK columns. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers.customer_id` targets `duplicates_for_distinct: 4` (from atomic operations). The program's `sample_fresh_primary_keys` deduplicates PKs, so no duplicates. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers_Cards.card_id` targets `duplicates_for_distinct: 3`. The program's `sample_fresh_primary_keys` deduplicates PKs, so no duplicates. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers_Cards.card_type_code` targets `duplicates_for_distinct: 1`. The program's `EnumSampler` samples from ['Credit', 'Debit'], so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers_Cards.customer_id` targets `duplicates_for_distinct: 1`. The program's `_fill_fk` draws from parent values, so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Accounts.customer_id` targets `duplicates_for_distinct: 1`. The program's `_fill_fk` draws from parent values, so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers.customer_first_name` targets `duplicates_for_distinct: 2`. The program's `StringSampler` samples from base with 45% probability, so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Customers.customer_last_name` targets `duplicates_for_distinct: 2`. The program's `StringSampler` samples from base with 45% probability, so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Financial_Transactions.transaction_type` targets `duplicates_for_distinct: 2`. The program's `EnumSampler` samples from ['Payment', 'Refund'], so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` for `Financial_Transactions.account_id` targets `duplicates_for_distinct: 1`. The program's `_fill_fk` draws from parent values, so duplicates are likely. This is correctly implemented.",
+     "requested_revision": "None; this is correctly implemented."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Customers.customer_id` targets `ties_for_order_limit: 3`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Customers.customer_id, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Accounts.customer_id` targets `ties_for_order_limit: 3`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Accounts.customer_id, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Customers.customer_first_name` targets `ties_for_order_limit: 2`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Customers.customer_first_name, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Customers.customer_last_name` targets `ties_for_order_limit: 2`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Customers.customer_last_name, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Customers_Cards.card_type_code` targets `ties_for_order_limit: 2`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Customers_Cards.card_type_code, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `ties_for_order_limit` for `Financial_Transactions.transaction_amount` targets `ties_for_order_limit: 1`. The program does not implement this. This is a gap.",
+     "requested_revision": "Implement ties_for_order_limit for Financial_Transactions.transaction_amount, or remove from spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` for `Customers.customer_id` targets `group_sizes: '1, 2 and >= 3'`. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` for `Customers_Cards.customer_id` targets `group_sizes: '1, 2 and >= 3'`. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` for `Accounts.customer_id` targets `group_sizes: '1, 2 and >= 3'`. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `group_sizes` for `Financial_Transactions.account_id` targets `group_sizes: '1, 2 and >= 3'`. The program does not implement this (as noted in issue 2).",
+     "requested_revision": "Fix issue 2."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Customers.customer_id` targets `joins_with: ['Customers_Cards.customer_id', 'Accounts.customer_id', 'Customers_Cards.card_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Customers_Cards.card_id` targets `joins_with: ['Customers.customer_id', 'Financial_Transactions.card_id', 'Accounts.account_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Customers_Cards.customer_id` targets `joins_with: ['Customers.customer_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Accounts.customer_id` targets `joins_with: ['Customers.customer_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Accounts.account_id` targets `joins_with: ['Financial_Transactions.account_id', 'Customers_Cards.card_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Financial_Transactions.account_id` targets `joins_with: ['Accounts.account_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Financial_Transactions.card_id` targets `joins_with: ['Customers_Cards.card_id']`, `parent_rows_without_children: true`. The program does not guarantee this (as noted in issue 3).",
+     "requested_revision": "Fix issue 3."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether `table_sizes_per_instance` refers to total rows or appended rows (issue 12).",
+    "Whether `null_targets` is intended to restrict NULL planting to the listed columns or is merely a hint (issue 1).",
+    "Whether LIKE-pattern and substring boundary values (e.g., '%Art%', 'cott', 'u') are intended as data values or query-side variants (issue 4).",
+    "Whether the enum for card_type_code should include 'credit' (lowercase) or not (issue 5).",
+    "Whether ties_for_order_limit and aggregate_boundary patterns are intended to be constructed or are merely descriptive (issues 2, 6)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fill_fk` draws FK values uniformly from ALL parent keys minus a single reserved key, and `_plan_group_sizes`/`_apply_group_sizes` reassigns values only within the child's own already-drawn list before PK dedup. There is no construction that guarantees a parent key has children reaching target sizes 1, 2 and >=3, nor that exactly one parent is childless for each dependency. Execution feedback shows `construction_pairs: eligible 132, separated 22` with empty `construction_pairs_by_group`, i.e. the intended group_sizes / aggregate_boundary / unmatched_join separations are essentially not realized (only ~17% separated). The spec (per_column_exceptions group_sizes/aggregate_boundary/unmatched_join_rows and uncertainty 'intended to be constructed by controlling FK multiplicity') requires these to be constructed.",
+     "requested_revision": "Implement construction in `_fill_fk`: after building each parent table, plan child multiplicity per parent so that for every targeted FK column there exist parent keys with 1, 2 and >=3 children (and reserve exactly one childless parent per dependency, not 'last key minus one' which is only a draw-pool exclusion). Ensure the plan survives PK/UNIQUE dedup (apply plans after dedup, or size the appended rows to leave room). Also implement aggregate_boundary on the actual grouping column used by the boundary aggregate (COUNT(*)/COUNT(DISTINCT card_id)) so boundary values 1,2,3 and 3,4,5,6 are achieved, not merely random reassignment."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "intsampling: `IntSampler` and all non-FK integer samplers ignore declared type width and use uniform [1,10000] with no per-column exception for `Customers_Cards.customer_id` vs `Accounts.account_id` etc. More importantly, `_apply_rows_with_different_values` only perturbs one row per group by +0.01 but the tie construction `_apply_ties_for_order_limit` then rewrites whole groups to a constant `per` value, which can destroy the '>=2 different values per group' property. Order of application: `_apply_ties_for_order_limit` then `_apply_rows_with_different_values`, so different-values is applied last\u2014but it only bumps `idxs[0]` by 0.01 when all equal, which then breaks the SUM tie it just constructed; the two constructions are mutually inconsistent and no evidence shows both hold.",
+     "requested_revision": "Reconcile the two patterns: when both `ties_for_order_limit` (SUM tie) and `rows_with_different_values` (>=2 distinct amounts per group) apply, vary amounts within each tying group while keeping the group sums equal (e.g. split the target sum into two distinct amounts per group summing to the same total). Add an assertion/check that reports both properties hold per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule interface says the NULL share should follow the compact database's share for that column. `build_random_instance` plants 5% for null_targets and `_compact_null_share` otherwise\u2014but evidence shows e.g. `Customers.other_customer_details: NULL 10/53` (19%) and `Financial_Transactions.transaction_comment: NULL 29/606` (~4.8%). `Accounts.account_name: NULL 20/113` (18%) though it is not a null_target and the compact share is unknown from the fast-mode stats. This is inconsistent: null_targets get 5% while non-targets get compact share, which may exceed targets. More seriously, `_plant_nulls` is applied AFTER `_apply_semantic_rules` but `date_valid_to >= date_valid_from` and `transaction_amount >= 0` operate on possibly-NULL operands\u2014the rule states planted NULLs are never replaced to satisfy a rule, which holds, but the program computes rules on lists that may then be nulled, and for `Financial_Transactions.transaction_amount` (nullable, not in null_targets) it gets 5% NULLs from `_plant_nulls`, so `transaction_amount >= 0` is fine under 3VL, but `_apply_rows_with_different_values` and `_apply_ties_for_order_limit` run BEFORE NULL planting and thus their 'different values' / 'tie' guarantees can be broken by subsequent NULLing of the amount column.",
+     "requested_revision": "Apply NULL planting for amount/date columns BEFORE constructing ties and different-values (or recompute after planting), so non-NULL operands still satisfy the constructed patterns. Align NULL share for null_targets with the interface (compact share), and document the applied share explicitly in the output so it can be audited."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `semantic_rules_and_formulas` list `transaction_type IN ('Payment','Refund')` and `card_type_code IN ('Credit','Debit')` with evidence 'rows 1-8'; the `enum` per_column_exceptions give the same values. These are supported. But `previous_transaction_id` is listed only as a NULL target with no rule and no FK, and the spec's `uncertainty` acknowledges it is a free integer. The spec also lists `date_valid_to >= date_valid_from` supported only by 8 rows; the extraction shows `other_account_details`/`customer_phone` duplicates_for_distinct at '20-50%' with only `pairs:1`. These weaker patterns (small sample evidence) are correctly marked uncertain \u2014 fine. No blocking issue here; noted as supported vs uncertain: supported = id>0, amount>=0, enum membership, date ordering; uncertain = duplicate shares 20-50% and previous_transaction_id semantics.",
+     "requested_revision": "No change required; keep the uncertainty note. Optionally record the evidence row-count for each rule so small-sample rules (date ordering, duplicates share) are clearly flagged as weakly supported."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction separation is only 22/132; without query execution the degree to which group_sizes/aggregate_boundary/unmatched_join patterns are realizable against generated FK multiplicity cannot be confirmed from statistics alone.",
+    "NULL share for null_targets vs compact share cannot be fully verified because compact per-column NULL counts are not provided in fast-mode stats; only generated counts are shown.",
+    "Preservation of compact rows and reproducibility: returncode 0, reproducible=true, integrity all zero, preserved copy semantics \u2014 consistent with program; no defect found.",
+    "FMK (FK) generation targets compact parents, and self-referential prev_transaction_id is not an FK \u2014 matches spec."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_ties_and_different_values` only splits the SUM across the first two transaction_type groups (`keys[0]`, `keys[1]`). The spec's ties_for_order_limit target is `tie_at_rank: [1]` with `direction: 'ASC and DESC'` on `SUM(transaction_amount)`. With only two groups tied at rank 1, the DESC ordering also has a tie at rank 1, but the spec's `tie_at_rank: [1]` combined with `direction: 'ASC and DESC'` is satisfied only if the tie is at rank 1 in both directions \u2014 which requires the tied groups to be the top two by SUM (for DESC) and the bottom two (for ASC). The code picks `keys[0]`/`keys[1]` by sorted transaction_type name, not by SUM rank, so the tie may not land at rank 1 in either direction. Additionally, `_split_sum` for k>2 assigns `a` to the first k-1 rows and the remainder to the last, which can produce a third distinct value (the remainder) that breaks the intended two-value split and may not sum to `target` when rounding drifts.",
+     "requested_revision": "Select the two tying groups by SUM rank (lowest two for ASC rank-1 tie, highest two for DESC rank-1 tie, or construct a single pair that is simultaneously min and max only if there are exactly two groups). Ensure `_split_sum` produces exactly two distinct amounts per group that sum to `target` (e.g. a, b with counts n_a, n_b such that n_a*a + n_b*b == target), and assert the tie at rank 1 in both directions per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_aggregate_boundary` handles non-FK group columns (e.g. `Customers_Cards.card_type_code` with targets 3,4,5,6) by building a plan of length n and then `rng.shuffle(plan)`. The plan is built as `plan.extend([distinct[len(plan) % len(distinct)]] * k)` for each target k, but `len(plan)` is evaluated before the extend, so the distinct value chosen for each block is `distinct[0]` for the first block, `distinct[0]` again for the second (since len(plan) is still 0 at the start of the second iteration only if the first block was empty \u2014 actually len(plan) grows, so the index advances). More importantly, the plan is truncated to n and shuffled, so the block sizes 3,4,5,6 are not preserved as group sizes after shuffling \u2014 the shuffle interleaves values and the resulting group sizes are random, not the targeted boundaries. The spec requires `aggregate_boundary` on `COUNT(*)` with values [3,4,5,6] to be realized.",
+     "requested_revision": "Construct the plan so that after assignment the group sizes for the targeted column are exactly the boundary values (e.g. assign contiguous blocks of size 3,4,5,6 to distinct values, then fill the remainder), and do not shuffle in a way that destroys the block structure. Add a per-instance assertion that the realized group sizes include the boundary values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plan_multiplicity` requires `len(pool) >= 3 and n_children >= 6` to realize sizes 1, 2, >=3. For `Financial_Transactions.card_id` the spec targets `unmatched_join_rows` (parent_rows_without_children) but not `group_sizes`; the planner is still invoked because `unmatched_join_rows` sets `targeted = True`, and it will attempt to realize 1/2/>=3 group sizes on card_id even though the spec only requires a childless parent. This over-constrains card_id and may conflict with the account_id plan (both FKs on the same child table are planned independently, so a single child row's (account_id, card_id) pair is not jointly planned \u2014 the two plans are applied sequentially and the second overwrites the first's assignment for its column, which is fine, but the joint distribution of (account_id, card_id) is not controlled). More critically, `_apply_fk_multiplicity` iterates `schema.tables[table].columns` and applies a plan per FK column, but the reserved childless parent is chosen per (parent_table, parent_column) and the same reserved key is excluded from every child's plan \u2014 so if two child tables reference the same parent, both will leave the same parent childless, which is consistent, but the spec's `unmatched_join_rows` for `Customers.customer_id` lists joins_with `['Customers_Cards.customer_id', 'Accounts.customer_id', 'Customers_Cards.card_id']` \u2014 the `Customers_Cards.card_id` entry is a spurious join (card_id is not a FK to Customers.customer_id) and the planner will not handle it.",
+     "requested_revision": "Restrict the multiplicity planner to FK columns that are actually targeted by `group_sizes` or `unmatched_join_rows` with a real FK dependency; do not apply group-size 1/2/>=3 planning to columns only targeted by `unmatched_join_rows`. Clarify in the spec that `Customers_Cards.card_id` in the `Customers.customer_id` unmatched_join_rows joins_with list is not a real FK and should be removed or handled explicitly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` lists `Customers.other_customer_details`, `Financial_Transactions.transaction_comment`, `Financial_Transactions.other_transaction_details`, `Financial_Transactions.previous_transaction_id`. Execution feedback shows `Customers.other_customer_details: NULL 53/53`, `Financial_Transactions.other_transaction_details: NULL 606/606`, `Financial_Transactions.transaction_comment: NULL 606/606` \u2014 i.e. 100% NULL, not the compact share (fallback 5%). The spec's uncertainty note says these are '100% NULL in sample; generated with compact-share NULLs (fallback 5%) and random text otherwise', but the program's `_compact_null_share` returns 1.0 for these columns (since the compact sample is 100% NULL), so `_plant_nulls` plants 100% NULL. This contradicts the spec's stated intent of 'fallback 5%' and 'random text otherwise'.",
+     "requested_revision": "Either (a) change the spec to state that these columns are 100% NULL and accept 100% NULL generation, or (b) change the program's `_compact_null_share` to cap the share (e.g. at 0.95) or to use the fallback 5% when the compact share is 1.0, so that some non-NULL text is generated. The current spec text and program behavior are inconsistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_semantic_rules` for `date_valid_to >= date_valid_from` parses `str(v)[:19]` with `'%Y-%m-%d %H:%M:%S'`. The DateTimeSampler produces `'%Y-%m-%d %H:%M:%S'` strings, so this works for generated rows. However, the compact rows are copied verbatim and are not re-checked; if the compact DB has any row violating the rule, the instance will too. The spec's evidence is 'Customers_Cards rows 1-8', which is weak (8 rows). More importantly, `_apply_semantic_rules` is called before `_plant_nulls`, so if `date_valid_from` is NULL-planted after the rule is applied, the rule is not re-evaluated \u2014 but the rule only constrains non-NULL operands, so a NULL `date_valid_from` with non-NULL `date_valid_to` is fine under SQL three-valued logic. The real issue is that `_apply_semantic_rules` runs before `_apply_aggregate_boundary` and `_apply_ties_and_different_values`, and `_apply_ties_and_different_values` can modify `transaction_amount` after the `>= 0` rule was applied \u2014 but `_split_sum` and the `+0.01` adjustment keep amounts non-negative, so this is likely fine. The `transaction_amount >= 0` rule is applied via `max(0.0, float(v))`, which is correct.",
+     "requested_revision": "Add a per-instance assertion that the compact rows also satisfy the semantic rules (or document that compact rows are trusted). Re-run `_apply_semantic_rules` after `_apply_ties_and_different_values` for `transaction_amount` to be safe, or assert non-negativity after the tie construction."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `comparison_boundary` for `Customers.customer_first_name` targets `['Art', 'art']` and for `Customers.customer_last_name` targets `['Turcotte', 'turcotte']`. The StringSampler's `_boundary_values` filters out LIKE patterns but keeps 'Art', 'art', 'Turcotte', 'turcotte'. However, `_near_dup` can produce case-flipped variants of these, and the sampler's `base` pool includes observed values, so the boundary values are inserted with probability ~0.2 each. The spec's uncertainty note says only literal boundary values are inserted, which is consistent. But the spec's `comparison_boundary` for `Customers.customer_first_name` also lists `'%Art%'`, `'%art%'` as targets \u2014 these are correctly filtered by `_is_like_pattern`. No issue here, but the spec's `comparison_boundary` for `Customers.customer_last_name` lists `'cott'`, `'COTT'`, `'u'`, `'U'` as targets \u2014 these are substring variants, not LIKE patterns, so `_is_like_pattern` does not filter them, and they will be inserted as data values. The spec's uncertainty note says 'substring boundary variants (cott, u, U) are query-side variants and are not inserted as data values', but the program does insert them because they don't contain `%` or `_`.",
+     "requested_revision": "Either (a) update `_is_like_pattern` (or add a separate filter) to also exclude the substring variants 'cott', 'COTT', 'u', 'U' for customer_last_name, or (b) update the spec to state that these substring variants are inserted as data values. The current spec text and program behavior are inconsistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `table_sizes_per_instance` gives exact sizes (Customers 20, Accounts 24, Customers_Cards 24, Financial_Transactions 40), but `spec.py` `table_size` jitters the size by \u00b125% (`lo = max(0, base - max(2, base // 4))`, `hi = base + max(2, base // 4)`). Execution feedback shows `rows_added` of 53, 113, 67, 606 across 20 instances, i.e. ~2.65, 5.65, 3.35, 30.3 appended rows per instance on average \u2014 far more than the spec's total sizes minus compact sizes (which would be 20-8=12, 24-8=16, 24-8=16, 40-8=32 if compact sizes are 8). The jitter and the `max(0, total - compact)` logic mean the actual appended counts vary widely and the total sizes are not the spec's exact values.",
+     "requested_revision": "Either (a) remove the jitter in `table_size` so the total sizes match the spec exactly, or (b) update the spec to state that sizes are jittered by \u00b125%. The spec's `table_sizes_per_instance` is presented as exact ('total rows per instance'), which conflicts with the program's jitter."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` for `Customers.customer_id` targets `joins_with: ['Customers_Cards.customer_id', 'Accounts.customer_id', 'Customers_Cards.card_id']`. The `Customers_Cards.card_id` entry is not a FK to `Customers.customer_id` (card_id is a PK of Customers_Cards, and Customers_Cards.customer_id is the FK to Customers). The program's `_reserved_parent_keys` iterates `schema.fks.items()` and reserves one parent key per (parent_table, parent_column), so it will reserve a childless Customers.customer_id for both Customers_Cards.customer_id and Accounts.customer_id \u2014 but the same reserved key is used for both, so both child tables leave the same Customers row childless. This is consistent with 'exactly one childless parent per dependency' only if the spec intends one childless parent total, not one per child table. The spec says 'exactly one parent key (chosen deterministically, not the last key) has 0 children' per FK column, which the program implements per (parent_table, parent_column) \u2014 but since both child tables share the same parent column, the same key is reserved, so there is one childless parent total, not one per child table. This may be acceptable but should be clarified.",
+     "requested_revision": "Clarify in the spec whether 'exactly one childless parent' is per FK column or per parent table. If per FK column, the program should reserve a different key for each child table's FK to the same parent. If per parent table, the spec should say so."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 22/132 separated, 0 unknown executions. The 110 unseparated pairs may be due to the tie/aggregate-boundary issues above, but without held-out query pairs I cannot confirm whether the unseparated pairs are query-equivalent or generation failures.",
+    "The compact database's actual row counts are not given in the input; the `rows_added` numbers suggest compact sizes of ~8 per table, but this is inferred.",
+    "The `Financial_Transactions.transaction_id` is declared `INTEGER NOT NULL` but not `PRIMARY KEY` in the schema; the spec's `null_in_count_column` target says 'none (NOT NULL column)', which the program respects (no NULL planting on NOT NULL columns). No issue, but the PK-like uniqueness of transaction_id is not enforced by the schema and the program does not dedup it \u2014 this is consistent with the schema."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances failed with AssertionError('card_type_code group size 3/4/5 missing'); n_ok=0, n_fail=20. The assertion in _assert_constructed (instance.py) requires every boundary value 3,4,5,6 to appear as a realized group size for Customers_Cards.card_type_code. _apply_aggregate_boundary builds contiguous blocks of sizes 3,4,5,6 only when len(distinct) >= 2 and enough rows exist; with only 2 enum values ('Credit','Debit') and 24 total rows (compact + appended), the block plan assigns distinct[0] to size 3 and distinct[1] to size 4, then fills the remainder with rng.choice(distinct), which merges into existing groups and destroys the 5/6 block sizes. The assertion therefore fires on nearly every instance.",
+     "requested_revision": "Reconcile the aggregate_boundary target for Customers_Cards.card_type_code with the enum domain and table size. Either (a) relax the assertion to require only the boundary values that are realizable given the number of distinct enum values and row count (e.g. require the largest realizable subset, or require at least the minimum boundary value), or (b) change the block construction so that the remainder fill does not merge into the boundary blocks (e.g. assign remainder to a dedicated filler value or extend blocks deterministically), and document in the spec which boundary values are guaranteed. The spec currently lists values [3,4,5,6] for a 2-value enum over 24 rows, which cannot all be realized as distinct group sizes without additional distinct values; the spec and program must agree on a realizable target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions lists Customers_Cards.card_type_code aggregate_boundary targets values [3,4,5,6], but the enum domain is only ['Credit','Debit'] (2 distinct values) and table_sizes_per_instance gives Customers_Cards 24 total rows. With 2 groups, at most 2 distinct group sizes can exist; realizing 3,4,5,6 simultaneously is impossible. The spec's uncertainty note claims 'contiguous blocks of sizes 3,4,5,6 are assigned to distinct values' but there are only 2 distinct values.",
+     "requested_revision": "Either expand the enum domain (add more card_type_code values) so 4 distinct group sizes are possible, or reduce the aggregate_boundary target to a realizable set (e.g. [3,4] or a single boundary value) and update the uncertainty note accordingly. The spec must state a target consistent with the enum cardinality and row count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_aggregate_boundary: after building the block plan it does `while len(plan) < n: plan.append(rng.choice(distinct))`, which appends values that merge into the already-assigned blocks, changing their sizes. Even when 4 distinct values existed, the remainder fill would corrupt block sizes. Also the block plan uses `distinct[di % len(distinct)]` so with 2 values the 5 and 6 blocks reuse the same values as the 3 and 4 blocks, merging them.",
+     "requested_revision": "Make the remainder fill use a value not already used for a boundary block (or a dedicated filler), and ensure each boundary block uses a distinct value. Add a construction-time check that the realized group sizes match the target before asserting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_fk_multiplicity: for FK columns targeted by group_sizes, _plan_multiplicity is called with the full parent key list `pv` (not excluding the reserved key) and `reserved=rv`; _plan_multiplicity excludes the reserved key from the pool but the plan length is n_children. However _fill_fk already drew initial FK values excluding the reserved key, and _apply_fk_multiplicity reassigns only non-NULL entries using `plan[pi]`, where plan was built over `pv` (including reserved) \u2014 the reserved key may still be assigned because _plan_multiplicity's `pool` excludes it but the fallback `rng.choice(pool)` uses pool; this is consistent. The bigger issue: _plan_multiplicity's branch `if len(pool) >= 3 and n_children >= 6` builds `[a] + [b,b] + [c]*max(3, n_children-3)` then truncates to n_children; when n_children is exactly 6 this yields [a,b,b,c,c,c] \u2014 sizes 1,2,3 \u2014 OK. But when n_children < 6 it falls to uniform distribution, so group sizes 1,2,>=3 are not guaranteed. With Financial_Transactions 40 rows and Accounts 24 parents this is fine, but the spec's group_sizes target for Accounts.customer_id (24 rows, 20 parents) and Customers_Cards.customer_id (24 rows, 20 parents) may not always realize all three sizes; the assertion does not check group_sizes, so failures are silent.",
+     "requested_revision": "Add per-instance assertions for group_sizes targets (1, 2, >=3) on FK columns, and make _plan_multiplicity guarantee the three sizes whenever n_children >= 6 and len(pool) >= 3; otherwise document graceful degradation in the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_ties_and_different_values: when len(groups) > 2, low_pair and high_pair differ; the code sets `tie_groups = set(low_pair) | set(high_pair)` and assigns the same `target` to all of them, so all four groups tie \u2014 this satisfies rank-1 tie in both directions but the spec says 'the two tying transaction_type groups are selected by SUM rank (lowest two for ASC rank-1 tie, highest two for DESC rank-1 tie)'. With only two enum values ('Payment','Refund') this is moot, but the code's behavior for >2 groups is not what the spec describes. Also _split_sum_two_values fallback may produce a third distinct value or negative amounts; the fallback sets `amounts[idxs[-1]] = round(target - a*(k-1), 2)` which can be negative if a is large, violating transaction_amount >= 0 (though the re-apply clamps to 0, breaking the exact-sum tie).",
+     "requested_revision": "Fix the fallback in _split_sum_two_values to guarantee non-negative amounts and exactly two distinct values summing to target; or raise instead of falling back. Align the >2-group tie selection with the spec text."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls: the NULL rule says 'at least one NULL row per nullable column per instance' and 'NULL share follows the compact database's share'. _plant_nulls is called for every nullable non-PK column with share = compact share capped at 0.95 (or 0.05 if zero). But _apply_fk_multiplicity preserves NULLs in FK columns via `if v is None: out.append(None)`, so FK NULLs survive. However _fill_fk already plants ~5% NULLs for nullable FKs before _plant_nulls runs; _plant_nulls then overwrites with the compact share. For NOT NULL FK columns (e.g. Financial_Transactions.account_id, card_id are NOT NULL), _fill_fk is called with nullable=False so no NULLs \u2014 correct. But _plant_nulls is only called for `not cm.notnull and cm.pk_pos == 0`; nullable FK columns like Financial_Transactions.previous_transaction_id (nullable, not an FK) get NULLs \u2014 OK. The issue: _plant_nulls is called AFTER _apply_semantic_rules and _apply_aggregate_boundary but the spec's construction_order says NULL planting for amount/date columns runs BEFORE tie construction \u2014 which is satisfied. However _plant_nulls may plant NULLs in transaction_amount, and _apply_ties_and_different_values skips NULL amounts in groups, so a group could end up with <2 non-NULL amounts and the >=2-distinct assertion is not checked (only tie is).",
+     "requested_revision": "Add an assertion for rows_with_different_values (>=2 distinct non-NULL amounts per qualifying group) and ensure _apply_ties_and_different_values operates on enough non-NULL rows after NULL planting; if a group has <2 non-NULL amounts, either reduce NULL planting for that column or document the exception."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec uncertainty note says 'LIKE-pattern and substring boundary variants ... are query-side variants and are not inserted as data values; only literal boundary values ... are inserted.' The program's _is_like_pattern filters '%' and '_' and the set {'cott','u'}, but the spec's comparison_boundary targets for customer_last_name include 'cott','COTT','u','U' and for customer_first_name include '%Art%','%art%'. The program filters these, consistent with the note. However the spec's per_column_exceptions for customer_last_name lists targets values ['Turcotte','turcotte'] only (not 'cott' etc.), while the atomic operations list 'cott','COTT','u','U' as targets \u2014 the spec and atomic operations disagree on which values are boundary targets. The program follows the spec's per_column_exceptions (Turcotte/turcotte), which is consistent with the spec but not with the atomic operations.",
+     "requested_revision": "Reconcile the spec's per_column_exceptions comparison_boundary targets with the atomic operations' targets for customer_last_name and customer_first_name; state explicitly which values are inserted as data vs query-side variants."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py write_instance_sqlite: when orig exists, it copies the compact DB and opens it; it sets `pragma foreign_keys = OFF` and inserts rows. The compact DB already contains rows; appended rows are inserted with explicit PK values starting at max(existing)+1 (per spec integer_pk rule). But _existing_keys reads compact PKs and sample_fresh_primary_keys drops collisions \u2014 however the PK sampler (IntSampler) draws uniform [1,10000], not sequential from max+1. The spec's integer_pk rule says 'Sequential from 1, unique, NOT NULL; generated PKs start at max(existing_pk)+1 and increment'. The program's IntSampler does NOT implement sequential PK generation; it draws uniform integers and relies on dedup to avoid collisions. This violates the spec's integer_pk rule.",
+     "requested_revision": "Implement sequential PK generation for integer primary keys: start at max(existing_pk)+1 and increment, per the spec's integer_pk rule. The current uniform draw plus dedup is not the specified behavior and may produce PKs far from max+1 or exhaust the [1,10000] range."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "samplers.py IntSampler.sample: for integer columns it draws uniform [1,10000] with boundary +-1 and observed/pool reuse. The spec's integer_numeric rule says 'Uniform integer in [1, 10000]; boundary values at listed literals +/-1 when a per_column_exception names the column.' The program applies boundary +-1 for ALL integer columns with boundary values (from _boundary_values), not only when a per_column_exception names the column \u2014 but _boundary_values only returns values from comparison_boundary exceptions, so it is effectively per-column. However the spec's integer_pk rule is separate and not implemented (see above). Also the spec's varchar_numeric_string rule says zero-padded 3-digit '000'-'999'; NumericStringSampler implements this for account_name, but account_name is VARCHAR(50) and the spec's comparison_boundary targets are ['337','338','339'] \u2014 the program's NumericStringSampler uses '%03d' formatting which would produce '337' etc. \u2014 consistent. But the spec's varchar_short rule says 'Random token of 3-12 alphanumeric chars; 10% near-duplicate variants' \u2014 StringSampler implements this but also inserts boundary values and observed/pool values, which is not in the varchar_short rule.",
+     "requested_revision": "Document in the spec that samplers also draw from observed and pool literals (not only fresh tokens), or remove observed/pool reuse from StringSampler to match the varchar_short rule. Similarly document boundary insertion for integer columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_semantic_rules: for 'date_valid_to >= date_valid_from' it parses with '%Y-%m-%d %H:%M:%S' and on ValueError appends v unchanged \u2014 so a compact row with a different date format would not be corrected. The spec's semantic rule evidence is 'Customers_Cards rows 1-8' and the program trusts compact rows verbatim (per spec uncertainty). The rule is applied only to generated rows; compact rows are not checked. The spec says 'a per-instance assertion checks compact rows also satisfy the semantic rules' but _assert_constructed does NOT check compact rows for date ordering or enum membership \u2014 only transaction_amount non-negative and card_type_code group sizes and tie. This is a gap between spec and program.",
+     "requested_revision": "Add compact-row assertions for date_valid_to >= date_valid_from and enum membership (card_type_code IN ('Credit','Debit'), transaction_type IN ('Payment','Refund')) as the spec claims, or remove that claim from the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec semantic_rules_and_formulas includes 'transaction_amount >= 0' with evidence 'Financial_Transactions rows 1-8', and 'date_valid_to >= date_valid_from' with evidence 'Customers_Cards rows 1-8'. The spec's uncertainty note admits 'Rules date ordering and duplicate shares (20-50%) rest on only 8 sample rows and are weakly supported.' The evidence is only 8 rows per table, which is weak for a rule claimed to hold generally. The spec should distinguish supported rules (enum membership, positive IDs \u2014 structurally enforced) from weakly supported ones (date ordering, duplicate shares).",
+     "requested_revision": "Mark date_valid_to >= date_valid_from and duplicate_share 20-50% as weakly supported in the spec (not as hard rules), or provide stronger evidence. The program should not assert these as hard constraints on compact rows without stronger evidence."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's actual card_type_code distinct values and row count allow realizing boundary sizes 3,4,5,6 \u2014 the spec and program disagree and execution failed on all 20 instances.",
+    "Whether the FK multiplicity planner realizes group_sizes 1,2,>=3 for all targeted FK columns (no assertion checks this; only card_type_code and tie are asserted).",
+    "Whether rows_with_different_values (>=2 distinct non-NULL amounts per group) holds after NULL planting \u2014 no assertion checks it.",
+    "Whether compact rows satisfy the semantic rules (date ordering, enum membership) \u2014 the spec claims an assertion but the program does not implement it.",
+    "Whether integer PKs are generated sequentially from max(existing)+1 as the spec's integer_pk rule requires \u2014 the program uses uniform draws plus dedup."
+   ]
+  }
+ ]
 }

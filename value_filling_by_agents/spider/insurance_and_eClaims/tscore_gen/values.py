@@ -1,7 +1,9 @@
-"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224; fuzz/{base,number,string,date,time,bool}.py)."""
+"""Per-type value generators."""
 import datetime as dt
 import re
 import string
+
+from . import spec
 
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
@@ -9,7 +11,7 @@ _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y
 
 
 class ColumnSampler:
-    """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
+    """Base fuzzer: drops None elements, p := 1 without elements."""
 
     def __init__(self, elements: list, p: float, max_l0: float, rng):
         self.elements = [e for e in elements if e is not None]
@@ -37,7 +39,7 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
+    """Numeric fuzzer with the upstream list_max overwrite quirk preserved."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
@@ -71,7 +73,7 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """String fuzzer with prefix/suffix/dropped-char variants."""
 
     def __init__(self, elements, p, max_l0, rng, length=20):
         els = [str(e) for e in elements if e is not None]
@@ -118,7 +120,7 @@ def _parse_date(s: str):
 
 
 class DateSampler(ColumnSampler):
-    """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
+    """Generic date fuzzer (kept for compatibility; spec datetimes use SpecDateSampler)."""
 
     def __init__(self, elements, p, max_l0, rng):
         super().__init__(elements, p, max_l0, rng)
@@ -153,7 +155,7 @@ class DateSampler(ColumnSampler):
 
 
 class TimeSampler(ColumnSampler):
-    """fuzz/time.py."""
+    """Clock-time fuzzer."""
 
     def sample(self):
         r = self.rng
@@ -170,7 +172,7 @@ class TimeSampler(ColumnSampler):
 
 
 class BoolSampler(ColumnSampler):
-    """fuzz/bool.py (Bool True/False, Bit 1/0)."""
+    """Boolean / bit fuzzer."""
 
     def __init__(self, elements, p, max_l0, rng, bit=False):
         super().__init__(elements, p, max_l0, rng)
@@ -182,8 +184,84 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Spec enum pool with near-variants (char_code / comparison_boundary rules)."""
+
+    def __init__(self, pool: list, near: list, p: float, max_l0: float, rng):
+        super().__init__(pool + near, p, max_l0, rng)
+        self.pool = list(pool)
+        self.near = list(near)
+
+    def sample(self):
+        r = self.rng
+        if self.near and r.random() < 0.15:
+            return r.choice(self.near)
+        return r.choice(self.pool)
+
+
+class IntEnumSampler(ColumnSampler):
+    """Integer enum pool (e.g. Claim_Stage_ID in {1, 3})."""
+
+    def __init__(self, pool: list, p: float, max_l0: float, rng):
+        super().__init__(pool, p, max_l0, rng)
+        self.pool = list(pool)
+
+    def sample(self):
+        return self.rng.choice(self.pool)
+
+
+class DecimalSampler(ColumnSampler):
+    """Decimal in [AMOUNT_LO, AMOUNT_HI] with 2-4 fractional digits; includes 0 and near-literal values."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
+        self.literals = list(self.elements)
+
+    def _draw(self):
+        r = self.rng
+        if r.random() < 0.1:
+            return 0.0
+        if self.literals and r.random() < 0.3:
+            base = r.choice(self.literals)
+            return max(spec.AMOUNT_LO, min(spec.AMOUNT_HI, base + r.choice([-1, -2, 1, 2])))
+        v = r.uniform(spec.AMOUNT_LO, spec.AMOUNT_HI)
+        return round(v, r.choice([2, 3, 4]))
+
+    def sample(self):
+        return self._fresh_or_reuse(self._draw)
+
+
+class SpecDateSampler(ColumnSampler):
+    """Datetime in [DATE_LO, DATE_HI] formatted '%Y-%m-%d %H:%M:%S'."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.literals = [e for e in self.elements if isinstance(e, str)]
+
+    def _draw(self):
+        r = self.rng
+        if self.literals and r.random() < 0.3:
+            base = r.choice(self.literals)
+            t, d = _parse_date(base)
+            if d is not None:
+                d = d + dt.timedelta(seconds=r.randint(-86400, 86400))
+                d = max(spec.DATE_LO, min(spec.DATE_HI, d))
+                return d.strftime(spec.DATE_FMT)
+        span = int((spec.DATE_HI - spec.DATE_LO).total_seconds())
+        d = spec.DATE_LO + dt.timedelta(seconds=r.randint(0, span))
+        return d.strftime(spec.DATE_FMT)
+
+    def sample(self):
+        return self._fresh_or_reuse(self._draw)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
-    """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    """Pick the fuzzer by declared type; spec enums override."""
+    key = (column.table, column.name)
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], spec.NEAR_VARIANTS.get(key, []), p, max_l0, rng)
+    if key in spec.INT_ENUMS:
+        return IntEnumSampler(spec.INT_ENUMS[key], p, max_l0, rng)
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
@@ -195,14 +273,16 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
             return NumberSampler(els, p, max_l0, rng, scale=4)
-        return DateSampler(els, p, max_l0, rng)
+        return SpecDateSampler(els, p, max_l0, rng)
     if 'bool' in t:
         return BoolSampler(els, p, max_l0, rng)
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
         return NumberSampler(els, p, max_l0, rng, scale=4)
-    if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
+    if any(k in t for k in ('decimal', 'numeric')):
+        return DecimalSampler(els, p, max_l0, rng)
+    if any(k in t for k in ('int', 'float', 'double', 'number', 'real')):
         is_int = 'int' in t
         scale, prec = 10, (0 if is_int else 4)
         if args:
@@ -216,9 +296,12 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of the fuzzer; spec boundary literals added to the pool."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    for b in spec.BOUNDARY_LITERALS.get((column.table, column.name), []):
+        if b not in els:
+            els.append(b)
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
@@ -226,10 +309,3 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
     return make_column_sampler(column, els, p, max_l0, rng)
-
-
-def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
-    """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
-    return [s.sample() for _ in range(n)]

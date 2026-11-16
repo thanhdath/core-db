@@ -1,7 +1,9 @@
-"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224; fuzz/{base,number,string,date,time,bool}.py)."""
+"""Per-type value generators (fuzz/fuzz.py:40-80, 198-224)."""
 import datetime as dt
 import re
 import string
+
+from . import spec
 
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
@@ -39,11 +41,15 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if lo is not None and hi is not None:
+            self.min, self.max = int(lo), int(hi)
+        else:
+            h = min(10 ** scale, _MAX)
+            self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-h, h)
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -118,7 +124,7 @@ def _parse_date(s: str):
 
 
 class DateSampler(ColumnSampler):
-    """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
+    """fuzz/date.py + utils/data_parser.py."""
 
     def __init__(self, elements, p, max_l0, rng):
         super().__init__(elements, p, max_l0, rng)
@@ -182,6 +188,101 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    def __init__(self, values, p, max_l0, rng):
+        super().__init__(values, p, max_l0, rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class CurrencySampler(ColumnSampler):
+    """Format 'US$<integer>,<3-digit>.00'; integer part in [lo, hi]."""
+
+    def __init__(self, lo, hi, p, max_l0, rng, elements=(), boundary=True):
+        super().__init__(list(elements), p, max_l0, rng)
+        self.lo, self.hi = int(lo), int(hi)
+        self.boundary = boundary
+
+    @staticmethod
+    def _fmt(n):
+        n = max(0, int(n))
+        return 'US$%s,%03d.00' % (format(n // 1000, ','), n % 1000)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        n = r.randint(self.lo, self.hi)
+        if self.boundary and r.random() < 0.15:
+            cand = [b for b in spec.SALARY_BOUNDARY if self.lo <= b <= self.hi]
+            if cand:
+                n = r.choice(cand)
+        return self._fmt(n)
+
+    @classmethod
+    def format_value(cls, n):
+        return cls._fmt(n)
+
+
+class FormattedDateSampler(ColumnSampler):
+    def __init__(self, fmt, lo, hi, p, max_l0, rng, elements=()):
+        super().__init__(list(elements), p, max_l0, rng)
+        self.fmt = fmt
+        self.lo = dt.datetime(*lo)
+        self.hi = dt.datetime(*hi)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        span = int((self.hi - self.lo).total_seconds())
+        d = self.lo + dt.timedelta(seconds=r.randint(0, span))
+        s = d.strftime(self.fmt)
+        return re.sub(r'(^|[-/ :])0(\d)', r'\1\2', s)
+
+
+class SsnSampler(ColumnSampler):
+    def sample(self):
+        r = self.rng
+        return '%03d-%02d-%04d' % (r.randint(0, 999), r.randint(0, 99), r.randint(0, 9999))
+
+
+class PhoneSampler(ColumnSampler):
+    def sample(self):
+        r = self.rng
+        return '(%03d)%03d-%04d' % (r.randint(200, 999), r.randint(0, 999), r.randint(0, 9999))
+
+
+class NameSampler(ColumnSampler):
+    def sample(self):
+        r = self.rng
+        k = r.randint(3, 9)
+        return ''.join(r.choice(string.ascii_uppercase) if i == 0 else r.choice(string.ascii_lowercase)
+                       for i in range(k))
+
+
+class BoundarySampler(ColumnSampler):
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
+
+
+class IntGroupSampler(ColumnSampler):
+    """Integer column whose GROUP BY must show group sizes 1, 2 and >= 3. Returns small distinct integers so groups
+    are naturally formed by FK/join aggregation."""
+    def __init__(self, lo, hi, p, max_l0, rng):
+        super().__init__([], p, max_l0, rng)
+        self.lo, self.hi = int(lo), int(hi)
+
+    def sample(self):
+        return self.rng.randint(self.lo, self.hi)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -230,6 +331,48 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
                                p: float = 0.2, max_l0: float = float('inf')) -> list:
-    """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column: str, column_meta, literal_pool: list, original_values,
+                 p: float, max_l0: float, rng) -> ColumnSampler:
+    """Return a sampler that implements the specification for (table, column)."""
+    key = (table, column)
+    ov = [v for v in original_values if v is not None]
+    pool = sorted({str(v) for v in literal_pool})
+    if key in spec.ENUMS:
+        vals = list(spec.ENUMS[key])
+        vals += [v for v in spec.BOUNDARY_VALUES.get(key, []) if v not in vals]
+        vals += [v for v in spec.LIKE_VARIANTS.get(key, []) if v not in vals]
+        return EnumSampler(vals, p, max_l0, rng)
+    if key == ('employee', 'salary'):
+        return CurrencySampler(spec.SALARY_RANGE[0], spec.SALARY_RANGE[1], p, max_l0, rng, elements=ov,
+                               boundary=True)
+    if key == ('position', 'minsalary'):
+        return CurrencySampler(spec.MINSALARY_RANGE[0], spec.MINSALARY_RANGE[1], p, max_l0, rng, elements=ov,
+                               boundary=False)
+    if key == ('position', 'maxsalary'):
+        return CurrencySampler(spec.MAXSALARY_RANGE[0], spec.MAXSALARY_RANGE[1], p, max_l0, rng, elements=ov,
+                               boundary=False)
+    if key == ('employee', 'hiredate'):
+        return FormattedDateSampler(spec.DATE_FORMAT, spec.DATE_RANGE[0], spec.DATE_RANGE[1],
+                                    p, max_l0, rng, elements=ov)
+    if key == ('employee', 'ssn'):
+        return SsnSampler([], p, max_l0, rng)
+    if key == ('location', 'officephone'):
+        return PhoneSampler([], p, max_l0, rng)
+    if key in (('employee', 'firstname'), ('employee', 'lastname')):
+        return NameSampler([], p, max_l0, rng)
+    if key == ('location', 'zipcode'):
+        return IntGroupSampler(1000, 99999, p, max_l0, rng)
+    if key in (('location', 'locationID'), ('position', 'positionID')):
+        return NumberSampler([], 1.0, float('inf'), rng, is_int=True, lo=1, hi=10 ** 6)
+    if key in spec.BOUNDARY_VALUES or key in spec.LIKE_VARIANTS:
+        vals = list(spec.BOUNDARY_VALUES.get(key, [])) + list(spec.LIKE_VARIANTS.get(key, []))
+        vals += ov
+        return BoundarySampler(vals, rng)
+    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + pool
+    if column_meta.checked:
+        p = 0.0
+    return make_column_sampler(column_meta, els, p, max_l0, rng)

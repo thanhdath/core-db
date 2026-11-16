@@ -1,4 +1,4 @@
-"""Random instance construction (fuzz/fuzz.py:83-196)."""
+"""Random instance construction (fuzz/fuzz.py:83-196) + specification by construction."""
 from .values import _init_sampler
 
 
@@ -33,58 +33,110 @@ def drop_unique_duplicates(table_meta, columns: dict) -> dict:
     return columns
 
 
-def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
-    """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
+def _parent_values(instance: dict, schema, pt: str, pc: str) -> list:
+    """Parent key values: compact rows first, then generated rows (in memory)."""
+    vals = list(schema.original_values.get((pt, pc), []))
+    vals += list(instance.get(pt, {}).get(pc, []))
+    return [v for v in vals if v is not None]
+
+
+def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng, spec: dict) -> dict:
+    """FK child columns draw from the parent's values; NULL on nullable, no dangling keys."""
     out = {}
     for cm in schema.tables[table].columns:
         key = (table, cm.name)
         if key not in schema.fks:
             continue
         pt, pc = schema.fks[key]
-        pv = instance.get(pt, {}).get(pc) or []
-        out[cm.name] = [rng.choice(pv) for _ in range(n)] if pv else [None] * n
+        pv = _parent_values(instance, schema, pt, pc)
+        nullable = not spec['notnull'].get(key, False)
+        null_share = spec['null_share'].get(key, 0.0) if nullable else 0.0
+        col = []
+        for _ in range(n):
+            u = rng.random()
+            if nullable and u < null_share:
+                col.append(None)
+            elif pv:
+                col.append(rng.choice(pv))
+            else:
+                col.append(None if nullable else 0)
+        out[cm.name] = col
     return out
 
 
-def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+def choose_table_sizes(schema, rng, spec: dict) -> dict:
+    """Honour spec['sizes'] exactly (review item 3)."""
     sizes = {}
-    if rng.random() < 0.5:
-        for lvl in schema.table_order:
-            for t in lvl:
-                min_c = 30 * rng.random()
-                sizes[t] = int(min_c + int(rng.random() * 200))
-    else:
-        s = 1 + 30 * rng.random()
-        for lvl in schema.table_order:
-            for t in lvl:
-                sizes[t] = int(min(s, 2500))
-            s *= 4
+    for lvl in schema.table_order:
+        for t in lvl:
+            sizes[t] = max(0, int(spec['sizes'].get(t, 20)))
     return sizes
 
 
-def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
+def _fresh_pk_start(schema, table: str, column: str) -> int:
+    vals = [v for v in schema.original_values.get((table, column), []) if isinstance(v, int)]
+    return (max(vals) + 1) if vals else 1
+
+
+def _apply_duplicates(cols: dict, key: tuple, share: float, rng) -> None:
+    """Repeat a share of the values of a DISTINCT-target column (COUNT(DISTINCT) < COUNT(*))."""
+    t, c = key
+    if c not in cols or not cols[c]:
+        return
+    n = len(cols[c])
+    k = int(n * share)
+    if k <= 0:
+        return
+    idx = list(range(n))
+    rng.shuffle(idx)
+    for i in idx[:k]:
+        j = rng.randrange(n)
+        cols[c][i] = cols[c][j]
+
+
+def build_random_instance(schema, literal_pool: dict, size, rng, spec: dict) -> dict:
+    """Build one random instance (fuzz.py:111-196) as appended rows only."""
     p = 0.0 if rng.random() < 0.3 else 0.2
     order = [t for lvl in schema.table_order for t in lvl]
     samplers = {}
     for t in order:
         tm = schema.tables[t]
         for cm in tm.columns:
-            if (t, cm.name) not in schema.fks:
-                samplers[(t, cm.name)] = _init_sampler(cm, literal_pool.get((t, cm.name), []),
-                                                       schema.original_values.get((t, cm.name), []), p, rng,
-                                                       len(tm.primary_key))
+            key = (t, cm.name)
+            if key in schema.fks:
+                continue
+            samplers[key] = _init_sampler(
+                cm, literal_pool.get(key, []), schema.original_values.get(key, []), p, rng,
+                len(tm.primary_key),
+                domain=spec['ranges'].get(key),
+                boundaries=spec['boundary_numeric'].get(key),
+                near=spec['near_variants'].get(key),
+                like=spec['like_patterns'].get(key),
+                enum=spec['enums'].get(key),
+                type_hint=spec['types'].get(key))
     if size is None:
-        size = choose_table_sizes(schema, rng)
+        size = choose_table_sizes(schema, rng, spec)
     inst: dict = {}
     for t in order:
         tm = schema.tables[t]
         n = int(size.get(t, 0))
         cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)]
                 for cm in tm.columns if (t, cm.name) in samplers}
+        for c in tm.primary_key:
+            if c in cols and (t, c) not in schema.fks:
+                start = _fresh_pk_start(schema, t, c)
+                cols[c] = [start + i for i in range(n)]
         inst[t] = cols
-        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
+        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng, spec))
+        for cm in tm.columns:
+            key = (t, cm.name)
+            if spec['notnull'].get(key, False) or cm.name not in cols:
+                continue
+            if cols[cm.name] and all(v is not None for v in cols[cm.name]):
+                cols[cm.name][rng.randrange(len(cols[cm.name]))] = None
+        for key, share in spec['dup_share'].items():
+            if key[0] == t:
+                _apply_duplicates(cols, key, share, rng)
         cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
         cols = drop_unique_duplicates(tm, cols)
         for cm in tm.columns:

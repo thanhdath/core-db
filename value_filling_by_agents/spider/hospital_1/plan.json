@@ -1,49 +1,767 @@
 {
  "db": "hospital_1",
- "operator_io_quirks": [
-  "All table/column names are CamelCase or snake_case with underscores (Affiliated_With, On_Call, Trained_In, DateUndergoes, PrepNurse); must be double-quoted in generated SQL.",
-  "Tiny DB: largest table Room=36 rows, Block=12, Trained_In=15; original_values sampling of 5 with replacement will heavily repeat.",
-  "DATETIME columns store TEXT in two formats: date-only 'YYYY-MM-DD' (Trained_In, Stay, Undergoes) and 'YYYY-MM-DD HH:MM' (Appointment, Prescribes, On_Call). Date fuzzer template must be inferred per column from first parsable element.",
-  "DATETIME declared type dispatches to 'Date|Number(int elements)' branch: first element '2008-01-01' is not int, so Date fuzzer; but StayStart '2008-05-01' likewise. No int-stored dates here.",
-  "BOOLEAN columns (PrimaryAffiliation, Registered, Unavailable) store integer 0/1, not text; Bool fuzzer emits True/False which sqlite stores as 1/0 \u2014 fine.",
-  "Composite FKs: Room(BlockFloor,BlockCode)->Block(BlockFloor,BlockCode) and On_Call(BlockFloor,BlockCode)->Block; pragma foreign_key_list reports them as two separate single-column FKs, so fill_foreign_keys_consistently draws each column independently and can produce non-matching pairs (upstream behaviour).",
-  "Composite PKs: Affiliated_With(Physician,Department), Trained_In(Physician,Treatment), Prescribes(Physician,Patient,Medication,Date), Block(BlockFloor,BlockCode), On_Call(5 cols), Undergoes(4 cols) \u2014 PK-duplicate dropping is essential; Date in Prescribes PK is a DATETIME text.",
-  "Nullable columns: Appointment.PrepNurse (null_rate 0.222), Prescribes.Appointment (0.333), Undergoes.AssistingNurse (0.0 but nullable). FK fill from empty parent yields NULLs; NOT NULL not enforced in Python so insert may fail and skip.",
-  "No self-references, no dangling FKs, all parent tables/columns exist.",
-  "Medication.Description has distinct=1 ('N/A'); Room.RoomType distinct=1 ('Single') \u2014 String fuzzer with 5 sampled originals will mostly reproduce these.",
-  "Physician.SSN, Nurse.SSN, Patient.SSN are INTEGER but semantically 9-digit IDs (111111111, 100000001); Number fuzzer will emit small ints, breaking joins on SSN-like equality.",
-  "Cost REAL samples are round (1500.0, 3750.0); Number float fuzzer perturbs by \u00b10.01/\u00b10.02 and draws uniform in [-10^scale,10^scale] with scale from '(a,b)' args \u2014 REAL has no args so scale default, likely huge range."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template inferred from first element, e.g. '%Y-%m-%d' for Trained_In/Stay/Undergoes, '%Y-%m-%d %H:%M' for Appointment/Prescribes/On_Call; range = [min,max] of parsed originals (narrow, ~2008), so fresh dates cluster in 2008.",
-  "Number fuzzer on INTEGER PKs (EmployeeID, DepartmentID, Code, AppointmentID, StayID, RoomNumber): full range [-10^scale,10^scale] with scale from type args (none -> default), so PKs become large random ints; FK children draw from parent's final values so joins hold.",
-  "Number fuzzer on SSN/InsuranceID (INTEGER, no args): random ints, not 9-digit; queries filtering SSN ranges or joining Physician.SSN=Nurse.SSN will see implausible values -> likely FN.",
-  "String fuzzer on Name/Position/Address/Phone/Dose/RoomType: 5 sampled originals + pool literals, p=0.2 fresh random over a-zA-Z0-9() with contamination; Phone '555-0256' pattern lost -> queries with LIKE '555%' or phone format -> FN.",
-  "Bool fuzzer on PrimaryAffiliation/Registered/Unavailable: p=0.2 fresh True/False else element; fine.",
-  "Composite FK Room->Block drawn column-wise independently: BlockFloor and BlockCode pairs may not exist in Block -> join Room-Block yields fewer rows than expected -> FP/FN on block queries.",
-  "Composite PK duplicate dropping (sample_fresh_primary_keys) on Prescribes(Physician,Patient,Medication,Date) with Date as text: many rows dropped, table may shrink to near-empty -> queries counting prescriptions -> FN.",
-  "Tiny parent tables (Physician=9, Nurse=3, Patient=4, Department=3, Procedures=7, Medication=5, Block=12) with FK draw-with-replacement: child tables (Appointment, Prescribes, Undergoes, On_Call, Stay) get heavy duplicate FK tuples, then PK dedup collapses them -> very small child tables -> aggregate/count queries -> FN.",
-  "Prescribes.Appointment nullable FK: drawn from Appointment's final values or NULL; if Appointment table shrinks, many NULLs -> queries joining Prescribes-Appointment -> FN.",
-  "No CHECK constraints, no UNIQUE single-column constraints beyond PKs; drop_unique_duplicates is a no-op here.",
-  "Literal pool from train SQL will contain 'N/A', 'Single', room letters 'A','B','C', dose '5','10', dates '2008-...' \u2014 String/Date fuzzers will reuse these, helping some equality predicates but not range predicates."
- ],
- "challenger_refs": [
-  "G10",
-  "G15",
-  "G16",
-  "G13",
-  "G2",
-  "G12",
-  "G18",
-  "G1",
-  "G3",
-  "G14"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; assigned after all parent tables are final.",
+   "integer_fk": "Sample from the parent table's FINAL key pool (after PK dedup and unique-column drops); nullable FKs get NULL with the column's null share and at least one NULL row per instance.",
+   "integer_numeric": "Uniform integer in [1, 1000] unless a per-column exception gives a range.",
+   "real_numeric": "Uniform real rounded to 2 decimals in [0, 20000] unless a per-column exception gives a range; always emit a numeric value (never a string token).",
+   "varchar_short": "Random token of 3-12 ASCII letters, first letter capitalized; near-variants (case change, one-char edit) for equality literals.",
+   "varchar_name": "Random first+last name from a small pool; duplicates allowed at 20-50% share where DISTINCT is exercised.",
+   "varchar_numeric_text": "For text columns whose values are parsed as numbers (only Prescribes.Dose), emit a decimal string of digits only, e.g. '5' or '10'; never letters.",
+   "boolean": "0 or 1 with equal probability; boundary probes outside {0,1} are used only for comparison, never stored.",
+   "datetime": "Random datetime in 2008-01-01..2008-12-31, formatted per column exception; order rules applied after sampling; no leading-zero stripping.",
+   "text_room": "Random single uppercase letter A-Z.",
+   "null_share": "For nullable columns, 20% NULL unless a per-column exception states otherwise; at least one NULL row per nullable column per instance, even when the table has a single generated row.",
+   "boundary": "For numeric columns with a listed literal L, include L-1, L, L+1; for dates include L-1 day, L, L+1 day; comparison-only probes are never stored.",
+   "tie": "For ORDER columns with listed ranks, plant at least two rows sharing the tie value at that rank.",
+   "fresh_share": "30% of non-key values are fresh random draws; 70% drawn from the parent/related pool.",
+   "fk_finality": "All child FK values are validated against the final parent key set before writing; foreign_keys pragma is ON during insert so violations surface as counted failures."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Physician",
+    "column": "EmployeeID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Affiliated_With.Physician",
+      "Prescribes.Physician"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Physician",
+    "column": "Name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "John Wen",
+      "john wen"
+     ]
+    }
+   },
+   {
+    "table": "Physician",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Physician",
+    "column": "Position",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Department",
+    "column": "DepartmentID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Affiliated_With.Department"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Department",
+    "column": "DepartmentID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "table": "Affiliated_With",
+    "column": "Department",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Department.DepartmentID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Affiliated_With",
+    "column": "Physician",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Physician.EmployeeID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Patient",
+    "column": "SSN",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Stay.Patient",
+      "Undergoes.Patient",
+      "Prescribes.Patient"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Patient",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Stay",
+    "column": "Patient",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Patient.SSN",
+      "Prescribes.Patient"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Stay",
+    "column": "Room",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      110,
+      111,
+      112,
+      113
+     ]
+    }
+   },
+   {
+    "table": "Stay",
+    "column": "StayStart",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      2
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "table": "Nurse",
+    "column": "EmployeeID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Appointment.PrepNurse",
+      "Undergoes.AssistingNurse",
+      "On_Call.Nurse"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "Nurse",
+    "column": "Name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any",
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "Appointment",
+    "column": "Patient",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "Appointment",
+    "column": "PrepNurse",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Nurse.EmployeeID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "Appointment",
+    "column": "Start",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "Prescribes",
+    "column": "Patient",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Patient.SSN",
+      "Stay.Patient"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Procedures",
+    "column": "Cost",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      999,
+      1000,
+      1001,
+      4999,
+      5000,
+      5001
+     ]
+    }
+   },
+   {
+    "table": "Procedures",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Room",
+    "column": "Unavailable",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1,
+      2
+     ],
+     "stored_values": [
+      0,
+      1
+     ],
+     "note": "boolean-domain probes -1 and 2 are used only for comparison, never stored"
+    }
+   },
+   {
+    "table": "Room",
+    "column": "RoomNumber",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      110,
+      111,
+      112,
+      113
+     ]
+    }
+   },
+   {
+    "table": "Block",
+    "column": "BlockFloor",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "Block",
+    "column": "BlockCode",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Room.BlockCode"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Medication",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "On_Call",
+    "column": "Nurse",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "Prescribes",
+    "column": "Dose",
+    "pattern": "numeric_text",
+    "targets": {
+     "format": "digits only, e.g. '5', '10', '20'",
+     "note": "Prescribes.Dose is the only numeric-text column"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Department.Head",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Affiliated_With.Physician",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Affiliated_With.Department",
+    "parent": "Department.DepartmentID",
+    "copied": []
+   },
+   {
+    "child": "Trained_In.Physician",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Trained_In.Treatment",
+    "parent": "Procedures.Code",
+    "copied": []
+   },
+   {
+    "child": "Patient.PCP",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Appointment.Patient",
+    "parent": "Patient.SSN",
+    "copied": []
+   },
+   {
+    "child": "Appointment.PrepNurse",
+    "parent": "Nurse.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Appointment.Physician",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Prescribes.Physician",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Prescribes.Patient",
+    "parent": "Patient.SSN",
+    "copied": []
+   },
+   {
+    "child": "Prescribes.Medication",
+    "parent": "Medication.Code",
+    "copied": []
+   },
+   {
+    "child": "Prescribes.Appointment",
+    "parent": "Appointment.AppointmentID",
+    "copied": []
+   },
+   {
+    "child": "Room.BlockFloor",
+    "parent": "Block.BlockFloor",
+    "copied": []
+   },
+   {
+    "child": "Room.BlockCode",
+    "parent": "Block.BlockCode",
+    "copied": []
+   },
+   {
+    "child": "On_Call.Nurse",
+    "parent": "Nurse.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "On_Call.BlockFloor",
+    "parent": "Block.BlockFloor",
+    "copied": []
+   },
+   {
+    "child": "On_Call.BlockCode",
+    "parent": "Block.BlockCode",
+    "copied": []
+   },
+   {
+    "child": "Stay.Patient",
+    "parent": "Patient.SSN",
+    "copied": []
+   },
+   {
+    "child": "Stay.Room",
+    "parent": "Room.RoomNumber",
+    "copied": []
+   },
+   {
+    "child": "Undergoes.Patient",
+    "parent": "Patient.SSN",
+    "copied": []
+   },
+   {
+    "child": "Undergoes.Procedures",
+    "parent": "Procedures.Code",
+    "copied": []
+   },
+   {
+    "child": "Undergoes.Stay",
+    "parent": "Stay.StayID",
+    "copied": []
+   },
+   {
+    "child": "Undergoes.Physician",
+    "parent": "Physician.EmployeeID",
+    "copied": []
+   },
+   {
+    "child": "Undergoes.AssistingNurse",
+    "parent": "Nurse.EmployeeID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Physician",
+    "column": "EmployeeID",
+    "formula": "EmployeeID > 0"
+   },
+   {
+    "table": "Physician",
+    "column": "SSN",
+    "formula": "SSN > 0"
+   },
+   {
+    "table": "Department",
+    "column": "DepartmentID",
+    "formula": "DepartmentID > 0"
+   },
+   {
+    "table": "Affiliated_With",
+    "column": "PrimaryAffiliation",
+    "formula": "PrimaryAffiliation IN (0, 1)"
+   },
+   {
+    "table": "Procedures",
+    "column": "Cost",
+    "formula": "Cost >= 0"
+   },
+   {
+    "table": "Trained_In",
+    "column": "CertificationExpires",
+    "formula": "CertificationExpires >= CertificationDate"
+   },
+   {
+    "table": "Patient",
+    "column": "InsuranceID",
+    "formula": "InsuranceID > 0"
+   },
+   {
+    "table": "Nurse",
+    "column": "Registered",
+    "formula": "Registered IN (0, 1)"
+   },
+   {
+    "table": "Nurse",
+    "column": "SSN",
+    "formula": "SSN > 0"
+   },
+   {
+    "table": "Appointment",
+    "column": "End",
+    "formula": "End > Start"
+   },
+   {
+    "table": "Medication",
+    "column": "Code",
+    "formula": "Code > 0"
+   },
+   {
+    "table": "Prescribes",
+    "column": "Dose",
+    "formula": "CAST(Dose AS INTEGER) > 0"
+   },
+   {
+    "table": "Block",
+    "column": "BlockFloor",
+    "formula": "BlockFloor >= 0"
+   },
+   {
+    "table": "Block",
+    "column": "BlockCode",
+    "formula": "BlockCode >= 0"
+   },
+   {
+    "table": "Room",
+    "column": "Unavailable",
+    "formula": "Unavailable IN (0, 1)"
+   },
+   {
+    "table": "Room",
+    "column": "RoomNumber",
+    "formula": "RoomNumber > 0"
+   },
+   {
+    "table": "On_Call",
+    "column": "OnCallEnd",
+    "formula": "OnCallEnd > OnCallStart"
+   },
+   {
+    "table": "Stay",
+    "column": "StayEnd",
+    "formula": "StayEnd >= StayStart"
+   },
+   {
+    "table": "Undergoes",
+    "column": "DateUndergoes",
+    "formula": "DateUndergoes >= (SELECT StayStart FROM Stay WHERE Stay.StayID = Undergoes.Stay)",
+    "evidence": "sample rows 05-02..05-13 vs stays 05-01..05-14; enforced as DateUndergoes >= StayStart"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Physician": 9,
+   "Department": 3,
+   "Affiliated_With": 11,
+   "Procedures": 7,
+   "Trained_In": 15,
+   "Patient": 4,
+   "Nurse": 3,
+   "Appointment": 9,
+   "Medication": 5,
+   "Prescribes": 3,
+   "Block": 12,
+   "Room": 36,
+   "On_Call": 6,
+   "Stay": 3,
+   "Undergoes": 6
+  },
+  "null_targets": [
+   "Appointment.PrepNurse",
+   "Prescribes.Appointment",
+   "Undergoes.AssistingNurse"
+  ],
+  "supporting_evidence": {
+   "Appointment.End > Start": [
+    "13216584: 10:00->11:00",
+    "26548913: 10:00->11:00",
+    "36549879: 10:00->11:00"
+   ],
+   "Trained_In.CertificationExpires >= CertificationDate": [
+    "2008-01-01->2008-12-31",
+    "2007-01-01->2007-12-31"
+   ],
+   "Stay.StayEnd >= StayStart": [
+    "3215: 05-01->05-04",
+    "3216: 05-03->05-14",
+    "3217: 05-02->05-03"
+   ],
+   "On_Call.OnCallEnd > OnCallStart": [
+    "11:00->19:00",
+    "19:00->03:00 next day"
+   ],
+   "Procedures.Cost >= 0": [
+    "1500.0",
+    "3750.0",
+    "25.0"
+   ],
+   "Undergoes.DateUndergoes >= Stay.StayStart": [
+    "3215: 05-03 >= 05-01",
+    "3217: 05-02 >= 05-02",
+    "3217: 05-10 >= 05-02"
+   ]
+  },
+  "uncertainty": "Undergoes.DateUndergoes vs Stay.StayStart is now stated as a semantic rule (DateUndergoes >= StayStart) with supporting evidence, matching the program's enforcement. Prescribes.Dose is the only numeric-text column; integer positivity enforced via CAST. Room.Unavailable boundary probes -1 and 2 are comparison-only and never stored; stored values are 0/1. Procedures.Cost and Prescribes.Dose must be emitted as numeric/numeric-text values (never random letter tokens). Parent table sizes are kept small; unmatched_join_rows targets are satisfied by ensuring at least one parent row per listed FK is unreferenced, and child tables are populated from the remaining parent pool. FK values are validated against the final parent key set before writing, and foreign_keys pragma is ON during insert."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with ValueError(\"could not convert string to float: 'L4P'\") etc. (n_ok=0, n_fail=20). The traceback originates in _apply_semantic_rules (instance.py) where `columns['Cost'] = [max(0.0, float(v)) ...]` and `columns['Dose'] = [str(max(1, int(float(v)))) ...]` are applied. The Cost/Dose columns are sampled by StringSampler because the literal pool / spec elements are routed as strings and the declared type 'REAL'/'VARCHAR' path in make_column_sampler does not guarantee numeric output; the spec elements for Procedures.Cost are added as ints but the literal pool and original values are strings, and StringSampler produces random tokens. The float() cast then fails on non-numeric strings.",
+     "requested_revision": "Make the semantic-rule application robust to non-numeric values (e.g. coerce via a safe parse that falls back to a numeric default, or ensure Procedures.Cost and Prescribes.Dose are sampled with NumberSampler / numeric-only pools). The generator must produce instances without exceptions; currently n_ok=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_semantic_rules` for Undergoes.DateUndergoes only looks up `schema.original_values` for Stay.StayID/StayStart, ignoring generated Stay rows. Since Stay is generated (3 rows) and Undergoes references generated stays, the soft rule DateUndergoes >= StayStart is not enforced for generated stays. Also the spec marks this rule as 'soft/uncertain' (uncertainty field), so it should not be hard-enforced anyway.",
+     "requested_revision": "Either drop the Undergoes.DateUndergoes rule from hard enforcement (it is flagged uncertain in the spec) or extend the lookup to include generated Stay rows. Do not silently apply a partial rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions include ('Room','Unavailable') boundary values [-1,0,1,2] and ('Block','BlockFloor') [0,1,2], but the spec's own uncertainty note says -1 and 2 are outside the boolean domain and 'only used as comparison-boundary probes, not stored values'. The program's BOUNDARY_LITERALS for Room.Unavailable correctly stores only [0,1]. This is consistent, but the spec should state explicitly that boolean boundary probes are not stored, to avoid ambiguity.",
+     "requested_revision": "Clarify in the specification that boolean-domain boundary probes (-1, 2) are not stored values; keep the program's [0,1] storage."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL rule: NULLABLE_COLUMNS sets Appointment.PrepNurse=0.222, Prescribes.Appointment=0.333, Undergoes.AssistingNurse=0.20, and _apply_null_rule plants at least one NULL. However, _apply_null_rule runs before _apply_semantic_rules and before FK re-draw; for Prescribes.Appointment the FK fill happens in fill_foreign_keys_consistently before null rule, so NULLs are planted correctly. But the spec's null_targets also lists these three; the program's NOT_NULL_COLUMNS includes Appointment.Start and On_Call.Nurse, consistent. No blocking issue, but note: _apply_null_rule uses `k = min(k, n-1) if n>1 else 1` which for n=1 sets k=1, planting NULL in a single-row column \u2014 acceptable per interface (at least one NULL).",
+     "requested_revision": "No change required; noted for the engineer to confirm NULL share matches compact DB share (0.222/0.333/0.20) \u2014 it does."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Preservation of compact rows: writer.write_instance_sqlite is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` with orig_path=None, so the branch `if orig_path is None or not os.path.exists(orig_path): for s in schema.ddl: con.execute(s)` creates a fresh DB from DDL and appends generated rows \u2014 the compact rows are NOT copied. The docstring claims 'the instance file starts as a copy of the compact database', but the CLI never passes orig_path. This contradicts the stated round-1 adaptation (compact rows kept untouched).",
+     "requested_revision": "Pass the original DB path to write_instance_sqlite (e.g. add orig_path to args and forward it), or update the docstring/spec to state instances are fresh DBs. As written, compact rows are not preserved, which conflicts with the specification's 'appended rows' design."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli._one seeds rng with `a['seed_base']*100003 + i`, deterministic per unit. However, build_random_instance calls choose_table_sizes only when size is None (it is None from CLI), and _init_sampler uses rng.random() for max_l0 \u2014 all deterministic given the seed. Reproducibility appears satisfied, but the ValueError failures mean no instances were produced to verify.",
+     "requested_revision": "After fixing the ValueError, re-run and confirm n_ok>0 and deterministic output across two runs with the same seed."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (n_ok=0), so integrity-constraint satisfaction, dependent-value consistency, and value-variation separation could not be verified from execution.",
+    "Whether Procedures.Cost and Prescribes.Dose end up numeric after the fix (needed for the semantic rules and for the comparison_boundary pattern on Cost).",
+    "Whether the compact-row preservation intent is actually required; the spec says 'appended rows' but the CLI does not copy the original DB."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 105 across 20 instances and validity.invalid: 20 with reason 'new_integrity_failures'. The writer (writer.py) sets 'pragma foreign_keys = OFF' and inserts rows with executemany, so FK violations are silently accepted. The instance builder's _numeric_child_fks and _plant_unmatched_joins only check membership against the in-memory parent pool, but the writer appends rows to a copy of the compact DB; if a parent row is dropped by sample_fresh_primary_keys / drop_unique_duplicates after the child was sampled, or if a child FK references a parent value that was later filtered out, the FK is broken. The 105 violations confirm this path is exercised.",
+     "requested_revision": "Ensure every generated child FK value is present in the *final* parent key set (after PK dedup and unique-column drops) before writing, and/or enable 'pragma foreign_keys = ON' during the insert transaction so violations surface as counted failures rather than silent corruption. Re-run and confirm fk_violations == 0 and validity.invalid == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "nullable_columns feedback: 'Appointment.PrepNurse: generated rows: NULL 0 / 1'. The NULL rule requires at least one NULL row per nullable column per instance. In instance.py, _plant_unmatched_joins sets child_vals[0] = None only when 'all(v is not None for v in child_vals)'; but _apply_null_rule runs *before* _plant_unmatched_joins and only handles NULLABLE_COLUMNS entries, which does include ('Appointment','PrepNurse'). However, the row count for Appointment.PrepNurse in the generated rows is 1 (only one row survived), and the single row is non-NULL \u2014 the NULL planting is skipped because len(child_vals) is 1 and the 'all non-NULL' branch sets index 0 to None, but then _numeric_child_fks (which runs earlier) or the writer's row-by-row fallback may have dropped it. Net effect: 0 NULLs in the only generated row.",
+     "requested_revision": "Guarantee at least one NULL in every nullable FK column per instance even when the generated row count is 1 (e.g. force the single row to NULL, or ensure >=2 rows for nullable-FK tables). Verify the feedback line reads 'NULL >= 1 / n' for Appointment.PrepNurse, Prescribes.Appointment, and Undergoes.AssistingNurse."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped is large and uneven: Physician 89, Department 49, Affiliated_With 101, Procedures 74, Trained_In 111, Patient 49, Nurse 38, Appointment 78, Medication 55, Block 88, Room 157, Stay 38, Undergoes 8. The writer's row-by-row fallback silently drops rows that violate constraints (PK duplicates, NOT NULL, FK). This means the intended table sizes (Physician 9, Department 3, ...) are not actually realized \u2014 e.g. Physician added 22 but skipped 89, so the effective generated row count is far from the specification's table_sizes_per_instance. The specification's per-instance sizes are therefore not implemented.",
+     "requested_revision": "Diagnose why rows are skipped (likely PK collisions from NumberSampler producing duplicate integers, and FK values not in the final parent pool). Fix the samplers so that generated rows satisfy PK uniqueness and FK membership by construction, so rows_skipped is ~0 and rows_added matches table_sizes_per_instance (with the documented \u00b125% jitter)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists per_column_exceptions for Physician.EmployeeID, Department.DepartmentID, Affiliated_With.Department, Affiliated_With.Physician, Patient.SSN, Stay.Patient, Prescribes.Patient, Nurse.EmployeeID, Block.BlockCode with pattern 'unmatched_join_rows' and target 'parent_rows_without_children: true'. But the specification's table_sizes_per_instance gives Physician 9, Department 3, Patient 4, Nurse 3, Block 12 \u2014 small parent tables. With such small parents and the requirement that at least one parent row be unreferenced, the child tables (Affiliated_With 11, Prescribes 3, Undergoes 6, On_Call 6, Room 36) cannot simultaneously satisfy 'parent rows without children' for every listed FK and still populate the child tables meaningfully. The construction_pairs feedback shows only 60/136 pairs separated, consistent with this tension.",
+     "requested_revision": "Either increase parent table sizes so that unreferenced-parent targets are achievable alongside populated child tables, or relax the unmatched_join_rows targets to a subset of FKs per instance (documented), so the specification is internally consistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas includes 'Undergoes.DateUndergoes vs Stay.StayStart is not verifiable ... it is dropped from hard enforcement and not listed as a semantic rule.' However, instance.py's _apply_semantic_rules *does* enforce DateUndergoes >= StayStart (sets DateUndergoes = StayStart + 1 day). This is a program behavior not backed by the specification's stated rules \u2014 a mismatch between spec and program.",
+     "requested_revision": "Either add the Undergoes.DateUndergoes >= Stay.StayStart rule to the specification's semantic_rules_and_formulas (with supporting evidence), or remove the enforcement from _apply_semantic_rules so the program matches the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'integer_numeric: Uniform integer in [1, 1000]' and 'real_numeric: Uniform real rounded to 2 decimals in [0, 20000]'. But values.py's NumberSampler uses scale=10 by default, giving ranges like [-10^10, 10^10] for signed integers and [0, 2*10^10] for unsigned \u2014 far outside the specified [1,1000] / [0,20000] ranges. This is why PK collisions and skipped rows are frequent (large integer space but also large duplicate probability from the 'fresh_or_reuse' reuse path).",
+     "requested_revision": "Align NumberSampler ranges with the specification: integer_numeric in [1,1000], real_numeric in [0,20000] rounded to 2 decimals, unless a per-column exception overrides. This will also reduce PK collisions and skipped rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'datetime: Random datetime in 2008-01-01..2008-12-31, formatted per column exception'. values.py's DateSampler uses self.full = (2008-01-01, 2008-12-31) only when p is drawn or n_parsed <= 1; otherwise it uses the min/max of parsed original values, which may fall outside 2008. Also, the 'strip0' logic removes leading zeros, which can produce non-standard date strings that fail to parse in _apply_semantic_rules (which expects '%Y-%m-%d' or '%Y-%m-%d %H:%M').",
+     "requested_revision": "Constrain DateSampler to the 2008 range as specified, and ensure the emitted format matches the column exception format exactly (no leading-zero stripping that breaks parsing)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'varchar_short: Random token of 3-12 letters, capitalized first letter'. values.py's StringSampler uses CHARSET = ascii_letters + ' ' + digits + '()' and length range from original values (or 0..20), producing tokens with digits, spaces, parentheses, and arbitrary lengths \u2014 not the specified 3-12 capitalized letters.",
+     "requested_revision": "Implement varchar_short as specified: 3-12 letters, first letter capitalized, for short varchar columns; keep the broader charset only for columns where the specification allows it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'null_share: For nullable columns, 20% NULL unless a per-column exception states otherwise; at least one NULL row per nullable column per instance.' values.py's NULLABLE_COLUMNS uses 0.222, 0.333, 0.20 for the three nullable FKs \u2014 these are the compact DB's shares, which is consistent with 'following the compact database's share'. However, the execution feedback shows Appointment.PrepNurse got 0 NULLs, violating the 'at least one NULL' guarantee (see issue 2).",
+     "requested_revision": "Same as issue 2: guarantee at least one NULL per nullable column per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include ('Room','Unavailable') with targets values [-1,0,1,2] and note 'boolean-domain probes -1 and 2 are used only for comparison, never stored'. values.py's BOUNDARY_LITERALS for ('Room','Unavailable') is [0,1] (correct \u2014 probes not stored), but _spec_elements adds v-1, v, v+1 for each, i.e. -1,0,1,2 \u2014 and these are added to the sampler's element pool. BoolSampler then may return them as stored values, violating the 'never stored' note. The execution feedback does not show a violation here, but the code path allows it.",
+     "requested_revision": "Exclude comparison-only probes from the stored value pool for Room.Unavailable; only 0 and 1 may be stored."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include ('Prescribes','Dose') with pattern 'numeric_text' and targets format 'digits only, e.g. 5, 10, 20'. The semantic_rules_and_formulas include 'CAST(Dose AS INTEGER) > 0'. values.py's DigitsSampler emits digit strings in [1,20], which satisfies both. However, the specification's generic_sampling_rules do not mention numeric_text as a generic rule, only as a per-column exception \u2014 this is consistent, but the specification should clarify that Dose is the only numeric-text column, since the program's NUMERIC_TEXT_COLUMNS only lists Dose.",
+     "requested_revision": "Clarify in the specification that Prescribes.Dose is the only numeric-text column, or list all numeric-text columns explicitly."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 105 FK violations are all from the same root cause (parent pool vs final parent set) or from multiple causes; the writer's foreign_keys=OFF masks the exact failing rows.",
+    "Whether the large rows_skipped counts are primarily PK collisions (NumberSampler range) or FK/NOT NULL failures; the writer's row-by-row fallback does not report which constraint failed.",
+    "Whether the construction_pairs separation of 60/136 is due to the small parent table sizes (designer issue) or to sampler behavior (engineer issue); both are plausible and both need fixing.",
+    "Whether the DateSampler's strip0 logic ever produces unparseable dates in practice; the execution feedback does not show parse failures, but the code path exists."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 9 of 20 units failed with ValueError('empty range for randrange() (36546321, 1001, -36545320)') and similar. This originates in NumberSampler.sample(): when the numeric pool contains large values (e.g. SSN-like integers from the compact DB or literal pool), self.list_min = min(self.elements) can be far above self.max (1000), so r.randint(int(lo), int(hi)) is called with lo > hi. The code does not clamp list_min/list_max to [self.min, self.max] before drawing.",
+     "requested_revision": "Clamp the reuse range in NumberSampler.sample() so that lo <= hi always holds (e.g. lo = max(self.min, min(self.list_min, self.max)); hi = min(self.max, max(self.list_max, self.min)); if lo > hi fall back to (self.min, self.max)). Re-run generation and confirm n_fail == 0 and no ValueError in stderr."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback rows_skipped is large for many tables (Physician 60, Department 24, Affiliated_With 68, Procedures 41, Trained_In 69, Patient 31, Nurse 17, Appointment 42, Medication 30, Block 57, Room 108, On_Call 34, Stay 17, Undergoes 12). The writer falls back to row-by-row inserts and counts failures, so many generated rows are silently dropped. This indicates the generated rows frequently violate NOT NULL / PK / FK constraints (e.g. NOT NULL FK columns receiving None from _finalize_foreign_keys when the parent pool is empty, or PK collisions after _apply_* rules overwrite key columns).",
+     "requested_revision": "Investigate and eliminate the row-skipping: (a) ensure _finalize_foreign_keys never emits None for NOT NULL FK columns (raise or resample instead of writing None); (b) ensure _apply_required_literals / _apply_planted_strings / _apply_ties / _apply_group_sizes do not overwrite primary-key columns (e.g. Department.DepartmentID tie planting, Block.BlockFloor literal planting) in a way that creates PK duplicates; (c) re-run and confirm rows_skipped is zero or negligible and integrity.fk_violations/not_null_violations/pk_duplicates remain 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification null_targets lists Appointment.PrepNurse, Prescribes.Appointment, Undergoes.AssistingNurse. Execution feedback nullable_columns only reports Prescribes.Appointment (11/30) and Undergoes.AssistingNurse (10/60); Appointment.PrepNurse is absent from the report, suggesting no NULL was generated for it (or the report omitted it). The NULL rule requires at least one NULL row per nullable column per instance.",
+     "requested_revision": "Verify that _apply_null_rule is applied to Appointment.PrepNurse and that _plant_unmatched_joins does not overwrite the planted NULL. Confirm the execution feedback reports NULL > 0 for Appointment.PrepNurse; if the column is genuinely nullable in the schema, ensure at least one NULL per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification per_column_exceptions for Physician.EmployeeID, Department.DepartmentID, Affiliated_With.Physician/Department, Patient.SSN, Stay.Patient, Prescribes.Patient, Nurse.EmployeeID, Block.BlockCode all request unmatched_join_rows with parent_rows_without_children. The program's _plant_unmatched_joins only guarantees one unreferenced parent key per FK, but the specification's targets list multiple joins_with per column (e.g. Patient.SSN -> Stay.Patient, Undergoes.Patient, Prescribes.Patient). The construction_pairs feedback shows only 57/136 separated, and construction_pairs_by_group is empty, so it is unclear which targets are actually satisfied.",
+     "requested_revision": "Clarify in the specification whether each listed joins_with target must independently have an unreferenced parent row, or whether one unreferenced parent row per parent column suffices. If independent, update the program to plant one unreferenced parent per listed child join. Also add per-group construction_pairs reporting so separation can be verified."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas includes Undergoes.DateUndergoes >= (SELECT StayStart FROM Stay WHERE Stay.StayID = Undergoes.Stay) with evidence from sample rows. The program enforces this in _apply_semantic_rules by setting DateUndergoes = StayStart + 1 day, which is consistent. However, the specification's uncertainty note and the supporting_evidence only cite a few sample rows; the rule is stated as a semantic rule but the evidence is thin (3 sample rows).",
+     "requested_revision": "Either strengthen the evidence for the Undergoes.DateUndergoes >= Stay.StayStart rule (more sample rows or a documented source), or downgrade it to an uncertain pattern in the specification so the program's enforcement is clearly labeled as a design choice rather than a confirmed rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification generic_sampling_rules.integer_numeric says 'Uniform integer in [1, 1000] unless a per-column exception gives a range.' NumberSampler.sample() applies random +/-1, +/-2 perturbations after drawing, which can push values outside [1, 1000] (e.g. 1000 + 2 = 1002) and outside [0, 20000] for reals. The specification does not authorize out-of-range perturbations.",
+     "requested_revision": "Clamp the perturbed value to [self.min, self.max] before casting, or restrict perturbations to stay within the declared range. Confirm generated numeric values are within the specified ranges."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification generic_sampling_rules.datetime says 'Random datetime in 2008-01-01..2008-12-31, formatted per column exception.' DateSampler._draw uses self.full = (2008-01-01, 2008-12-31) but the span is computed as total_seconds() of the full range, so the upper bound is inclusive only if the random draw hits exactly the end; more importantly, the format for Stay.StayStart is '%Y-%m-%d' (date only), so the time component is dropped, which is consistent with the column exception. However, the specification's ties_for_order_limit for Stay.StayStart requires ties at ranks [1,2] in DESC order; _apply_ties sets vals[1] = vals[0], which plants a tie but does not guarantee the tie is at rank 1 and 2 in DESC order (it depends on the sampled values).",
+     "requested_revision": "Ensure _apply_ties for Stay.StayStart plants at least two rows with the maximum StayStart value (so they tie at rank 1 and 2 in DESC order), and similarly for Department.DepartmentID at rank 1 in ASC and DESC. Verify with a query on the generated instances."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether construction_pairs_by_group being empty means no per-group separation was measured, or whether the reporting is incomplete.",
+    "Whether the 9 ValueError failures are the only cause of n_fail=9, or whether other units also failed for different reasons (stderr_tail only shows ValueError).",
+    "Whether Appointment.PrepNurse NULLs are actually generated but omitted from the nullable_columns report, or genuinely absent."
+   ]
+  }
+ ]
 }

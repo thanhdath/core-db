@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -27,6 +29,26 @@ class ColumnSampler:
 
     def sample(self):
         raise NotImplementedError
+
+
+class EnumSampler(ColumnSampler):
+    """Draws only from the enumerated pool (specification: 0% fresh values)."""
+
+    def __init__(self, elements: list, rng):
+        super().__init__(elements, 0.0, 0, rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class IntPoolSampler(ColumnSampler):
+    """Draws only from the small integer pool (specification: 0% fresh values)."""
+
+    def __init__(self, elements: list, rng):
+        super().__init__(elements, 0.0, 0, rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
 
 
 def _num(x):
@@ -217,6 +239,11 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    key = (column.table, column.name)
+    if key in spec.ENUM_POOLS:
+        return EnumSampler(spec.enum_pool(column.table, column.name), rng)
+    if key in spec.INT_POOLS:
+        return IntPoolSampler(spec.int_pool(column.table, column.name), rng)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:

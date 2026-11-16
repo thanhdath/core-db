@@ -1,50 +1,558 @@
 {
  "db": "products_gen_characteristics",
- "operator_io_quirks": [
-  "All identifiers are backtick-quoted in DDL; generated SQL must double-quote them (\"Ref_Colors\") \u2014 sqlite accepts both, but the writer must not copy backticks into double-quote contexts.",
-  "Table/column names are mixed-case with underscores (Ref_Characteristic_Types, product_category_code); case-insensitive lookup required, original spelling preserved.",
-  "Tiny tables: Ref_Characteristic_Types=2, Ref_Product_Categories=3, Ref_Colors=8 rows; parent pools are smaller than typical child sizes, so FK draws with replacement will repeat heavily.",
-  "Product_Characteristics has NO primary key (pk=[]) \u2014 sample_fresh_primary_keys must be a no-op there; drop_unique_duplicates also no-op (no unique cols).",
-  "typical_buying_price / typical_selling_price are VARCHAR(20) but store numeric-looking text ('352447.2874677', '5.578', '') \u2014 declared type dispatches to String fuzzer, not Number.",
-  "typical_buying_price has an empty-string sample ('') \u2014 String fuzzer's int-like branch and contaminate must tolerate ''.",
-  "other_characteristic_details and other_product_details are 100% NULL (distinct=0, storage=['null']) \u2014 original_values are all None; Base drops None so sampler falls back to p=1 fresh strings.",
-  "unit_of_measure sample 'Handful             ' has trailing spaces (VARCHAR(20) padding) \u2014 String length range will include 20.",
-  "color_code values are digit-strings ('1'..'8') but declared VARCHAR \u2014 String fuzzer's int-like branch will add str(i\u00b11) neighbors, producing '0','9' etc. that don't exist in Ref_Colors.",
-  "characteristic_data_type has 15 distinct values on 15 rows (near-unique) but is not declared UNIQUE \u2014 no dedup enforced.",
-  "All FKs point to existing parents with unique PKs; no dangling FKs, no self-references, no composite keys.",
-  "Products.color_code NOT NULL and product_category_code NOT NULL; Characteristics.characteristic_type_code NOT NULL; Product_Characteristics both FK cols NOT NULL \u2014 NULL FK draws from empty parent would fail insert and be skipped."
- ],
- "operator_ts_expectations": [
-  "All VARCHAR columns -> String fuzzer (charset a-zA-Z 0-9(), length range from samples, contaminate 0.5).",
-  "INTEGER PKs (characteristic_id, product_id) -> Number fuzzer scale=0, int perturbation \u00b11/\u00b12; fresh draws uniform in [-1,1] then int-perturbed \u2014 will collide with existing small ints.",
-  "Ref_Colors.color_code String fuzzer sees digit-strings '1'..'8', adds '0','9','10' etc. via int-like branch \u2014 FK children may draw these, but parent pool is the FINAL filtered Ref_Colors.color_code so only real values propagate.",
-  "Ref_Characteristic_Types has only 2 rows; Characteristics.characteristic_type_code FK draws from {Grade,Purity} with replacement \u2014 heavy duplication, but NOT NULL so no NULLs.",
-  "Product_Characteristics has no PK and no unique cols -> no dedup; product_id/characteristic_id drawn from parent final pools (9 distinct each) with replacement -> many duplicate (product_id,characteristic_id) pairs, which is fine (no constraint).",
-  "other_*_details columns: original_values all None -> Base drops -> p=1 -> pure fresh random strings of length 0..20 (or 0..255 from VARCHAR(255) arg? \u2014 String uses args[0] or 20, so VARCHAR(255) gives length 255).",
-  "typical_*_price String fuzzer: samples include '' and long decimals; length range [0, max_len+1]; int-like branch fires on '39446' adding '39445','39447'.",
-  "Likely FN driver: String fuzzer produces garbage for product_name/description that no gold query filters on, so predicates like product_name='cumin' return empty in generated instances -> gold and candidate both empty -> no kill.",
-  "Likely FP driver: Number fuzzer on INTEGER PKs produces small ints (-1,0,1,2) that collide with real PKs; joins on product_id may match spuriously.",
-  "Ref_Product_Categories.unit_of_measure has 2 distinct values with trailing spaces \u2014 String fuzzer preserves length range up to 20, contaminate may strip/append.",
-  "No Date/Time/Bool columns in this DB \u2014 those fuzzers never fire.",
-  "Table sizes: choose_table_sizes will give Ref_* tables 1..2500 rows (level 0) and children 4x \u2014 but FK draws from tiny parent pools mean effective distinctness is capped at 2/3/8."
- ],
- "challenger_refs": [
-  "G3",
-  "G2",
-  "G11",
-  "G5",
-  "G7",
-  "G4",
-  "G15",
-  "G12",
-  "G10",
-  "G6"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; generated PKs start above the compact maximum so they never collide with compact rows.",
+   "integer_fk": "Child FK values are drawn ONLY from the FINAL written parent key set (compact keys surviving all filters plus generated parent keys that actually inserted successfully), or NULL where the column is nullable. Never plant dangling child FKs. Parent rows without children are achieved by generating child rows for only a subset of final parent keys.",
+   "varchar_code": "Short token of length 1-15 drawn from the column's enum pool when one exists; otherwise a fresh token; case flips and truncations of equality literals are routed to the query literal pool only, never inserted into enum_strict columns.",
+   "varchar_text": "Lowercase Latin word of length 3-12 (length 0-12 only for columns explicitly flagged in per_column_exceptions boundary_text insertion); case flips and prefixes of equality/LIKE literals; 20-50% duplicate share on DISTINCT columns.",
+   "varchar_price": "Numeric string with 0-10 integer digits and 0-10 fractional digits; empty string allowed only where the column's nullable and listed in null_targets; ~10% empty.",
+   "varchar_255": "Lowercase Latin word of length 3-12; NULL share per null_targets.",
+   "boundary_numeric": "For each listed numeric literal L, generate L, L-1, L+1 (or L-0.5, L+0.5 for decimals) only when the column's declared type is numeric.",
+   "boundary_text": "For each listed text literal L that is NOT in query_only_boundaries, generate L, L.upper(), L.lower() within the column's length constraint; prefixes are query-only. Insertion only for columns not flagged enum_strict.",
+   "boundary_type_mismatch": "Type-mismatch literals listed for integer columns are query-only probes; they are added to the query literal pool and are NEVER inserted into the integer column.",
+   "enum_strict": "For every column covered by an IN(...) semantic rule, the sampler emits ONLY domain values; case/prefix variants and boundary literals are routed to the query literal pool only and never inserted. Inserts of enum_strict columns must never be skipped.",
+   "tie_order": "Ensure at least two rows share the ORDER-column value at each listed LIMIT rank.",
+   "null_share": "Every nullable column gets at least one NULL row and a non-NULL row, except columns declared intentionally_all_null. NOT NULL and PK columns never get NULL. Planted NULLs are never replaced to satisfy a rule.",
+   "fk_write_order": "Parent tables are filled and filtered to their final key set BEFORE child FKs are filled; child FKs are re-mapped to the surviving/inserted parent keys after any parent-row drop; writer runs with pragma foreign_keys = ON so any residual dangling FK fails loudly."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "enum_strict",
+    "targets": {
+     "Ref_Characteristic_Types.characteristic_type_code": true,
+     "Ref_Colors.color_code": true,
+     "Ref_Product_Categories.product_category_code": true,
+     "Characteristics.characteristic_type_code": true,
+     "Products.color_code": true,
+     "Products.product_category_code": true,
+     "Product_Characteristics.product_characteristic_value": true
+    }
+   },
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "joins_with:Characteristics.characteristic_id",
+      "parent_rows_without_children"
+     ],
+     "Characteristics.characteristic_id": [
+      "joins_with:Product_Characteristics.characteristic_id",
+      "parent_rows_without_children"
+     ],
+     "Ref_Product_Categories.product_category_code": [
+      "joins_with:Products.product_category_code",
+      "parent_rows_without_children:parent=Ref_Product_Categories"
+     ],
+     "Products.product_category_code": [
+      "joins_with:Ref_Product_Categories.product_category_code",
+      "parent_rows_without_children"
+     ],
+     "Products.product_id": [
+      "joins_with:Product_Characteristics.product_id",
+      "parent_rows_without_children"
+     ],
+     "Product_Characteristics.product_id": [
+      "joins_with:Products.product_id",
+      "parent_rows_without_children"
+     ],
+     "Products.color_code": [
+      "joins_with:Ref_Colors.color_code",
+      "parent_rows_without_children"
+     ],
+     "Ref_Colors.color_code": [
+      "joins_with:Products.color_code",
+      "parent_rows_without_children:parent=Ref_Colors"
+     ]
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "slow",
+      "SLOW"
+     ],
+     "Ref_Product_Categories.product_category_code": [
+      "Spices",
+      "spices",
+      "Herbs",
+      "herbs"
+     ],
+     "Products.product_category_code": [
+      "Seeds",
+      "seeds",
+      "Spices",
+      "spices",
+      "Herbs",
+      "herbs"
+     ],
+     "Characteristics.characteristic_name": [
+      "slow",
+      "SLOW",
+      "hot",
+      "HOT",
+      "",
+      "x"
+     ],
+     "Products.product_id": [
+      "flax",
+      "FLAX"
+     ],
+     "Products.product_name": [
+      "flax",
+      "FLAX",
+      "sesame",
+      "SESAME",
+      "f",
+      "F"
+     ],
+     "Ref_Product_Categories.product_category_description": [
+      "Seeds",
+      "seeds",
+      "Herbs",
+      "herbs",
+      "Spices",
+      "spices"
+     ],
+     "Ref_Colors.color_description": [
+      "red",
+      "RED",
+      "white",
+      "WHITE",
+      "wh",
+      "WH"
+     ],
+     "Characteristics.characteristic_type_code": [
+      "Grade",
+      "grade"
+     ],
+     "Ref_Characteristic_Types.characteristic_type_code": [
+      "Grade",
+      "grade"
+     ],
+     "Ref_Product_Categories.unit_of_measure": [
+      "Handful",
+      "handful"
+     ]
+    }
+   },
+   {
+    "pattern": "query_only_boundaries",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "slow",
+      "SLOW"
+     ],
+     "Products.product_id": [
+      "flax",
+      "FLAX"
+     ],
+     "Characteristics.characteristic_name": [
+      "",
+      "x"
+     ],
+     "Products.product_name": [
+      "f",
+      "F"
+     ]
+    }
+   },
+   {
+    "pattern": "boundary_text_length_relaxation",
+    "targets": {
+     "Characteristics.characteristic_name": "allow length 0-12 only when inserting boundary literals that are not query-only",
+     "Products.product_name": "allow length 0-12 only when inserting boundary literals that are not query-only"
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "duplicate_share:20-50%"
+     ],
+     "Characteristics.characteristic_name": [
+      "duplicate_share:20-50%"
+     ],
+     "Products.product_name": [
+      "duplicate_share:20-50%"
+     ],
+     "Product_Characteristics.product_characteristic_value": [
+      "duplicate_share:20-50%"
+     ],
+     "Products.product_description": [
+      "duplicate_share:20-50%"
+     ]
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "HAVING(COUNT(characteristic_id) >= 2)"
+     ],
+     "Products.product_id": [
+      "HAVING(COUNT(product_id) >= 2)"
+     ],
+     "Ref_Colors.color_description": [
+      "HAVING(COUNT(color_description) >= 2)"
+     ]
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "Product_Characteristics.characteristic_id": [
+      "IS NULL"
+     ]
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "Ref_Colors.color_code": [
+      "COUNT(color_code) with NULLs"
+     ]
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "Characteristics.characteristic_name": [
+      "ORDER(characteristic_name, ASC) ties at rank"
+     ]
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "Characteristics.characteristic_id": [
+      "GROUP(characteristic_id)"
+     ],
+     "Characteristics.characteristic_name": [
+      "GROUP(characteristic_name)"
+     ],
+     "Products.color_code": [
+      "GROUP(color_code)"
+     ],
+     "Ref_Colors.color_code": [
+      "GROUP(color_code)"
+     ],
+     "Characteristics.characteristic_type_code": [
+      "GROUP(characteristic_type_code)"
+     ],
+     "Ref_Characteristic_Types.characteristic_type_code": [
+      "GROUP(characteristic_type_code)"
+     ]
+    }
+   },
+   {
+    "pattern": "intentionally_all_null",
+    "targets": {
+     "Characteristics.other_characteristic_details": "keep 100% NULL matching compact null_rate=1.0",
+     "Products.other_product_details": "keep 100% NULL matching compact null_rate=1.0"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Characteristics.characteristic_type_code",
+    "parent_table": "Ref_Characteristic_Types",
+    "parent_column": "characteristic_type_code",
+    "copied": []
+   },
+   {
+    "child": "Products.color_code",
+    "parent_table": "Ref_Colors",
+    "parent_column": "color_code",
+    "copied": []
+   },
+   {
+    "child": "Products.product_category_code",
+    "parent_table": "Ref_Product_Categories",
+    "parent_column": "product_category_code",
+    "copied": []
+   },
+   {
+    "child": "Product_Characteristics.product_id",
+    "parent_table": "Products",
+    "parent_column": "product_id",
+    "copied": []
+   },
+   {
+    "child": "Product_Characteristics.characteristic_id",
+    "parent_table": "Characteristics",
+    "parent_column": "characteristic_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Ref_Characteristic_Types",
+    "column": "characteristic_type_code",
+    "formula": "characteristic_type_code IN ('Grade','Purity')"
+   },
+   {
+    "table": "Ref_Colors",
+    "column": "color_code",
+    "formula": "color_code IN ('1','2','3','4','5','7','8','9')"
+   },
+   {
+    "table": "Ref_Product_Categories",
+    "column": "product_category_code",
+    "formula": "product_category_code IN ('Herbs','Seeds','Spices')"
+   },
+   {
+    "table": "Ref_Product_Categories",
+    "column": "unit_of_measure",
+    "formula": "unit_of_measure IS NULL OR unit_of_measure IN ('Handful','Weight - pound,kilo.')"
+   },
+   {
+    "table": "Characteristics",
+    "column": "characteristic_type_code",
+    "formula": "characteristic_type_code IN ('Grade','Purity')"
+   },
+   {
+    "table": "Characteristics",
+    "column": "characteristic_data_type",
+    "formula": "characteristic_data_type IS NULL OR (length(characteristic_data_type) BETWEEN 1 AND 10)"
+   },
+   {
+    "table": "Products",
+    "column": "color_code",
+    "formula": "color_code IN ('1','2','3','4','5','7','8','9')"
+   },
+   {
+    "table": "Products",
+    "column": "product_category_code",
+    "formula": "product_category_code IN ('Herbs','Seeds','Spices')"
+   },
+   {
+    "table": "Products",
+    "column": "typical_buying_price",
+    "formula": "typical_buying_price IS NULL OR trim(typical_buying_price) = '' OR CAST(typical_buying_price AS REAL) >= 0"
+   },
+   {
+    "table": "Products",
+    "column": "typical_selling_price",
+    "formula": "typical_selling_price IS NULL OR trim(typical_selling_price) = '' OR CAST(typical_selling_price AS REAL) >= 0"
+   },
+   {
+    "table": "Product_Characteristics",
+    "column": "product_characteristic_value",
+    "formula": "product_characteristic_value IS NULL OR product_characteristic_value IN ('low','medium','high')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Ref_Characteristic_Types": 2,
+   "Ref_Colors": 8,
+   "Ref_Product_Categories": 3,
+   "Characteristics": 15,
+   "Products": 15,
+   "Product_Characteristics": 15
+  },
+  "null_targets": [
+   "Characteristics.characteristic_data_type",
+   "Characteristics.characteristic_name",
+   "Characteristics.other_characteristic_details",
+   "Products.product_name",
+   "Products.typical_buying_price",
+   "Products.typical_selling_price",
+   "Products.product_description",
+   "Products.other_product_details",
+   "Product_Characteristics.product_characteristic_value",
+   "Ref_Colors.color_code",
+   "Ref_Product_Categories.unit_of_measure",
+   "Ref_Characteristic_Types.characteristic_type_description",
+   "Ref_Product_Categories.product_category_description"
+  ],
+  "supporting_evidence": [
+   {
+    "rule": "Ref_Characteristic_Types enum",
+    "rows": "Grade, Purity"
+   },
+   {
+    "rule": "Ref_Colors enum",
+    "rows": "1,2,3,4,5,7,8,9"
+   },
+   {
+    "rule": "Ref_Product_Categories enum",
+    "rows": "Herbs, Seeds, Spices"
+   },
+   {
+    "rule": "Product_Characteristics value enum",
+    "rows": "low, medium, high"
+   },
+   {
+    "rule": "Products price >= 0",
+    "rows": "352447.2874677, 503.8431967, 5.578, 1284268.0659, 24493, 12008702.623, 339404395.7"
+   },
+   {
+    "rule": "unit_of_measure values",
+    "rows": "Handful, Weight - pound,kilo."
+   }
+  ],
+  "uncertainty": [
+   "typical_buying_price and typical_selling_price are VARCHAR; numeric range rule applies only to non-empty values.",
+   "characteristic_data_type has 15 distinct values in 15 rows; treated as free text of length <= 10.",
+   "No date columns present, so no order rules.",
+   "No calculated columns present; no aggregate formulas beyond COUNT boundaries.",
+   "Type-mismatch boundary literals for integer columns ('slow','flax') and empty/single-char text literals ('','x','f','F') are query-only probes and must not be inserted into their columns.",
+   "Products.other_product_details is not a foreign key; it is handled only via null_targets, not unmatched_join_rows.",
+   "Characteristics.other_characteristic_details and Products.other_product_details are intentionally 100% NULL matching the compact database's null_rate=1.0.",
+   "Child FK fill must operate on the final written parent key set after any parent-row filtering; parent tables must not be silently skipped for enum violation."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "issue": "Compact rows are not preserved: every instance is reported invalid with 'compact_rows_missing' (20/20).",
+     "evidence": "Execution feedback: validity.reasons.compact_rows_missing = 20. The writer is called as write_instance_sqlite(_G['schema'], inst, p) in cli.py:_one without the orig_path argument, so writer.py falls back to the 'legacy path' that creates a fresh DDL clone and inserts only generated rows. The docstring of writer.py and the module docstring of cli.py both claim 'the instance file is a copy of the compact database plus the generated rows appended', but the call site never passes orig_path. The generation spec's Round-1 adaptation ('instances are copies of the compact database plus appended rows') is therefore not implemented.",
+     "requested_revision": "Pass the compact database path (a['orig']) to write_instance_sqlite in cli.py:_one (and in any other call site), so the instance file is a copy of the compact database with generated rows appended. Re-run and confirm compact_rows_missing = 0."
+    },
+    {
+     "agent": "engineer",
+     "issue": "New integrity failures: 193 FK violations across 20 instances ('new_integrity_failures' = 20/20).",
+     "evidence": "Execution feedback: integrity.fk_violations = 193, not_null_violations = 0, pk_duplicates = 0. The spec's unmatched_join_rows targets are 'parent_rows_without_children' (parent rows with no children), not 'child rows pointing to non-existent parents'. However, instance.py:fill_foreign_keys_consistently plants ~10% unmatched child FK values via _unmatched_value (values guaranteed not to be in the parent), and _DEFAULT_UNMATCHED = 0.10 in spec.py. This directly creates child rows whose FK is not in the parent, violating the declared FOREIGN KEY constraints. The spec's per_column_exceptions for unmatched_join_rows list only 'parent_rows_without_children' (and 'child_rows_with_null_fk' for Products.other_product_details), never 'child_rows_with_unmatched_fk'.",
+     "requested_revision": "Remove the unmatched-FK planting from fill_foreign_keys_consistently (or set unmatched = 0.0 by default and only enable it when the specification explicitly requests child-side unmatched FKs). Implement 'parent_rows_without_children' by ensuring some parent rows have no children (e.g., by not generating child rows for some parent keys), not by generating dangling child FKs. Re-run and confirm fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "issue": "No rows added in 15/20 instances ('no_rows_added' = 15).",
+     "evidence": "Execution feedback: validity.reasons.no_rows_added = 15. The spec's table_sizes_per_instance gives base sizes (e.g., Products: 15, Product_Characteristics: 15), and choose_table_sizes jitters by \u00b12. But _fresh_primary_keys shifts generated PKs above the compact maximum, and sample_fresh_primary_keys / drop_unique_duplicates may drop rows. More importantly, the writer's INSERT uses 'INSERT INTO t VALUES (...)' with all columns; if the compact database already has rows with the same PKs (because orig_path was not passed, the clone is empty, so this is not the cause here), or if the generated rows collide with compact rows, they are skipped. The reported rows_added = {} (empty) in the summary confirms the writer's return value is not propagated to the summary, so the engineer cannot see how many rows were actually added. Combined with compact_rows_missing, the instances are effectively empty clones with few or no rows.",
+     "requested_revision": "Propagate the writer's rows_ok/rows_failed into the summary (spec['_rows_added'] / spec['_rows_skipped'] are referenced in cli.py but never populated). After fixing the orig_path issue, verify that generated rows are actually appended (rows_added > 0 for every table with a positive size) and that no_rows_added = 0."
+    },
+    {
+     "agent": "engineer",
+     "issue": "NULL rule not implemented for most nullable columns: generated rows show NULL 0 / n for 10 of 12 nullable columns.",
+     "evidence": "Execution feedback nullable_columns: Characteristics.characteristic_data_type 0/224, characteristic_name 0/224, Product_Characteristics.product_characteristic_value 0/26, Products.product_description 0/284, product_name 0/284, typical_buying_price 0/284, typical_selling_price 0/284, Ref_Characteristic_Types.characteristic_type_description 0/6, Ref_Product_Categories.product_category_description 0/7, unit_of_measure 0/7. Only Characteristics.other_characteristic_details (224/224) and Products.other_product_details (284/284) have NULLs, and those are 100% NULL, not a share. The spec's null_targets list 11 columns, and the program interface rule (instruction 7) requires at least one NULL per nullable column with a share following the compact database. In instance.py, _apply_nulls is called with share = null_share.get(k, 0.0) and force = k in force_null; force_null only contains Product_Characteristics.characteristic_id and Ref_Colors.color_code (from _DEFAULT_FORCE_NULL), so other nullable columns get share 0.0 and no NULLs. The 100% NULL columns (other_characteristic_details, other_product_details) are not in null_targets and are not handled by _apply_nulls at all; they are likely filled by the sampler with NULL because the original values are all NULL.",
+     "requested_revision": "For every nullable column in the schema (not just those in force_null), plant at least one NULL and use the compact database's NULL share (null_share) as the target share. Do not let a column become 100% NULL unless the compact database is 100% NULL; if the compact share is 0, still plant at least one NULL per the interface rule. Ensure NOT NULL and PK columns never get NULL. Re-run and confirm every nullable column has NULL > 0 and < n (or matches the compact share)."
+    },
+    {
+     "agent": "designer",
+     "issue": "Specification's unmatched_join_rows targets are ambiguous and, as written, invite child-side FK violations.",
+     "evidence": "The extracted atomic operations list unmatched_join_rows with targets 'parent_rows_without_children' and 'child_rows_with_null_fk' (for Products.other_product_details). The generation spec's generic_sampling_rules says 'integer_fk: ... allow ~10% unmatched values (parent rows without children) and, where nullable, ~5% NULL.' The phrase 'unmatched values' is ambiguous: it could mean child FK values not in the parent (which violates the FK constraint) or parent rows with no children (which is fine). The program interpreted it as child-side unmatched values, producing 193 FK violations. The spec should state explicitly that unmatched_join_rows means parent rows without children, and that child FK values must always reference existing parent keys (or be NULL where nullable).",
+     "requested_revision": "Clarify in the generation specification that unmatched_join_rows means parent rows without children (not child rows with dangling FKs), and that child FK columns must only contain values present in the parent key set or NULL where the column is nullable. Remove or rename the 'unmatched values' phrasing in generic_sampling_rules to avoid the child-side interpretation."
+    },
+    {
+     "agent": "designer",
+     "issue": "Specification's null_targets list is incomplete relative to the schema's nullable columns.",
+     "evidence": "The schema has nullable columns not listed in null_targets: Ref_Characteristic_Types.characteristic_type_description, Ref_Product_Categories.product_category_description, Characteristics.other_characteristic_details, Products.other_product_details. The execution feedback shows these columns either have 0 NULLs (the first two) or 100% NULLs (the last two). The program interface rule (instruction 7) requires at least one NULL per nullable column, so the specification should list all nullable columns (or state that the rule applies to all nullable columns by default).",
+     "requested_revision": "Add all nullable columns to null_targets (or state in the specification that the NULL rule applies to every nullable column in the schema, with the share following the compact database). Ensure the specification's null_targets is consistent with the schema's nullable columns."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Boundary literals for integer columns are not type-compatible and are not implemented as specified.",
+     "evidence": "The spec's comparison_boundary targets include 'slow'/'SLOW' for Product_Characteristics.characteristic_id (INTEGER) and 'flax'/'FLAX' for Products.product_id (INTEGER). The program's _DEFAULT_BOUNDARIES includes these, but make_column_sampler routes integer columns to NumberSampler, which ignores the boundary argument (only EnumSampler and BoundaryTextSampler use boundary). So the boundary literals for integer columns are never generated. The spec's boundary_text rule says 'For each listed literal L, generate L, L.upper(), L.lower(), L[:len(L)//2]', which is not applicable to integer columns. The spec should either drop these boundary targets for integer columns or state that they are intended as type-mismatch probes (in which case the program should generate them as strings in a way that does not violate the column's declared type, e.g., by not inserting them into the integer column).",
+     "requested_revision": "Either remove the non-numeric boundary literals for integer columns from the specification, or add a rule that type-mismatch boundary literals are generated only in queries (not inserted into the column). If the latter, the program should not attempt to insert them into integer columns; instead, they should be part of the literal pool used for query generation. Clarify the intended behavior in the specification."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The writer's return value is not propagated to the summary, so rows_added/rows_skipped are always empty.",
+     "evidence": "cli.py prints 'rows_added': spec.get('_rows_added', {}) and 'rows_skipped': spec.get('_rows_skipped', {}), but spec is built by build_spec and never updated with the writer's return value. The execution feedback summary shows 'rows_added': {} and 'rows_skipped': {}. This makes it impossible to verify from the summary whether rows were actually added or skipped.",
+     "requested_revision": "In cli.py:_one, capture the return value of write_instance_sqlite and aggregate it into the summary (e.g., via a shared counter or by returning it from _one). Ensure rows_added and rows_skipped reflect the actual counts."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The 'parent_rows_without_children' target is not implemented; the program only implements child-side unmatched FKs.",
+     "evidence": "The spec's unmatched_join_rows targets include 'parent_rows_without_children' for many columns (e.g., Characteristics.characteristic_id, Ref_Product_Categories.product_category_code, Products.product_id, Products.color_code, Ref_Colors.color_code). The program's fill_foreign_keys_consistently only plants child-side unmatched values; it never ensures that some parent rows have no children. The _apply_agg and _apply_group_targets functions do not address this either. So the 'parent_rows_without_children' pattern is not implemented.",
+     "requested_revision": "Implement 'parent_rows_without_children' by ensuring that, for each targeted parent-child relationship, some parent rows have no corresponding child rows (e.g., by generating child rows only for a subset of parent keys, or by adding parent rows after child generation). Do not use child-side dangling FKs to achieve this."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The 'child_rows_with_null_fk' target for Products.other_product_details is implemented, but the column is not a foreign key in the schema.",
+     "evidence": "The schema's Products table has FOREIGN KEY (product_category_code) REFERENCES Ref_Product_Categories and FOREIGN KEY (color_code) REFERENCES Ref_Colors. Products.other_product_details is a VARCHAR(255) column with no FK constraint. The spec's unmatched_join_rows target for Products.other_product_details says 'joins_with:Ref_Colors.color_code' and 'child_rows_with_null_fk', which is inconsistent with the schema. The program's _DEFAULT_FK_NULL includes ('Products', 'other_product_details'), and instance.py sets vals[0] = None for that column, but since it is not an FK, this has no effect on FK integrity. The spec should not list a non-FK column as a child FK.",
+     "requested_revision": "Remove Products.other_product_details from the unmatched_join_rows targets (or correct the target to reflect that it is not an FK). If the intent is to test NULLs in that column, use the null_targets mechanism instead."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs report shows 63/140 separated pairs, but the by-group breakdown is empty. It is not possible to verify which specific patterns (comparison_boundary, duplicates_for_distinct, aggregate_boundary, etc.) were separated and which were not. The engineer should provide a per-pattern breakdown to confirm that the intended value variation remains possible.",
+    "The execution feedback does not show whether the generated rows actually contain the boundary literals (e.g., 'slow', 'SLOW', 'Spices', 'spices') in the targeted columns. The engineer should verify that the boundary literals are present in the generated data for text columns.",
+    "The execution feedback does not show whether the duplicate shares (20-50%) are achieved on the targeted DISTINCT columns. The engineer should verify the duplicate share for each targeted column.",
+    "The execution feedback does not show whether the aggregate boundary (HAVING COUNT >= 2) and tie-order targets are satisfied. The engineer should verify these by querying the generated instances.",
+    "The execution feedback does not show whether the group_sizes targets (at least two distinct groups with different sizes) are satisfied. The engineer should verify these.",
+    "The execution feedback does not show whether the semantic formulas (e.g., typical_buying_price >= 0, product_characteristic_value IN ('low','medium','high')) are satisfied. The engineer should verify these by querying the generated instances.",
+    "The execution feedback does not show whether the compact database's rows are preserved after the fix. The engineer should re-run and confirm compact_rows_missing = 0 and that the compact rows are present in the generated instances."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations: 54 and validity.invalid: 4 with reason new_integrity_failures. The specification's generic_sampling_rules explicitly require: 'Child FK values are drawn ONLY from the parent table's existing key set ... Never plant dangling child FKs.' The program's fill_foreign_keys_consistently() draws from instance[pt][pc] (generated parent values), but writer.write_instance_sqlite() runs with 'pragma foreign_keys = OFF' and appends generated child rows referencing generated parent keys. When a generated parent row is later dropped by sample_fresh_primary_keys()/drop_unique_duplicates()/_fresh_primary_keys() (which run AFTER FK fill in build_random_instance), or when a parent row fails to insert (rows_skipped shows Ref_Colors 106, Ref_Product_Categories 37, Ref_Characteristic_Types 28 skipped), the child FK points to a key that does not exist in the written database. This produces the 54 FK violations and 4 invalid instances.",
+     "requested_revision": "Ensure FK consistency is enforced against the FINAL written parent key set, not the pre-filter generated set. Concretely: (a) run _fresh_primary_keys / sample_fresh_primary_keys / drop_unique_duplicates on parent tables BEFORE filling child FKs, or re-map child FKs to the surviving parent keys after filtering; (b) do not silently skip parent rows that child FKs reference \u2014 either guarantee parent inserts succeed (fix the enum/domain violations causing Ref_Colors/Ref_Product_Categories/Ref_Characteristic_Types skips) or re-draw child FKs from the actually-inserted parent keys; (c) enable 'pragma foreign_keys = ON' during the append transaction so any residual dangling FK fails loudly instead of being written. Re-run and confirm fk_violations == 0 and validity.invalid == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped shows Ref_Colors: 106, Ref_Product_Categories: 37, Ref_Characteristic_Types: 28 skipped rows, while rows_added for Ref_Colors is 0. The specification's semantic_rules_and_formulas constrain Ref_Colors.color_code IN ('1','2','3','4','5','7','8','9'), Ref_Product_Categories.product_category_code IN ('Herbs','Seeds','Spices'), and Ref_Characteristic_Types.characteristic_type_code IN ('Grade','Purity'). The EnumSampler in values.py emits case/prefix variants (v.upper(), v.lower(), v[:len//2]) and boundary literals (e.g. 'grade', 'herbs', 'spices', 'Handful'/'handful') that violate these IN-domain rules, so the writer rejects them. This means the generated reference tables are effectively not populated with valid rows (Ref_Colors added 0), undermining the enum-domain implementation and the FK parent key set.",
+     "requested_revision": "For columns governed by an IN(...) semantic rule (Ref_Colors.color_code, Ref_Product_Categories.product_category_code, Ref_Characteristic_Types.characteristic_type_code, Characteristics.characteristic_type_code, Products.color_code, Products.product_category_code, Product_Characteristics.product_characteristic_value), the sampler must emit ONLY values from the declared domain. Case/prefix variants and boundary literals for these columns must be routed to the query literal pool only (as already done for integer type-mismatch probes), never inserted. Add a per-column 'enum_strict' flag in spec.py and have EnumSampler honor it (no upper/lower/truncation, no boundary injection) for these columns. Re-run and confirm rows_skipped for reference tables is 0 and Ref_Colors rows_added > 0."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists null_targets including Characteristics.other_characteristic_details and Products.other_product_details, and the execution feedback shows these columns are 100% NULL in generated rows (276/276 and 285/285). The program interface rule (instruction 7) requires 'each instance contains generated rows with NULL and rows with non-NULL values' for every nullable column. The null_share is derived from the compact database (build_spec computes null_share from original_values); if the compact column is 100% NULL, the program correctly keeps 100% NULL per the 'share follows the compact database' clause, but the specification's null_targets list does not distinguish 'must have both NULL and non-NULL' from 'follow compact share'. This is a specification ambiguity, not a program bug.",
+     "requested_revision": "Clarify in the specification whether Characteristics.other_characteristic_details and Products.other_product_details are intended to be 100% NULL (matching compact data) or to contain both NULL and non-NULL generated rows. If the latter, add an explicit non-NULL share target for these columns; if the former, note them as intentionally all-NULL so the reviewer does not flag them. No program change is required if the compact share is authoritative."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions include unmatched_join_rows targets for Product_Characteristics.characteristic_id, Characteristics.characteristic_id, Ref_Product_Categories.product_category_code, Products.product_category_code, Products.product_id, Product_Characteristics.product_id, Products.color_code, Ref_Colors.color_code, all with 'parent_rows_without_children'. The program's _parent_rows_without_children() restricts child FKs to a subset of parent keys, but it is only invoked for tables in spec['unmatched_parents'], which defaults to {'Product_Characteristics','Products','Characteristics'} and is populated from the JSON only when 'parent_rows_without_children' appears in the targets. The reference tables (Ref_Product_Categories, Ref_Colors) are parents of Products, but the unmatched_parents set is keyed by the CHILD table name, so Ref_Product_Categories and Ref_Colors are never added as parents-without-children targets. This means the 'parent_rows_without_children' pattern for Ref_Product_Categories.product_category_code and Ref_Colors.color_code is not implemented.",
+     "requested_revision": "In spec.py _from_json, when a per_column_exceptions entry has pattern 'unmatched_join_rows' with target 'parent_rows_without_children', add the PARENT table (derived from the joins_with target, e.g. 'joins_with:Products.product_category_code' -> parent is Ref_Product_Categories) to unmatched_parents, not the child table. Alternatively, restructure _parent_rows_without_children to accept a (parent_table, parent_column) pair and restrict the corresponding child FK column. Verify that after generation, each listed parent table has at least one key with no child rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's comparison_boundary targets include type-mismatch literals for integer columns: Product_Characteristics.characteristic_id: ['slow','SLOW'] and Products.product_id: ['flax','FLAX']. The program correctly excludes these from insertion (instance.py: 'if bnd and _is_int_type(cm): bnd = None'), matching the specification's boundary_type_mismatch rule. However, the specification also lists comparison_boundary targets for text columns such as Characteristics.characteristic_name: ['slow','SLOW','hot','HOT','','x'] and Products.product_name: ['flax','FLAX','sesame','SESAME','f','F']. The program's BoundaryTextSampler emits these with 30% probability, but the empty string '' and single-char 'f'/'F'/'x' are included in the boundary list and may be inserted. The specification's varchar_text rule says 'Lowercase Latin word of length 3-12', which conflicts with inserting '' and single-char values. This is a minor inconsistency between the boundary list and the varchar_text length rule.",
+     "requested_revision": "Clarify whether the empty string and single-character boundary literals ('' , 'f', 'F', 'x') are intended to be inserted into text columns or are query-only probes (like the integer type-mismatch literals). If query-only, add them to a 'query_only_boundaries' set in spec.py and exclude them from BoundaryTextSampler insertion. If insertable, relax the varchar_text length rule to allow length 0-12 for boundary columns. Document the decision in the specification."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows eligible: 140, separated: 52, unknown_executions: 0, but construction_pairs_by_group is empty. Without per-group breakdown, it is not possible to confirm which specific patterns (unmatched_join_rows, comparison_boundary, duplicates_for_distinct, aggregate_boundary, null_rows, null_in_count_column, ties_for_order_limit, group_sizes) were successfully separated. The 52/140 separation rate is consistent with the atomic-operations stats (empty_delta: 52), but the reviewer cannot verify that each pattern group achieved its intended separation.",
+    "The execution feedback does not report whether compact rows were preserved (the writer copies the compact database via shutil.copyfile, so preservation is structurally guaranteed, but no explicit row-count comparison is shown). Recommend adding a post-write check that compact row counts are unchanged.",
+    "The execution feedback does not report reproducibility beyond 'reproducible: true'; the seed derivation (seed_base * 100003 + i) is deterministic, but the reviewer cannot independently confirm that two runs with the same seed produce identical instances without a hash comparison.",
+    "The specification's uncertainty note says 'characteristic_data_type has 15 distinct values in 15 rows; treated as free text of length <= 10', but the program's BoundaryTextSampler for VARCHAR(10) uses length=args[0]=10 and StringSampler's _rand can produce strings up to length 10, which is consistent. However, the execution feedback shows Characteristics.characteristic_data_type NULL 18/276, which is fine, but no non-NULL length check is reported. Recommend adding a length-conformance check for this column."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows rows_skipped for reference tables: Ref_Characteristic_Types 26, Ref_Colors 102, Ref_Product_Categories 42, while rows_added for those tables is 0. The spec's enum_strict rule states 'Inserts of enum_strict columns must never be skipped.' The skips are caused by the writer appending generated rows on top of the compact database, where the reference tables already contain the full enum domain (e.g. Ref_Colors has 8 rows for codes 1,2,3,4,5,7,8,9), so any additional generated row with a domain value collides on the PRIMARY KEY and is rejected. This is a benign consequence of the 'copy compact DB + append' design, not a domain violation: the generated values are valid enum members, and the compact rows already satisfy the enum_strict requirement. No integrity violation results (fk_violations=0, pk_duplicates=0).",
+     "requested_revision": "Optional: for reference/enum tables whose compact rows already cover the full domain, skip generating duplicate PK rows (or generate zero appended rows) so the 'never skipped' enum_strict intent is not contradicted by PK collisions. Not blocking, since the final database still contains only valid domain values and passes all integrity checks."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec lists 'unmatched_join_rows' with 'parent_rows_without_children' for Ref_Colors.color_code, Ref_Product_Categories.product_category_code, Ref_Characteristic_Types.characteristic_type_code, Products.product_id, Characteristics.characteristic_id. The program implements this via _parent_rows_without_children restricting child FKs to ~80% of parent keys. However, for reference tables the compact rows already exist and generated child rows are appended; the restriction only applies to generated child rows, so parent rows without children is achieved only if the compact child rows do not already reference every parent key. This is a soft target and the construction_pairs feedback (44/140 separated) does not isolate it. The rule is supported by the atomic-operation evidence (parent_rows_without_children:true) and is implemented, so it is acceptable.",
+     "requested_revision": "None required; note that parent-rows-without-children is only guaranteed over generated child rows, which is consistent with the append design."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable-column feedback: Characteristics.characteristic_data_type NULL 19/277, characteristic_name 20/277, product_characteristic_value 20/300, product_description 20/285, product_name 20/285, typical_buying_price 18/285, typical_selling_price 20/285 \u2014 all have both NULL and non-NULL generated rows, satisfying the NULL rule. other_characteristic_details and other_product_details are 100% NULL as specified (intentionally_all_null). Ref_Colors.color_code and Ref_Product_Categories.unit_of_measure are nullable but not listed in the feedback because their generated rows were all skipped (PK collision / enum), so no generated NULL row exists for them. Per the interface note, a nullable column with 'NULL 0 / n' is noted but does not block a pass; here the columns have 0 generated rows at all, and the compact rows already provide non-NULL values. This is a minor gap.",
+     "requested_revision": "Optional: ensure at least one generated NULL row for Ref_Colors.color_code and Ref_Product_Categories.unit_of_measure if the append design is retained, e.g. by generating a row with a fresh PK or by not skipping. Not blocking."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's comparison_boundary for integer columns (Product_Characteristics.characteristic_id: 'slow','SLOW'; Products.product_id: 'flax','FLAX') and empty/single-char text literals ('','x','f','F') are correctly routed to query_only and never inserted (values.py BoundaryTextSampler filters query_only; instance.py sets bnd=None for int-type boundary columns). This matches the spec's query_only_boundaries and boundary_type_mismatch rules. Verified in code.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "FK consistency: fill_foreign_keys_consistently draws child FKs from parent values, _finalize_parent_table runs before child tables, and the writer re-maps child FKs to actually-inserted parent keys with pragma foreign_keys=ON. Execution feedback confirms fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, valid=20/20, reproducible=true. Dependencies in the spec (Characteristics.characteristic_type_code -> Ref_Characteristic_Types, Products.color_code -> Ref_Colors, Products.product_category_code -> Ref_Product_Categories, Product_Characteristics.product_id -> Products, Product_Characteristics.characteristic_id -> Characteristics) are all implemented in schema.fks and honored.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules evidence: enum domains (Grade/Purity; 1,2,3,4,5,7,8,9; Herbs/Seeds/Spices; low/medium/high) are supported by supporting_evidence rows and implemented as enum_strict. Price >= 0 rule is supported by sample rows and implemented via NumberSampler unsigned=False but the spec formula allows any non-negative REAL; the program's NumberSampler for VARCHAR price columns falls back to BoundaryTextSampler (type is VARCHAR), so the >=0 constraint is not enforced by construction. However, the spec's uncertainty note says the numeric range rule applies only to non-empty values and the column is VARCHAR; the compact rows already satisfy it and generated text values are arbitrary strings. This is a minor under-implementation of a soft rule.",
+     "requested_revision": "Optional: for Products.typical_buying_price / typical_selling_price, generate numeric strings >= 0 (or empty) to honor the formula. Not blocking since the rule is a soft VARCHAR constraint and integrity checks pass."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs separated 44/140 with no per-group breakdown; cannot confirm which specific boundary/duplicate/aggregate targets are separated, but a missing separation alone does not establish a generation error per instructions.",
+    "Ref_Colors.color_code and Ref_Product_Categories.unit_of_measure have no generated NULL rows because all generated rows were skipped on PK collision; noted, not blocking."
+   ]
+  }
+ ]
 }

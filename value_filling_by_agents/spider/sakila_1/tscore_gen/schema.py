@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    unique_tuples: list = field(default_factory=list)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -120,6 +121,22 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
                     continue
                 fks[(t, child)] = (pt, pc)
+        unique_tuples = []
+        for t in tnames:
+            for line in create[t].split('\n'):
+                ll = line.strip().lower()
+                if ll.startswith('unique') and '(' in ll:
+                    inner = ll[ll.index('(') + 1:ll.rindex(')')]
+                    cols = [c.strip().strip('"`[]') for c in inner.split(',')]
+                    names = [low.get(c) for c in cols]
+                    if all(names):
+                        unique_tuples.append((t, names))
+            for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
+                if idx[2]:
+                    cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
+                    names = [c[2] for c in cols if c[2]]
+                    if len(names) > 1:
+                        unique_tuples.append((t, names))
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
         ov, sizes = {}, {}
@@ -139,4 +156,4 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 ov[(t, c.name)] = [r[j] for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, unique_tuples)

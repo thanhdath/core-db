@@ -1,48 +1,573 @@
 {
  "db": "musical",
- "operator_io_quirks": [
-  "Table/column names mixed case (Musical_ID, Name, age); must double-quote in generated SQL.",
-  "actor.Musical_ID FK points to actor(Actor_ID) \u2014 a SELF-reference on the same table, not to musical. Upstream process_order must ignore table self-edges; FK fill draws from actor.Actor_ID's own final values.",
-  "FK parent column Actor_ID is the PK (unique) but the FK is semantically wrong (musical IDs stored in actor.Musical_ID, values 1,2,4,6 overlap musical.Musical_ID 1..7). No real FK to musical exists.",
-  "musical.Year declared INT, distinct=1 (all 1986) \u2014 Number fuzzer will scatter wildly; no date semantics.",
-  "actor.Duration declared TEXT but holds year-range strings ('1988\u2014', '1988, 1992\u2014', '1988\u20132008, 2013') with en-dashes/commas; String fuzzer, not Date.",
-  "musical.Category long text with spaces/commas; String fuzzer length range from samples.",
-  "musical.Name contains non-ASCII (Les Mis\u00e9rables) \u2014 CHARSET a-zA-Z0-9() will not reproduce accents.",
-  "All columns notnull=0, no CHECK/UNIQUE constraints beyond PKs; insert failures only from PK dupes (already filtered).",
-  "Tiny tables (7 and 9 rows) \u2014 choose_table_sizes will still request 30..2500 rows; PK/unique filtering shrinks but Number PKs rarely collide.",
-  "musical.Award/Nominee/Result low cardinality (2 distinct) \u2014 String sampler will mostly reuse elements.",
-  "No views/triggers/indexes beyond PK; DDL clone trivial.",
-  "actor.age INT small ints (18-26); Number fuzzer range \u00b110^scale."
- ],
- "operator_ts_expectations": [
-  "musical.Musical_ID / actor.Actor_ID: Number fuzzer, int, scale from INT (no args) -> range \u00b110^scale, perturb \u00b11/\u00b12; PK uniqueness filter keeps first occurrence.",
-  "musical.Year: Number fuzzer over single value 1986 -> list range quirk (min(el), full max) so fresh draws span huge range; likely FN on Year predicates.",
-  "musical.Name/Category/Nominee/Award/Result, actor.Name/Character/Duration: String fuzzer, length range from samples, 0.5 contaminate; Duration year-strings get random suffix/prefix \u2014 implausible but TS-consistent.",
-  "actor.Musical_ID: FK fill from actor.Actor_ID final values (self-ref) \u2014 values will be actor IDs, not musical IDs; queries joining actor->musical on Musical_ID will mostly miss (FP/FN).",
-  "No real FK to musical means joins musical.Actor implicitly via Musical_ID equality are not enforced; TS will not create matching pairs.",
-  "p=0.2 default, whole-instance p=0 w.p. 0.3 -> some instances pure element reuse (ties/duplicates), others fresh.",
-  "max_l0 cap (rng*30) on non-PK columns -> repeated fresh values, driving duplicate-heavy results.",
-  "Low-cardinality columns (Award, Result, Nominee) -> many ties; ORDER BY / DISTINCT queries may match by luck (FP) or miss (FN).",
-  "Year single distinct -> any 'Year = 1986' predicate: original all-true, TS mostly false (FN).",
-  "Duration text with en-dash: LIKE '%1988%' may still match after contamination (prefix/suffix keeps substring).",
-  "Self-FK: upstream draws child FK from parent's FINAL filtered column, so actor.Musical_ID values are a subset of actor.Actor_ID \u2014 self-join actor on Musical_ID=Actor_ID plausible.",
-  "Tiny originals: TS sizes 30-2500 rows vs 7-9 -> cardinality-sensitive queries (COUNT, aggregates) diverge."
- ],
- "challenger_refs": [
-  "G6",
-  "G7",
-  "G5",
-  "G4",
-  "G1",
-  "G2",
-  "G8",
-  "G3"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table, never NULL; every instance appends exactly table_sizes_per_instance rows per table (musical=7, actor=9) with no jitter; generated PKs must be fresh against the compact DB: offset the PK range above max(original PK) (musical.Musical_ID >= 8, actor.Actor_ID >= 9) and dedup against schema.original_values so rows_skipped stays 0; writer reports rows_added/rows_skipped per table. The offset is computed once per table in build_random_instance (fresh_pk_start(schema, table, column)) and the concrete [lo,hi] is passed to the sampler; spec.RANGES PK entries are relative offsets and the module-level _SCHEMA_REF indirection is removed.",
+   "int_foreign_key": "Draw from parent primary-key pool with replacement; 5-30% NULL when nullable; plant at least one non-NULL child FK value that matches no parent (unmatched join) and ensure at least one parent row has no children; NULLs are planted last and never overwritten by later passes.",
+   "int_numeric": "Uniform integer in [min, max] from statistics; boundary values min-1, min, min+1, max-1, max, max+1 are allowed to be generated even when outside the semantic range (they are the comparison-boundary targets); never NULL for NOT NULL columns.",
+   "text_short": "Draw from a small pool of realistic values; 20-50% duplicate share on DISTINCT-targeted columns; include near-variants (case changes, trailing/leading spaces, truncations) of listed literals at a small probability (~10%).",
+   "text_nullable": "5-30% NULL share planted last; non-NULL values from pool with near-variants; NULL positions are skipped by group-size, duplicate and order-tie passes.",
+   "text_enum": "Draw from the explicit enum list; include near-variants of each literal for comparison-boundary coverage at a small probability (~10%).",
+   "order_tie": "Ensure at least two rows share the top value of the ORDER column so rank-1 ties occur; for ASC force the minimum value to appear at least twice, for DESC force the maximum; direction per column exception; order-tie pass runs on positions disjoint from group-size and duplicate passes.",
+   "group_size": "Ensure groups of size 1, 2, and >=3 exist on the GROUP column; group-size pass runs before order-tie pass and on disjoint positions; NULL positions are excluded from group pools; assert per instance that targets were met on the full 7/9-row batches."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "musical.Award",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Tony Award",
+      "tony award",
+      "Drama Desk Award",
+      "drama desk award",
+      "Cleavant Derricks",
+      "cleavant derricks",
+      " Aw",
+      " aw",
+      " Awa",
+      " awa",
+      "Tonyard",
+      "tonyard"
+     ]
+    }
+   },
+   {
+    "column": "musical.Award",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "DESC",
+     "tie_at_rank": "any (no LIMIT)"
+    }
+   },
+   {
+    "column": "actor.Musical_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "actor.Musical_ID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "actor.Musical_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "actor.Musical_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "actor.Musical_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "musical.Musical_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "child_rows_with_unmatched_non_null_fk": true
+    }
+   },
+   {
+    "column": "musical.Musical_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "musical.Musical_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "actor.Actor_ID",
+      "actor.Musical_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "musical.Musical_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "musical.Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "musical.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "musical.Name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC",
+     "tie_at_rank": "any (no LIMIT)"
+    }
+   },
+   {
+    "column": "musical.Nominee",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "musical.Nominee",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "musical.Nominee",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 % of generated rows"
+    }
+   },
+   {
+    "column": "musical.Nominee",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "DESC",
+     "tie_at_rank": [
+      1
+     ],
+     "tie_on": [
+      "COUNT(musical.nominee)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "musical.Nominee",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "musical.Nominee"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "actor.Actor_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "musical.Musical_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "actor.Actor_ID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "actor.Actor_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(DISTINCT actor.actor_id)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "actor.age",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -1,
+      0,
+      1
+     ]
+    }
+   },
+   {
+    "column": "actor.age",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "actor.age",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "DESC",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "musical.Result",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "musical.Result",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "musical.Result",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC",
+     "tie_at_rank": [
+      1
+     ]
+    }
+   },
+   {
+    "column": "musical.Year",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "direction": "ASC and DESC",
+     "tie_at_rank": "any (no LIMIT)"
+    }
+   },
+   {
+    "column": "musical.Year",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "actor.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "actor.Character",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "actor.Musical_ID",
+    "parent_table": "musical",
+    "parent_column": "Musical_ID",
+    "copied_columns": [],
+    "note": "Declared FK in schema points to actor(Actor_ID) which is self-referential and intentionally ignored; logical FK is actor.Musical_ID -> musical.Musical_ID per atomic operations. Generation order: musical before actor. At least one non-NULL child FK value matches no parent Musical_ID; at least one parent musical row has no children. The declared self-FK is intentionally unenforced (writer sets pragma foreign_keys = OFF); the logical FK is the operative dependency."
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "musical",
+    "column": "Musical_ID",
+    "formula": "Musical_ID > 0"
+   },
+   {
+    "table": "musical",
+    "column": "Year",
+    "formula": "Year BETWEEN 1900 AND 2100",
+    "evidence": "Observed Year=1986; range widened to satisfy group_sizes (1,2,>=3) despite distinct=1 in statistics. Inferred rule, not directly evidenced by compact data."
+   },
+   {
+    "table": "musical",
+    "column": "Award",
+    "formula": "Award IN ('Tony Award', 'Drama Desk Award')"
+   },
+   {
+    "table": "musical",
+    "column": "Result",
+    "formula": "Result IN ('Nominated', 'Won')"
+   },
+   {
+    "table": "actor",
+    "column": "Actor_ID",
+    "formula": "Actor_ID > 0"
+   },
+   {
+    "table": "actor",
+    "column": "age",
+    "formula": "age > 0",
+    "condition": "age IS NOT NULL",
+    "evidence": "Observed ages 26,22,21,20,18,17 all > 0; boundary values -1,0,1 are generated as comparison-boundary targets and are exempt from this rule."
+   },
+   {
+    "table": "actor",
+    "column": "Musical_ID",
+    "formula": "Musical_ID IS NULL OR Musical_ID IN (SELECT Musical_ID FROM musical)",
+    "condition": "Musical_ID IS NOT NULL",
+    "evidence": "Logical FK to musical.Musical_ID; NULL allowed; at least one non-NULL unmatched value is generated for unmatched_join_rows."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "musical": 7,
+   "actor": 9
+  },
+  "null_targets": [
+   "actor.Musical_ID",
+   "musical.Nominee"
+  ],
+  "supporting_evidence": {
+   "musical.Award enum": "Observed values: 'Tony Award', 'Drama Desk Award' (distinct=2).",
+   "musical.Result enum": "Observed values: 'Nominated', 'Won' (distinct=2).",
+   "actor.age > 0": "Observed ages 26,22,21,20,18,17 all > 0; comparison_boundary targets -1,0,1.",
+   "actor.Musical_ID nullable": "null_rows pattern with 5-30% share; child_rows_with_null_fk true; unmatched non-NULL child FK required.",
+   "musical.Nominee nullable": "null_rows pattern with 5-30% share; NULLs planted last and never overwritten.",
+   "musical.Year range": "Observed Year=1986; ties_for_order_limit on Year; range 1900-2100 is a safe bound consistent with statistics.",
+   "writer row counts": "Every instance appends exactly 7 musical and 9 actor rows; rows_added/rows_skipped populated per table; PKs offset above max(original PK) to avoid collisions with compact rows."
+  },
+  "uncertainty": [
+   "Schema declares actor.Musical_ID FK referencing actor(Actor_ID), which is self-referential and inconsistent with atomic operations that join actor.Musical_ID = musical.Musical_ID; treated as logical FK to musical (stated rule, not uncertainty). The declared self-FK is intentionally unenforced.",
+   "musical.Year has distinct=1 in statistics but group_sizes pattern requires groups of 1,2,>=3; generation will vary Year within 1900-2100 to satisfy group-size targets while keeping the range rule. This is an inferred rule, not directly evidenced by compact data.",
+   "musical.Award and musical.Nominee have distinct=2 in statistics; near-variants are generated only for comparison-boundary coverage at ~10% probability, not as the dominant distribution.",
+   "Whether unmatched non-NULL child FKs for actor.Musical_ID are required is resolved here as required (child_rows_with_unmatched_non_null_fk true) in addition to NULL FKs."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 7 with reason 'no_rows_added' (7 of 20 instances added zero generated rows). writer.py appends generated rows to a copy of the compact DB; instance.py builds rows but the writer's per-table insert loop uses `n = len(cols.get(names[0], []))`. When the first column of a table is a logical-FK column that was excluded from `samplers` (actor.Musical_ID is a logical FK, so it is not in `samplers`), `cols` for that table is built only from non-FK columns, but `names[0]` is the first declared column. For `actor`, the first declared column is `Actor_ID` (present), so this is not the direct cause; however the observed 0-row instances indicate the generated dict is empty for at least one table in those units, and the writer silently writes nothing rather than failing. The CLI reports `rows_added: {}` and `rows_skipped: {}` (never populated), so the zero-row outcome is invisible in the summary.",
+     "requested_revision": "Make the writer/CLI surface per-table row counts (populate rows_added/rows_skipped from write_instance_sqlite's return) and ensure every instance actually appends the specified table_sizes_per_instance rows (musical=7, actor=9). Investigate why 7/20 units produced no rows and fix the construction so all instances add rows; do not rely on the compact copy alone."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_SHARE sets ('actor','Musical_ID')=0.20 and ('musical','Nominee')=0.20, and instance._plant_nulls plants NULLs. But execution feedback shows 'musical.Nominee: generated rows: NULL 0 / 11' and 'actor.Musical_ID: generated rows: NULL 1 / 18'. The Nominee NULL rule is not realized at all. Cause: _plant_nulls runs on `cols` after sample_fresh_primary_keys/drop_unique_duplicates, but for musical the Nominee column is present; the 0/11 indicates the planted NULLs were overwritten or the column was regenerated. In build_random_instance, _plant_nulls is called, then _force_group_sizes/_force_duplicates/_force_order_tie run afterward on Nominee (it is in GROUP_SIZE_COLUMNS, DUP_COLUMNS, ORDER_TIES), and _force_duplicates/_force_group_sizes draw from `pool = [v for v in vals if v is not None]` and reassign positions including previously-NULL slots, erasing planted NULLs.",
+     "requested_revision": "Order the specification passes so NULL planting is not undone: either plant NULLs last, or make _force_group_sizes/_force_duplicates/_force_order_tie skip positions currently NULL. Guarantee at least one NULL and a 5-30% share for every nullable column (musical.Nominee, actor.Musical_ID) in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.RANGES sets ('actor','age')=(1,60) and BOUNDARY_VALUES ('actor','age')=[-1,0,1], but _init_sampler filters boundary values to `lo <= b <= hi`, so -1 and 0 are dropped and only 1 survives. The comparison_boundary target for actor.age explicitly lists values [-1,0,1] and the semantic rule is `age > 0`; the boundary cases age=0 and age=-1 (which make `age > 0` FALSE) are never generated, so the boundary is not exercised. Similarly the semantic rule `age > 0` is never violated by construction, which is acceptable for a rule but the boundary-coverage target is unmet.",
+     "requested_revision": "Allow the boundary values -1 and 0 for actor.age to be generated (they are valid INT values and are exactly the comparison-boundary targets), while keeping the dominant distribution within the semantic range. Do not filter out the listed boundary literals."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.ORDER_TIES includes ('musical','Year','ASC') and ('musical','Year','DESC') with tie_at_rank 'any (no LIMIT)', and GROUP_SIZE_COLUMNS includes ('musical','Year'). But spec.RANGES ('musical','Year')=(1900,2100) and NumberSampler draws uniformly over that 200-wide range, so with only ~7 generated rows per instance, groups of size >=3 on Year are essentially impossible and order ties on Year are unlikely. _force_group_sizes requires n>=6 and samples 3 distinct values from the pool; with 7 rows it can force a triple, but _force_order_tie then overwrites two positions with the max, potentially destroying the forced group structure. The two Year order-tie entries (ASC and DESC) both call _force_order_tie with the same max-based logic, so only the DESC top is guaranteed; the ASC top (min) is not forced.",
+     "requested_revision": "Make _force_order_tie respect the direction: for ASC force the minimum value to appear at least twice, for DESC force the maximum. Ensure the Year group-size and order-tie passes do not overwrite each other's planted structure (apply them in a defined order or on disjoint positions)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The schema declares `FOREIGN KEY (\"Musical_ID\") REFERENCES \"actor\"(\"Actor_ID\")` (self-referential, dangling). The specification's dependencies note treats actor.Musical_ID as a logical FK to musical.Musical_ID and spec.LOGICAL_FKS encodes this. This is a reasonable resolution, but the specification's semantic rule `Musical_ID IS NULL OR Musical_ID IN (SELECT Musical_ID FROM musical)` combined with the unmatched_join_rows target (child_rows_with_null_fk true, parent_rows_without_children true) is only partially realizable: fill_foreign_keys_consistently draws from parent values with replacement, so unmatched child FKs (non-NULL values matching no parent) are never produced, only NULLs. The atomic operation explicitly lists child_rows_with_null_fk true and parent_rows_without_children true for the actor.Musical_ID join.",
+     "requested_revision": "Clarify in the specification whether unmatched non-NULL child FKs are required in addition to NULL FKs for actor.Musical_ID. If so, the engineer must inject at least one non-NULL child FK value that matches no parent Musical_ID (while keeping the semantic rule's NULL allowance), and ensure at least one parent musical row has no children."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 75, separated 15, unknown_executions 0. Only 15 of 75 atomic-operation pairs are separated by the generated instances. This is not by itself proof of error (per instructions, missing separation alone does not establish a generation error), but combined with the NULL-erasure and boundary-filtering issues above, several targeted patterns (comparison_boundary on Award/age, null_rows on Nominee, group_sizes on Year) are demonstrably not realized, which explains part of the low separation.",
+     "requested_revision": "After fixing the NULL-planting order, the age boundary filtering, and the Year order-tie direction, re-run and confirm that the targeted patterns (Award comparison boundaries, Nominee NULLs, Year group sizes and ASC/DESC ties, age boundary values) are actually present in generated rows. Report per-pattern presence counts."
+    }
+   ],
+   "unresolved_checks": [
+    "Why 7/20 instances added zero rows is not fully diagnosed from the provided code; the writer's silent zero-row path and the empty rows_added/rows_skipped reporting prevent confirmation.",
+    "Whether unmatched non-NULL child FKs for actor.Musical_ID are required is a specification ambiguity (designer decision).",
+    "The exact interaction between _force_group_sizes, _force_duplicates and _force_order_tie on the same column (e.g. musical.Year, musical.Nominee) is order-dependent and not verified to preserve all planted structures simultaneously."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution summary: rows_added {musical: 17, actor: 17} over 20 instances, rows_skipped {musical: 86, actor: 108}; validity reports 2 invalid instances with reason 'no_rows_added'. The spec requires every instance to append exactly 7 musical and 9 actor rows (table_sizes_per_instance). The writer (writer.py) inserts generated rows into a copy of the compact DB with foreign_keys=OFF, but the compact DB already contains rows; generated PKs are drawn from RANGES musical.Musical_ID (1,7) and actor.Actor_ID (1,9), which collide with existing compact PKs, so most INSERTs fail on PRIMARY KEY and are counted as rows_skipped. sample_fresh_primary_keys only dedups within the generated batch, not against schema.original_values.",
+     "requested_revision": "Make generated primary keys fresh against the compact rows (e.g. offset the PK range above max(original PK) or dedup against schema.original_values), so each instance appends exactly the specified table sizes and rows_skipped stays 0. This is the blocking error: the program does not implement table_sizes_per_instance and produces instances with no added rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py RANGES sets ('musical','Musical_ID'):(1,7) and ('actor','Actor_ID'):(1,9), and choose_table_sizes adds rng.randint(-1,1) jitter to TABLE_SIZES. The specification states 'every instance appends exactly table_sizes_per_instance rows per table (musical=7, actor=9)'. The jitter contradicts 'exactly', and the PK ranges are too small to coexist with compact rows.",
+     "requested_revision": "Remove the per-instance jitter in choose_table_sizes (use exact TABLE_SIZES) and widen/offset PK ranges so generated keys are unique against compact rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _force_group_sizes requires n>=6 and free positions>=6, and _force_duplicates/_force_order_tie operate on the same generated batch. With the current PK collisions the effective generated row count per table is ~1, so group-size (1,2,>=3), duplicate-share (20-50%) and order-tie targets cannot be realized. construction_pairs shows only 17/75 separated, consistent with too few generated rows.",
+     "requested_revision": "After fixing row counts, verify that group-size, duplicate and order-tie passes actually run on the full 7/9-row batches; add an assertion or report that the targets were met per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The schema declares actor.Musical_ID FOREIGN KEY REFERENCES actor(Actor_ID) (self-referential), which is inconsistent with the atomic operations joining actor.Musical_ID = musical.Musical_ID. The spec resolves this via LOGICAL_FKS and notes it under uncertainty. This is a reasonable resolution but should be recorded as an explicit assumption rather than left as 'uncertainty'.",
+     "requested_revision": "Promote the logical-FK resolution to a stated rule in the specification (already implemented in spec.LOGICAL_FKS) and note that the declared self-referential FK is intentionally ignored; no code change required beyond documentation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "musical.Year has distinct=1 in statistics but group_sizes requires groups of 1,2,>=3; the spec widens Year to 1900-2100. This is a defensible interpretation but changes the observed distribution. Similarly musical.Award/Nominee distinct=2 with near-variants only for boundary coverage is stated but the EnumSampler draws near-variants at ~35% probability (u<0.90 branch), which is higher than 'small probability'.",
+     "requested_revision": "Either lower the near-variant probability in EnumSampler to match the stated 'small probability' intent, or update the specification to state the actual near-variant share. Document the Year range widening as an explicit rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable columns actor.Character, actor.Duration, actor.Name, actor.age, musical.Award, musical.Category, musical.Name, musical.Result, musical.Year show 'generated rows: NULL 0 / n'. Per the interface rule this is noted but not blocking; however the spec's null_targets only lists actor.Musical_ID and musical.Nominee, so this is consistent with the spec. actor.Musical_ID (3/18) and musical.Nominee (3/20) do have NULLs, satisfying the 5-30% share.",
+     "requested_revision": "No change required; noted for the engineer that only the two spec-listed nullable columns receive NULLs, which matches null_targets."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's existing rows already satisfy some group-size/order-tie targets independently of generated rows (not verified).",
+    "Whether the 2 invalid 'no_rows_added' instances are the only ones affected or whether all 20 instances have far fewer than 7/9 appended rows (summary aggregates suggest widespread skipping)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with AttributeError(\"'NoneType' object has no attribute 'original_values'\"), n_ok=0, n_instances=0. In values.py, _init_sampler computes the PK offset via `fresh_pk_start(_SCHEMA_REF.get('schema'), ...)`, but _SCHEMA_REF is only populated by set_schema_ref(), which is never called anywhere in instance.py, cli.py, or elsewhere. _SCHEMA_REF.get('schema') therefore returns None and fresh_pk_start dereferences schema.original_values.",
+     "requested_revision": "Call set_schema_ref(schema) at the start of build_random_instance (or pass the schema explicitly into _init_sampler) so the PK-offset computation has a valid schema. Re-run generation and confirm n_ok == n_instances with rows_added populated for musical and actor."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after fixing the None schema, the PK offset logic is fragile: spec.RANGES for ('musical','Musical_ID') is (1,7) and ('actor','Actor_ID') is (1,9), and _init_sampler shifts lo/hi by `off = fresh_pk_start(...) - 1`. With compact max PKs of 7 and 9 (per the spec's stated offsets musical>=8, actor>=9), the generated PK range becomes [8,14] and [10,18] \u2014 correct in principle, but the offset is computed inside the sampler while the spec's stated rule is 'offset the PK range above max(original PK)'. The two mechanisms (spec.RANGES + runtime offset) are not documented as a single rule and depend on the un-called set_schema_ref.",
+     "requested_revision": "Make the PK offset a single explicit step in build_random_instance (compute fresh_pk_start once per table and pass the concrete [lo,hi] to the sampler), and remove the module-level _SCHEMA_REF indirection. Document that spec.RANGES PK entries are relative offsets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty list admits 'musical.Year has distinct=1 in statistics but group_sizes pattern requires groups of 1,2,>=3; generation will vary Year within 1900-2100'. The atomic operations only show ORDER(musical.year, ASC/DESC) with tie_at_rank 'any (no LIMIT)' and GROUP(musical.year) with group_sizes '1,2,>=3'. Widening Year to 1900-2100 is a reasonable inference but is not directly evidenced by the compact data (only Year=1986 observed). This is a supported-but-uncertain rule.",
+     "requested_revision": "Keep the widened range but mark it explicitly as an inferred rule in the spec (it already is in uncertainty); no code change required, but the reviewer notes it as an uncertain pattern rather than a hard-evidenced rule."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The schema declares actor.Musical_ID FK referencing actor(Actor_ID) (self-referential), which is inconsistent with the atomic operations that join actor.Musical_ID = musical.Musical_ID. The spec resolves this by declaring LOGICAL_FKS and ignoring the declared FK. This is a stated rule, not an uncertainty, and is consistent with the operations. However, the declared FK is still present in the DDL copied into each instance, so the writer disables foreign_keys (pragma foreign_keys = OFF) \u2014 meaning the declared self-FK is never enforced. This is acceptable but should be documented as intentional.",
+     "requested_revision": "No change required; confirm in the spec that the declared self-FK is intentionally unenforced and that the logical FK is the operative dependency."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "NULL rule: _plant_nulls runs last and plants NULLs for actor.Musical_ID and musical.Nominee at 20% share. However, _force_group_sizes, _force_duplicates, _force_order_tie, and _inject_unmatched_fk all run before _plant_nulls and operate on non-NULL positions, so planted NULLs are never overwritten \u2014 consistent with the interface rule. But _check_targets runs after _plant_nulls and excludes NULLs from group/dup/tie checks, which is correct. No issue here, but the execution feedback shows no instances were produced, so NULL behavior is unverified.",
+     "requested_revision": "After fixing the AttributeError, verify per-instance that actor.Musical_ID and musical.Nominee each contain at least one NULL and a 5-30% NULL share, and that NOT NULL/PK columns contain no NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Unmatched FK injection: _inject_unmatched_fk picks a random int in [1, 10^6] not in parent_vals. For actor.Musical_ID the parent pool includes compact musical.Musical_ID values (1..7) plus generated (8..14). A random value in [1,10^6] is almost certainly unmatched, satisfying child_rows_with_unmatched_non_null_fk. However, the spec's per_column_exceptions for actor.Musical_ID unmatched_join_rows lists child_rows_with_null_fk: true and the spec adds child_rows_with_unmatched_non_null_fk: true \u2014 both are implemented. No issue, but unverified due to the crash.",
+     "requested_revision": "After the fix, confirm at least one actor row has a non-NULL Musical_ID not present in musical.Musical_ID, and at least one musical row has no matching actor."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli.py seeds rng = random.Random(seed_base * 100003 + i) per unit, and build_random_instance uses only that rng. However, _init_sampler uses rng.random() < 0.5 to decide max_l0 and rng.choices for original values, and make_column_sampler filters elements with rng.random() < 0.9 \u2014 all deterministic given the seed. The only non-determinism risk is dict iteration order in schema.tables / schema.fks, which are built from sqlite_master order (deterministic). Reproducibility appears sound but is unverified because no instances were produced.",
+     "requested_revision": "After the fix, run the same seed twice and confirm identical instance files (byte-identical or identical row content)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Preservation of compact rows: writer.py copies orig_path to part then appends rows with INSERT; compact rows are never deleted or updated. This satisfies the preservation requirement. However, because generation crashed, no instance files were written, so preservation is unverified in execution.",
+     "requested_revision": "After the fix, verify each instance file contains the original compact rows unchanged plus exactly 7 musical and 9 actor appended rows (rows_added = {musical:7, actor:9}, rows_skipped = 0)."
+    }
+   ],
+   "unresolved_checks": [
+    "All execution checks (integrity constraints, dependent-value consistency, compact-row preservation, reproducibility, NULL shares, group/dup/tie targets) are unverified because generation produced 0 instances due to the AttributeError.",
+    "Whether the widened musical.Year range (1900-2100) is the intended inference remains a designer-level uncertainty; it is documented but not directly evidenced by compact data.",
+    "Whether the declared self-referential actor.Musical_ID FK should be enforced or ignored is resolved by the spec (ignored) but the DDL still carries it; this is a documentation point, not a blocker."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution summary shows massive row loss: rows_added {musical: 21, actor: 19} vs rows_skipped {musical: 83, actor: 108} across 20 instances. Expected 20*7=140 musical and 20*9=180 actor rows. The writer's row-by-row fallback silently skips rows failing constraints. The spec requires 'rows_skipped stays 0' and 'every instance appends exactly table_sizes_per_instance rows'. The likely cause: PK ranges are relative offsets computed as fresh_pk_start(schema, t, col) - 1 = max(original PK), so [lo+off, hi+off] = [max+1, max+7] for musical \u2014 but the compact DB already has 7 musical rows with PKs 1..7, so generated PKs 8..14 should be fine. However, the actual failure is more likely the FK/unique/other constraints or the PK range colliding with compact rows when the compact table already has more than 7 rows. Either way, the writer's silent skip path violates the spec's 'rows_skipped stays 0' requirement and the 'exact table sizes' requirement.",
+     "requested_revision": "Fix the generation so that every instance appends exactly 7 musical and 9 actor rows with rows_skipped = 0. Diagnose why rows are being skipped (likely PK collisions with compact rows or NOT NULL/unique violations) and correct the PK offset logic and/or the sampler so no row fails. The writer should not silently skip rows; if a row fails, the generation should be corrected upstream, not masked by the fallback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution summary reports many unmet targets: unmet:group:actor.Musical_ID 15/20, unmet:group:musical.Musical_ID 14/20, unmet:group:musical.Name 19/20, unmet:group:musical.Nominee 19/20, unmet:group:musical.Result 17/20, unmet:group:musical.Year 15/20, unmet:dup:actor.Name 18/20, unmet:dup:actor.Character 14/20, unmet:tie:musical.Year.ASC 5/20, unmet:dup:musical.Nominee 5/20, unmet:tie:musical.Nominee.DESC 4/20, unmet:dup:musical.Result 1/20. The spec requires these targets to be met per instance ('assert per instance that targets were met on the full 7/9-row batches'). The _force_group_sizes function returns early if n < 6 or len(free) < 6, and _force_duplicates returns early if k < 2 or no free positions; _force_order_tie falls back to overlapping positions. With only 7/9 rows and many passes competing for disjoint positions, targets are frequently missed.",
+     "requested_revision": "Rework the group-size, duplicate, and order-tie passes so they reliably meet targets on 7-row and 9-row batches. The current disjoint-position scheme is too constrained: with 7 rows and multiple passes (group, dup, order-tie) plus NULL planting, there are not enough free positions. Either relax the disjointness requirement (allow controlled overlap where safe), increase the row budget per pass, or restructure the passes to guarantee targets. The spec's 'assert per instance that targets were met' must hold."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's NULL rule states '5-30% NULL share planted last and never overwritten' for actor.Musical_ID and musical.Nominee. Execution feedback shows actor.Musical_ID: NULL 4/24 and musical.Nominee: NULL 5/21 \u2014 these are within 5-30% and have at least one NULL, so the NULL rule is satisfied. However, the spec's 'null_share' for actor.Musical_ID is 0.20 and for musical.Nominee is 0.20; the actual shares (4/24 \u2248 16.7%, 5/21 \u2248 23.8%) are within range. No issue here. But the spec's 'unmatched_join_rows' for actor.Musical_ID requires 'child_rows_with_unmatched_non_null_fk: true' \u2014 the _inject_unmatched_fk function plants a random value 1..10^6 not in parent_vals, but with only 9 actor rows and 20% NULL, there may not be enough free positions to plant both NULLs and an unmatched FK. The execution shows 4 NULLs in 24 actor rows (across 20 instances, ~1.2 per instance), leaving ~7.8 non-NULL rows per instance; the unmatched FK injection may compete with other passes.",
+     "requested_revision": "Clarify in the spec how the unmatched non-NULL FK requirement interacts with the NULL planting and other passes on small batches (9 rows). Ensure the spec explicitly states the priority order and that at least one non-NULL unmatched FK is guaranteed per instance even when NULLs and other targets consume positions. Alternatively, relax the 'disjoint positions' requirement for the unmatched FK injection."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'comparison_boundary' for musical.Award lists 12 target values including 'Tony Award', 'tony award', 'Drama Desk Award', 'drama desk award', 'Cleavant Derricks', 'cleavant derricks', ' Aw', ' aw', ' Awa', ' awa', 'Tonyard', 'tonyard'. The EnumSampler draws from enum + boundary + near-variants with probabilities 0.60/0.20/0.10/0.10. The boundary values are drawn at 20% probability, but the spec says near-variants should be at ~10% and the boundary values are the comparison-boundary targets. The spec's 'comparison_boundary' targets are the 12 listed values; the EnumSampler's boundary list is spec.BOUNDARY_VALUES[('musical','Award')] which includes all 12. However, the spec's 'text_enum' rule says 'include near-variants of each literal for comparison-boundary coverage at a small probability (~10%)'. The EnumSampler's 20% boundary draw plus 10% near-variant draw may over-represent boundary values relative to the spec's intent. More importantly, the spec's 'comparison_boundary' targets include 'Cleavant Derricks' and 'cleavant derricks' which are NOT in the enum list ['Tony Award', 'Drama Desk Award'] \u2014 these are boundary-only values. The EnumSampler includes them in the pool via boundary, so they can be generated. This is consistent.",
+     "requested_revision": "No change required for Award boundary values; the EnumSampler includes all 12 boundary targets. However, verify that the 20% boundary draw does not violate the spec's 'small probability (~10%)' for near-variants \u2014 the boundary values are distinct from near-variants and the spec lists them as comparison-boundary targets, so 20% is acceptable. No revision needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'int_foreign_key' rule says 'Draw from parent primary-key pool with replacement; 5-30% NULL when nullable; plant at least one non-NULL child FK value that matches no parent (unmatched join) and ensure at least one parent row has no children; NULLs are planted last and never overwritten by later passes.' The fill_foreign_keys_consistently function draws from parent values with replacement, but the _plant_nulls function runs AFTER the FK fill and AFTER the group/dup/order passes. The _inject_unmatched_fk runs BEFORE _plant_nulls. So NULLs are planted last \u2014 consistent. However, the spec also requires 'ensure at least one parent row has no children'. The code does not explicitly ensure this: with 7 musical rows and 9 actor rows drawing FKs from 7 parent values with replacement, it's possible (though unlikely) that all 7 parents get at least one child. The spec's 'parent_rows_without_children: true' target is not explicitly enforced.",
+     "requested_revision": "Add explicit enforcement in the generation program (or spec) that at least one parent musical row has no actor children. The current random draw does not guarantee this. Either reserve one parent PK to be excluded from the FK pool, or post-process to ensure at least one parent has zero children."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'semantic_rules_and_formulas' includes 'musical.Year BETWEEN 1900 AND 2100' with evidence 'Observed Year=1986; range widened to satisfy group_sizes (1,2,>=3) despite distinct=1 in statistics. Inferred rule, not directly evidenced by compact data.' The spec's 'uncertainty' section acknowledges this is inferred. The RANGES for musical.Year is (1900, 2100), and the NumberSampler draws uniformly from this range. This is a reasonable inferred rule. However, the spec's 'group_sizes' for musical.Year requires groups of size 1, 2, and >=3 \u2014 with 7 rows and a 200-year range, the _force_group_sizes function may not reliably create these groups because it picks 3 distinct values from the pool and assigns 1/2/3 counts. The execution shows unmet:group:musical.Year 15/20, confirming this.",
+     "requested_revision": "The Year range rule is adequately evidenced as an inferred rule. The group-size enforcement for Year needs the same fix as issue #2 (rework group-size passes for small batches). No spec change needed for the range itself."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'null_in_count_column' for actor.Actor_ID requires 'null_share: none (NOT NULL column)'. The execution feedback shows actor.Actor_ID is NOT NULL and no NULLs are generated. Consistent. The spec's 'aggregate_boundary' for actor.Actor_ID requires HAVING COUNT(DISTINCT actor.actor_id) >= 3 with values [2,3,4]. The generation does not explicitly enforce this aggregate boundary \u2014 it's a query-level target, not a row-level target. The spec lists it as a per-column exception but the program does not implement any aggregate-boundary enforcement. This is a gap: the spec says 'aggregate_boundary' targets values [2,3,4] but the program only ensures PK uniqueness (which gives COUNT(DISTINCT) = n = 9 per instance, satisfying >=3 trivially). The boundary values 2,3,4 are not specifically targeted.",
+     "requested_revision": "Clarify whether aggregate_boundary targets require specific group sizes (2,3,4) or just that the aggregate can reach those values. If specific, add enforcement in the program. If not, document that PK uniqueness trivially satisfies >=3 and the boundary values are query-level, not row-level."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'rows_with_different_values' for actor.age requires '>= 2 per group with different values' and the example shows 'scalar:SELECT(MAX(actor.age))', 'PRED(actor.age = (SELECT MAX(actor.age) FROM actor))', 'scalar:TABLE(actor)'. The program's NumberSampler for actor.age draws from [1,60] with boundary values [-1,0,1] at 15% probability. The spec's 'comparison_boundary' for actor.age targets [-1,0,1]. The program includes these as boundary values. However, the spec's 'rows_with_different_values' target is not explicitly enforced \u2014 the program does not ensure at least 2 rows per group have different age values. With random draws from [1,60], this is likely but not guaranteed.",
+     "requested_revision": "Add explicit enforcement that at least 2 rows per group have different actor.age values, or document that random draws from [1,60] with 9 rows make this overwhelmingly likely (probability of all same \u2248 (1/60)^8 \u2248 negligible). The spec should state whether this is a hard target or a probabilistic expectation."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'dependencies' note says 'Declared FK in schema points to actor(Actor_ID) which is self-referential and intentionally ignored; logical FK is actor.Musical_ID -> musical.Musical_ID per atomic operations.' The program's _logical_fk function checks schema.fks first, then spec.LOGICAL_FKS. The schema's read_schema reads the declared FK actor.Musical_ID -> actor(Actor_ID) into schema.fks. So _logical_fk returns the declared self-FK, NOT the logical FK to musical! This is a bug: the code checks schema.fks before spec.LOGICAL_FKS, so the declared self-referential FK takes precedence. The spec says the declared FK is 'intentionally ignored' and the logical FK is 'the operative dependency', but the code does not ignore the declared FK.",
+     "requested_revision": "Fix _logical_fk to prioritize spec.LOGICAL_FKS over schema.fks for actor.Musical_ID, or remove the declared self-FK from schema.fks during read_schema. The spec explicitly states the declared FK is intentionally ignored; the program must implement that. Currently fill_foreign_keys_consistently would draw actor.Musical_ID from actor.Actor_ID values (self-referential), not from musical.Musical_ID \u2014 this is a critical dependency error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'int_primary_key' rule says 'offset the PK range above max(original PK) (musical.Musical_ID >= 8, actor.Actor_ID >= 9) and dedup against schema.original_values so rows_skipped stays 0'. The code computes fresh_pk_start(schema, t, col) = max(original PK) + 1, then off = fresh_pk_start - 1 = max(original PK), and pk_range = (lo + off, hi + off). For musical with original PKs 1..7, off=7, so range = (1+7, 7+7) = (8, 14). This is correct. But the execution shows rows_skipped = 83 for musical and 108 for actor \u2014 massive skipping. The likely cause: the compact DB may have more than 7 musical rows (the spec says 'compact DB' but the actual original may have more rows), or the PK range collides with existing rows. The spec's 'rows_skipped stays 0' is violated.",
+     "requested_revision": "Diagnose why rows are skipped despite the PK offset. Check the actual compact DB row counts and PK max values. The offset logic assumes max(original PK) is the highest PK, but if the compact DB has gaps or non-sequential PKs, the range may still collide. Also check whether the writer's row-by-row fallback is catching NOT NULL or unique violations unrelated to PKs. Fix the generation so rows_skipped = 0."
+    }
+   ],
+   "unresolved_checks": [
+    "The actual compact DB row counts and PK max values are not shown in the execution feedback; the rows_skipped cause cannot be fully diagnosed without them.",
+    "Whether the declared self-FK actor.Musical_ID -> actor(Actor_ID) is actually read into schema.fks and takes precedence over spec.LOGICAL_FKS \u2014 the code suggests yes, but the execution integrity shows fk_violations=0, which may be because foreign_keys=OFF in the writer.",
+    "Whether the aggregate_boundary targets (COUNT >= 2,3,4) require specific row-level enforcement or are query-level only.",
+    "Whether the 'rows_with_different_values' target for actor.age is a hard requirement or probabilistic."
+   ]
+  }
+ ]
 }

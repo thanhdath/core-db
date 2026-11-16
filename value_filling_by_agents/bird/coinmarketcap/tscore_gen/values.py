@@ -182,6 +182,37 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform over the listed enum values (spec enum_small)."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class BoundarySampler(ColumnSampler):
+    """Wraps a base sampler; 1% of draws return a listed boundary literal (typed)."""
+
+    def __init__(self, base: ColumnSampler, boundaries: list, rng, is_int=False):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.base = base
+        self.boundaries = list(boundaries)
+        self.is_int = is_int
+
+    def sample(self):
+        if self.boundaries and self.rng.random() < 0.01:
+            v = self.rng.choice(self.boundaries)
+            if self.is_int:
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return v
+            return v
+        return self.base.sample()
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -215,21 +246,38 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), spec: dict = None) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224, plus spec-driven construction."""
+    spec = spec or {}
+    key = (column.table, column.name)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    for lit in spec.get('like_literals', {}).get(key, []):
+        els.append(str(lit).replace('%', ''))
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    dup = spec.get('duplicate_share', {}).get(key)
+    if dup is not None:
+        max_l0 = max(1.0, float(dup) * 10.0)
+    enums = spec.get('enums', {}).get(key)
+    if enums:
+        base = EnumSampler(enums, rng)
+    else:
+        base = make_column_sampler(column, els, p, max_l0, rng)
+    bounds = spec.get('boundaries', {}).get(key)
+    if bounds:
+        is_int = 'int' in (column.type_str or '').lower()
+        base = BoundarySampler(base, bounds, rng, is_int=is_int)
+    return base
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), spec: dict = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, spec=spec)
     return [s.sample() for _ in range(n)]

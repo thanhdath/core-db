@@ -1,53 +1,308 @@
 {
  "db": "soccer_2",
- "operator_io_quirks": [
-  "Tiny DB (4/6/6 rows); original read is trivial, no rowid sampling needed.",
-  "Mixed-case table names (College, Player, Tryout) and mixed-case columns (cName, pID, pName, yCard, HS, pPos, enr); must double-quote in generated SQL.",
-  "DDL uses tabs and multi-line column defs; line-based unique/check scan must tolerate tabs and trailing commas.",
-  "numeric(5,0) declared but storage is integer; TS Number fuzzer with scale=5, precision=0, is_int=False (no 'int' substring) -> float perturbation +-0.01/+-0.02, then sqlite affinity coerces to int on insert.",
-  "varchar(2) state holds 2-char codes; varchar(3) yCard/decision hold 'yes'/'no' (3 chars) \u2014 String fuzzer length range [min,max+1] from elements.",
-  "Tryout composite PK (pID, cName) both FK children; both nullable in DDL (notnull=0) though PK implies NOT NULL in sqlite.",
-  "FKs Tryout.pID->Player.pID and Tryout.cName->College.cName both resolve; no dangling FKs, no self-refs.",
-  "No unique/check constraints beyond PKs; no views/triggers/indexes in DDL.",
-  "All columns null_rate=0 in original; TS may still emit NULLs for nullable columns (String/Number samplers don't force non-null).",
-  "enr/HS/pID numeric values are small ints (300..22000); Number full range [-10^5,10^5] will produce implausible magnitudes.",
-  "pName samples are capitalized first names; String CHARSET a-zA-Z 0-9() will produce garbage names.",
-  "Table order: College, Player (level 0), Tryout (level 1) \u2014 no cycles."
- ],
- "operator_ts_expectations": [
-  "College.cName/state, Player.pName/yCard, Tryout.cName/pPos/decision -> String fuzzer: random a-zA-Z0-9() strings length in [min,max+1] of elements, plus 50% contaminate (suffix/prefix/drop char).",
-  "College.enr, Player.pID/HS, Tryout.pID -> Number fuzzer scale=5: uniform in [-1e5,1e5] then +-0.01/+-0.02 perturbation; sqlite stores as int via affinity.",
-  "yCard/decision 'yes'/'no' will be replaced by random 3-char strings -> queries like yCard='yes' return 0 rows (FN).",
-  "state 'LA'/'AZ'/'OK'/'FL' replaced by random 2-char strings -> state='LA' misses (FN).",
-  "pPos 'goalie'/'striker'/'mid' replaced by random 8-char strings -> pPos='goalie' misses (FN).",
-  "pName 'Andrew' etc replaced by random strings -> pName='Andrew' misses (FN).",
-  "enr/HS random large numbers -> enr>20000 or HS<500 predicates may match implausibly or miss (FP/FN).",
-  "Tryout FK columns drawn from parent's final values with replacement -> duplicates in (pID,cName) dropped by sample_fresh_primary_keys; ties/duplicates in original (none here) not reproduced.",
-  "Composite PK Tryout: max_l0=30 cap on fresh draws; single-col PKs (College.cName, Player.pID) get inf cap -> many distinct keys.",
-  "Small table sizes (choose_table_sizes: level0 1+30u, level1 x4 capped 2500) -> Tryout may be much larger than parents, FK draws with replacement create heavy duplication then PK dedup shrinks it.",
-  "No NOT NULL/CHECK enforcement in Python; rows violating PK/NOT NULL skipped at insert -> effective row counts may be < requested.",
-  "Literal pool from train SQL (e.g. 'ASU','LA','goalie','yes') seeds String elements; with p=0.2 some fresh draws, some element reuse -> partial plausibility."
- ],
- "challenger_refs": [
-  "g140a1dc2",
-  "gf2a9c2f5",
-  "g24c84de8",
-  "g24c84de8",
-  "g5055230d",
-  "g5055230d",
-  "gddd2951c",
-  "gddd2951c",
-  "g625c102f",
-  "ge79ec674",
-  "g267c1429",
-  "g7d70c64a",
-  "gfd78feda"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_numeric": "Sample integers uniformly from the observed min..max of the column, widened by one step on each side; include the boundary literals listed in per_column_exceptions; never NULL for NOT NULL/PK columns.",
+   "short_text_enum": "Sample from the explicit enum pool of the column; include case variants (upper/lower) of each literal when the column appears in a comparison_boundary pattern; never NULL for NOT NULL/PK columns.",
+   "free_text": "Sample from the observed distinct values plus near-variants (case changes, one-character edits) so that DISTINCT counts stay in the 20-50% duplicate-share band; allow NULL only if the column is nullable.",
+   "nullable_columns": "For every nullable column, each instance contains at least one NULL row and non-NULL rows; NULL share follows the compact database share (0% observed, so use a small 5-10% share to exercise IS NULL / IS NOT NULL / COUNT(col) / COALESCE); planted NULLs are never replaced.",
+   "primary_keys": "Generate fresh unique tuples per instance; never NULL; never reuse an original value.",
+   "foreign_keys": "Copy the parent key value from an already-generated parent row; child rows may reference only existing parents; parent rows without children are allowed; nullable FK columns may also take NULL.",
+   "distinct_columns": "Ensure the duplicate share on DISTINCT-targeted columns stays in 20-50% by repeating a subset of values.",
+   "order_tie_columns": "When a column is an ORDER target with a tie at a rank, plant at least two rows sharing the tie value at that rank in both ASC and DESC directions.",
+   "boundary_numeric": "For each numeric literal L in a comparison_boundary target, include L-1, L, L+1 (by the column step) in the sampled pool.",
+   "boundary_text": "For each equality literal L in a comparison_boundary target, include L and its case variants (L upper, L lower) in the sampled pool.",
+   "like_near_variant": "For each LIKE literal 'X%', include values starting with X and near-variants (X lower, X with one extra char) in the sampled pool."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "College",
+    "column": "state",
+    "pattern": "comparison_boundary, null_rows, group_sizes, duplicates_for_distinct",
+    "targets": {
+     "values": [
+      "AZ",
+      "az",
+      "LA",
+      "la",
+      "FL",
+      "fl",
+      "OK",
+      "ok"
+     ],
+     "null_share": "5-30% of generated rows",
+     "group_sizes": "1, 2 and >= 3",
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "College",
+    "column": "cName",
+    "pattern": "unmatched_join_rows, ties_for_order_limit, duplicates_for_distinct",
+    "targets": {
+     "parent_rows_without_children": true,
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": "cName COLLATE NOCASE",
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "College",
+    "column": "enr",
+    "pattern": "comparison_boundary, ties_for_order_limit, duplicates_for_distinct, rows_with_different_values",
+    "targets": {
+     "values": [
+      -2688,
+      -2687,
+      -2686,
+      9999,
+      10000,
+      10001,
+      14999,
+      15000,
+      15001
+     ],
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": "SUM(enr)",
+     "duplicate_share": "20-50%",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "Player",
+    "column": "pID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "table": "Player",
+    "column": "pName",
+    "pattern": "duplicates_for_distinct, like_near_variant, comparison_boundary",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "like_literals": [
+      "D%"
+     ],
+     "near_variants": [
+      "D",
+      "d",
+      "Da",
+      "Dx"
+     ]
+    }
+   },
+   {
+    "table": "Player",
+    "column": "yCard",
+    "pattern": "comparison_boundary, null_rows",
+    "targets": {
+     "values": [
+      "no",
+      "NO",
+      "yes",
+      "YES"
+     ],
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Player",
+    "column": "HS",
+    "pattern": "comparison_boundary, duplicates_for_distinct, rows_with_different_values",
+    "targets": {
+     "values": [
+      499,
+      500,
+      501,
+      1498,
+      1499,
+      1500,
+      1501
+     ],
+     "duplicate_share": "20-50%",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "Tryout",
+    "column": "pID",
+    "pattern": "unmatched_join_rows, aggregate_boundary, duplicates_for_distinct",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "having_count_gt": 0,
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Tryout",
+    "column": "cName",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, ties_for_order_limit",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "duplicate_share": "20-50%",
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "Tryout",
+    "column": "pPos",
+    "pattern": "comparison_boundary, null_rows, ties_for_order_limit",
+    "targets": {
+     "values": [
+      "goalie",
+      "GOALIE",
+      "mid",
+      "MID",
+      "striker",
+      "STRIKER"
+     ],
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "Tryout",
+    "column": "decision",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "yes",
+      "YES",
+      "no",
+      "NO"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "Tryout",
+    "child_column": "pID",
+    "parent_table": "Player",
+    "parent_column": "pID",
+    "copied_columns": []
+   },
+   {
+    "child_table": "Tryout",
+    "child_column": "cName",
+    "parent_table": "College",
+    "parent_column": "cName",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "College",
+    "column": "state",
+    "formula": "state IS NULL OR state IN ('AZ','LA','FL','OK')",
+    "evidence": "observed states AZ, LA, OK, FL"
+   },
+   {
+    "table": "College",
+    "column": "enr",
+    "formula": "enr IS NULL OR enr BETWEEN 0 AND 99999",
+    "evidence": "numeric(5,0) range; observed 12000..22000"
+   },
+   {
+    "table": "Player",
+    "column": "yCard",
+    "formula": "yCard IS NULL OR yCard IN ('no','yes')",
+    "evidence": "observed no, yes"
+   },
+   {
+    "table": "Player",
+    "column": "HS",
+    "formula": "HS IS NULL OR HS BETWEEN 0 AND 99999",
+    "evidence": "numeric(5,0); observed 300..1600"
+   },
+   {
+    "table": "Tryout",
+    "column": "pPos",
+    "formula": "pPos IS NULL OR pPos IN ('goalie','striker','mid')",
+    "evidence": "observed goalie, striker, mid"
+   },
+   {
+    "table": "Tryout",
+    "column": "decision",
+    "formula": "decision IS NULL OR decision IN ('no','yes')",
+    "evidence": "observed no, yes"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "College": 8,
+   "Player": 12,
+   "Tryout": 12
+  },
+  "null_targets": [
+   "College.state",
+   "Player.yCard",
+   "Player.HS",
+   "Tryout.pPos",
+   "Tryout.decision"
+  ],
+  "supporting_evidence": {
+   "College.state": "observed values AZ, LA, OK, FL; group_sizes 1,2,>=3; null_rows pattern",
+   "College.enr": "observed 12000,18000,19000,22000; boundary literals -2688..15001",
+   "Player.yCard": "observed no, yes; comparison_boundary literals no/NO/yes/YES",
+   "Player.HS": "observed 300,600,1200,1600; boundary literals 499..1501",
+   "Tryout.pPos": "observed goalie, striker, mid; case variants",
+   "Tryout.decision": "observed no, yes; case variants"
+  },
+  "uncertainty": "No formulas hold across all shown rows (no calculated columns). NULL shares observed as 0% but nullable columns are given a small 5-30% share to exercise IS NULL/COUNT patterns. Parent rows without children are allowed per unmatched_join_rows targets."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's semantic_rules_and_formulas for College.state is \"state IS NULL OR state IN ('AZ','LA','FL','OK')\" with evidence 'observed states AZ, LA, OK, FL'. The atomic-operation targets for College.state comparison_boundary list values ['AZ','az','LA','la','FL','fl'] (case variants), and the per_column_exceptions for College.state add 'OK','ok'. The formula's IN-list is case-sensitive in SQLite, so 'az'/'la'/'fl'/'ok' would violate the formula as written, yet the spec also asks for those case variants. The program's _formula_ok lowercases both sides, so it accepts them. This is a genuine tension between the formula and the case-variant targets, but it is resolved consistently by the program and does not block generation.",
+     "requested_revision": "Clarify in the specification that the state formula is case-insensitive (or that case variants are permitted), so the formula and the boundary targets are not contradictory. No program change required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback: 'College.enr: generated rows: NULL 0 / 166' and 'Player.pName: generated rows: NULL 0 / 364'. College.enr is nullable (no NOT NULL) and is listed in null_targets; Player.pName is nullable but not in null_targets. The program's _null_share only plants NULLs for keys in spec['null_targets'], so College.enr gets no NULLs despite being a null target. Per the interface rule, a 'NULL 0 / n' line is noted for the engineer and does not block a pass.",
+     "requested_revision": "Ensure College.enr (a declared null target) receives a planted NULL share in each instance, e.g. by confirming the (table, column) key matches between normalise_spec and _null_share. Player.pName is not a null target and may remain NULL-free."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's table_sizes_per_instance is {College: 8, Player: 12, Tryout: 12}, but choose_table_sizes ignores the exact value and instead randomizes between randint(0, base+30) and min(base*4, 2500). Execution shows rows_added per instance ranging 18-78 total, and the summary reports College 166, Player 364, Tryout 423 across 20 instances (avg ~8.3, ~18.2, ~21.2), so the per-instance sizes deviate substantially from the specified 8/12/12. This is a deliberate 'vary per instance' design but is not faithful to the stated fixed sizes.",
+     "requested_revision": "Either honor table_sizes_per_instance as the base size (with modest variation) or update the specification to state that sizes are randomized around the base. Not blocking, since the sizes still exercise the patterns."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "The specification's generic_sampling_rules 'nullable_columns' says NULL share should follow the compact database share (0% observed) but use a small 5-10% share; per_column_exceptions say 5-30%. The program uses rng.uniform(0.05, 0.30) in _null_share, matching the per-column exceptions but not the 5-10% generic rule. Observed shares: College.state 37/166 (~22%), Player.HS 61/364 (~17%), Player.yCard 81/364 (~22%), Tryout.decision 84/423 (~20%), Tryout.pPos 74/423 (~17%) \u2014 all within 5-30%.",
+     "requested_revision": "Reconcile the generic 5-10% rule with the per-column 5-30% targets in the specification text. The program's behavior is within the per-column targets, so no code change is strictly required."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "Construction feedback: 132 eligible pairs, 65 separated, 0 unknown executions. Integrity: 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, 0 compact-row changes across all 20 instances. Reproducible (seed_base*100003+i). The program implements FK copying from parent compact+generated rows, fresh PK tuples, unique-column dedup, and formula filtering with counted skips (0 skipped).",
+     "requested_revision": "None; this is positive evidence supporting the pass."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the case-insensitive interpretation of the College.state formula is the intended reading (the spec text is ambiguous).",
+    "Whether table_sizes_per_instance is meant to be exact or a base for randomization; the program treats it as a base.",
+    "The 5-10% vs 5-30% NULL-share discrepancy in the specification text is not fully resolved, though observed shares fall in the per-column range."
+   ]
+  }
+ ]
 }

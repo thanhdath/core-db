@@ -3,8 +3,7 @@ import datetime as dt
 import re
 import string
 
-# fuzz/number.py:5 MAX = 9223372036854775807 - epsilon (int64, no 2^31 clamp)
-MAX = 9223372036854775807 - 1e-9
+_MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
@@ -38,33 +37,25 @@ def _num(x):
 
 
 class NumberSampler(ColumnSampler):
-    """fuzz/number.py: int64 MAX, list range [min, max+1] capped at MAX, type range [-10^scale, 10^scale]."""
+    """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, MAX)) if unsigned else (-hi, hi)
-        if self.elements:
-            self.list_min = min(self.elements)
-            self.list_max = min(max(self.elements) + 1, MAX)
-        else:
-            self.list_min, self.list_max = self.min, self.max
+        hi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        self.list_min = min(self.elements) if self.elements else self.min
+        self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        # number.py:88: integer columns truncate, float columns keep precision
-        return int(v) if self.is_int else (round(v, self.precision) if self.precision else v)
-
-    def _draw(self, lo, hi):
-        # number.py:79: random.random() * (end - start) + start
-        return self.rng.random() * (hi - lo) + lo
+        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
-            v = self._fresh_or_reuse(lambda: self._draw(lo, hi))
+            v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
         d = 1 if self.is_int else 0.01
@@ -77,6 +68,38 @@ class NumberSampler(ColumnSampler):
         elif r.random() < 1 / 3:
             v -= 2 * d
         return self._cast(v)
+
+
+class RangeNumberSampler(ColumnSampler):
+    """Numeric sampler over an explicit [lo, hi] range with boundary pool and perturbations."""
+
+    def __init__(self, lo, hi, is_int, decimals, boundary, p, max_l0, rng):
+        super().__init__(boundary, p, max_l0, rng)
+        self.lo, self.hi, self.is_int, self.decimals = lo, hi, is_int, decimals
+        self.boundary = list(boundary)
+
+    def _draw(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.05:
+            return r.choice(self.boundary)
+        if self.is_int:
+            return r.randint(int(self.lo), int(self.hi))
+        return round(r.uniform(self.lo, self.hi), self.decimals)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+        else:
+            v = self._fresh_or_reuse(self._draw)
+        if r.random() < 0.1:
+            d = 1 if self.is_int else 0.01
+            v = v + d if r.random() < 0.5 else v - d
+            if self.is_int:
+                v = int(round(v))
+            else:
+                v = round(v, self.decimals)
+        return v
 
 
 class StringSampler(ColumnSampler):
@@ -114,6 +137,60 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class PoolStringSampler(ColumnSampler):
+    """String sampler drawing from a realistic pool with a controlled duplicate share and near-variants (case / typo)
+    of pool values."""
+
+    def __init__(self, pool, boundary, p, max_l0, rng, dup_share=0.35, variant_rate=0.05):
+        super().__init__(list(pool) + list(boundary), p, max_l0, rng)
+        self.pool = [str(x) for x in pool if x is not None]
+        self.boundary = [str(x) for x in boundary if x is not None]
+        self.dup_share = dup_share
+        self.variant_rate = variant_rate
+        self._seen: list = []
+
+    def _variant(self, s):
+        r = self.rng
+        u = r.random()
+        if u < 0.4:
+            return s.lower()
+        if u < 0.6:
+            return s.upper()
+        if u < 0.8 and len(s) > 1:
+            i = r.randrange(len(s))
+            return s[:i] + s[i + 1:]
+        if len(s) > 1:
+            i = r.randrange(len(s))
+            return s[:i] + r.choice(string.ascii_letters) + s[i + 1:]
+        return s + 'x'
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.05:
+            return r.choice(self.boundary)
+        if self._seen and r.random() < self.dup_share:
+            v = r.choice(self._seen)
+        elif self.pool and r.random() >= self.p:
+            v = r.choice(self.pool)
+        else:
+            v = self._fresh_or_reuse(lambda: r.choice(self.pool) if self.pool else '')
+        if r.random() < self.variant_rate:
+            v = self._variant(v)
+        self._seen.append(v)
+        return v
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform draw from a small enum domain."""
+
+    def __init__(self, values, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
 
 
 def _parse_date(s: str):
@@ -158,6 +235,31 @@ class DateSampler(ColumnSampler):
     def sample(self):
         if self.elements and self.rng.random() < self.p:
             return self.rng.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
+class RangeDateSampler(ColumnSampler):
+    """Date/datetime sampler over an explicit [lo, hi] range with boundary pool."""
+
+    def __init__(self, lo, hi, fmt, boundary, p, max_l0, rng):
+        super().__init__(boundary, p, max_l0, rng)
+        self.lo = dt.datetime.strptime(lo, fmt)
+        self.hi = dt.datetime.strptime(hi, fmt)
+        self.fmt = fmt
+        self.boundary = list(boundary)
+
+    def _draw(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.05:
+            return r.choice(self.boundary)
+        span = int((self.hi - self.lo).total_seconds())
+        d = self.lo + dt.timedelta(seconds=r.randint(0, max(0, span)))
+        return d.strftime(self.fmt)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
         return self._fresh_or_reuse(self._draw)
 
 
@@ -242,3 +344,27 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def make_spec_sampler(table: str, column: str, column_meta, spec: dict, literal_pool: list,
+                      original_values: list, rng) -> ColumnSampler:
+    """Build a sampler honouring the specification for (table, column)."""
+    key = (table, column)
+    boundary = list(spec['boundaries'].get(key, []))
+    ov = [v for v in original_values if v is not None]
+    pool = list(ov) + [str(v) for v in literal_pool]
+    p = 0.2
+    max_l0 = float('inf')
+    if key in spec['enums']:
+        return EnumSampler(spec['enums'][key], rng)
+    if key in spec['ranges']:
+        lo, hi, is_int, dec = spec['ranges'][key]
+        return RangeNumberSampler(lo, hi, is_int, dec, boundary, p, max_l0, rng)
+    if key in spec['date_ranges']:
+        lo, hi, fmt = spec['date_ranges'][key]
+        return RangeDateSampler(lo, hi, fmt, boundary, p, max_l0, rng)
+    if key in spec['long_text']:
+        return PoolStringSampler(pool, boundary, p, max_l0, rng)
+    if boundary:
+        return make_column_sampler(column_meta, pool + boundary, p, max_l0, rng)
+    return make_column_sampler(column_meta, pool, p, max_l0, rng)

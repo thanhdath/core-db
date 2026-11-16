@@ -1,4 +1,4 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + specification helpers (column ranges, exceptions)."""
 import math
 import sqlite3
 import warnings
@@ -58,7 +58,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -140,3 +140,32 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
     finally:
         con.close()
     return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+
+
+def spec_exceptions(spec: dict) -> dict:
+    """Map (table_lower, column_lower) -> list of spec exceptions (compact keys)."""
+    out: dict = {}
+    for e in (spec or {}).get('per_column_exceptions') or []:
+        key = str(e.get('column', '')).split('.')
+        if len(key) != 2:
+            continue
+        out.setdefault((key[0].lower(), key[1].lower()), []).append(e)
+    return out
+
+
+def column_bounds(schema: Schema, table: str, column: str, spec: dict) -> dict:
+    """Integer range from boundary targets and observed values; enum/tag targets for TEXT columns."""
+    low, high = [], []
+    values: list = []
+    for e in spec_exceptions(spec).get((table.lower(), column.lower()), []):
+        tg = e.get('targets') or {}
+        for v in tg.get('values') or []:
+            if isinstance(v, int) and not isinstance(v, bool):
+                low.append(v)
+                high.append(v)
+            elif isinstance(v, str):
+                values.append(v)
+    seen_nums = [v for v in schema.original_values.get((table, column), []) if isinstance(v, int) and not isinstance(v, bool)]
+    allv = low + high + seen_nums
+    return {'lo': min(allv) - 2 if allv else None, 'hi': max(allv) + 2 if allv else None,
+            'values': values, 'observed': seen_nums}

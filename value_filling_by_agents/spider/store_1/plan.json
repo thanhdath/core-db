@@ -1,51 +1,898 @@
 {
  "db": "store_1",
- "operator_io_quirks": [
-  "All table/column names are lowercase ASCII; no spaces or mixed case, so quoting is trivial but still required for reserved-ish names (e.g. 'title', 'name').",
-  "employees.reports_to is a SELF-FK to employees.id; process_order must ignore the table self-edge and the child column must draw from the parent's FINAL filtered id list (upstream draws before PK filter only for same-table self-FK).",
-  "playlist_tracks has a COMPOSITE PK (playlist_id, track_id) declared via CONSTRAINT PK_PlaylistTrack; both members are also FKs to playlists.id and tracks.id, so composite-PK-member max_l0=30 applies and PK-duplicate dropping must use the tuple.",
-  "playlist_tracks also has a redundant UNIQUE INDEX index_playlist_track_on_id on (playlist_id, track_id) \u2014 same tuple as PK; drop_unique_duplicates on single unique columns must not treat this as a single-column unique.",
-  "Every table has an AUTOINCREMENT INTEGER PRIMARY KEY id plus a redundant CREATE UNIQUE INDEX index_<t>_on_id ON <t>(id); the line-based 'unique' scan will mark id unique twice \u2014 harmless superset, but record it.",
-  "birth_date/hire_date/invoice_date are declared TIMESTAMP but stored as TEXT 'YYYY-MM-DD HH:MM:SS' (space-separated, zero-padded, midnight time). TS dispatches to Date (first element not int-parsable) with template %Y-%m-%d %H:%M:%S; the '00:00:00' time part is constant in the original.",
-  "NUMERIC(10,2) columns (invoices.total, tracks.unit_price, invoice_lines.unit_price) store REAL (e.g. 1.98, 0.99); TS Number(scale=2, precision=10) will emit floats in [-100,100] and perturb by \u00b10.01/\u00b10.02 \u2014 declared type and storage class agree on 'numeric' but not on integer-ness.",
-  "INTEGER columns store integer storage class throughout; no column has a storage class contradicting its declared type (no text-in-INTEGER, no int-in-VARCHAR).",
-  "tracks.bytes and tracks.milliseconds are large INTEGERs (up to ~1.1e8); Number(scale=4) full range is [-10^4,10^4] so TS fresh draws are far below the original magnitudes \u2014 list range [min(el), 10^4] quirk applies.",
-  "invoice_lines.quantity has distinct=1 (all 1); TS Number will still perturb by \u00b11/\u00b12 and draw fresh values, so quantity will not stay 1.",
-  "tracks.unit_price and invoice_lines.unit_price have distinct=2 (0.99, 1.99); TS Number list range [0.99, 100] (min(el), MAX) \u2014 the overwrite quirk means fresh draws can exceed 1.99.",
-  "customers.company (null_rate 0.83), customers.fax (0.80), customers.state (0.49), invoices.billing_state (0.49), tracks.composer (0.28) are heavily NULL; TS String sampler drops None elements and never emits NULL, so these columns will be non-NULL in generated units.",
-  "customers.first_name/last_name/address/city contain non-ASCII (Lu\u00eds, K\u00f6hler, S\u00e3o Jos\u00e9 dos Campos, Stra\u00dfe); TS String CHARSET is a-zA-Z 0-9() so generated values are ASCII-only \u2014 no encoding issue but a distribution shift."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on birth_date/hire_date/invoice_date: template %Y-%m-%d %H:%M:%S (first parsable element), range = [min,max] of parsed originals (e.g. 1947..2003 for employees, 2007 for invoices); fresh draws uniform in that range, formatted with the template \u2014 plausible dates, but time always 00:00:00.",
-  "String fuzzer on name/title/company/address/city/state/country/postal_code/phone/fax/email: random strings over a-zA-Z 0-9() of length in [min len, max len+1] of the 5 sampled originals, with 50% contaminate (suffix/prefix/around/drop-first/drop-last) \u2014 implausible emails, phones, postal codes; drives FN on LIKE/format predicates.",
-  "Number fuzzer on id/artist_id/customer_id/support_rep_id/reports_to/album_id/media_type_id/genre_id/track_id/invoice_id/playlist_id/milliseconds/bytes/quantity: full range [-10^scale,10^scale] (scale=4 for INTEGER, scale=2 for NUMERIC(10,2)); fresh draws are tiny vs. original magnitudes for bytes/milliseconds, and \u00b11/\u00b12 perturbation on quantity breaks the all-1 invariant.",
-  "Number on NUMERIC(10,2) total/unit_price: scale=2, precision=10, is_int=False; fresh draws uniform in [-100,100] with \u00b10.01/\u00b10.02 perturbation \u2014 plausible magnitude but not the 0.99/1.99 grid; drives FN on unit_price=0.99/1.99 equality and FP on total ranges.",
-  "FK columns (albums.artist_id, tracks.album_id/media_type_id/genre_id, invoices.customer_id, invoice_lines.invoice_id/track_id, playlist_tracks.playlist_id/track_id, customers.support_rep_id, employees.reports_to) draw from the parent's FINAL filtered PK list with replacement \u2014 referential integrity holds, but the parent PK list is itself TS-generated (small, e.g. 1..N) so FK values are small integers, not the original 1..3503 spread.",
-  "Self-FK employees.reports_to: parent employees.id is generated first (same table), then reports_to draws from the filtered id list; with 8 original rows and TS size ~30-2500, reports_to will be a small subset of generated ids \u2014 plausible but the 12.5% NULL rate is lost (TS never emits NULL).",
-  "PK/unique filtering: sample_fresh_primary_keys drops duplicate id tuples (first kept), drop_unique_duplicates drops rows repeating any single unique column \u2014 with AUTOINCREMENT id and Number sampler, id collisions are rare but possible; playlist_tracks composite PK (playlist_id,track_id) will be deduped, shrinking the table below the chosen size.",
-  "NOT NULL columns (albums.title, albums.artist_id, employees.last_name/first_name, customers.first_name/last_name/email, invoices.customer_id/invoice_date/total, tracks.name/media_type_id/milliseconds/unit_price, invoice_lines.*, playlist_tracks.*) are not enforced in Python; String sampler never emits NULL so NOT NULL text is safe, but Number sampler can emit NULL only via empty parent FK (not here) \u2014 rows should mostly insert.",
-  "CHECK constraints: none in this DDL; the line-based 'checked' scan finds no 'check (' so p=0 (no fresh draws) never triggers \u2014 all columns use the default p=0.2 (or 0 for the whole instance w.p. 0.3).",
-  "Known misses driven by implausible values: emails/phones/postal codes/addresses are random strings (FN on LIKE '%@%', format predicates); dates have constant 00:00:00 time (FN on time-of-day predicates, though none in this DB); unit_price not on 0.99/1.99 grid (FN on equality, FP on BETWEEN ranges); quantity not 1 (FN on quantity=1).",
-  "Known misses driven by missing ties/duplicates: original has duplicate artist_id (204 distinct over 347 albums), duplicate track_id in invoice_lines (1984 distinct over 2240), duplicate playlist_id in playlist_tracks (14 distinct over 8715) \u2014 TS FK draws with replacement preserve some duplication but the parent PK list is small, so join cardinalities differ; GROUP BY/HAVING counts will differ (FP/FN).",
-  "playlists.name has 14 distinct over 18 rows (duplicates); TS String sampler draws from 5 sampled originals + literal pool, so duplicates are likely but the exact multiset differs \u2014 GROUP BY name counts will differ."
- ],
- "challenger_refs": [
-  "g75ac0924",
-  "gd84e90c8",
-  "g20f3fb08",
-  "g23939be6",
-  "g0a86846d",
-  "g25b62a8f",
-  "g80b73d68",
-  "g59557e60",
-  "g413815db",
-  "g4e4dcf88"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table, no NULL, no reuse.",
+   "integer_fk": "Uniform pick from parent PK pool; nullable FKs get NULL share per null_targets; planted NULLs are never overwritten.",
+   "varchar_text": "Pick from a small curated pool per column; 10% chance of a near-variant (case flip, trailing space, prefix/suffix) when the column is not an enum.",
+   "varchar_enum": "Uniform pick from the explicit enum list in per_column_exceptions.",
+   "numeric_money": "Uniform pick from {0.99, 1.99} for unit_price; totals computed by formula.",
+   "numeric_quantity": "Always 1 (matches observed distinct=1).",
+   "timestamp": "Uniform datetime in 2002-01-01..2010-12-31 00:00:00, stored as datetime objects and formatted %Y-%m-%d %H:%M:%S only at write time; never mix str and datetime in a column.",
+   "nullable_share": "Each nullable column: at least one NULL row per instance; share follows compact DB null_rate (rounded up to >=1 row).",
+   "boundary_values": "For columns listed in per_column_exceptions with pattern comparison_boundary: include the literal, its case-flipped variant, and one value on each side (lexicographic neighbor for text). Per-column target lists override the generic neighbor requirement.",
+   "distinct_duplicates": "For columns with pattern duplicates_for_distinct: ensure 20-50% of non-NULL values repeat an earlier value; post-check the final share and adjust deterministically if outside [0.20, 0.50].",
+   "order_ties": "For columns with pattern ties_for_order_limit: plant at least two rows sharing the value at the listed rank, only when the table has enough rows for that rank.",
+   "group_sizes": "For columns with pattern group_sizes: ensure at least one value with count 1, one with count 2, one with count >= 3; for FK columns restrict the pool to valid parent ids.",
+   "unmatched_join_rows": "For join columns with pattern unmatched_join_rows: ensure at least one parent row with no child and (if nullable) at least one child row with NULL FK; verify after planting.",
+   "aggregate_boundary": "For columns with pattern aggregate_boundary: ensure a parent group with child count exactly 9, 10, and 11; skip NULL child FKs when assigning counts.",
+   "like_near_variant": "For columns with pattern like_near_variant: include the literal, a %literal% variant, and a case-flipped variant.",
+   "null_in_count_column": "For columns with pattern null_in_count_column: ensure at least one NULL row (only if nullable) so COUNT(col) < COUNT(*)."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "employees",
+    "column": "last_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Edwards",
+     "edwards",
+     "Johnson",
+     "johnson"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "first_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Nancy",
+     "nancy",
+     "Steve",
+     "steve"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "first_name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "country",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Canada",
+     "canada"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "hire_date",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1, ASC"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "birth_date",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1, DESC"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "reports_to",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "employees",
+    "column": "reports_to",
+    "pattern": "null_rows",
+    "targets": [
+     "at least one NULL"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "state",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "IL",
+     "il",
+     "CA",
+     "ca"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Chicago",
+     "chicago"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "country",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "company",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "last_name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Almeida",
+     "%Almeida%"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "first_name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "customers",
+    "column": "id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with invoices.customer_id, parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "invoices",
+    "column": "customer_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with customers.id, parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "invoices",
+    "column": "billing_state",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "IL",
+     "il"
+    ]
+   },
+   {
+    "table": "invoices",
+    "column": "billing_city",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Chicago",
+     "chicago"
+    ]
+   },
+   {
+    "table": "invoices",
+    "column": "billing_country",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "albums",
+    "column": "title",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "albums",
+    "column": "id",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(albums.id) in {9,10,11}"
+    ]
+   },
+   {
+    "table": "genres",
+    "column": "name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "genres",
+    "column": "id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with tracks.genre_id, parent_rows_without_children, child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "tracks",
+    "column": "genre_id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with genres.id, parent_rows_without_children, child_rows_with_null_fk"
+    ]
+   },
+   {
+    "table": "tracks",
+    "column": "id",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "joins_with invoice_lines.track_id, parent_rows_without_children"
+    ]
+   },
+   {
+    "table": "tracks",
+    "column": "composer",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "table": "artists",
+    "column": "name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "Led%",
+     "%Led%",
+     "Led",
+     "Lee",
+     "Led x",
+     "led"
+    ]
+   },
+   {
+    "table": "media_types",
+    "column": "name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "MPEG audio file",
+     "mpeg audio file"
+    ]
+   },
+   {
+    "table": "playlists",
+    "column": "name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "invoice_lines",
+    "column": "unit_price",
+    "pattern": "enum",
+    "targets": [
+     0.99,
+     1.99
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "albums.artist_id",
+    "parent": "artists.id",
+    "copied": []
+   },
+   {
+    "child": "employees.reports_to",
+    "parent": "employees.id",
+    "copied": []
+   },
+   {
+    "child": "customers.support_rep_id",
+    "parent": "employees.id",
+    "copied": []
+   },
+   {
+    "child": "invoices.customer_id",
+    "parent": "customers.id",
+    "copied": [
+     "billing_address=customers.address",
+     "billing_city=customers.city",
+     "billing_state=customers.state",
+     "billing_country=customers.country",
+     "billing_postal_code=customers.postal_code"
+    ]
+   },
+   {
+    "child": "tracks.album_id",
+    "parent": "albums.id",
+    "copied": []
+   },
+   {
+    "child": "tracks.media_type_id",
+    "parent": "media_types.id",
+    "copied": []
+   },
+   {
+    "child": "tracks.genre_id",
+    "parent": "genres.id",
+    "copied": []
+   },
+   {
+    "child": "invoice_lines.invoice_id",
+    "parent": "invoices.id",
+    "copied": []
+   },
+   {
+    "child": "invoice_lines.track_id",
+    "parent": "tracks.id",
+    "copied": [
+     "unit_price=tracks.unit_price"
+    ]
+   },
+   {
+    "child": "playlist_tracks.playlist_id",
+    "parent": "playlists.id",
+    "copied": []
+   },
+   {
+    "child": "playlist_tracks.track_id",
+    "parent": "tracks.id",
+    "copied": []
+   },
+   {
+    "unique": "playlist_tracks(playlist_id, track_id)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "employees",
+    "column": "reports_to",
+    "formula": "reports_to IS NULL OR reports_to <> id"
+   },
+   {
+    "table": "employees",
+    "column": "hire_date",
+    "formula": "hire_date > birth_date"
+   },
+   {
+    "table": "employees",
+    "column": "birth_date",
+    "formula": "birth_date < hire_date"
+   },
+   {
+    "table": "tracks",
+    "column": "unit_price",
+    "formula": "unit_price IN (0.99, 1.99)"
+   },
+   {
+    "table": "tracks",
+    "column": "milliseconds",
+    "formula": "milliseconds > 0"
+   },
+   {
+    "table": "tracks",
+    "column": "bytes",
+    "formula": "bytes IS NULL OR bytes > 0"
+   },
+   {
+    "table": "invoice_lines",
+    "column": "quantity",
+    "formula": "quantity > 0"
+   },
+   {
+    "table": "invoice_lines",
+    "column": "unit_price",
+    "formula": "unit_price >= 0"
+   },
+   {
+    "table": "invoices",
+    "column": "total",
+    "formula": "total >= 0"
+   },
+   {
+    "table": "invoices",
+    "column": "total",
+    "formula": "SUM(invoice_lines.unit_price * invoice_lines.quantity) GROUP BY invoice_lines.invoice_id",
+    "evidence": "rows 1..8: total = sum(unit_price*quantity) for each invoice"
+   },
+   {
+    "table": "invoice_lines",
+    "column": "unit_price",
+    "formula": "invoice_lines.unit_price = tracks.unit_price VIA invoice_lines.track_id"
+   },
+   {
+    "table": "invoices",
+    "column": "billing_address",
+    "formula": "invoices.billing_address = customers.address VIA invoices.customer_id"
+   },
+   {
+    "table": "invoices",
+    "column": "billing_city",
+    "formula": "invoices.billing_city = customers.city VIA invoices.customer_id"
+   },
+   {
+    "table": "invoices",
+    "column": "billing_state",
+    "formula": "invoices.billing_state = customers.state VIA invoices.customer_id"
+   },
+   {
+    "table": "invoices",
+    "column": "billing_country",
+    "formula": "invoices.billing_country = customers.country VIA invoices.customer_id"
+   },
+   {
+    "table": "invoices",
+    "column": "billing_postal_code",
+    "formula": "invoices.billing_postal_code = customers.postal_code VIA invoices.customer_id"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "artists": 40,
+   "albums": 60,
+   "employees": 12,
+   "customers": 30,
+   "genres": 12,
+   "media_types": 5,
+   "tracks": 120,
+   "invoices": 60,
+   "invoice_lines": 200,
+   "playlists": 10,
+   "playlist_tracks": 150
+  },
+  "null_targets": [
+   "employees.reports_to",
+   "customers.company",
+   "customers.state",
+   "customers.postal_code",
+   "customers.phone",
+   "customers.fax",
+   "customers.support_rep_id",
+   "invoices.billing_state",
+   "invoices.billing_postal_code",
+   "tracks.album_id",
+   "tracks.genre_id",
+   "tracks.composer",
+   "tracks.bytes",
+   "artists.name",
+   "genres.name",
+   "media_types.name",
+   "playlists.name"
+  ],
+  "supporting_evidence": {
+   "invoices.total": [
+    "invoice 1: 1.98 = 0.99*1 + 0.99*1",
+    "invoice 2: 3.96 = 1.99*1 + 1.99*1",
+    "invoice 3: 5.94 = 0.99*1 + 0.99*1 + 0.99*1 + 0.99*1 + 0.99*1 + 0.99*1"
+   ],
+   "invoice_lines.unit_price": [
+    "rows 1..8 show only 0.99 and 1.99",
+    "tracks.unit_price also only 0.99 and 1.99"
+   ],
+   "employees.hire_date > birth_date": [
+    "all 8 employees: birth 1947-1973, hire 2002-2004"
+   ]
+  },
+  "uncertainty": [
+   "Exact duplicate share for DISTINCT columns is only bounded (20-50%); generator uses 30% and post-checks.",
+   "Group-size targets are satisfied by construction but exact counts per value are not fixed.",
+   "billing_* copy rule holds on shown rows; NULL billing_state/postal_code propagate from customer NULLs only (no additional planting).",
+   "employees.reports_to self-reference: root employee (id=1) has NULL reports_to; others point to a lower id.",
+   "employees table size raised to 12 so the hire_date rank-1 tie and birth_date rank-1 DESC tie are achievable; rank-10 tie target dropped as inconsistent with the original 8-row table.",
+   "invoices.billing_state/billing_city/billing_country are copied from customers; boundary/group_sizes targets for these columns are satisfied by choosing customers whose values match the targets, not by overwriting copied values."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "39d508cfb2e98d15"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` sets out[0..5] all to `base = out[0]`, producing a single value with count 6 and no value with count 1 or 2. The spec requires 'at least one value with count 1, one with count 2, one with count >= 3' for employees.first_name, employees.reports_to, customers.country, customers.first_name, invoices.billing_country, genres.name, playlists.name. Execution feedback shows construction_pairs separated=34/127 with no group-size separation reported.",
+     "requested_revision": "Rewrite `_plant_group_sizes` to plant three distinct values with counts 1, 2, and >=3 respectively (e.g. out[0]=A, out[1]=B, out[2]=B, out[3]=C, out[4]=C, out[5]=C), preserving the rest of the column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_boundary` writes the boundary literals into positions 0..len(lits)-1 of the column, but for invoices.billing_state/billing_city the column is first populated by the COPIED rule from customers.state/city, then `_plant_boundary` overwrites the first rows. This breaks the copied-column formula `invoices.billing_state = customers.state VIA invoices.customer_id` for those rows. The spec lists both the copy rule and the boundary rule; the boundary literals must be reachable via a customer whose state/city is the literal, not by overwriting the copy.",
+     "requested_revision": "Ensure customers.state/city contain the boundary literals (IL/il/CA/ca, Chicago/chicago) so that the copied invoices.billing_state/billing_city inherit them; do not overwrite the copied values in `_build_invoices`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` picks random target indices and copies a random other non-NULL value into them, but does not guarantee the resulting duplicate share is within 20-50% of non-NULL values (it can over- or under-shoot because the source value may itself be a duplicate target). Also `_plant_duplicates` is applied to albums.title, customers.company, tracks.composer, but customers.company is later overwritten by `_plant_nulls` in `_build_customers` (order: company built, then `_plant_nulls` for company) \u2014 actually `_plant_duplicates` is not called for customers.company at all in `_build_customers`; only `_plant_nulls` is. So the duplicates_for_distinct rule for customers.company is not implemented.",
+     "requested_revision": "Call `_plant_duplicates('customers','company', ...)` in `_build_customers` before `_plant_nulls`, and make `_plant_duplicates` verify the achieved duplicate share is in [0.20, 0.50] of non-NULL values (retry or adjust)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_aggregate_boundary` assigns the first 9+10+11=30 tracks to the first three albums, but the remaining tracks keep their random album_id, which may also land on those three albums, breaking the exact 9/10/11 counts. Also `_plant_aggregate_boundary` is defined but never called in `build_random_instance`.",
+     "requested_revision": "Call `_plant_aggregate_boundary` after tracks are built, and reassign any remaining tracks whose album_id is one of the three chosen albums to other albums so the counts are exactly 9, 10, 11."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_unmatched` is defined but never called in `build_random_instance`. The unmatched_join_rows rule (customers.id/invoices.customer_id, genres.id/tracks.genre_id, tracks.id/invoice_lines.track_id) is therefore not enforced. Execution feedback shows construction_pairs separated=34/127, consistent with several rules not being applied.",
+     "requested_revision": "Call `_plant_unmatched` in `build_random_instance` after all tables are built, and ensure at least one parent row has no children and (for nullable FKs) at least one child has NULL FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_order_ties` is defined but never called in `build_random_instance`. The ties_for_order_limit rule for employees.hire_date (rank 1 and 10 ASC) and employees.birth_date (rank 1 DESC) is not enforced. Also `_build_employees` generates random hire/birth dates that may not produce the required ties.",
+     "requested_revision": "Call `_plant_order_ties` after employees are built, and additionally plant a tie at rank 10 for hire_date (two rows sharing the 10th-smallest hire_date)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['country'] = ['Canada','canada']*(n//2) + ['Canada']*(n%2)`, which satisfies the comparison_boundary for employees.country but the spec also lists employees.country under comparison_boundary with targets ['Canada','canada'] \u2014 this is fine. However `_build_employees` does not apply `_plant_group_sizes` to employees.first_name or employees.reports_to; the group_sizes rule for these columns is not enforced (reports_to is hand-built with counts 1,2,1,... which may or may not satisfy >=3).",
+     "requested_revision": "Apply `_plant_group_sizes` (fixed per issue 1) to employees.first_name and employees.reports_to, or verify the hand-built reports_to distribution yields counts 1, 2, and >=3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_customers` does not apply `_plant_boundary` to customers.state or customers.city; it only uses a fixed list `states = ['IL','il','CA','ca',...]` and `cities = ['Chicago','chicago',...]` which happen to include the literals, so the boundary is satisfied by construction. But `_build_customers` does not apply `_plant_group_sizes` to customers.country or customers.first_name; the group_sizes rule for these columns is not enforced.",
+     "requested_revision": "Apply `_plant_group_sizes` (fixed per issue 1) to customers.country and customers.first_name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_invoices` does not apply `_plant_group_sizes` to invoices.billing_country; the group_sizes rule for this column is not enforced.",
+     "requested_revision": "Apply `_plant_group_sizes` (fixed per issue 1) to invoices.billing_country."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_genres` and `_build_playlists` do not apply `_plant_group_sizes` to genres.name or playlists.name; the group_sizes rule for these columns is not enforced.",
+     "requested_revision": "Apply `_plant_group_sizes` (fixed per issue 1) to genres.name and playlists.name."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_artists` uses a fixed list including 'Led','Led Zeppelin','led','Led x','Lee' which satisfies the like_near_variant rule for artists.name, but `_build_customers` does not apply `_plant_like` to customers.last_name; the like_near_variant rule for customers.last_name (targets ['Almeida','%Almeida%']) is not enforced (the fixed list includes 'Almeida','almeida' but not '%Almeida%').",
+     "requested_revision": "Apply `_plant_like` to customers.last_name, or add '%Almeida%' to the fixed list."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_tracks` applies `_plant_duplicates` to tracks.composer but not `_plant_group_sizes`; the spec does not list tracks.composer under group_sizes, so this is fine. However `_build_tracks` does not apply `_plant_unmatched` for tracks.id/invoice_lines.track_id or genres.id/tracks.genre_id (see issue 5).",
+     "requested_revision": "See issue 5."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_invoice_lines` copies unit_price from tracks.unit_price via track_id, satisfying the copied-column formula. But `_build_invoices` sets `cols['total'] = [0.0]*n` and never computes the total from invoice_lines; the formula `invoices.total = SUM(invoice_lines.unit_price * invoice_lines.quantity) GROUP BY invoice_lines.invoice_id` is not implemented. Execution feedback shows no total-related separation.",
+     "requested_revision": "After invoice_lines are built, compute invoices.total as the sum of unit_price*quantity per invoice_id (0 for invoices with no lines), and write it back to the invoices column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_invoices` applies `_plant_nulls` to billing_state and billing_postal_code after copying from customers, which can replace a copied value with NULL. The spec's uncertainty note says 'NULL billing_state/postal_code propagate from customer NULLs', implying the NULL should come from the customer, not be planted independently. Planting NULL directly on invoices.billing_state breaks the copy formula for that row (customer.state is non-NULL but invoice.billing_state is NULL).",
+     "requested_revision": "Do not plant NULLs directly on invoices.billing_state/billing_postal_code; instead ensure some customers have NULL state/postal_code so the copy propagates NULLs, or accept that the copy formula holds only for non-NULL operands (SQL three-valued logic) and document this."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['reports_to']` with root NULL and others pointing to lower ids, satisfying `reports_to IS NULL OR reports_to <> id`. But `_build_employees` does not apply `_plant_nulls` to reports_to; the NULL share follows the compact null_rate via the hand-built root NULL only (1 NULL out of n). The spec's null_targets includes employees.reports_to and the NULL rule requires 'at least one NULL row per nullable column' (satisfied) and 'share follows the compact null_rate' (may not be satisfied if compact null_rate > 1/n).",
+     "requested_revision": "Apply `_plant_nulls` to employees.reports_to after building, or verify the compact null_rate is <= 1/n."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_customers` applies `_plant_nulls` to support_rep_id, which is a nullable FK. The NULL rule requires at least one NULL and share following compact null_rate; this is satisfied. However `_build_customers` does not apply `_plant_nulls` to customers.address/city/country (not in NULL_TARGETS, so fine).",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_tracks` applies `_plant_nulls` to album_id, genre_id, composer, bytes. The NULL rule requires at least one NULL and share following compact null_rate; this is satisfied. However `_build_tracks` does not apply `_plant_unmatched` for genres.id/tracks.genre_id (see issue 5).",
+     "requested_revision": "See issue 5."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_albums` applies `_plant_duplicates` to albums.title, but `_plant_duplicates` does not guarantee the 20-50% share (see issue 3). Also `_build_albums` does not apply `_plant_aggregate_boundary` (see issue 4).",
+     "requested_revision": "See issues 3 and 4."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_media_types` uses a fixed list including 'MPEG audio file','mpeg audio file' which satisfies the comparison_boundary rule for media_types.name. However `_build_media_types` applies `_plant_nulls` to name, which can replace the boundary literals with NULL, potentially removing the boundary values. The spec requires the boundary literals to be present.",
+     "requested_revision": "Apply `_plant_nulls` before planting boundary values, or ensure the boundary literals are not overwritten by NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_artists` applies `_plant_nulls` to name, which can replace the like_near_variant literals ('Led','Led Zeppelin','led','Led x','Lee') with NULL, potentially removing them. The spec requires the LIKE variants to be present.",
+     "requested_revision": "Apply `_plant_nulls` before planting LIKE variants, or ensure the LIKE variants are not overwritten by NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_genres` applies `_plant_nulls` to name, which can replace the group_sizes values with NULL, potentially breaking the group_sizes rule. The spec requires group sizes 1, 2, >=3 among non-NULL values.",
+     "requested_revision": "Apply `_plant_nulls` before `_plant_group_sizes`, or ensure the group_sizes values are not overwritten by NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_playlists` applies `_plant_nulls` to name, which can replace the group_sizes values with NULL, potentially breaking the group_sizes rule.",
+     "requested_revision": "Apply `_plant_nulls` before `_plant_group_sizes`, or ensure the group_sizes values are not overwritten by NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_customers` applies `_plant_nulls` to company, state, postal_code, phone, fax, support_rep_id. For company, the duplicates_for_distinct rule is not applied at all (see issue 3). For state, the boundary literals 'IL','il','CA','ca' may be overwritten by NULLs, potentially removing the boundary values.",
+     "requested_revision": "Apply `_plant_nulls` before planting boundary values for state, or ensure the boundary literals are not overwritten by NULLs. See issue 3 for company."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_invoices` applies `_plant_nulls` to billing_state and billing_postal_code after `_plant_boundary` for billing_state, which can overwrite the boundary literals 'IL','il' with NULL, potentially removing them.",
+     "requested_revision": "Apply `_plant_nulls` before `_plant_boundary`, or ensure the boundary literals are not overwritten by NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_tracks` applies `_plant_nulls` to composer after `_plant_duplicates`, which can overwrite duplicate values with NULL, potentially breaking the 20-50% duplicate share among non-NULL values.",
+     "requested_revision": "Apply `_plant_nulls` before `_plant_duplicates`, or ensure the duplicate share is computed among non-NULL values after NULL planting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_albums` applies `_plant_duplicates` to title, but `_plant_duplicates` does not guarantee the 20-50% share (see issue 3).",
+     "requested_revision": "See issue 3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['first_name']` and `cols['last_name']` from fixed lists that include the boundary literals, satisfying the comparison_boundary rule. However `_build_employees` does not apply `_plant_group_sizes` to first_name (see issue 7).",
+     "requested_revision": "See issue 7."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['country']` to ['Canada','canada']*(n//2)+['Canada']*(n%2), satisfying the comparison_boundary rule. However `_build_employees` does not apply `_plant_group_sizes` to country (not in GROUP_SIZES for employees, so fine).",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['hire_date']` and `cols['birth_date']` from random dates in the specified ranges, satisfying hire_date > birth_date. However `_plant_order_ties` is not called (see issue 6).",
+     "requested_revision": "See issue 6."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_employees` sets `cols['reports_to']` with root NULL and others pointing to lower ids, satisfying `reports_to IS NULL OR reports_to <> id`. However `_plant_group_sizes` is not applied to reports_to (see issue 7).",
+     "requested_revision": "See issue 7."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_customers` sets `cols['support_rep_id']` from employees ids, satisfying the FK. However `_plant_nulls` is applied, which is correct for a nullable FK.",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_invoice_lines` sets `cols['quantity'] = [QUANTITY]*n` with QUANTITY=1, satisfying quantity > 0 and matching observed distinct=1. `cols['unit_price']` is copied from tracks.unit_price, satisfying unit_price >= 0 and the copied-column formula.",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_tracks` sets `cols['milliseconds']` from TRACK_MS=(60000,600000), satisfying milliseconds > 0. `cols['bytes']` from TRACK_BYTES=(1000000,20000000), satisfying bytes IS NULL OR bytes > 0. `cols['unit_price']` from ENUMS[('tracks','unit_price')]=[0.99,1.99], satisfying unit_price IN (0.99,1.99).",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_playlist_tracks` deduplicates (playlist_id, track_id) pairs, satisfying the unique constraint. However it may produce fewer than n rows if duplicates are frequent; the spec's table_sizes_per_instance says playlist_tracks: 150, but the actual count may be less. This is a minor deviation.",
+     "requested_revision": "Optionally retry until n unique pairs are generated, or document that the count may be less than 150."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py copies the compact database and appends generated rows with executemany, with a row-by-row fallback that skips bad rows. Execution feedback shows fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0, valid=20/20, reproducible=true. This satisfies integrity and preservation of compact rows.",
+     "requested_revision": "None; this is a note only."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows nullable_columns with 'generated rows: NULL 0 / n' for many columns (artists.name, customers.company, customers.state, etc.). Per instruction 7, this may be noted for the engineer but does not block a pass. However combined with the NULL-overwrite issues above, the NULL rule may not be fully satisfied.",
+     "requested_revision": "Investigate why NULL 0 / n is reported for nullable columns; ensure `_plant_nulls` is actually planting NULLs and that they are not being overwritten by later rules."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact null_rate for each nullable column is <= 1/n (so the hand-built root NULL in employees.reports_to satisfies the share).",
+    "Whether the fixed lists in _build_artists, _build_media_types, _build_customers, _build_employees actually contain the required boundary/LIKE literals after NULL planting.",
+    "Whether the group_sizes rule is satisfied for employees.reports_to given the hand-built distribution.",
+    "Whether the aggregate_boundary rule (albums with exactly 9, 10, 11 tracks) is satisfied after the remaining tracks are reassigned.",
+    "Whether the duplicates_for_distinct rule (20-50% share) is satisfied for albums.title, customers.company, tracks.composer after NULL planting.",
+    "Whether the copied-column formulas (invoices.billing_*, invoice_lines.unit_price) hold for all non-NULL operands after boundary/NULL planting.",
+    "Whether the invoices.total formula is satisfied after computing totals from invoice_lines."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with TypeError(\"'<' not supported between instances of 'str' and 'datetime.datetime'\"). Root cause is in tscore_gen/values.py DateSampler: `self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full` and `self.full = (dt.datetime(...), dt.datetime(...))`. When `len(set(parsed)) < 2`, `self.rng_dates` is set to `self.full` (a tuple of datetimes), but `_draw` computes `lo, hi = self.full if (...) else self.rng_dates` and then `d = lo + dt.timedelta(...)`. The failure arises because `parsed` can contain a mix of `datetime` and `str` (or `min`/`max` over heterogeneous elements), or because `self.elements` retains raw strings while `parsed` holds datetimes, so `min(parsed)`/`max(parsed)` or the subsequent comparison mixes types. In any case, the generator crashes on every instance, so no instances are produced (n_ok=0, n_fail=20).",
+     "requested_revision": "Fix DateSampler so that `parsed` contains only datetimes (filter out unparseable elements before min/max), and ensure `self.rng_dates` and `self.full` are both tuples of datetimes. Also guard `_draw` against `lo`/`hi` being strings. Re-run generation and confirm n_ok > 0 with no TypeError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_employees` sets `cols['country'] = ['Canada', 'canada'] * (n // 2) + ['Canada'] * (n % 2)` and then calls `_plant_boundary('employees', 'country', ...)`. The BOUNDARY entry for ('employees','country') is ['Canada','canada'] only (no lexicographic neighbors), which is consistent with the spec targets. However, the spec's generic `boundary_values` rule says 'include the literal, its case-flipped variant, and one value on each side (lexicographic neighbor for text)'. For employees.country the spec targets only list Canada/canada, so this is acceptable, but the program's `_plant_boundary` writes only `len(lits)` slots (2), which is fine. No blocking issue here, but note the spec's generic rule is not fully honored for columns whose target list omits neighbors; this is a spec-level ambiguity, not a program error.",
+     "requested_revision": "No change required for pass; optionally clarify in the spec that per-column target lists override the generic neighbor requirement."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_order_ties` sets `emp['hire_date'][0] = HIRE_TIE` and `[1] = HIRE_TIE`, and `birth_date[0]=[1]=BIRTH_TIE`. But `_build_employees` already wrote `birth_date`/`hire_date` as strings via `strftime('%Y-%m-%d %H:%M:%S')`. HIRE_TIE and BIRTH_TIE are `datetime` objects, so the column becomes a mix of `str` and `datetime`. This is a latent type inconsistency that will surface once the DateSampler crash is fixed (e.g., in `_compute_invoice_totals` or writer). It also means the 'tie at rank 1 and 10, ASC' target is only partially implemented: the rank-10 tie branch requires `n >= 11`, but employees table size is 8, so the rank-10 tie is never planted.",
+     "requested_revision": "Format HIRE_TIE/BIRTH_TIE with `strftime('%Y-%m-%d %H:%M:%S')` before assignment. Either raise the employees table size to >= 11 to satisfy the rank-10 tie target, or adjust the spec target to reflect the actual table size (8) so the rank-10 tie is not required."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_aggregate_boundary` assigns exactly 9/10/11 tracks to the first three albums, but `_build_tracks` already assigned `album_id` randomly and `_plant_nulls` may have set some `album_id` to NULL. The function overwrites `new_album[pos]` for the first 9+10+11=30 positions, potentially overwriting NULLs (violating 'a planted NULL is never replaced to satisfy a rule') and potentially leaving the chosen albums with more than the intended count if later positions still point at them (the code moves them to `others`, which is correct). The NULL-overwrite is a rule violation.",
+     "requested_revision": "In `_plant_aggregate_boundary`, skip positions where `new_album[i] is None` when assigning the 9/10/11 counts, and only move non-NULL tracks away from chosen albums. Ensure the final counts are exactly 9/10/11 on non-NULL album_id values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_invoices` copies billing_* from customers, then calls `_plant_boundary('invoices','billing_state',...)` and `_plant_boundary('invoices','billing_city',...)`, which overwrite copied values. This breaks the dependency rule `invoices.billing_state = customers.state VIA invoices.customer_id` and `billing_city = customers.city`. The spec lists these as copied columns (dependencies) AND as comparison_boundary targets, which is contradictory: you cannot both copy and plant boundary literals. The program resolves it by overwriting, violating the copy rule.",
+     "requested_revision": "Designer: resolve the conflict in the spec \u2014 either drop billing_state/billing_city from the copied-columns dependency list (allowing boundary planting) or drop them from the comparison_boundary targets (preserving the copy). Engineer: implement whichever resolution is chosen; do not silently overwrite copied values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_invoices` calls `_plant_group_sizes('invoices','billing_country',...)`, overwriting copied `billing_country` values, again breaking the copy rule `billing_country = customers.country`. Same conflict as above.",
+     "requested_revision": "Same as previous issue: resolve spec conflict between copied-columns and group_sizes for invoices.billing_country."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_invoice_lines` copies `unit_price` from `tracks.unit_price` via `track_id`, but `_build_tracks` may have set `tracks.unit_price` to 0.99/1.99 (ENUMS) \u2014 consistent. However, `_plant_unmatched` may set `tracks.genre_id` to NULL and `_plant_aggregate_boundary` may reassign `album_id`, but `unit_price` is not affected. The copy is correct. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_unmatched` sets `child_vals[0] = None` for nullable child FKs, but this may overwrite a value that was already NULL or may violate the 'planted NULL never replaced' rule if `child_vals[0]` was a planted NULL from `_plant_nulls`. Also, for `tracks.genre_id`, `_plant_nulls` already planted NULLs; `_plant_unmatched` then sets index 0 to None again (harmless) but does not ensure a non-NULL child exists. The spec requires 'at least one child row with NULL FK' \u2014 satisfied \u2014 but the parent-without-children requirement may be violated if all parents are used.",
+     "requested_revision": "In `_plant_unmatched`, only set `child_vals[0] = None` if it is not already None, and verify at least one parent has no children after the operation; if not, free one parent as the code attempts. Add an assertion or post-check."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `table_sizes_per_instance` sets employees=8, but the spec's `ties_for_order_limit` target for employees.hire_date is 'tie at rank 1 and 10, ASC'. With only 8 rows, rank 10 does not exist. The program's `_plant_order_ties` guards with `if n >= 11`, so the rank-10 tie is never planted. This is a spec inconsistency.",
+     "requested_revision": "Either increase employees table size to >= 11, or change the target to 'tie at rank 1, ASC' (and similarly verify birth_date rank-1 DESC is achievable with 8 rows \u2014 it is)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `null_targets` includes `invoices.billing_state` and `invoices.billing_postal_code`, but the dependency rule says these are copied from customers. If the customer value is non-NULL, the copy is non-NULL; the program only plants NULLs 'where the copy is non-NULL and the column is a NULL target' (see `_build_invoices`), which contradicts the copy rule. The spec does not clarify whether NULL propagation from customers is the only source of NULLs or whether additional NULLs may be planted.",
+     "requested_revision": "Clarify in the spec: billing_state/billing_postal_code NULLs should propagate only from customer NULLs (no additional planting), or explicitly allow additional planting and remove them from the copied-columns dependency list."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_customers` calls `_plant_duplicates('customers','company',...)` after `_plant_nulls`, which is correct (non-NULL slots only). But `_plant_duplicates` fallback 'first non-NULL value repeated target times' may produce a share outside 20-50% if the retry loop fails; the code does not verify the final share. Similarly for albums.title and tracks.composer.",
+     "requested_revision": "Add a post-check in `_plant_duplicates` that asserts the final duplicate share is within [0.20, 0.50]; if not, adjust deterministically (e.g., repeat exactly `target` times from the first non-NULL value and ensure no other duplicates)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_playlist_tracks` uses rejection sampling with `max_attempts = max(n*20, 1000)`. With playlists=10 and tracks=120, the pair space is 1200, and n=150, so 150 unique pairs are easily found. No blocking issue, but the function does not guarantee exactly n rows if attempts are exhausted; it silently returns fewer rows. The spec requires playlist_tracks=150.",
+     "requested_revision": "After the loop, if `len(cols['playlist_id']) < n`, fill remaining rows by iterating over the full Cartesian product of (playlist_id, track_id) not yet used, to guarantee exactly n rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_employees` sets `cols['reports_to']` with root NULL and others pointing to lower ids, then calls `_plant_nulls` (which may set additional NULLs) and `_plant_group_sizes` (which overwrites the first 6 non-NULL slots with A/B/C values). The group_sizes plant may set `reports_to` to a value that is not a valid employee id (e.g., 'reports_to_0' from the fallback pool), violating the FK constraint. The writer disables foreign_keys, so this would not be caught at write time, but it violates the schema.",
+     "requested_revision": "In `_plant_group_sizes`, when the column is a FK (reports_to), restrict the pool to valid parent ids and ensure planted values are valid employee ids (or NULL). Do not use the string fallback for FK columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_employees` sets `cols['country'] = ['Canada','canada'] * (n//2) + ['Canada'] * (n%2)`, then `_plant_boundary` overwrites the first 2 non-NULL slots with 'Canada','canada'. This is fine, but the spec's `comparison_boundary` for employees.country targets only Canada/canada, and the generic rule asks for lexicographic neighbors. Minor spec ambiguity, not blocking.",
+     "requested_revision": "None (spec clarification optional)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_artists` sets `cols['name']` from a fixed list including 'Led','Led Zeppelin','led','Led x','Lee', then `_plant_nulls` and `_plant_like`. The LIKE_VARIANTS for artists.name is ['Led','Led Zeppelin','led','Led x','Lee'], which matches the spec targets. However, `_plant_like` writes only `len(lits)` slots (5), which is fine. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_media_types` sets names including 'MPEG audio file','mpeg audio file', then `_plant_nulls` and `_plant_boundary`. The boundary plant overwrites the first 2 non-NULL slots with the same literals, which is redundant but harmless. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_genres` sets names from a fixed list, then `_plant_nulls` and `_plant_group_sizes`. The group_sizes plant uses `pool = sorted({str(out[i]) for i in slots})` and picks the first 3 distinct values; if fewer than 3 distinct values exist, it appends `'%s_%d' % (column, k)` strings. For genres.name this is fine (not a FK). No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_build_tracks` sets `cols['unit_price']` from ENUMS, then `_plant_nulls` for album_id/genre_id/composer/bytes, then `_plant_duplicates` for composer. The `unit_price` is not NULL-planted (not in NULL_TARGETS), correct. `milliseconds` and `bytes` are positive, correct. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_compute_invoice_totals` computes totals from invoice_lines, but `_build_invoices` initializes `cols['total'] = [0.0]*n` and the totals are computed after all tables are built. This is correct. However, if `invoice_lines` has fewer rows than expected (due to playlist_tracks-style rejection sampling \u2014 not applicable here since invoice_lines uses direct random choice), totals may be 0 for some invoices. The spec's supporting evidence shows totals = sum of lines; 0 is valid if no lines. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py disables foreign_keys (`pragma foreign_keys = OFF`), so FK violations (e.g., from `_plant_group_sizes` on reports_to) are not caught. The spec requires FK integrity. The writer should either enable foreign_keys or validate FKs before writing.",
+     "requested_revision": "Enable `pragma foreign_keys = ON` in the writer, or add a pre-write validation that all FK values reference existing parent keys (including compact rows). Report violations as errors rather than silently writing them."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the DateSampler crash is the only cause of the 20/20 failures or whether additional type errors exist after fixing it (e.g., HIRE_TIE/BIRTH_TIE datetime vs str).",
+    "Whether `_plant_group_sizes` on employees.reports_to produces valid FK values after the fix.",
+    "Whether the spec conflict between copied billing_* columns and boundary/group_sizes plants is resolved by the designer.",
+    "Whether the employees table size (8) vs rank-10 tie target is resolved.",
+    "Whether `_plant_duplicates` reliably achieves 20-50% share for all three columns.",
+    "Whether `_build_playlist_tracks` always produces exactly 150 rows."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` is the only NULL-planting path, and it is called only from the per-table builders (`_build_employees`, `_build_customers`, `_build_artists`, `_build_genres`, `_build_media_types`, `_build_tracks`, `_build_invoices`, `_build_playlists`). However, `build_random_instance` never calls these `_build_*` functions: it builds every table generically via `samplers[(t, cm.name)].sample()` + `fill_foreign_keys_consistently`, then applies only `_plant_aggregate_boundary`, `_plant_unmatched`, `_plant_order_ties`, `_compute_invoice_totals`. The execution feedback confirms this: every nullable column reports 'generated rows: NULL 0 / n' (e.g. `employees.reports_to: NULL 0 / 470`, `tracks.genre_id: NULL 0 / 337`, `customers.company: NULL 0 / 321`). The specification's `nullable_share` rule ('at least one NULL row per instance; share follows compact DB null_rate') is therefore not implemented at all.",
+     "requested_revision": "Wire the `_build_*` functions (or at least the NULL-planting step) into `build_random_instance` so that every column in `NULL_TARGETS` receives at least one NULL per instance with the compact null_rate share, and planted NULLs are never overwritten. Re-run and confirm the nullable-column feedback lines show non-zero NULL counts."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per-column structural rules (comparison_boundary, like_near_variant, group_sizes, duplicates_for_distinct, aggregate_boundary, unmatched_join_rows, order_ties, enum for invoice_lines.unit_price) are implemented only inside the `_build_*` helpers, which are dead code (see previous issue). The generic path in `build_random_instance` uses `_init_sampler`/`make_column_sampler`, which draws from the literal pool and original values but never plants the required literals (e.g. 'Edwards'/'edwards', 'IL'/'il', 'Led%' variants, group sizes 1/2/>=3, 20-50% duplicate share, albums with 9/10/11 tracks). The construction_pairs feedback (34/127 separated) is consistent with these rules not being enforced. `_plant_aggregate_boundary` and `_plant_unmatched` are called but operate on the generic instance; `_plant_unmatched` only plants a NULL child FK when `(ct, cc) in NULL_TARGETS`, which is fine, but the boundary/group/duplicate/LIKE plants are absent.",
+     "requested_revision": "Either route `build_random_instance` through the `_build_*` functions, or port the structural plants (`_plant_boundary`, `_plant_like`, `_plant_group_sizes`, `_plant_duplicates`, `_plant_aggregate_boundary`, `_plant_order_ties`, enum for `invoice_lines.unit_price`) into the generic path after sampling and before FK/copy computation. Verify each per_column_exception target is present in the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_invoices` copies `billing_*` from customers and then calls `_plant_boundary('invoices','billing_state',...)` and `_plant_boundary('invoices','billing_city',...)`, which overwrite copied values. The specification's `uncertainty` note explicitly says: 'invoices.billing_state/billing_city/billing_country are copied from customers; boundary/group_sizes targets for these columns are satisfied by choosing customers whose values match the targets, not by overwriting copied values.' The same applies to `_plant_group_sizes('invoices','billing_country',...)`. This violates the `invoices.billing_* = customers.*` formula in `semantic_rules_and_formulas`.",
+     "requested_revision": "Remove the post-copy `_plant_boundary`/`_plant_group_sizes` calls on `invoices.billing_state`, `invoices.billing_city`, `invoices.billing_country`; instead ensure the customer pool contains the required literals (IL/il, Chicago/chicago, group sizes) so the copied values satisfy the targets. Add a post-check that `invoices.billing_* = customers.*` holds for every non-NULL row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_order_ties` sets `emp['hire_date'][0]` and `[1]` to `HIRE_TIE` and `emp['birth_date'][0]`/`[1]` to `BIRTH_TIE` unconditionally, without checking `hire_date > birth_date`. `HIRE_TIE = 2002-05-01` and `BIRTH_TIE = 1973-07-01` are compatible, but the function also overwrites `hire_date[9]`/`[10]` with `hires[9]` (a sorted value) without re-checking the birth_date constraint for those rows. More importantly, the specification's `uncertainty` says 'rank-10 tie target dropped as inconsistent with the original 8-row table' and the table size was raised to 12; the code's `if n >= 11` branch re-introduces the rank-10 tie that the specification dropped. This is a spec/program mismatch.",
+     "requested_revision": "Either remove the `n >= 11` rank-10 tie branch to match the specification, or update the specification to re-include the rank-10 tie target. Also add a post-check that `hire_date > birth_date` holds for every employee row after tie planting."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_employees` sets `cols['country'] = ['Canada', 'canada'] * (n // 2) + ['Canada'] * (n % 2)` and then `_plant_boundary('employees','country',...)` overwrites the first two non-NULL slots with 'Canada'/'canada'. The specification's `comparison_boundary` for `employees.country` targets `['Canada','canada']` with op `PRED(employees.country >= 'Canada')`. The code does not plant a value on each side of the boundary (e.g. 'Canada' vs 'canada' is a case-flip, not a lexicographic neighbor), and the generic `boundary_values` rule says 'include the literal, its case-flipped variant, and one value on each side (lexicographic neighbor for text)'. The per-column target list overrides the neighbor requirement, so this is acceptable per the spec, but the code's `_plant_boundary` only plants the listed literals and does not ensure the `>=` boundary is exercised (e.g. a value like 'Canad' or 'Canadb'). This is a minor gap, not blocking.",
+     "requested_revision": "Optional: add a lexicographic neighbor for `employees.country` (e.g. 'Canad' and 'Canadb') to exercise the `>=` boundary, or document that the per-column target list intentionally omits neighbors."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` says 'employees table size raised to 12 so the hire_date rank-1 tie and birth_date rank-1 DESC tie are achievable; rank-10 tie target dropped as inconsistent with the original 8-row table.' However, the `per_column_exceptions` still lists `{'table':'employees','column':'hire_date','pattern':'ties_for_order_limit','targets':['tie at rank 1, ASC']}` and `{'table':'employees','column':'birth_date','pattern':'ties_for_order_limit','targets':['tie at rank 1, DESC']}` \u2014 consistent with the dropped rank-10. The `extracted atomic operations` for `employees.hire_date` lists `tie_at_rank:[1,10]`, so the spec's decision to drop rank-10 is a deliberate deviation from the extracted pattern. This is documented and acceptable, but the spec should explicitly state that the rank-10 tie is intentionally not generated.",
+     "requested_revision": "Add an explicit note in `uncertainty` or `per_column_exceptions` that the rank-10 hire_date tie is intentionally omitted, so the engineer does not re-introduce it (see the `_plant_order_ties` issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_playlist_tracks` does not set `id` (the table has no `id` column, only `playlist_id`/`track_id`), which is correct. However, `build_random_instance`'s generic path calls `sample_fresh_primary_keys(tm, ...)` and `drop_unique_duplicates(tm, ...)` on `playlist_tracks`, whose `primary_key` is `['playlist_id','track_id']`. `sample_fresh_primary_keys` deduplicates on the PK tuple, which is correct, but `drop_unique_duplicates` iterates `tm.columns` and checks `cm.unique`; `playlist_tracks` has no single-column unique, so this is a no-op. The generic path also calls `fill_foreign_keys_consistently` for `playlist_tracks`, which draws `playlist_id` and `track_id` independently with replacement, then `sample_fresh_primary_keys` deduplicates \u2014 this can produce fewer than `n` rows (the spec's `table_sizes_per_instance` says 150). The execution feedback does not report row counts per table, so this is unverified.",
+     "requested_revision": "Add a post-check that `playlist_tracks` has exactly `table_sizes_per_instance['playlist_tracks']` rows (or document that the size is a target, not a guarantee). If the generic path is used, ensure the dedup loop retries until `n` unique pairs are found (as `_build_playlist_tracks` does)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_compute_invoice_totals` computes `invoices.total = SUM(invoice_lines.unit_price * quantity)` for each invoice, but `_build_invoice_lines` sets `unit_price` from `tracks.unit_price` via `track_price.get(tid, 0.99)`. If `track_id` is NULL (possible if `tracks.id` is empty, though unlikely), `unit_price` defaults to 0.99, which may not match any track. More importantly, the generic path in `build_random_instance` does not call `_build_invoice_lines`, so `invoice_lines.unit_price` is sampled by `NumberSampler` (NUMERIC(10,2) \u2192 scale=8, precision=2) and is not restricted to `{0.99, 1.99}` nor copied from `tracks.unit_price`. The specification's `semantic_rules_and_formulas` requires `invoice_lines.unit_price = tracks.unit_price VIA invoice_lines.track_id` and `unit_price IN (0.99, 1.99)`. The execution feedback does not report a violation, but the generic path does not enforce it.",
+     "requested_revision": "Ensure `invoice_lines.unit_price` is always copied from `tracks.unit_price` via `track_id` (and `tracks.unit_price` is restricted to `{0.99, 1.99}`) in the generic path, or route through `_build_invoice_lines`. Add a post-check that `invoice_lines.unit_price = tracks.unit_price` for every non-NULL `track_id`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_tracks` sets `cols['unit_price'] = [rng.choice(ENUMS[('tracks','unit_price')]) ...]` (0.99/1.99), but the generic path samples `tracks.unit_price` via `NumberSampler` (NUMERIC(10,2) \u2192 scale=8, precision=2), which can produce arbitrary values. The specification's `semantic_rules_and_formulas` requires `tracks.unit_price IN (0.99, 1.99)`. The execution feedback does not report a violation, but the generic path does not enforce it.",
+     "requested_revision": "Restrict `tracks.unit_price` to `{0.99, 1.99}` in the generic path (e.g. via a per-column enum override), or route through `_build_tracks`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_build_employees` sets `cols['reports_to']` with `reports.append(rng.choice(ids[:i]))` for `i >= 4`, which can pick `ids[0]` (the root, whose `reports_to` is NULL) \u2014 fine \u2014 but also `ids[1]`, `ids[2]`, `ids[3]`, which may themselves report to `ids[0]`. The specification's `semantic_rules_and_formulas` requires `reports_to IS NULL OR reports_to <> id`, which is satisfied. However, `_plant_group_sizes('employees','reports_to',...,valid_pool=ids)` overwrites the first six non-NULL slots with `pool[0]`, `pool[1]`, `pool[1]`, `pool[2]`, `pool[2]`, `pool[2]`, which may set `reports_to = id` for some row (e.g. if `pool[0] = ids[0]` and slot 0 is `ids[0]`). The code does not re-check `reports_to <> id` after planting. The generic path does not call `_build_employees`, so this is only a latent bug in dead code.",
+     "requested_revision": "After `_plant_group_sizes` on `employees.reports_to`, re-check `reports_to IS NULL OR reports_to <> id` and fix any violations (e.g. by swapping with a valid parent id)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_unmatched` for `('tracks','id') -> ('invoice_lines','track_id')` plants a NULL in `invoice_lines.track_id` if `(ct, cc) in NULL_TARGETS`. But `invoice_lines.track_id` is `NOT NULL` in the schema (`track_id INTEGER NOT NULL`), and `NULL_TARGETS` does not include `invoice_lines.track_id`, so the NULL plant is skipped \u2014 correct. However, the `unmatched_join_rows` pattern for `tracks.id` targets `joins_with: ['tracks.id','invoice_lines.track_id'], parent_rows_without_children: true, child_rows_with_null_fk: false`, so no NULL child FK is required. The code's `_plant_unmatched` correctly skips the NULL plant. No issue here, but the `_plant_unmatched` loop for `('genres','id') -> ('tracks','genre_id')` plants a NULL in `tracks.genre_id` (which is nullable and in `NULL_TARGETS`), satisfying `child_rows_with_null_fk: true`. This is correct.",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`writer.write_instance_sqlite` copies the compact database and appends generated rows with `INSERT INTO ... VALUES (...)`. The generated primary keys start at `_pk_start(schema, table) = max(compact PK) + 1`, so keys are fresh. However, `_pk_start` is only used in the `_build_*` functions, which are dead code. The generic path in `build_random_instance` samples PKs via `NumberSampler` (INTEGER \u2192 scale=10, is_int=True), which can produce values that collide with compact PKs. `sample_fresh_primary_keys` deduplicates within the generated rows but does not check against compact PKs. The writer's `executemany` would fail on PK collision and fall back to row-by-row, skipping the bad row. The execution feedback reports `pk_duplicates: 0` and `not_ok: 0`, so no collision occurred in the 20 instances, but this is not guaranteed.",
+     "requested_revision": "In the generic path, ensure generated PKs start above the compact maximum (e.g. by seeding the PK sampler with `range(max_compact_pk+1, max_compact_pk+1+n)` or by post-processing to shift PKs). Add a post-check that no generated PK collides with a compact PK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`build_random_instance` calls `_plant_aggregate_boundary(inst, schema, rng)` which assigns `tracks.album_id` to the first three albums with counts 9, 10, 11. But `tracks.album_id` is nullable and `_plant_nulls` is not called in the generic path, so `tracks.album_id` has no NULLs (confirmed by feedback: `tracks.album_id: NULL 0 / 337`). The `unmatched_join_rows` pattern for `albums.id` targets `parent_rows_without_children: true` (no NULL child FK required), so this is fine. However, the `aggregate_boundary` pattern for `albums.id` targets `HAVING(COUNT(albums.id) > 10)` with values `[9,10,11]`, and the code plants exactly 9, 10, 11 \u2014 correct. But the code does not ensure the remaining tracks are distributed so that no other album accidentally has 9/10/11 (which would be fine, but the spec's `aggregate_boundary` only requires the three boundary groups to exist). No issue here.",
+     "requested_revision": "No change required; noted for completeness."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `generic_sampling_rules.varchar_text` says '10% chance of a near-variant (case flip, trailing space, prefix/suffix) when the column is not an enum.' The program's `StringSampler.sample` applies a 50% chance of a mutation (append/prepend/trim), not 10%. This is a spec/program mismatch, though minor.",
+     "requested_revision": "Either update the specification to say 50% (matching the upstream fuzzer) or change `StringSampler` to use 10%. Document the choice."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `generic_sampling_rules.timestamp` says 'Uniform datetime in 2002-01-01..2010-12-31 00:00:00, stored as datetime objects and formatted %Y-%m-%d %H:%M:%S only at write time; never mix str and datetime in a column.' The program's `DateSampler` uses `self.full = (1800-01-01, 2100-01-01)` and `self.rng_dates` from parsed original values, and returns strings (or ints if `as_int`). It does not restrict to 2002-2010. The `_build_employees` function uses `EMPLOYEE_BIRTH = (1947, 1975)` and `EMPLOYEE_HIRE = (2002, 2004)`, which is closer to the spec but still not 2002-2010 for all timestamps. The spec's `timestamp` rule is not implemented in the generic path.",
+     "requested_revision": "Either update the specification to match the program's date ranges (1800-2100 for generic, 1947-1975/2002-2004 for employees) or restrict `DateSampler` to the specified range. Document the choice."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback reports `construction_pairs: {eligible: 127, separated: 34, unknown_executions: 0}`. 34/127 separated is low, consistent with the structural plants not being applied (see earlier issues). The feedback does not report per-group breakdown (`construction_pairs_by_group: []`), so it is unclear which patterns are separated. This is a symptom of the dead-code issue, not a separate bug.",
+     "requested_revision": "After fixing the dead-code issue, re-run and confirm `construction_pairs.separated` increases and `construction_pairs_by_group` is populated."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the generic path's `NumberSampler` for `tracks.unit_price` and `invoice_lines.unit_price` ever produces values outside {0.99, 1.99} in the 20 instances (feedback does not report value distributions).",
+    "Whether `playlist_tracks` has exactly 150 rows per instance (feedback does not report per-table row counts).",
+    "Whether generated PKs ever collide with compact PKs (feedback reports 0 duplicates, but the generic path does not guarantee freshness).",
+    "Whether `invoices.billing_* = customers.*` holds for all non-NULL rows in the generic path (the generic path does not copy these columns; `_build_invoices` does, but is dead code).",
+    "Whether `employees.hire_date > birth_date` holds after `_plant_order_ties` (the function does not re-check)."
+   ]
+  }
+ ]
 }

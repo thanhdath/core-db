@@ -1,48 +1,677 @@
 {
  "db": "student_assessment",
- "operator_io_quirks": [
-  "All table/column names are plain ASCII, no spaces or mixed case; quoting still required for safety but no BIRD-style hazards.",
-  "Tiny DB (max 15 rows); read_schema sampling is trivial, no huge-table path exercised.",
-  "DATETIME columns store text 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no fractional seconds); ts_fuzzer dispatch is 'Date|Number(int elements)' because first element does not parse as int -> Date fuzzer with template %Y-%m-%d %H:%M:%S.",
-  "Courses.course_id is VARCHAR(100) but Student_Course_Registrations.course_id is INTEGER and FK-references it; declared-type mismatch across the FK edge (parent text '301', child integer 301).",
-  "Student_Course_Attendance has a COMPOSITE FK (student_id, course_id) -> Student_Course_Registrations(student_id, course_id); pragma foreign_key_list yields two single-column rows, so read_schema sees two separate FKs, not one composite.",
-  "Students.student_id, Candidates.candidate_id are PKs that are ALSO FKs to People.person_id (PK-as-FK); same for People_Addresses.person_id/address_id (non-PK FK to PK).",
-  "Student_Course_Registrations.student_id FK -> Students.student_id, which is itself an FK to People.person_id: FK chain depth 2 (People -> Students -> Registrations -> Attendance).",
-  "Courses.other_details is 100% NULL (distinct=0, storage=['null']); String sampler with empty elements -> p:=1, always fresh random strings.",
-  "Addresses.country has distinct=1 ('USA'); String sampler will mostly emit random charset strings, not 'USA'.",
-  "Addresses.zip_postcode CHAR(20) stores short numeric strings ('862','716'); String fuzzer will treat as int-like and add +-1 variants.",
-  "People.password stores 40-char hex; String fuzzer length range [40,41] from elements, so fresh strings are 40-41 chars over a-zA-Z0-9() space.",
-  "No views, triggers, or unique indexes beyond PKs; no CHECK constraints; no dangling FKs (all parent_exists=true)."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template %Y-%m-%d %H:%M:%S, range from min/max of 5 sampled originals (e.g. 2008-2018), so fresh dates cluster in that window; implausible for 'future' or 'before 2008' predicates -> likely FN.",
-  "Number fuzzer on INTEGER PKs (person_id, address_id, course_id-as-int): range [-10^4,10^4] with +-1/+-2 perturbation; original IDs are small (111,121,...) so fresh IDs are wildly out of range -> joins on ID equality mostly miss -> FN on ID-predicate queries.",
-  "String fuzzer on names/cities/emails: random charset a-zA-Z0-9() space, length from element range; 'USA' country, 'Pass'/'Fail' outcome, 'A'/'B'/'C'/'D' qualification will be replaced by random strings -> FN on equality predicates like qualification='A'.",
-  "Courses.course_id VARCHAR but child FK INTEGER: TS draws child values from parent's generated text values (e.g. '301'), inserts into INTEGER column -> sqlite affinity converts to 301; joins still work but type-strict comparisons may differ.",
-  "Composite PK (student_id, course_id) on Registrations/Attendance: sample_fresh_primary_keys drops duplicate tuples; with small sizes (1-30) and Number fuzzer over [-10^4,10^4], collisions rare -> few drops, but FK draws from parent's filtered column may produce tuples not in parent -> FK violations silently skipped at insert (foreign_keys OFF).",
-  "PK-as-FK (Students.student_id -> People.person_id): child draws from parent's final person_id values, so student_id subset of person_id; if People is small (1-30) and Students larger, many Students rows fail PK uniqueness or FK -> row loss.",
-  "People_Addresses.date_from/date_to both Date fuzzer independently -> date_from > date_to frequently; queries asserting date_from < date_to will see implausible rows -> FN.",
-  "Courses.other_details all-NULL: String sampler with no elements -> p=1, always fresh random strings; queries 'WHERE other_details IS NULL' will find none -> FN.",
-  "Small table sizes (choose_table_sizes: 1-30 or 30-230) mean joins often empty; TS misses ties/duplicates because PK/unique filtering removes them -> FP on DISTINCT-vs-not and COUNT queries.",
-  "No CHECK constraints, so TS never exercises constraint-violation paths; NOT NULL violations (e.g. registration_date) are the main insert-failure source."
- ],
- "challenger_refs": [
-  "G13",
-  "g0ea83504",
-  "g3b0d5554",
-  "G2",
-  "g8891e72b",
-  "G12",
-  "G11",
-  "G9",
-  "G3",
-  "G6"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": null,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "build_order": "Finalize each table completely before its dependents: (1) sample free columns, (2) apply per-column exceptions/forced literals, (3) sample fresh PK/UNIQUE values, (4) deduplicate unique tuples, (5) apply group-size/tie targets, (6) apply semantic rules that touch non-key columns only, (7) apply null rule, (8) MATERIALIZE immutable final key tuple set. Children then sample FKs exclusively from the parent's materialized final key tuples. No parent-side mutation may occur after child FK fill; if a parent is ever touched post-hoc, re-run child FK fill.",
+   "integer_pk": "Sequential unique integers within [1, 230]; never NULL. For PKs that are also FKs (Students.student_id, Candidates.candidate_id), values are taken exclusively from the parent's materialized key pool (copied), never generated fresh.",
+   "integer_fk": "Sample from the parent table's MATERIALIZED final key tuples (after dedup, group-size, tie, semantic and null rules); coerce to child's declared type (VARCHAR parent -> INTEGER child via CAST); never NULL for NOT NULL FK columns; fail loudly if parent pool is empty.",
+   "composite_fk": "Sample the joint tuple from the parent's MATERIALIZED final composite key tuples; never sample composite-FK columns independently.",
+   "integer_measure_or_flag": "Random integer in observed range; flags drawn from {0,1}.",
+   "varchar_name_or_text": "Random word string length 3-30 using letters/spaces; near-variants (case changes) inserted when an equality/LIKE pattern is targeted.",
+   "varchar_email": "Random <word>.<word>@example.{com|net|org}.",
+   "varchar_phone": "Random phone format matching observed styles (digits, parens, x-extension, dots, hyphens).",
+   "varchar_login": "Random 4-letter lowercase string.",
+   "varchar_password": "Random 40-char lowercase hex string.",
+   "varchar_char_small": "Random short uppercase letter string length 1-3 within CHAR length.",
+   "datetime_general": "Random datetime between 2008-01-01 00:00:00 and 2018-03-22 00:00:00, formatted '%Y-%m-%d %H:%M:%S'.",
+   "literal_injection": "For every per_column_exceptions entry with explicit numeric 'values' on a NON-FK column, force at least one generated row per listed literal and one step on each side of each numeric boundary. For entries listed as 'inject_into_parent', inject the literal into the PARENT primary key stream before the parent is finalized; children then FK-fill from the parent's final set. FK columns are never force-overwritten with values outside the parent's final key set.",
+   "null_rule": "Only columns listed in null_targets receive planted NULLs; every other nullable column is always non-NULL. Each null_target column gets at least one NULL per instance and a share matching spec_share (compact database's share, default 0.10-0.20 when unknown). NOT NULL/PK/FK/UNIQUE columns never get NULL. Planted NULLs are never replaced."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Addresses.city",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Addresses.line_1",
+    "pattern": "not_null",
+    "targets": {
+     "note": "always non-NULL; not a null_target"
+    }
+   },
+   {
+    "column": "Courses.course_id",
+    "pattern": "varchar_pk_compact",
+    "targets": {
+     "values": [
+      "300",
+      "301",
+      "302",
+      "303",
+      "304",
+      "305",
+      "306",
+      "307",
+      "308",
+      "309",
+      "310"
+     ],
+     "note": "CHAR(100) numeric strings; boundary 300 added so child CAST coerce of 300 is FK-legal in a parent row"
+    }
+   },
+   {
+    "column": "Courses.course_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "statistics",
+      "STATISTICS"
+     ],
+     "note": "LOWER(course_name)='statistics' reachable via both literals"
+    }
+   },
+   {
+    "column": "Courses.course_description",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "statistics",
+      "STATISTICS"
+     ]
+    }
+   },
+   {
+    "column": "Courses.other_details",
+    "pattern": "null_share",
+    "targets": {
+     "share": "1.0",
+     "note": "all NULL in compact; null_target column"
+    }
+   },
+   {
+    "column": "Students.student_id",
+    "pattern": "boundary_inject_into_parent",
+    "targets": {
+     "values": [
+      170,
+      171,
+      172
+     ],
+     "inject_into_parent": "People.person_id",
+     "inject_values": [
+      170,
+      171,
+      172
+     ],
+     "note": "boundary lives in People; Students copies from People's final set \u2014 never force-overwrite child"
+    }
+   },
+   {
+    "column": "Students.student_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Student_Course_Registrations.student_id",
+      "Student_Course_Attendance.student_id"
+     ],
+     "parent_rows_without_children": true,
+     "note": "people exist as students with zero registrations/attendance; FK to People always satisfied"
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.student_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Students.student_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.student_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.course_id",
+    "pattern": "boundary_inject_into_parent",
+    "targets": {
+     "values": [
+      300,
+      301,
+      302
+     ],
+     "inject_into_parent": "Courses.course_id",
+     "inject_values": [
+      "300",
+      "301",
+      "302"
+     ],
+     "note": "boundary course cast 300/301/302 live in Courses; child copies coerced value"
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.course_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Courses.course_id",
+      "Student_Course_Attendance.course_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.course_id",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "deterministic": "reserve dedicated course_id groups: one course with size 1, one with size 2, one with size >= 3; fill remaining rows without shuffle-overwriting reserved indices"
+    }
+   },
+   {
+    "column": "Student_Course_Registrations.registration_date",
+    "pattern": "not_null",
+    "targets": {
+     "note": "never NULL"
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.student_id",
+    "pattern": "boundary_inject_into_parent",
+    "targets": {
+     "values": [
+      170,
+      171,
+      172
+     ],
+     "inject_into_parent": "People.person_id",
+     "inject_values": [
+      170,
+      171,
+      172
+     ]
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.student_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.student_id",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)",
+     "note": "never NULL despite prior atomic-op hint"
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.course_id",
+    "pattern": "boundary_inject_into_parent",
+    "targets": {
+     "values": [
+      300,
+      301,
+      302
+     ],
+     "inject_into_parent": "Courses.course_id",
+     "inject_values": [
+      "300",
+      "301",
+      "302"
+     ]
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.course_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Student_Course_Attendance.date_of_attendance",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC",
+     "tie_on": [
+      "STRFTIME('%Y-%m-%d', date_of_attendance)"
+     ],
+     "note": "dedicate at least two distinct (student,course) attendance rows sharing a calendar date; ensure ties survive dedup since PK includes both FK cols"
+    }
+   },
+   {
+    "column": "Candidates.candidate_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Candidate_Assessments.candidate_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Candidate_Assessments.candidate_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Candidates.candidate_id"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Candidate_Assessments.qualification",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "A",
+      "B",
+      "C",
+      "D"
+     ]
+    }
+   },
+   {
+    "column": "Candidate_Assessments.asessment_outcome_code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Pass",
+      "Fail"
+     ]
+    }
+   },
+   {
+    "column": "Candidate_Assessments.assessment_date",
+    "pattern": "rows_with_different_values",
+    "condition": "candidate has >= 2 assessment qualification rows",
+    "targets": {
+     "qualifying_rows": ">=2 per candidate with different assessment_date values"
+    }
+   },
+   {
+    "column": "People.first_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "People.last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "People.email_address",
+    "pattern": "literal_pool",
+    "targets": {
+     "values": [
+      "stanley.monahan@example.org"
+     ]
+    }
+   },
+   {
+    "column": "People.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "People_Addresses.person_id",
+      "Students.student_id"
+     ],
+     "parent_rows_without_children": true,
+     "note": "people with no address row and no student row"
+    }
+   },
+   {
+    "column": "People_Addresses.person_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Students.student_id",
+      "People.person_id"
+     ],
+     "parent_rows_without_children": true,
+     "note": "a Person referenced by an address need not be a Student"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Students.student_id",
+    "parent_table": "People",
+    "parent_column": "person_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Candidates.candidate_id",
+    "parent_table": "People",
+    "parent_column": "person_id",
+    "copied_columns": []
+   },
+   {
+    "child": "People_Addresses.person_id",
+    "parent_table": "People",
+    "parent_column": "person_id",
+    "copied_columns": []
+   },
+   {
+    "child": "People_Addresses.address_id",
+    "parent_table": "Addresses",
+    "parent_column": "address_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Student_Course_Registrations.student_id",
+    "parent_table": "Students",
+    "parent_column": "student_id",
+    "copied_columns": []
+   },
+   {
+    "child": "Student_Course_Registrations.course_id",
+    "parent_table": "Courses",
+    "parent_column": "course_id",
+    "coercion": "CAST(Courses.course_id AS INTEGER)",
+    "copied_columns": []
+   },
+   {
+    "child": "Student_Course_Attendance.(student_id,course_id)",
+    "parent_table": "Student_Course_Registrations",
+    "parent_column": "(student_id,course_id)",
+    "composite": true,
+    "sampling": "sample joint tuple from materialized final Student_Course_Registrations rows",
+    "copied_columns": []
+   },
+   {
+    "child": "Candidate_Assessments.candidate_id",
+    "parent_table": "Candidates",
+    "parent_column": "candidate_id",
+    "copied_columns": []
+   },
+   {
+    "composite_pk": "Student_Course_Attendance PK (student_id,course_id) unique after FK fill; deduplicate post-FK"
+   },
+   {
+    "composite_pk": "Student_Course_Registrations PK (student_id,course_id) unique"
+   },
+   {
+    "composite_pk": "Candidate_Assessments PK (candidate_id,qualification) unique"
+   },
+   {
+    "invariant": "After every unit write, run PRAGMA foreign_key_check; reject and retry the instance if any violation is found"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "People_Addresses",
+    "column": "date_to",
+    "formula": "date_to IS NULL OR date_to >= date_from",
+    "evidence": "8/8 compact rows (2012-09-26->2018-03-21, 2008-07-31->2018-03-09, 2008-05-26->2018-03-11)"
+   },
+   {
+    "table": "Student_Course_Registrations",
+    "column": "registration_date",
+    "formula": "registration_date IS NOT NULL"
+   },
+   {
+    "table": "Student_Course_Attendance",
+    "column": "date_of_attendance",
+    "formula": "date_of_attendance >= (SELECT MIN(r.registration_date) FROM Student_Course_Registrations r WHERE r.student_id = Student_Course_Attendance.student_id AND r.course_id = Student_Course_Attendance.course_id)",
+    "condition": "EXISTS (SELECT 1 FROM Student_Course_Registrations r WHERE r.student_id = Student_Course_Attendance.student_id AND r.course_id = Student_Course_Attendance.course_id)",
+    "evidence": "attendance 2008-11-04 for reg 2008-11-04; 2012-04-09 >= 2008-10-04; 2013-04-09 >= 2008-11-06"
+   },
+   {
+    "table": "Candidate_Assessments",
+    "column": "asessment_outcome_code",
+    "formula": "asessment_outcome_code IN ('Pass','Fail')",
+    "evidence": "all shown rows"
+   },
+   {
+    "table": "Candidate_Assessments",
+    "column": "qualification",
+    "formula": "qualification IN ('A','B','C','D')",
+    "evidence": "shown rows values A,B,D,C"
+   },
+   {
+    "table": "Candidate_Assessments",
+    "column": "assessment_date",
+    "formula": "assessment_date BETWEEN '2008-01-01 00:00:00' AND '2018-03-22 00:00:00'",
+    "evidence": "all shown rows in 2010-04"
+   },
+   {
+    "table": "Courses",
+    "column": "course_id",
+    "formula": "CAST(course_id AS INTEGER) > 0",
+    "evidence": "course_id values 301-306 numeric"
+   },
+   {
+    "table": "Students",
+    "column": "student_id",
+    "formula": "student_id > 0",
+    "evidence": "positive ids 111-181"
+   },
+   {
+    "table": "Candidates",
+    "column": "candidate_id",
+    "formula": "candidate_id > 0",
+    "evidence": "positive ids 111-181"
+   },
+   {
+    "table": "People",
+    "column": "person_id",
+    "formula": "person_id > 0",
+    "evidence": "positive ids 111-181"
+   },
+   {
+    "table": "Addresses",
+    "column": "address_id",
+    "formula": "address_id > 0",
+    "evidence": "positive ids 5-63"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Addresses": 20,
+   "People": 26,
+   "Students": 18,
+   "Courses": 20,
+   "People_Addresses": 22,
+   "Student_Course_Registrations": 30,
+   "Student_Course_Attendance": 14,
+   "Candidates": 10,
+   "Candidate_Assessments": 16
+  },
+  "null_targets": [
+   "People.middle_name",
+   "People.cell_mobile_number",
+   "People.email_address",
+   "People.login_name",
+   "People.password",
+   "Addresses.line_2",
+   "Addresses.city",
+   "Addresses.zip_postcode",
+   "Addresses.state_province_county",
+   "Addresses.country",
+   "People_Addresses.date_to",
+   "Students.student_details",
+   "Courses.course_name",
+   "Courses.course_description",
+   "Courses.other_details",
+   "Candidates.candidate_details"
+  ],
+  "supporting_evidence": [
+   "People_Addresses date_to order 8/8 (2012-09-26->2018-03-21, 2008-07-31->2018-03-09, 2008-05-26->2018-03-11).",
+   "Student_Course_Attendance date_of_attendance >= same student's min registration_date: 2008-11-04/2008-11-04, 2012-04-09/2008-10-04, 2013-04-09/2008-11-06.",
+   "Candidate_Assessments outcome {Pass,Fail}; qualification {A,B,C,D} on shown rows.",
+   "Courses.course_id numeric strings 301-306; parent pool extended to 300-310 so CAST boundary 300/301/302 are FK-representable.",
+   "Composite FK attendance->registrations requires joint-tuple sampling from materialized parent (per review).",
+   "Courses.course_id VARCHAR -> Student_Course_Registrations.course_id INTEGER requires CAST coercion (per review).",
+   "Students/Candidates FK-to-People violations traced to pre-dedup/pre-semantic-rule parent pool; fixed by finalize-then-sample order.",
+   "NULL share previously over-applied to non-target columns (Addresses.line_1, People.first_name/last_name, People_Addresses.date_from, Courses.other_details); fixed by null_targets-only rule, with Courses.other_details explicitly 100% NULL as observed."
+  ],
+  "uncertainty": "People.middle_name/last_name lengths and near-duplicates unmeasured; attendance rows shown (8) vs registrations (9) suggest sparse attendance \u2014 table sizes set so a fraction of registrations have attendance (parent_rows_without_children reachable). People_Addresses.address_id values 88/99/92/82 not in shown Addresses sample implies more addresses exist than the 8 shown; Addresses sized 20 to cover. Boundary injection into People.person_id (170-172) and Courses.course_id (300-302) assumes parent generators can carry non-sequential literal keys alongside sequential ones; verify with PRAGMA foreign_key_check per unit. Tie target on attendance date requires two distinct (student,course) rows sharing a calendar date \u2014 may conflict with sparse attendance sizing; adjust if unreachable across seeds and log per-instance target audit."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances invalid with new_integrity_failures; 2388 FK violations total. Dominant: Student_Course_Attendance.(student_id,course_id) -> Student_Course_Registrations.(student_id,course_id) with 2275 rows across 20 instances; also Student_Course_Registrations.course_id -> Courses.course_id with 113 rows across 11 instances. In instance.py, fill_foreign_keys_consistently draws each FK child column independently from the parent column's values (rng.choice per column). For the composite FK (student_id, course_id) this produces pairs that were never registered together, so the composite FK is violated. Similarly, Student_Course_Registrations.course_id is drawn from Courses.course_id values, but the sampler for course_id (INTEGER) can produce values not present in Courses (Courses.course_id is VARCHAR(100) and the FK target values are strings), and the writer disables foreign_keys pragma so violations are silently committed.",
+     "requested_revision": "Make FK generation respect composite keys: for a multi-column FK, sample whole parent tuples (from the parent table's generated+compact rows) and assign them jointly to the child columns, not column-by-column. Also ensure the child column's sampler domain is restricted to the parent's actual key values (including type coercion for VARCHAR vs INTEGER course_id), and/or re-enable foreign_keys enforcement in the writer so violations are caught rather than silently written. Re-run and confirm new_fk_violations = 0 for all instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Student_Course_Attendance has PRIMARY KEY (student_id, course_id) and FK to Student_Course_Registrations on the same pair. Because fill_foreign_keys_consistently samples student_id and course_id independently, the generated attendance rows also frequently duplicate the (student_id, course_id) PK across rows (the PK dedup in sample_fresh_primary_keys runs before FK fill in build_random_instance, so FK-filled columns are not re-deduplicated). The feedback shows 0 new_duplicate_keys only because the writer's executemany fails and falls back to per-row inserts that skip duplicates \u2014 but the FK violations remain. This is a latent correctness gap: the PK dedup step is applied to the pre-FK columns, then FK columns are overwritten afterwards.",
+     "requested_revision": "Apply primary-key deduplication after FK columns are filled (or fill FKs before dedup), and for composite FKs sample joint parent tuples so the resulting (student_id, course_id) pairs are both unique and valid registrations."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification is empty ({}), so there is no documented statement of the value domains, sampling rules, NULL rule, or FK-consistency requirement that the program is supposed to implement. The atomic-operation statistics (e.g. unmatched_join_rows for Students.student_id vs Student_Course_Registrations/Attendance, comparison_boundary on student_id=171, course_id=301, course_name='statistics', duplicates_for_distinct 20-50%) are not reflected in any written rule. Without a specification the reviewer cannot confirm the program implements the intended domains; the observed FK failures are consistent with an under-specified FK-consistency rule.",
+     "requested_revision": "Provide a non-empty generation specification that states: (a) per-column value domains and samplers, (b) the NULL rule (at least one NULL per nullable column, share following compact share, NOT NULL/PK never NULL), (c) FK consistency including composite FKs (joint parent-tuple sampling), (d) preservation of compact rows, and (e) the intended variation targets (e.g. boundary values 170/171/172, 300/301/302, case variants of 'statistics')."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the composite-FK fix alone eliminates all 2388 FK violations (the course_id VARCHAR vs INTEGER mismatch also needs verification).",
+    "Whether the empty specification is intentional (fast mode) or a defect; the reviewer treats it as a defect because it prevents confirming domain/sampling rules.",
+    "Construction pairs: 40 of 78 separated, 0 unknown executions \u2014 no evidence of over-constraining, but separation cannot be fully assessed without the specification."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports 2388 FK violations across all 20 instances (0 valid). The largest source is Student_Course_Attendance.(student_id,course_id) -> Student_Course_Registrations.(student_id,course_id): 2275 rows in 20/20 instances; plus Student_Course_Registrations.course_id -> Courses.course_id: 113 rows in 11 instances. Root causes in code: (1) In instance.py, `fill_foreign_keys_consistently` samples each FK column independently (`out[cm.name] = [rng.choice(pv) ...]`), so the composite FK (student_id,course_id) into Student_Course_Registrations is filled column-by-column, not by joint parent tuples - violating the spec dependency 'sample joint parent tuples; do not sample child columns independently'. (2) `sample_fresh_primary_keys`/`drop_unique_duplicates` and `_apply_null_rule` run AFTER FK fill and can drop/alter parent tuples the child referenced; but more decisively the child attendance rows only draw from parents present in the generated dict `inst` (which only holds generated parent values) \u2014 packed rows / later-filtered rows become orphan parents. (3) Courses.course_id is VARCHAR and Student_Course_Registrations.course_id is INTEGER; the spec requires 'CAST(Courses.course_id AS INTEGER)'; the code raw-samples the string pool (`rng.choice(pv)`), so FK values are string-typed against an INTEGER FK column, and when parent PK dedup drops generated Courses rows, child course_id values link to non-existent courses.",
+     "requested_revision": "Implement the composite-FK joint-tuple sampling explicitly (register the FK as a tuple (student_id,course_id) and sample whole parent tuples), perform the composite-FK fill for Student_Course_Attendance from the MATERIALIZED final Student_Course_Registrations tuples (after dedup and null-rule, not the transient dict), and coerce Course FK values via CAST(Courses.course_id AS INTEGER) both in the parent sampling and the child fill. Then re-run and require new_fk_violations == 0 for all instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec nullable-column rules (eight-point note and program generic_sampling_rules) forbid NULL in NOT NULL columns. Although not_null_violations is 0 in the executed run, the mechanism is fragile: instance.py `fill_foreign_keys_consistently` returns `[None]*n` when a parent table has no values (`pv` empty), and _apply_null_rule is later applied uniformly to all nullable columns regardless of whether they are FK columns. For Parents used by Student_Course_Registrations.course_id (Courses.course_id is VARCHAR(100) NOT NULL, PK) the PK-sampling path can also produce NULL via filtering (`cols = _filter(...)`) but the only mechanism preventing NOT NULL failure today is SQLite's DDL check. The spec's NULL-target list explicitly names 'Students.student_id, Student_Course_Attendance.student_id, Candidate_Assessments.candidate_id' as NOT NULL columns and 'never NULL', contradicting the null_targets semantics (these are NOT NULL PK columns).",
+     "requested_revision": "Fix the spec null_targets field to list nullable columns only (e.g., People.middle_name, People_Addresses.date_to, Students.student_details, etc.), and in the engineer code ensure _apply_null_rule never introduces NULL into a column with column_meta.notnull or pk_pos>0 (currently guarded, but also guard FK fill fallback pv-empty path: fail loudly rather than emitting NULLs)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec table_sizes_per_instance caps Students at 8 and Courses at 8, while Student_Course_Registrations (14) and Student_Course_Attendance (14) draw FKs into them. The construction_pairs stats show separated 40 of 78 eligible pairs with no per-group entries (construction_pairs_by_group is empty), and the 'ties_for_order_limit' / 'comparison_boundary' targets for Student_Course_Attendance.date_of_attendance and Student_Course_Registrations.course_id rely on group sizes \u2265 3 (target 'group_sizes: 1, 2 and >= 3'), unreachable with only 8 Courses. Spec also asserts 'Course_id CHAR(100) but must be only source for child FK course_id' which conflicts with Student_Course_Attendance.course_id FK into Student_Course_Registrations.course_id (INTEGER) rather than Courses. The literal pool objective requires the tie/boundary rows to be observable in generated rows.",
+     "requested_revision": "Raise Courses and Students sizes to at least cover the largest FK cardinalities (e.g., Courses \u2265 20, Students \u2265 20), keep child FK sources aligned with the spec's singularity statement, and add a targets-driven size floor for the group_sizes/boundary columns so the intended separations are kept possible. Alternatively, note explicitly that missing separation is intentional."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec per-column exception requires Courses.course_id values in {'301'..'308'} (varchar_pk_compact) and specific literal pools (e.g., Candidate_Assessments.qualification \u2208 {A,B,C,D}, outcome \u2208 {Pass,Fail}). The generator (values.py StringSampler) samples strings from CHARSET (ascii letters+spaces+digits+parens) using element pool + random generation, and `_init_sampler` only forces p=0 when checked; there is no force-insertion of the required literals. The spec's 'comparison_boundary' targets for Students.student_id \u2208 {170,171,172}, Student_Course_Registrations.course_id \u2208 {300,301,302}, Student_Course_Attendance.course_id/student_id \u2208 {170,171,172/300,301,302} are not enforced by the program either - NumberSampler random-draws in [min,max] with boundary perturbations, never guaranteeing the specific targeted values exist. Course_id numeric-string domain is not enforced either; NumberSampler is not used for VARCHAR(100).",
+     "requested_revision": "Add a literal-injection layer that guarantees the specified boundary/enum values (301\u2013308 for Courses.course_id, A\u2013D/Pass/Fail qualification, statistics/STATISTICS for course_name and course_description, 170/171/172 for student_id, 300/301/302 for course FK) appears in generated rows for those columns, and coerce Courses.course_id type accordingly. Document how CAST(\u20183xx\u2019 AS INTEGER) is handled in the FK fill."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether `_apply_null_rule` after `drop_unique_duplicates` can create duplicate PK/unique entries in columns not managed by sample_fresh_primary_keys (e.g., single-column \u2018unique\u2019 indexes declared in DDL string parsed by _first_token) was not exhaustively tested; execution reported no duplicate keys, but composite indexed uniques (like composite PKs) rely on filtering order and were only spot-checked.",
+    "Attendance.date_of_attendance tie/boundary targets: execution does not report achieved target rows, so whether the two+ rows with the same STRFTIME('%Y-%m-%d') and rows meeting 170/171/172 boundary values are actually present is unverified beyond the nullable-column statistics.",
+    "People.person_id (Students subset) and People_Addresses.person_id unmatched/parent_rows_without_children pairs: the spec\u2019s uncertainty note about address_ids (88/99/92/82 not in shown sample) implies Addresses may need to grow, but the program\u2019s `size` map (from choose_table_sizes) is not guaranteed to cover People_Addresses FK counts; the current run\u2019s FK failures are dominated by the attendance/registrations composite issue, so this residual risk is masked and should be re-checked after fix."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of 20 instances is invalid with `new_integrity_failures`; aggregate `fk_violations: 322`. Largest offender is `Student_Course_Attendance.(student_id,course_id) -> Student_Course_Registrations.(student_id,course_id)` with 304 violating rows across all 20 instances, plus `Student_Course_Registrations.course_id -> Courses.course_id` (10 rows/5 instances), `Students.student_id -> People.person_id` (6/5) and `Candidates.candidate_id -> People.person_id` (2/2).",
+     "requested_revision": "Fix the FK pipeline so generated rows never introduce FK violations. Root cause: in `instance.py::build_random_instance`, `fill_foreign_keys_consistently` / `_fill_composite_fk` sample parent values from `instance.get(pt, ...)` (the *pre-dedup, pre-NULL* row set assembled by the samplers) and from `schema.original_values`, but afterwards `sample_fresh_primary_keys`, `drop_unique_duplicates`, `_apply_group_size_target`, `_apply_tie_target`, `_apply_semantic_rules` and `_apply_null_rule` can rewrite or delete parent key rows (`course_id` resequenced by the group-size target, `student_id`/`candidate_id` rewritten by `_apply_semantic_rules`, and `Students.student_id`/`Candidates.candidate_id`/`Student_Course_Registrations.course_id` can be dropped by dedup). Children therefore reference parent keys that no longer exist in the materialized final table. The spec explicitly requires sampling (including the composite FK) from the *MATERIALIZED final parent rows after dedup and null-rule*. Reorder/rebuild: fully finalize each parent table (dedup, group-size, tie, semantic and null rules applied) and materialize its final key set, then sample all child FKs from that final set, and re-verify by running PRAGMA foreign_key_check on each written unit before `os.replace`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.py::_apply_null_rule` iterates `for cm in tm.columns` and never consults `spec.NULL_TARGETS`; because the spec's `null_targets` list is effectively unused, the NULL share is instead computed from `schema.original_values` using `share = ... if ov else 0.2`. Feedback shows non-target nullable columns receiving NULLs: `Addresses.line_1: NULL 2 / 48`, `People.first_name: NULL 3 / 63`, `People.last_name: NULL 5 / 63`, `People_Addresses.date_from: NULL 5 / 67`, and `Courses.other_details: NULL 101 / 101` (every generated course has NULL other_details).",
+     "requested_revision": "Drive the NULL rule from `spec.NULL_TARGETS` (nullable columns only) rather than from every nullable column, and ensure the share matches the compact share for that column. The generic rule to force a NULL into `line_1`, `first_name`, `last_name` and `date_from` overrides designer intent and can distort query-result variation for queries targeting those columns; `Courses.other_details` at 100% NULL is not a 'share following the compact database'. At minimum, skip forcing NULLs on columns not in `NULL_TARGETS`, or align the fallback share with observed compact shares per column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` asserts `Students.student_id comparison_boundary values [170,171,172]`, `Student_Course_Registrations.course_id comparison_boundary [300,301,302]`, `Student_Course_Attendance.student_id [170,171,172]`, `Student_Course_Attendance.course_id [300,301,302]`, and `Courses.course_name/description = 'statistics'/'STATISTICS'`. But the schema has `Student_Course_Registrations.course_id -> Courses.course_id` (VARCHAR PK, values '301'..'308' per spec) and `Students.student_id -> People.person_id`; injecting child `course_id` values 300/301/302 and `student_id` 170/171/172 requires those exact parent keys to exist, yet the spec's `Courses.course_id` compact domain is only 301\u2013308 and People keys are generated from sequential ints. `Student_Course_Registrations.course_id` is also a NOT NULL FK, so literal injection either forces `_fill_foreign_keys_consistently` to be overridden by the forced values (causing FK violations) or forces those forced literals to be dropped (defeating the boundary target). The current code does both: `_inject_forced_values` runs before FK fill for non-FK columns, but `Student_Course_Registrations.course_id` is an FK, so the forced values overwrite FK-consistent values and then must be re-repaired \u2014 there is no such repair in the code.",
+     "requested_revision": "Decide the interaction between `forced literal injection` and FK consistency. Either (a) drop boundary literals on FK child columns (`Student_Course_Registrations.course_id`, `Student_Course_Attendance.student_id`, `Student_Course_Attendance.course_id`) since the parent's materialized key set cannot contain 300 without the parent having it \u2014 and extend the parent `Courses.course_id` literal domain to include 300 if 300-adjacency is needed, or (b) explicitly specify that `Students.student_id`, `Student_Course_Registrations.course_id`, `Student_Course_Attendance.student_id/course_id` are *derived* from FK fill and boundary variation on those columns is only reachable if the parent holds the boundary values, and then update the spec table sizes / `FORCED_VALUES` to inject those boundary keys into the parents instead of into the children. Current state is internally contradictory and yields FK violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`instance.py::_apply_semantic_rules` rewrites primary keys (`Students.student_id` and `Candidates.candidate_id` if `<= 0`) *after* child FKs were sampled; and the parent-key pruning in `sample_fresh_primary_keys`/`drop_unique_duplicates` also runs after FK fill. Neither is followed by a re-sample of children. Feedback's `Students.student_id -> People.person_id` violations (6 rows, 5 instances) and `Candidates.candidate_id -> People.person_id` violations (2 rows, 2 instances) are explained by `_parent_pool` including the original compact `People.person_id` values that get dropped/mutated by the later parent-side dedup/semantic rules.",
+     "requested_revision": "Function `_apply_semantic_rules` must not touch primary-key columns, or must run before FK sampling, and final parent key sets must be immutable once child FKs are sampled. Same for `drop_unique_duplicates` on unique/PK columns. Any post-hoc parent mutation must trigger *re-sampling* of dependent children (a two-pass build: finalize parents first, then children)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The 'unmatched_join_rows / parent_rows_without_children' target, per spec, is a pattern that must be observable, not explicitly forbidden. But the current pipeline for e.g. `Students.student_id` first builds Students with FK-derived keys from People, then `sample_fresh_primary_keys` dedups on Student keys, then `_apply_semantic_rules` is run \u2014 and `Students.student_id` can never be a value that isn't also in People, so 'unmatched join rows' on `Students.student_id -> People.person_id` is not directly reachable; separately, the composite FK fill samples from *all* materialized registration rows, including those without attendance, so Attendance has extra rows and `parent_rows_without_children` for `Student_Course_Registrations -> Student_Course_Attendance` *is* reachable, but the FK integrity requirement blocks it. The round report does not report any per-target reachability failures separately; instead the units are all rejected on FK violations before the target checks can be read.",
+     "requested_revision": "Resolve the tension between the spec's `parent_rows_without_children` targets and FK integrity. If unmatched join patterns are intended, they must be on joins like `Students -> Student_Course_Registrations` (child row does not exist) \u2014 which is legal \u2014 and not on `Students.student_id -> People.person_id` (a NOT NULL FK that is physically impossible to violate while satisfying integrity). The spec's `Students.student_id unmatched_join_rows joins_with People_Addresses.person_id` is reachable (a student need not have an address), but this should be clarified so the FK-violation-driven failure is not blamed on the target."
+    },
+    {
+     "agent": "designer",
+     "evidence": "`Students.student_id -> People.person_id` and `Candidates.candidate_id -> People.person_id` are both FK constraints. The spec lists `Students.student_id` as a `comparison_boundary` target with values [170,171,172] and `Candidates.candidate_id` as `unmatched_join_rows` target \u2014 but generating a boundary/fresh student_id that is not in People directly causes an FK violation. Since `Students.student_id` is also the FK to People, its values can only be a subset of People's final key set; a fresh number like 171 must exist in People for the boundary to be legal. Spec's generic rule 'integer_fk: sample from parent materialized final key values' is thus under-specified for the boundary case: it must say 'inject the boundary into the parent's key set, then propagate' or explicitly drop the boundary target.",
+     "requested_revision": "Either (i) remove `Students.student_id` and `Candidates.candidate_id` from `per_column_exceptions` boundary/unmatched targets (they are FK columns and boundary values are not freely choosable), or (ii) add a spec rule 'for boundary values on FK columns, inject the boundary into the parent primary key stream before finalizing the parent, then FK-fill children' with a matching code path. Also remove or rename `Students.student_id unmatched_join_rows joins_with [... \"People_Addresses.person_id\"]` since it is semantically meaningless (a person_id present only in People_Addresses does not imply a Student)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`spec.TABLE_SIZES` uses fixed near-constant per-table sizes but `choose_table_sizes` adds `rng.randint(-2,2)` for every table independently. The spec table `Student_Course_Registrations: 30` and `Student_Course_Attendance: 30` yields (via the feedback's row counts of ~100-124 rows added) that attendance has far fewer rows than registrations or vice versa. This does not itself cause the observed FK violation, but it makes the `group_sizes: 1, 2 and >=3` target very brittle: `_apply_group_size_target` allocates only 1+2+3=6 rows to size groups, which is unlikely to hold once `rng.shuffle` runs across 30 rows with `rng.choice(pool)` overwriting them.",
+     "requested_revision": "Make the group-size target deterministic: reserve dedicated row indices for each group size, or assign distinct course_ids with counts matching 1,2,>=3 after FK fill; do not `shuffle` the whole sequence into other random draws. Also verify the tie target (`_apply_tie_target` sets index 1 only, using `base = cols[col][0]`, so if index 0 is NULL it silently no-ops) \u2014 log per-instance target achievement in `run_report`."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether semantic rules from `spec.semantic_rules_and_formulas` hold on generated rows: `if empty final registrations exist for a student with an attendance row, formula's EXISTS precondition makes the min-registration rule vacuous; no direct check of this is reported in execution feedback.",
+    "The `People_Addresses.date_to IS NULL OR date_to >= date_from` rule: `_apply_semantic_rules` only repairs non-NULL `date_to < date_from` cases; whether NULL `date_to` and NULL `date_from` combinations remain semantically acceptable (they do per three-valued logic) vs. the compact all-NULL-date_to pattern (feedback shows date_to NULL 6/67 vs. date_from NULL 5/67 \u2014 plausible but not yet validated across all units).",
+    "The tie target `STRFTIME('%Y-%m-%d', date_of_attendance)` requires at least two distinct student rows to share a date. `_apply_tie_target` writes the tie value to row index 1 using row 0's date; but if index 0 is NULL or the string has a different format, the target may silently not be achieved. Execution feedback does not report tie-target success rate.",
+    "Reproducibility of target achievement across seeds: the reported run is for one seed-base; the spec promises reachability \u2014 no per-instance target audit is included in the execution feedback.",
+    "Whether the `Courses.course_id` VARCHAR coherence with `Student_Course_Registrations.course_id` INTEGER is preserved after `_apply_semantic_rules`' positive-integer fixup (which can rewrite course_id to a random 301-308, potentially colliding with the composite PK after registration dedup; PK-duplicate count in feedback is 0, but this only inspected final rows)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "All 20 instances fail with RuntimeError('foreign_key_check failed: N violations') at tscore_gen/writer.py:66. The program reports n_ok 0, n_fail 20, and zero instance directories are written. This is a hard blocker: no instance is produced at all.",
+     "requested_revision": "Diagnose and fix the FK violations. The most likely cause is that the compact database is copied verbatim (shutil.copyfile(orig, part)) and generated rows are appended, but the generated FK values are drawn from a pool that mixes generated parent keys with compact parent keys via _parent_pool/_parent_tuples. If the compact DB already contains rows that violate FKs (or if generated child rows reference compact parent keys that are not actually present in the copied DB, e.g. because schema.original_values was sampled/truncated or because the compact DB's own FK state is inconsistent), foreign_key_check will fail. Verify: (a) whether the compact DB itself passes foreign_key_check before appending; (b) whether _parent_pool's inclusion of schema.original_values (which may be a truncated sample when n > max_rows_per_table) introduces keys not present in the copied DB; (c) whether composite FK sampling from Student_Course_Registrations includes compact rows whose (student_id,course_id) tuples are not actually in the copied DB. The fix must ensure every generated FK value is present in the final written database, and that the compact DB's own integrity is preserved. Do not weaken the foreign_key_check gate; fix the value sourcing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In instance.py, _parent_pool and _parent_tuples append schema.original_values (the compact rows read by read_schema) to the generated pool. read_schema samples compact rows when a table exceeds max_rows_per_table (schema.py: 'where rowid %% %d = 0'), so original_values may be a strict subset of the compact DB. Children can then FK-fill to a compact key that was sampled into original_values but is not guaranteed to be in the copied DB \u2014 or, conversely, the compact DB may contain parent rows not in original_values. Either way the FK pool is not guaranteed to be a subset of the materialized final parent key set actually written.",
+     "requested_revision": "Make the FK parent pool exactly the set of parent key tuples that will exist in the written unit: generated parent rows (after finalization) UNION the compact parent rows actually present in the copied DB. Since the compact DB is copied verbatim, the compact parent keys are exactly those in the DB; read them fully (or at least ensure the sampled subset is a subset of what is written, which it is, but the reverse direction \u2014 child referencing a compact key not in the DB \u2014 must be impossible). Confirm the pool is a subset of the written parent keys and add an assertion before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The composite FK fill (_fill_composite_fk) samples joint tuples from _parent_tuples, which includes compact Student_Course_Registrations rows. But Student_Course_Attendance's composite FK references Student_Course_Registrations.(student_id,course_id). If the compact DB's Student_Course_Registrations rows are included in the pool but the generated attendance rows are appended to a DB where those compact registration rows exist, that is fine \u2014 unless the compact DB itself has attendance rows referencing registrations that were not copied, or the pool includes tuples from original_values that are not in the DB. The 6-14 violations per instance are consistent with a systematic pool/DB mismatch rather than random noise.",
+     "requested_revision": "After fixing the pool sourcing, re-run and confirm foreign_key_check passes for all instances. Add a per-instance audit that logs which FK (table.column -> parent) produced each violation, so future failures are diagnosable."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic rules are mostly supported by the compact evidence (date_to >= date_from 8/8; attendance >= min registration date on shown rows; outcome {Pass,Fail}; qualification {A,B,C,D}; course_id numeric 301-306). However, the specification itself flags uncertainty: 'People.middle_name/last_name lengths and near-duplicates unmeasured' and 'attendance rows shown (8) vs registrations (9) suggest sparse attendance'. The tie target on attendance date ('may conflict with sparse attendance sizing') and the boundary injection into People.person_id 170-172 / Courses.course_id 300-310 are assumptions, not measured facts. These are acceptable as uncertain patterns but should be marked as such rather than asserted as evidence-backed rules.",
+     "requested_revision": "Downgrade the tie target and boundary-injection entries to 'uncertain' in the specification, and note that the attendance-date tie may be unreachable under the chosen table sizes. This does not block generation but should be recorded so the engineer does not treat them as hard constraints that force FK-invalid values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule is implemented via _apply_null_rule driven by spec.NULL_TARGETS, with ALL_NULL_COLUMNS for Courses.other_details. This matches the interface rule (NULL share from compact, at least one NULL per nullable column, NOT NULL/PK/FK never NULL). However, because no instance was written, the NULL behavior could not be verified in execution. Also, _apply_null_rule computes share from schema.original_values, which may be a sampled subset \u2014 the share is still an estimate of the compact share, which is acceptable, but should be confirmed once instances are produced.",
+     "requested_revision": "After the FK fix, verify per-column NULL shares against the compact DB and confirm at least one NULL per nullable column and zero NULLs in NOT NULL/PK/FK columns. Report the 'generated rows: NULL 0 / n' lines for any nullable column that received no NULL."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The group-size target (_apply_group_size_target) reserves indices 0..5 and assigns course ids c1 (size 1), c2 (size 2), c3 (size 3). But it picks c1,c2,c3 from the distinct values already in cols[course_id], which were FK-filled from the Courses pool. If the Courses pool has fewer than 3 distinct values (e.g. after CAST coercion collapses values, or if the pool is small), the target silently returns without applying. Also, the reserved indices may be overwritten by later _apply_semantic_rules or _apply_null_rule? No \u2014 those do not touch course_id (it is a FK, excluded from NULL rule; semantic rules do not touch it). But the group-size target runs before _apply_tie_target and _apply_different_values_target, which do not touch course_id. So the reservation is safe, provided >= 3 distinct course ids exist.",
+     "requested_revision": "Assert that at least 3 distinct course ids are available before applying the group-size target, and fail loudly (or log) if not, rather than silently skipping. Confirm the target is actually achieved in written instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The tie target (_apply_tie_target) sets cols[date_of_attendance][1] to a fixed '09:00:00' on the same date as row 0. But row 0 and row 1 may have the same (student_id, course_id) composite PK, in which case the PK dedup in _finalize_table (sample_fresh_primary_keys) will drop one of them, destroying the tie. The spec note itself warns 'ensure ties survive dedup since PK includes both FK cols'. The code does not check that rows 0 and 1 have distinct (student_id,course_id).",
+     "requested_revision": "Before setting the tie, verify that rows 0 and 1 have distinct (student_id, course_id) tuples; if not, search for a pair of rows with distinct composite keys and set the tie on those. Add an assertion that the tie survives finalization."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The different-values target (_apply_different_values_target) groups by candidate_id and sets assessment_date to base + k days for k>=1. But Candidate_Assessments PK is (candidate_id, qualification), and qualification is drawn from {A,B,C,D}. If a candidate has >= 2 rows but they share the same qualification, the PK dedup will drop one, potentially leaving only one row per candidate and defeating the target. The code does not ensure distinct qualifications within a candidate group.",
+     "requested_revision": "Ensure that within each candidate group, the qualification values are distinct (or that the target is applied only to groups that will survive PK dedup). Add an assertion that at least one candidate has >= 2 rows with different assessment_date values after finalization."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The writer copies the compact DB and appends rows, but does not verify that the compact DB itself passes foreign_key_check before appending. If the compact DB has pre-existing FK violations (e.g. Student_Course_Attendance rows referencing registrations not present, or People_Addresses referencing missing addresses), the final foreign_key_check will fail regardless of generated rows. The 6-14 violations per instance are suspiciously stable, consistent with a fixed set of compact-DB violations plus a few generated ones.",
+     "requested_revision": "Run PRAGMA foreign_key_check on the copied compact DB before appending generated rows, and log the result. If the compact DB has violations, the specification's 'preserve compact rows' rule conflicts with the 'reject on any FK violation' rule; the designer must decide whether to (a) exclude the compact DB's violating rows, (b) relax the gate to only check generated rows, or (c) accept that the compact DB is the ground truth and only check that generated rows do not add new violations. This is a design decision that must be resolved before the engineer can make the gate pass."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB itself passes foreign_key_check (not verified; the writer only checks after appending).",
+    "Whether schema.original_values is a complete or sampled view of compact rows, and whether the FK pool is a subset of the written parent keys.",
+    "Whether the group-size, tie, and different-values targets survive PK dedup in practice (no instance was written to inspect).",
+    "Whether NULL shares match the compact DB per column (no instance was written to inspect).",
+    "Whether the boundary injections (People.person_id 170-172, Courses.course_id 300-310) are reachable given the table sizes and PK dedup."
+   ]
+  }
+ ]
 }

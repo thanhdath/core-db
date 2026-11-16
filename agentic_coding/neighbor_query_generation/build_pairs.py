@@ -1,13 +1,4 @@
-"""Construction pairs (gold, neighbor) of one database.
-
-Golds: the training gold queries of the database that are informative on the original database.
-Neighbors, at most ``--per-gold`` per gold and source, chosen deterministically:
-  grammar  grammar mutations of the gold (``grammar_mutations.py``) that compile in SQLite;
-  llm      LLM-written queries for the same question (``sample_llm_neighbors.py`` output).
-Whether a pair is eligible (same result as the gold on the original) is decided in the separation step.
-
-Output: <out>/pairs.json
-"""
+"""Construction pairs (gold, neighbor) of one database."""
 import argparse
 import json
 import random

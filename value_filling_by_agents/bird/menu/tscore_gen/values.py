@@ -3,9 +3,12 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_HEX = '0123456789abcdef'
 
 
 class ColumnSampler:
@@ -39,22 +42,37 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_s = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_s, hi_s)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
     def _cast(self, v):
-        return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
+        if self.is_int:
+            return int(round(v))
+        return round(v, self.precision) if self.precision else v
+
+    def _clamp(self, v):
+        if v < self.min:
+            return self.min
+        if v > self.max:
+            return self.max
+        return v
 
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
+            lo, hi = min(lo, hi), max(lo, hi)
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
@@ -67,7 +85,7 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        return self._cast(self._clamp(v))
 
 
 class StringSampler(ColumnSampler):
@@ -107,6 +125,21 @@ class StringSampler(ColumnSampler):
         return v
 
 
+class UuidSampler(ColumnSampler):
+    """Lowercase UUID-like hex string; uppercase near-variants are in the pool."""
+
+    def _draw(self):
+        r = self.rng
+        h = ''.join(r.choice(_HEX) for _ in range(32))
+        return '%s-%s-%s-%s-%s' % (h[:8], h[8:12], h[12:16], h[16:20], h[20:])
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
 def _parse_date(s: str):
     s = re.sub(r'(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*', lambda m: m.group(1).title(), s.strip())
     for t in _TEMPLATES:
@@ -132,7 +165,8 @@ class DateSampler(ColumnSampler):
                 self.template = self.template or t
                 parsed.append(d)
         self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.full = (dt.datetime(spec.DATE_LO.year, spec.DATE_LO.month, spec.DATE_LO.day),
+                     dt.datetime(spec.DATE_HI.year, spec.DATE_HI.month, spec.DATE_HI.day))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -149,6 +183,22 @@ class DateSampler(ColumnSampler):
     def sample(self):
         if self.elements and self.rng.random() < self.p:
             return self.rng.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
+class TimestampSampler(ColumnSampler):
+    """'YYYY-MM-DD HH:MM:SS UTC' between 2011-01-01 and 2012-12-31."""
+
+    def _draw(self):
+        r = self.rng
+        span = int((spec.TS_HI - spec.TS_LO).total_seconds())
+        d = spec.TS_LO + dt.timedelta(seconds=r.randint(0, span))
+        return d.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
         return self._fresh_or_reuse(self._draw)
 
 
@@ -201,14 +251,15 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
     if 'bit' in t:
         return BoolSampler(els, p, max_l0, rng, bit=True)
     if 'year' in t:
-        return NumberSampler(els, p, max_l0, rng, scale=4)
+        return NumberSampler(els, p, max_l0, rng, scale=4, lo=spec.YEAR_LO, hi=spec.YEAR_HI)
     if any(k in t for k in ('int', 'float', 'double', 'decimal', 'numeric', 'number', 'real')):
         is_int = 'int' in t
         scale, prec = 10, (0 if is_int else 4)
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t)
     if any(k in t for k in ('char', 'text', 'blob')):
         return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
     return StringSampler(els, p, max_l0, rng)

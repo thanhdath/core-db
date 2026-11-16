@@ -7,6 +7,13 @@ _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
 
+_FIRST = ['Kamila', 'Anna', 'Marek', 'Piotr', 'Szymon', 'Wladyslaw', 'Mariusz', 'Grazyna',
+          'Ewa', 'Jan', 'Katarzyna', 'Tomasz', 'Agnieszka', 'Michal', 'Barbara', 'Pawel']
+_LAST = ['Porczyk', 'Powierza', 'Siudym', 'Pregowski', 'Wydra', 'Grzywna', 'Zalejski', 'Wolszczak',
+         'Nowak', 'Kowalski', 'Wisniewski', 'Lewandowski', 'Zielinski', 'Szymanski', 'Wojcik', 'Kaminska']
+_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+           'September', 'October', 'November', 'December']
+
 
 class ColumnSampler:
     """Base fuzzer (fuzz/base.py): drops None elements, p := 1 without elements."""
@@ -68,6 +75,73 @@ class NumberSampler(ColumnSampler):
         elif r.random() < 1 / 3:
             v -= 2 * d
         return self._cast(v)
+
+
+class RangeSampler(ColumnSampler):
+    """Numeric column with a semantic range and boundary values (specification by construction)."""
+
+    def __init__(self, elements, p, max_l0, rng, lo, hi, boundaries, is_int=True):
+        super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
+        self.lo, self.hi = float(lo), float(hi)
+        self.boundaries = [float(b) for b in boundaries if lo <= float(b) <= hi] or [float(lo), float(hi)]
+        self.is_int = is_int
+        self.max_l0 = max_l0 if max_l0 != float('inf') else 6
+
+    def _cast(self, v):
+        v = min(max(v, self.lo), self.hi)
+        return int(round(v)) if self.is_int else round(v, 2)
+
+    def sample(self):
+        r = self.rng
+        u = r.random()
+        if u < 0.35:
+            v = r.choice(self.boundaries)
+        elif u < 0.55 and self.elements:
+            v = r.choice(self.elements)
+        else:
+            v = self._fresh_or_reuse(lambda: r.uniform(self.lo, self.hi))
+        if r.random() < 0.15:
+            v += 1 if r.random() < 0.5 else -1
+        return self._cast(v)
+
+
+class EnumSampler(ColumnSampler):
+    """Enumerated text column: values from the pool, duplicates allowed."""
+
+    def __init__(self, elements, p, max_l0, rng, pool):
+        super().__init__(list(pool), p, max_l0, rng)
+        self.pool = list(pool) or ['x']
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return r.choice(self.pool)
+
+
+class NameSampler(ColumnSampler):
+    """First/last-name combination; near-duplicates and repeats for DISTINCT / GROUP patterns."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.max_l0 = max_l0 if max_l0 != float('inf') else 5
+
+    def _draw(self):
+        r = self.rng
+        first = r.choice(_FIRST)
+        last = r.choice(_LAST)
+        u = r.random()
+        if u < 0.15:
+            last = last[:-1] if len(last) > 2 else last
+        elif u < 0.25:
+            first = first + r.choice(['a', 'e', ''])
+        return (first + ' ' + last).strip()
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() < self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
 
 
 class StringSampler(ColumnSampler):
@@ -152,6 +226,29 @@ class DateSampler(ColumnSampler):
         return self._fresh_or_reuse(self._draw)
 
 
+class MonthDateSampler(ColumnSampler):
+    """Chronological 'Month D, YYYY' strings (text_date rule)."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.p = p
+        self.cursor = None
+        self.step = 0
+
+    def _draw(self):
+        r = self.rng
+        if self.cursor is None:
+            self.cursor = dt.date(2001, 9, 1) + dt.timedelta(days=r.randint(0, 20))
+        self.step += r.randint(1, 9)
+        d = self.cursor + dt.timedelta(days=self.step)
+        return '%s %d, %d' % (_MONTHS[d.month - 1], d.day, d.year)
+
+    def sample(self):
+        if self.elements and self.rng.random() < self.p:
+            return self.rng.choice(self.elements)
+        return self._draw()
+
+
 class TimeSampler(ColumnSampler):
     """fuzz/time.py."""
 
@@ -182,11 +279,28 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng,
+                        spec: dict = None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    spec = spec or {}
+    key = (column.table, column.name)
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
+
+    if key in spec.get('enums', {}):
+        return EnumSampler(els, p, max_l0, rng, spec['enums'][key])
+    if key in spec.get('ranges', {}):
+        lo, hi = spec['ranges'][key]
+        if hi == float('inf'):
+            hi = max([lo + 10000] + [float(x) for x in els if _num(x) is not None] or [lo + 10000])
+        is_int = 'int' in t or all(float(x).is_integer() for x in els if _num(x) is not None)
+        return RangeSampler(els, p, max_l0, rng, lo, hi, spec.get('boundaries', {}).get(key, []), is_int=is_int)
+    if column.name.lower() == 'name' and ('char' in t or 'text' in t or t == ''):
+        return NameSampler(els, p, max_l0, rng)
+    if column.name.lower() == 'date' and ('char' in t or 'text' in t or t == ''):
+        return MonthDateSampler(els, p, max_l0, rng)
+
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
@@ -215,7 +329,7 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), spec: dict = None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,11 +339,44 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, spec)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),
-                               p: float = 0.2, max_l0: float = float('inf')) -> list:
+                               p: float = 0.2, max_l0: float = float('inf'), spec: dict = None) -> list:
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
-    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
+    s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0,
+                      max_l0, spec)
     return [s.sample() for _ in range(n)]
+
+
+def plan_multiset(sampler: ColumnSampler, n: int, rng) -> list:
+    """Plan a column multiset hitting group sizes 1, 2 and >= 3 and a 20-50 % duplicate share."""
+    if n <= 0:
+        return []
+    dup_rows = max(1, int(round(n * rng.uniform(0.2, 0.5))))
+    dup_rows = min(dup_rows, n - 1) if n > 1 else 0
+    plan = []
+    remaining = n
+    if remaining >= 3:
+        plan.append(3)
+        remaining -= 3
+    if remaining >= 2:
+        plan.append(2)
+        remaining -= 2
+    if remaining >= 1:
+        plan.append(1)
+        remaining -= 1
+    while remaining > 0:
+        if remaining >= 2 and rng.random() < 0.5:
+            plan.append(2)
+            remaining -= 2
+        else:
+            plan.append(1)
+            remaining -= 1
+    values = [sampler.sample() for _ in plan]
+    out = []
+    for v, k in zip(values, plan):
+        out.extend([v] * k)
+    rng.shuffle(out)
+    return out

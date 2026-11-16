@@ -1,50 +1,730 @@
 {
  "db": "regional_sales",
- "operator_io_quirks": [
-  "Mixed-case and spaced identifiers: tables 'Sales Team', 'Store Locations', 'Sales Orders'; columns 'Customer Names','Product Name','Sales Team','City Name','Household Income','Median Income','Land Area','Water Area','Time Zone','Sales Channel','Order Quantity','Discount Applied','Unit Price','Unit Cost' \u2014 all need double-quoting.",
-  "FK child columns are underscore-prefixed (_SalesTeamID,_CustomerID,_StoreID,_ProductID) while parent PKs are not (SalesTeamID,CustomerID,StoreID,ProductID); name-based FK inference would miss them, pragma foreign_key_list is required.",
-  "All declared NOT NULL flags are 0 and all null_rate 0.0 \u2014 no NULLs in original, but TS will emit NULLs (empty parent, dropout) and sqlite will accept them since no NOT NULL constraint.",
-  "Dates stored as TEXT in M/D/YY format ('12/31/17','4/10/18','6/1/18') \u2014 declared TEXT so TS dispatches to String, not Date; no %Y-%m-%d template will be inferred.",
-  "Unit Price / Unit Cost are TEXT with thousands separators ('1,963.10') \u2014 String fuzzer, not Number; numeric comparisons on them are string comparisons.",
-  "OrderNumber TEXT PK with format 'SO - 0001000' (spaces around dash) \u2014 String fuzzer will not reproduce the pattern; PK uniqueness enforced by drop-PK-duplicates.",
-  "Regions.StateCode is TEXT PK with 2-letter codes ('AL','AR'); Store Locations.StateCode FK references it \u2014 child draws from parent's final filtered values.",
-  "Store Locations has 367 rows but only 45 distinct StateCode values (many-to-one to Regions' 48) \u2014 FK fan-in is real, not 1:1.",
-  "CurrencyCode has distinct=1 ('USD') \u2014 String sampler with one element will mostly return 'USD' plus contamination.",
-  "Region columns in Regions and 'Sales Team' both have 4 distinct values (South/West/Northeast/Midwest) but no FK links them \u2014 TS will not correlate them.",
-  "Latitude/Longitude REAL with negative values (-86.79) \u2014 Number fuzzer range [-10^scale,10^scale] with scale from REAL (no args) will produce implausible magnitudes.",
-  "AreaCode INTEGER 3-digit (205,256) and Land Area INTEGER ~3e8 \u2014 Number fuzzer treats both as generic ints in [-10^scale,10^scale], losing the magnitude distinction."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns (dates, prices, codes, names, time zones) go to String fuzzer: random a-zA-Z0-9() strings of length 0-20 with 50% contamination \u2014 implausible for dates/prices/codes.",
-  "All INTEGER/REAL columns go to Number fuzzer: uniform in [-10^scale,10^scale] (scale=0 for INTEGER, scale=4 for REAL) then +-1/+-2 perturbation \u2014 Population, Land Area, Latitude all get same magnitude range.",
-  "PK columns (CustomerID, ProductID, StateCode, SalesTeamID, StoreID, OrderNumber) get max_l0=inf so fresh draws never reuse \u2014 good for uniqueness, but StateCode TEXT PK gets random strings not 2-letter codes.",
-  "FK columns (_SalesTeamID etc.) draw from parent's final values with replacement \u2014 ties/duplicates in child are expected and correct; parent PK filtering happens before child draw only for self-FK (none here).",
-  "String fuzzer on 'Customer Names' etc. will produce random strings, not 'Avon Corp' style \u2014 joins on names will still work (same random value drawn) but WHERE name='Avon Corp' will miss.",
-  "Date-like TEXT columns get String fuzzer, so ORDER BY ProcuredDate / date comparisons operate on random strings \u2014 lexicographic order is meaningless, likely FN on date-range queries.",
-  "Number fuzzer on Discount Applied (REAL, 7 distinct 0.05-0.3) will produce values in [-10^4,10^4] \u2014 WHERE discount BETWEEN 0.05 AND 0.15 will mostly miss.",
-  "Number fuzzer on Order Quantity (INTEGER, 8 distinct 1-8) will produce values in [-1,1] range mostly \u2014 WHERE quantity > 5 will mostly miss (FN).",
-  "String fuzzer on CurrencyCode (1 distinct) with p=0.2 fresh draws will inject random strings \u2014 WHERE CurrencyCode='USD' will miss ~20% of rows (FN).",
-  "String fuzzer on Sales Channel (4 distinct) will inject random strings \u2014 GROUP BY channel produces many spurious groups (FP on count-distinct queries).",
-  "Number fuzzer on AreaCode (177 distinct 3-digit) produces values in [-1,1] \u2014 WHERE AreaCode=205 will miss (FN).",
-  "Regions.Region and Sales Team.Region both 4 distinct but uncorrelated \u2014 TS draws independently, so joins on Region produce cross-product-like results (FP on correlation queries)."
- ],
- "challenger_refs": [
-  "G11",
-  "G9",
-  "G16",
-  "G13",
-  "G7",
-  "G3",
-  "G14",
-  "G17",
-  "G22",
-  "G26"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table, unique, never NULL; no duplicate planting on PK columns.",
+   "integer_fk": "Copy from parent PK pool; 5% NULL where nullable; include parent rows with no children; never apply near-variants to FK columns.",
+   "text_enum": "Pick from explicit enum list; no near-variants on enum-constrained columns; 3% near-variants (case/whitespace) only where non-FK and no constraint forbids.",
+   "text_free": "Synthetic short strings; 5% near-duplicates of existing values.",
+   "text_money": "Format 'd,ddd.dd' with comma thousands separator; value in [0.01, 9999.99].",
+   "real_rate": "Uniform in [0, 1] rounded to 3 decimals.",
+   "date_mmddyy": "Format M/D/YY; sample within 2017-01-01..2019-12-31.",
+   "boundary": "For each listed literal, include the literal, one step below and one step above; for text columns inject the literal and its case variant; for integer PK columns inject the literal values directly into the PK sequence.",
+   "null_share": "Per nullable column, 2-5% NULL rows, at least one per instance; never applied to PK columns; applied to FK columns after copy.",
+   "duplicates": "On DISTINCT-target columns, 20-50% duplicate share; never applied to PK columns; PK-column DISTINCT targets are realized as result-set duplicates via GROUP BY/DISTINCT query semantics, not base-column duplicates.",
+   "ties": "On ORDER-target columns, plant ties at listed LIMIT ranks."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Regions.Region",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Midwest",
+     "South",
+     "West",
+     "midwest",
+     "south",
+     "west"
+    ]
+   },
+   {
+    "column": "Regions.Region",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Regions.State",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "California",
+     "Michigan",
+     "Arizona",
+     "california",
+     "michigan",
+     "arizona"
+    ]
+   },
+   {
+    "column": "Regions.State",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Regions.StateCode",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "GA",
+     "ga"
+    ]
+   },
+   {
+    "column": "Regions.StateCode",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Store Locations.StateCode"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Products.ProductID",
+    "pattern": "comparison_boundary",
+    "targets": [
+     29,
+     30,
+     31,
+     39,
+     40,
+     41
+    ]
+   },
+   {
+    "column": "Products.ProductID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales Orders._ProductID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Products.ProductID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "realization": "result-set duplicates via GROUP BY/DISTINCT; PK base values remain unique"
+    }
+   },
+   {
+    "column": "Sales Orders._ProductID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Products.ProductID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Sales Orders._CustomerID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Customers.CustomerID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Sales Orders._SalesTeamID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales Team.SalesTeamID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Sales Orders._StoreID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Store Locations.StoreID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Sales Team.SalesTeamID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales Orders._SalesTeamID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Store Locations.StoreID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales Orders._StoreID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Store Locations.StateCode",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Regions.StateCode"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Customers.CustomerID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Sales Orders._CustomerID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Customers.CustomerID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      2,
+      3,
+      4
+     ]
+    }
+   },
+   {
+    "column": "Customers.CustomerID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.CustomerID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "realization": "result-set duplicates via GROUP BY/DISTINCT; PK base values remain unique"
+    }
+   },
+   {
+    "column": "Sales Orders.OrderNumber",
+    "pattern": "format",
+    "targets": [
+     "SO - NNNNNNN"
+    ]
+   },
+   {
+    "column": "Sales Orders.Sales Channel",
+    "pattern": "enum",
+    "targets": [
+     "In-Store",
+     "Online",
+     "Distributor",
+     "Wholesale"
+    ]
+   },
+   {
+    "column": "Sales Orders.WarehouseCode",
+    "pattern": "enum",
+    "targets": [
+     "WARE-UHY1004",
+     "WARE-NMK1003",
+     "WARE-PUJ1005",
+     "WARE-XYS1001",
+     "WARE-MKL1006",
+     "WARE-NBV1002"
+    ]
+   },
+   {
+    "column": "Sales Orders.CurrencyCode",
+    "pattern": "enum",
+    "targets": [
+     "USD"
+    ]
+   },
+   {
+    "column": "Sales Orders.Discount Applied",
+    "pattern": "range",
+    "targets": [
+     0.05,
+     0.075,
+     0.1,
+     0.15,
+     0.2,
+     0.3,
+     0.4
+    ]
+   },
+   {
+    "column": "Sales Orders.Order Quantity",
+    "pattern": "range",
+    "targets": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8
+    ]
+   },
+   {
+    "column": "Store Locations.Type",
+    "pattern": "enum",
+    "targets": [
+     "City",
+     "Town",
+     "CDP",
+     "Unified Government",
+     "Consolidated Government",
+     "Other",
+     "Township",
+     "Urban County"
+    ]
+   },
+   {
+    "column": "Store Locations.Time Zone",
+    "pattern": "enum",
+    "targets": [
+     "America/Chicago",
+     "America/Phoenix",
+     "America/Los Angeles",
+     "America/Denver",
+     "America/New York",
+     "Pacific/Honolulu",
+     "America/Boise",
+     "America/Indiana/Indianapolis"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Store Locations.StateCode",
+    "parent_table": "Regions",
+    "parent_column": "StateCode",
+    "copied": [
+     "State"
+    ]
+   },
+   {
+    "child": "Sales Orders._SalesTeamID",
+    "parent_table": "Sales Team",
+    "parent_column": "SalesTeamID",
+    "copied": []
+   },
+   {
+    "child": "Sales Orders._CustomerID",
+    "parent_table": "Customers",
+    "parent_column": "CustomerID",
+    "copied": []
+   },
+   {
+    "child": "Sales Orders._StoreID",
+    "parent_table": "Store Locations",
+    "parent_column": "StoreID",
+    "copied": []
+   },
+   {
+    "child": "Sales Orders._ProductID",
+    "parent_table": "Products",
+    "parent_column": "ProductID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Regions",
+    "column": "Region",
+    "formula": "Region IN ('Northeast','Midwest','South','West')"
+   },
+   {
+    "table": "Regions",
+    "column": "StateCode",
+    "formula": "length(StateCode) = 2"
+   },
+   {
+    "table": "Sales Team",
+    "column": "Region",
+    "formula": "Region IN ('Northeast','Midwest','South','West')"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "Sales Channel",
+    "formula": "Sales Channel IN ('In-Store','Online','Distributor','Wholesale')"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "CurrencyCode",
+    "formula": "CurrencyCode = 'USD'"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "Order Quantity",
+    "formula": "Order Quantity > 0"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "Discount Applied",
+    "formula": "Discount Applied BETWEEN 0 AND 1"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "Unit Price",
+    "formula": "CAST(REPLACE(Unit Price, ',', '') AS REAL) >= 0"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "Unit Cost",
+    "formula": "CAST(REPLACE(Unit Cost, ',', '') AS REAL) >= 0"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "ShipDate",
+    "formula": "julianday(ShipDate) >= julianday(OrderDate)",
+    "evidence": "SO-0001000: Order 5/31/18 <= Ship 6/14/18; SO-0001005: Order 6/5/18 <= Ship 6/8/18; SO-0001003 violates (compact row preserved unchanged)"
+   },
+   {
+    "table": "Sales Orders",
+    "column": "DeliveryDate",
+    "formula": "julianday(DeliveryDate) >= julianday(ShipDate)",
+    "evidence": "SO-0001000: Ship 6/14/18 <= Delivery 6/19/18; SO-0001005: Ship 6/8/18 <= Delivery 6/13/18; SO-0001003: Ship 6/2/18 <= Delivery 6/7/18"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Type",
+    "formula": "Type IN ('City','Town','CDP','Unified Government','Consolidated Government','Other','Township','Urban County')"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Household Income",
+    "formula": "Household Income >= 0"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Median Income",
+    "formula": "Median Income >= 0"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Land Area",
+    "formula": "Land Area >= 0"
+   },
+   {
+    "table": "Store Locations",
+    "column": "Water Area",
+    "formula": "Water Area >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 50,
+   "Products": 47,
+   "Regions": 48,
+   "Sales Team": 28,
+   "Store Locations": 120,
+   "Sales Orders": 400
+  },
+  "null_targets": [
+   "Sales Orders._SalesTeamID",
+   "Sales Orders._CustomerID",
+   "Sales Orders._StoreID",
+   "Sales Orders._ProductID",
+   "Store Locations.StateCode"
+  ],
+  "supporting_evidence": {
+   "date_order": [
+    "SO - 0001000: Order 5/31/18 <= Ship 6/14/18 <= Delivery 6/19/18",
+    "SO - 0001005: Order 6/5/18 <= Ship 6/8/18 <= Delivery 6/13/18",
+    "SO - 0001003: Order 6/3/18 <= Ship 6/2/18 (violates) -> only Order<=Ship<=Delivery enforced; ProcuredDate not constrained"
+   ],
+   "discount_range": [
+    "0.05,0.075,0.1,0.15,0.2,0.3,0.4 all in [0,1]"
+   ],
+   "quantity_positive": [
+    "5,3,1,8,4,6,7,2 all > 0"
+   ],
+   "money_format": [
+    "'1,963.10','3,939.60' comma thousands, two decimals"
+   ],
+   "region_enum": [
+    "Northeast, West, South, Midwest observed"
+   ]
+  },
+  "uncertainty": [
+   "ProcuredDate vs OrderDate order not consistent in sample (SO-0001003); only Order<=Ship<=Delivery enforced.",
+   "Unit Price/Cost stored as TEXT with comma separators; numeric range checked after REPLACE.",
+   "Store Locations.StateCode nullable in schema but 0% NULL observed; NULL planted per spec.",
+   "Sales Orders._ProductID distinct=47 equals Products rows; no orphan FKs observed but planted per join targets.",
+   "duplicates_for_distinct on PK columns (Products.ProductID, Customers.CustomerID) is interpreted as result-set duplicates via GROUP BY/DISTINCT query semantics, not base-column duplicates; PK columns are excluded from PK corruption.",
+   "Northeast removed from Regions.Region boundary values because it is not an observed comparison target; it remains an enum member.",
+   "OrderDate >= ProcuredDate rule removed to match the observed evidence (SO-0001003 violates it).",
+   "Compact-row preservation takes precedence over the ShipDate >= OrderDate rule for the pre-existing violating row SO-0001003.",
+   "Near-variants are not applied to enum-constrained columns (Regions.Region, Store Locations.Type, Sales Channel, CurrencyCode, WarehouseCode, Time Zone) because the enum semantic rule forbids them.",
+   "TIE_TARGETS (Store Locations.Population, Water Area, Sales Orders.Discount Applied, Unit Price, Unit Cost) are inferred from ORDER-target patterns; confirm against extracted operations."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "e692cf0696f154da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 7 of 20 units failed with TypeError at tscore_gen/spec.py:116 (`return v is None or v > 0`) and spec.py:121 (`return v is None or 0 <= v <= 1`), plus IndexError at instance.py:19. The cause is that `_apply_rules` runs on columns whose values were produced by the generic `_init_sampler` fallback (StringSampler) rather than the spec samplers, so `Order Quantity` / `Discount Applied` can be strings. The spec samplers are only selected when the key is in ENUMS/RANGES/MONEY_COLUMNS/DATE_COLUMNS; `('Sales Orders','Order Quantity')` and `('Sales Orders','Discount Applied')` are in ENUMS, but the fallback path is still reachable because `_make_spec_sampler` is only called for non-FK columns and the ENUMS lookup uses the exact table/column names \u2014 the observed failures show the rule predicates receive non-numeric values, so the sampler selection is not reliably applied (e.g. when the column is treated as FK or when the sampler returns a near-variant string).",
+     "requested_revision": "Make the semantic-rule predicates type-safe (coerce with try/except or `_num`) OR guarantee that `Order Quantity` and `Discount Applied` are always produced by `EnumSampler`/`RangeSampler` and never by the generic string fallback. Also fix the IndexError in `_filter`/`sample_fresh_primary_keys` (guard against `keep` indices exceeding a column's length, e.g. when columns have differing lengths after FK/copied-column handling)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: 2 instances (chk_0003, chk_0010) have `new_fk_violations: 1` each, all on `Store Locations.StateCode -> Regions.StateCode`. The spec requires `Store Locations.StateCode` to be a nullable FK with `child_rows_with_null_fk: true` and `parent_rows_without_children: true`, but the generated rows include StateCode values not present in Regions. The `_apply_null_rule` plants NULLs, but non-NULL values are drawn from `parent_pool` which includes compact Regions.StateCode values \u2014 however `_near_variants` is applied to string columns after FK assignment, and `Store Locations.StateCode` is a string column, so near-variants (case/whitespace) of valid StateCodes are produced that no longer match the parent PK.",
+     "requested_revision": "Exclude FK columns (and copied columns) from `_near_variants` post-processing, or re-validate FK values against the parent pool after near-variant generation. Ensure every non-NULL generated `Store Locations.StateCode` exists in `Regions.StateCode`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `n_ok: 13, n_fail: 7` \u2014 35% of units failed to build. The spec requires reproducible generation of all instances; the CLI reports failures but the run is not clean. The IndexError at instance.py:19 (`_filter`) and the TypeErrors at spec.py:116/121 are the direct causes.",
+     "requested_revision": "Fix the three error sites so that all units build without exceptions; re-run and confirm `n_fail: 0`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `supporting_evidence.date_order` states: 'SO - 0001003: Procured 10/27/18 <= Order 6/3/18 (violates) -> order rule only Order<=Ship<=Delivery'. The spec's `semantic_rules_and_formulas` nevertheless includes `OrderDate: julianday(OrderDate) >= julianday(ProcuredDate)`, and `RULES` in spec.py implements `_rule_order_ge_procured`. This is internally inconsistent: the evidence says the ProcuredDate<=OrderDate rule is not enforced, but the spec and program enforce it.",
+     "requested_revision": "Resolve the contradiction: either remove the `OrderDate >= ProcuredDate` rule from `semantic_rules_and_formulas` and `RULES` (matching the stated evidence), or update the supporting evidence to state the rule is enforced. The current state means the program may drop rows the spec intends to keep (or vice versa)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` lists `Regions.Region` comparison_boundary targets including `'Northeast'`, but the extracted atomic operations `comparison_boundary.targets.values` for `Regions.Region` are only `['Midwest','midwest','South','south','West','west']` \u2014 `Northeast` is not an observed comparison literal. Similarly `Regions.State` targets include `'Arizona'`/`'arizona'` which appear only in `scalar:PRED` ops, and `Regions.StateCode` targets `'GA'`/`'ga'` are supported. The `Northeast` addition is an unsupported extension of the boundary set.",
+     "requested_revision": "Either justify `Northeast` as a boundary literal (it is a valid enum member but not an observed comparison target) or remove it from `BOUNDARY_LITERALS`/`per_column_exceptions` so the boundary set matches the extracted operations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback `nullable_columns` shows many nullable columns with `NULL 0 / n` (e.g. `Sales Orders.CurrencyCode`, `Sales Orders.DeliveryDate`, `Store Locations.City Name`, `Store Locations.Latitude`, etc.). Per the interface rule, this is noted but does not block a pass. However, the spec's `null_targets` only lists the FK columns and `Store Locations.StateCode`; the program's `_apply_null_rule` is applied only to `NULL_TARGETS`, so other nullable columns never receive NULLs. This is consistent with the spec's `null_targets` but inconsistent with the interface rule that *every* nullable column should get at least one NULL per instance.",
+     "requested_revision": "Extend `NULL_TARGETS` (and the spec's `null_targets`) to cover all nullable columns, or document that the interface rule is intentionally narrowed to the listed targets. As written, the program does not satisfy the stated NULL rule for most nullable columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_duplicates` is applied to `DISTINCT_TARGETS` including `Products.ProductID` and `Customers.CustomerID`, which are primary keys. Planting duplicates on a PK column will cause `sample_fresh_primary_keys` to drop rows, and the spec's `duplicates_for_distinct` target for `Products.ProductID` has `duplicate_share: 20-50%` \u2014 but a PK cannot have duplicates. The `duplicates_for_distinct` pattern for `Products.ProductID` and `Customers.CustomerID` is therefore in tension with the PK constraint.",
+     "requested_revision": "Clarify whether `duplicates_for_distinct` on PK columns means duplicates in the *query result* (e.g. after a join) rather than in the base column. If so, remove PK columns from `DISTINCT_TARGETS` and implement the duplicate share via join/result construction instead of corrupting the PK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_make_spec_sampler` calls `_init_sampler(cm, literal_pool, original_values, p, rng, len(cm.table and [1]) or 1, max_l0)` \u2014 the `n_pk` argument is `len(cm.table and [1]) or 1`, which is always 1 (since `cm.table` is a non-empty string, `cm.table and [1]` is `[1]`, length 1). This is a bug: `n_pk` should reflect the number of PK columns, not a constant 1. It affects `max_l0` selection for PK columns in the fallback path.",
+     "requested_revision": "Pass the actual number of primary-key columns (e.g. `len(schema.tables[cm.table].primary_key)`) instead of the constant expression."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_rules` drops rows that fail a rule, but the writer's `rows_added`/`rows_skipped` are always `{}` in the CLI output (`'rows_added': {}, 'rows_skipped': {}`), and `write_instance_sqlite` returns `{'rows_ok': ok, 'rows_failed': bad}` which the CLI ignores. The spec says 'a row that fails a rule is skipped and counted (never silently dropped)', but the counting is not surfaced.",
+     "requested_revision": "Propagate `write_instance_sqlite`'s return value into the CLI summary so skipped/failed rows are reported, satisfying the 'counted, never silent' requirement."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the `OrderDate >= ProcuredDate` rule should be enforced (spec evidence contradicts the formula).",
+    "Whether `duplicates_for_distinct` on PK columns is intended as base-column duplicates or result-set duplicates.",
+    "Whether the NULL rule is intended to apply to all nullable columns or only the listed `null_targets`.",
+    "Whether `Northeast` is a legitimate boundary literal for `Regions.Region` given it is not in the extracted comparison targets."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 instances fail with TypeError(\"unhashable type: 'list'\") at tscore_gen/instance.py:233 (`tm = schema.tables[t]`). In build_random_instance, `order = [t for lvl in schema.table_order for t in lvl]` flattens table_order into table-name strings, but the sampler-construction loop iterates `for t in schema.table_order: for tname in t:` and then uses `schema.tables[t]` with `t` being a *level list* (e.g. ['Customers', ...]) rather than a table name. `schema.tables` is a dict keyed by table name, so a list key raises TypeError. This is a hard crash: 0 of 20 instance directories were written.",
+     "requested_revision": "Fix the loop variable confusion in build_random_instance: iterate over table names (e.g. `for t in order:` or `for tname in t:` consistently) and index `schema.tables[tname]`. Ensure the same table-name variable is used for `samplers[(t, cm.name)]`, `parent_pool`, and `inst[t]`. Re-run the construction check and confirm n_ok > 0 with instance directories written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_make_spec_sampler` references `RANGE_KEYS`, `_RangeSampler`, `_DateSampler`, `_EnumSampler` \u2014 but `RANGE_KEYS` is not defined in spec.py (only `RANGES`), `_RangeSampler`/`_DateSampler` are not imported (only `RangeSampler`, `MMDDYYDateSampler` are imported from values), and the local `_EnumSampler` subclass overrides `__init__` with `pass`, discarding the enum list so `self.enum` is never set. Even after fixing the crash above, enum/range/date columns would raise NameError or produce empty enums. Also `_make_spec_sampler` calls `_EnumSampler(schema, key, n_col=col)` and `_RangeSampler(lo, hi, is_int, rng, boundary=...)` with signatures that do not match the imported classes.",
+     "requested_revision": "Replace `RANGE_KEYS` with `RANGES`, import and use `RangeSampler`, `MMDDYYDateSampler`, `EnumSampler` from values.py with their actual constructor signatures (e.g. `EnumSampler(ENUMS[key], p, max_l0, rng)`, `RangeSampler(lo, hi, is_int, p, max_l0, rng, boundary=...)`, `MMDDYYDateSampler(p, max_l0, rng)`). Remove the broken `_EnumSampler` stub. Verify each spec-driven column (Regions.Region, Store Locations.Type, Sales Orders.Discount Applied, Unit Price, OrderDate, etc.) samples from the declared domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec requires boundary literals with one step below/above for Products.ProductID (29,30,31,39,40,41) and Regions.StateCode ('GA','ga'), Regions.Region/State case variants. `BOUNDARY_LITERALS` is defined in spec.py, but `_make_spec_sampler` only passes `boundary=_boundary_for(...)` to range/money samplers; for text columns (Regions.Region, Regions.State, Regions.StateCode) it falls through to `_init_sampler`, which does not inject boundary literals. Products.ProductID is a PK and is generated by the generic integer path, not a RangeSampler, so the BETWEEN 30 AND 40 boundary values are not guaranteed. The spec's `boundary` rule ('include the literal, one step below and one step above') is therefore not implemented for these columns.",
+     "requested_revision": "Add explicit boundary injection for text comparison columns (Regions.Region, Regions.State, Regions.StateCode) and for Products.ProductID (e.g. a dedicated sampler or post-processing that guarantees the listed literals plus one-step-below/above appear in generated rows). Confirm via a check that each listed literal appears at least once per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `unmatched_join_rows` targets require parent rows with no children and child rows with NULL FK. The program copies compact rows and appends generated rows; FK columns are drawn from `parent_pool` (compact + generated) with `rng.choice`, so generated child rows always reference existing parents. NULL is applied only via `NULL_TARGETS` post-processing, but `_apply_null_rule` is applied to FK columns *after* the FK copy, and `_apply_rules`/`drop_unique_duplicates` may drop rows. There is no explicit construction that guarantees (a) at least one parent row with no child and (b) at least one child row with NULL FK per instance for each listed join. The spec lists these as required targets for 10+ columns.",
+     "requested_revision": "Add explicit construction: for each `unmatched_join_rows` target, ensure at least one parent PK value is absent from the child FK column and at least one child row has NULL FK (respecting the NULL rule). Verify with a post-generation check that parent_rows_without_children and child_rows_with_null_fk hold for every listed join."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `duplicates_for_distinct` targets include Products.ProductID and Customers.CustomerID (PK columns) with 20-50% duplicate share, but the spec's own uncertainty note says these are 'result-set duplicates, not base-column duplicates; PK columns are excluded from PK corruption.' The program's `DISTINCT_TARGETS` in spec.py only lists Regions.Region and Regions.State, and `sample_fresh_primary_keys`/`drop_unique_duplicates` actively remove PK duplicates. This is consistent with the uncertainty note but the specification's per_column_exceptions list still names Products.ProductID and Customers.CustomerID under duplicates_for_distinct, creating an ambiguity. The program's interpretation (result-set duplicates via GROUP BY / DISTINCT queries) is defensible but should be documented.",
+     "requested_revision": "Clarify in the specification that duplicates_for_distinct on PK columns means result-set duplicates (achieved via GROUP BY / DISTINCT query semantics), not base-column duplicates, and confirm the program's DISTINCT_TARGETS list is the intended realization. No code change required if the interpretation is accepted, but the spec text should be reconciled."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `supporting_evidence.date_order` notes SO-0001003 violates Order<=Ship in the compact data, and the uncertainty note says 'OrderDate >= ProcuredDate rule removed to match the observed evidence.' The program's RULES enforce ShipDate >= OrderDate and DeliveryDate >= ShipDate but not ProcuredDate <= OrderDate, consistent with the spec. However, the compact database itself contains a violating row (SO-0001003), and the program copies compact rows unchanged. This means generated instances will contain a row violating the ShipDate >= OrderDate rule, which is acceptable per the spec's explicit decision but should be noted as a known data characteristic.",
+     "requested_revision": "No change required; the spec explicitly documents this. Note for the record that compact-row preservation takes precedence over the ShipDate >= OrderDate rule for the pre-existing violating row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_targets` includes Store Locations.StateCode, and the uncertainty note says 'Store Locations.StateCode nullable in schema but 0% NULL observed; NULL planted per spec.' The program's `_compact_null_share` returns max(0.02, min(0.05, n_null/len)) \u2014 with 0% NULL in compact data this yields 0.02, so at least one NULL is planted. This is consistent with the NULL rule. However, Store Locations.StateCode is also an FK to Regions.StateCode, and the spec's `unmatched_join_rows` target for Store Locations.StateCode requires child_rows_with_null_fk. The program applies `_apply_null_rule` to FK columns after the FK copy, which is correct, but `_apply_rules` does not constrain StateCode (no rule), so NULLs survive. This appears correct but should be verified after the crash fix.",
+     "requested_revision": "After fixing the crash, verify that Store Locations.StateCode generated rows contain both NULL and non-NULL values, and that at least one Regions.StateCode parent has no matching Store Locations child."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction execution produced 0 instances due to the TypeError crash; integrity constraints, dependent-value consistency, compact-row preservation, and reproducible generation could not be verified from execution evidence.",
+    "The `_apply_rules` function drops rows failing semantic rules, but the writer's `rows_failed` counter only counts rows rejected by SQLite constraints, not rows dropped by `_apply_rules`. The spec says 'a row that fails a rule is skipped and counted (never silently dropped)' \u2014 the counting is not surfaced in the writer stats. This should be verified after the crash fix.",
+    "The `_near_variants` function applies 3% case/whitespace variants to all string columns including enum columns (Regions.Region, Store Locations.Type, etc.), which may violate the enum semantic rules (e.g. 'midwest' is not in REGION_ENUM). The `_apply_rules` would then drop those rows, reducing row counts. This interaction should be checked: near-variants on enum columns conflict with the enum rule and the spec's '3% near-variants only where non-FK and no constraint forbids' \u2014 enum columns are constrained by the semantic rule, so near-variants should not be applied there.",
+    "The `_plant_duplicates` function is applied to DISTINCT_TARGETS (Regions.Region, Regions.State) but the spec's duplicates_for_distinct also lists Products.ProductID and Customers.CustomerID; the program's DISTINCT_TARGETS omits these, consistent with the PK-exclusion interpretation but not explicitly reconciled with the spec's per_column_exceptions.",
+    "The `_plant_ties` function is applied to TIE_TARGETS (Store Locations.Population, Water Area, Sales Orders.Discount Applied, Unit Price, Unit Cost), but the spec's extracted atomic operations do not list ORDER-target columns with LIMIT ranks; the TIE_TARGETS list appears to be inferred rather than directly supported by the extracted operations. This should be confirmed against the spec's `ties` rule."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 9 of 20 instances invalid with 'new_integrity_failures'; constraint_violations.foreign_keys shows 'Store Locations.StateCode -> Regions.StateCode' with 14 rows across 9 instances. The schema declares Store Locations.StateCode as a FK to Regions(StateCode). The program's writer.py sets 'pragma foreign_keys = OFF' and inserts generated rows without validating FK targets; instance.py draws Store Locations.StateCode from the parent pool but then applies the NULL rule and near-variant/duplicate post-processing, and the parent pool for Regions.StateCode is extended only after Regions rows are built \u2014 but the generated Store Locations.StateCode values can include values that were dropped from Regions by _apply_rules (e.g. StateCode length != 2 rule) or that were never inserted because Regions rows were filtered. The result is orphan FK rows.",
+     "requested_revision": "Ensure generated child FK values are drawn only from parent PK values that actually survive into the written instance (i.e. after _apply_rules and PK dedupe on the parent table), or re-validate FK targets after all post-processing and before writing. Do not rely on 'pragma foreign_keys = OFF' to mask violations. The instance must not introduce new FK violations relative to the compact database."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py applies _apply_null_rule to NULL_TARGETS including ('Store Locations','StateCode') and the four Sales Orders FK columns, but the FK columns are populated by rng.choice(pv) from the parent pool and then NULL-planted; the parent pool for Regions.StateCode is built from schema.original_values only at the start and extended with generated Regions values after Regions is processed. However, Regions generated rows are filtered by _apply_rules (StateCode length==2) and by sample_fresh_primary_keys, so some StateCode values in the pool never reach the written table. Store Locations then samples from that stale pool. This is the direct cause of the FK violations above.",
+     "requested_revision": "Rebuild the parent pool from the *final* (post-filter, post-dedupe) parent column values before sampling child FK columns, or filter child FK draws against the final parent set. Also ensure the NULL rule is applied to FK columns only after the FK value is known to be valid (NULL is allowed; a non-NULL value must reference an existing parent)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'generic_sampling_rules.integer_fk' says 'Copy from parent PK pool; 5% NULL where nullable; include parent rows with no children; never apply near-variants to FK columns.' The program's _near_variants is applied to any string column not in ENUMS or BOUNDARY_LITERALS, which includes Store Locations.StateCode (a FK) and Store Locations.State (copied). This can produce case/whitespace variants of FK values that no longer match the parent, contributing to FK violations. The spec's own rule forbids near-variants on FK columns.",
+     "requested_revision": "Exclude all FK columns (and copied dependency columns) from _near_variants in instance.py, consistent with the spec's 'never apply near-variants to FK columns' rule. Also exclude copied columns (Store Locations.State) from near-variant generation since they must stay consistent with the parent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification lists 'duplicates_for_distinct' for Regions.Region and Regions.State with 20-50% duplicate share, and DISTINCT_TARGETS in spec.py includes both. But Regions.Region is also an enum-constrained column (REGION_ENUM) and Regions.State is a free-text column. _plant_duplicates is applied to Regions.Region after EnumSampler, which is fine, but the spec's 'text_enum' rule says 'no near-variants on enum-constrained columns' \u2014 duplicates are not near-variants, so this is consistent. However, the spec's 'duplicates' rule says 'never applied to PK columns' and Regions.Region/State are not PKs, so this is consistent. No issue here; noted as checked.",
+     "requested_revision": "No change required; recorded as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns shows many nullable columns with 'generated rows: NULL 0 / n' (e.g. Customers.Customer Names, Products.Product Name, Regions.Region, Regions.State, all Sales Orders date/money/enum columns, Store Locations columns). Per instruction 7 this does not block a pass, but the NULL rule says 'for every nullable column ... each instance contains generated rows with NULL and rows with non-NULL values'. The program only applies _apply_null_rule to NULL_TARGETS (FK columns and Store Locations.StateCode), not to other nullable columns. This is a spec-vs-program gap: the spec's null_share rule says 'Per nullable column, 2-5% NULL rows, at least one per instance'.",
+     "requested_revision": "Either (a) extend _apply_null_rule to all nullable non-PK columns per the spec's null_share rule, or (b) narrow the spec's null_share rule to only the listed NULL_TARGETS. The current mismatch means the program does not implement the stated null_share rule for most nullable columns. Per instruction 7 this is a note, not a blocker, but should be reconciled."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'boundary' rule says 'For each listed literal, include the literal, one step below and one step above; for text columns inject the literal and its case variant; for integer PK columns inject the literal values directly into the PK sequence.' BOUNDARY_LITERALS for Products.ProductID is [29,30,31,39,40,41], which already includes the one-step-below/above values (29,31 around 30; 39,41 around 40). BoundaryIntSampler returns these in order for the first 6 draws, but then sample_fresh_primary_keys dedupes PKs and drop_unique_duplicates may drop rows, and _apply_rules may drop rows. The boundary values may not all survive. Also, the spec says 'inject the literal values directly into the PK sequence' \u2014 the program injects them as the first 6 generated PKs, which is consistent, but survival is not guaranteed.",
+     "requested_revision": "Ensure boundary literals for PK columns survive into the written instance (e.g. by not filtering them out in _apply_rules or by re-injecting after dedupe). For text boundary columns, BoundaryTextSampler returns literals in order but _plant_duplicates and _near_variants (excluded for BOUNDARY_LITERALS) and _apply_rules may drop them; verify survival."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_rules drops rows that violate semantic rules, and the execution feedback shows large rows_skipped counts (e.g. Customers 370 skipped, Products 392, Regions 179, Sales Team 251, Store Locations 436). This means the generated table sizes (TABLE_SIZES: Customers 50, Products 47, Regions 48, Sales Team 28, Store Locations 120, Sales Orders 400) are not achieved \u2014 the actual rows_added are much smaller (Customers 203 over 20 instances \u2248 10/instance vs 50 target). The spec's table_sizes_per_instance is not met.",
+     "requested_revision": "Either generate more candidate rows to compensate for rule-based drops so the final table sizes match TABLE_SIZES, or adjust the samplers so fewer rows are dropped (e.g. ensure enum/range samplers always produce valid values so _apply_rules rarely fires). The current behavior means the instance does not match the specified table sizes."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification 'semantic_rules_and_formulas' includes ShipDate >= OrderDate and DeliveryDate >= ShipDate, with evidence noting SO-0001003 violates Order<=Ship and 'compact row preserved unchanged'. The program's _rule_ship_ge_order and _rule_delivery_ge_ship are applied to generated rows only (compact rows are copied unchanged), which is consistent. However, the spec's uncertainty note says 'OrderDate >= ProcuredDate rule removed to match the observed evidence'. The program does not enforce ProcuredDate <= OrderDate, consistent with the spec. No issue.",
+     "requested_revision": "No change required; recorded as verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'unmatched_join_rows' targets require 'parent_rows_without_children: true' and 'child_rows_with_null_fk: true'. The program plants NULLs in FK columns via NULL_TARGETS, satisfying child_rows_with_null_fk. But parent_rows_without_children is not explicitly guaranteed: the program draws child FKs from the parent pool with rng.choice, which may or may not leave some parent rows without children. There is no explicit construction ensuring at least one parent row has no child. The execution feedback does not report on this directly, but the spec lists it as a target for many columns.",
+     "requested_revision": "Add explicit construction to guarantee at least one parent row per parent table has no matching child row (e.g. reserve one parent PK value and exclude it from child FK draws). Verify via execution feedback that parent_rows_without_children holds."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's 'ties' rule says 'On ORDER-target columns, plant ties at listed LIMIT ranks.' TIE_TARGETS includes Store Locations.Population, Water Area, Sales Orders.Discount Applied, Unit Price, Unit Cost. _plant_ties only ensures at least two rows share the max value; it does not plant ties at specific LIMIT ranks (e.g. rank 1, 2, 3). The spec's uncertainty note says 'TIE_TARGETS ... are inferred from ORDER-target patterns; confirm against extracted operations.' The extracted operations do not list ORDER targets for these columns, so the tie targets are speculative.",
+     "requested_revision": "Either confirm TIE_TARGETS against extracted operations (the provided atomic operations do not show ORDER targets for these columns) or remove them from the spec. If kept, implement rank-specific tie planting rather than just max-value ties."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's 'duplicates' rule says 'On DISTINCT-target columns, 20-50% duplicate share; never applied to PK columns; PK-column DISTINCT targets are realized as result-set duplicates via GROUP BY/DISTINCT query semantics, not base-column duplicates.' DISTINCT_TARGETS in spec.py only includes Regions.Region and Regions.State, but the extracted operations list duplicates_for_distinct for Products.ProductID and Customers.CustomerID as well. The spec's per_column_exceptions include these with 'realization: result-set duplicates via GROUP BY/DISTINCT; PK base values remain unique'. The program's DISTINCT_TARGETS omits Products.ProductID and Customers.CustomerID, so _plant_duplicates is not applied to them. This is consistent with the 'PK base values remain unique' realization, but the spec should be explicit that these are handled via GROUP_SIZE_TARGETS/AGGREGATE_BOUNDARY rather than _plant_duplicates.",
+     "requested_revision": "Clarify in the spec that Products.ProductID and Customers.CustomerID DISTINCT targets are realized via GROUP BY/DISTINCT query semantics (GROUP_SIZE_TARGETS and AGGREGATE_BOUNDARY), not base-column duplicates, and confirm the program's GROUP_SIZE_TARGETS/AGGREGATE_BOUNDARY construction achieves the intended result-set duplicate share."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether boundary literals for Products.ProductID and text boundary columns survive into the written instance after _apply_rules and dedupe (not directly observable from execution feedback).",
+    "Whether parent_rows_without_children holds for all unmatched_join_rows targets (not reported in execution feedback).",
+    "Whether the intended value variation (construction_pairs separated 68 of 343 eligible) is sufficient; the feedback shows 68 separated pairs, which is low but per instruction 4 a missing separation alone does not establish a generation error.",
+    "Whether TIE_TARGETS are correct given the extracted operations do not show ORDER targets for those columns.",
+    "Whether the NULL rule for non-FK nullable columns should be enforced (spec says per nullable column; program only applies to NULL_TARGETS)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: returncode 2, stderr 'cli.py: error: the following arguments are required: --out, --dbname', 0 of 20 instance directories written. The CLI (tscore_gen/cli.py) declares --out and --dbname as required=True, but the harness invocation did not supply them (or the harness expects a different interface). Regardless of cause, the program produced no instances this round.",
+     "requested_revision": "Make the CLI robust to the harness invocation: either accept the harness's actual argument set (e.g. derive --out/--dbname from --ds/--db defaults, or make them optional with sensible defaults), or document/align the required interface. The program must run to completion and write the expected layout <root>/<ds>/<db>__chk_NNNN/<db>__chk_NNNN.sqlite for all requested instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _build_table: FK columns are filled from parent_pools, but the 'childless' reservation uses pool[0] and draw_pool excludes it; however _plant_nulls then sets a random row's FK to None, and the post-processing FK re-validation loop repairs any FK not in pool_set by drawing rng.choice(pool) \u2014 which can re-introduce the reserved childless parent value, and can also overwrite a planted NULL? No: it checks v is not None, so NULLs survive. But the repair can pick the reserved childless PK, breaking the 'parent_rows_without_children' guarantee. Also _plant_duplicates/_plant_ties run before FK re-validation and can corrupt FK columns (e.g. _plant_ties on Sales Orders.Discount Applied is fine, but _plant_duplicates targets only Regions columns, so FK corruption is limited). The bigger issue: _plant_nulls plants NULL on FK columns but the spec's null_targets also includes Store Locations.StateCode, which is a copied-dependency column; _plant_nulls sets it to None but the copied 'State' column is not nulled, leaving an inconsistent (StateCode NULL, State non-NULL) pair.",
+     "requested_revision": "In the FK repair loop, exclude the reserved childless parent PK from the repair draw pool (use draw_pool, not pool). When planting NULL on a copied-dependency column (Store Locations.StateCode), also NULL the copied column (State) to preserve dependent-value consistency, or exclude copied columns from NULL planting and document the deviation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _build_table: after _dedupe_pk, the code does not re-inject boundary PK literals for Products.ProductID. The spec's boundary rule requires 'for integer PK columns inject the literal values directly into the PK sequence and guarantee survival by re-injecting after dedupe/rule filtering'. BoundaryIntSampler returns boundary values on the first draws, but _dedupe_pk keeps first occurrence and the generic NumberSampler fallback may also produce colliding values; there is no post-dedupe re-injection. Similarly BoundaryTextSampler for Regions.Region/State/StateCode returns boundary literals first, but _plant_duplicates (on Regions.Region, Regions.State) can overwrite them, and there is no survival verification.",
+     "requested_revision": "After _dedupe_pk and after _plant_duplicates/_plant_ties/_near_variants, verify each boundary literal is present in its column; if missing, overwrite a non-boundary row's value with the literal (for PK columns, ensure uniqueness by replacing a non-boundary PK). Exclude boundary columns from duplicate/near-variant overwrites as the spec states ('boundary columns are excluded from near-variants')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _plant_duplicates applies to DISTINCT_TARGETS = [('Regions','Region'), ('Regions','State')] only. The spec's per_column_exceptions also list duplicates_for_distinct for Products.ProductID and Customers.CustomerID, realized as result-set duplicates via GROUP BY/DISTINCT. The program has GROUP_SIZE_TARGETS and AGGREGATE_BOUNDARY defined in spec.py but never uses them in instance.py \u2014 no group-size planting (1, 2, >=3) and no COUNT(*) boundary (2,3,4) construction for Customers.CustomerID.",
+     "requested_revision": "Implement group-size planting for Customers.CustomerID in Sales Orders._CustomerID (groups of size 1, 2, and >=3) and ensure the aggregate boundary values 2,3,4 are realized. Since these are result-set duplicates on PK columns, they must be constructed via the child FK distribution, not base-column duplication."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _plant_ties: 'copy max into another row' only guarantees two rows share the max, not rank-specific tie planting at listed LIMIT ranks as the spec requires ('plant ties at the listed LIMIT ranks (rank-specific tie planting, not just a shared maximum)'). Also TIE_TARGETS includes Sales Orders.Unit Price/Unit Cost which are TEXT money columns; max() on strings is lexicographic, not numeric, so tie planting is semantically wrong for those columns.",
+     "requested_revision": "Implement rank-specific tie planting (e.g. for LIMIT k, ensure at least two rows tie at rank k). For TEXT money columns, compare numerically after stripping commas. Confirm TIE_TARGETS against the extracted operations (the spec's own uncertainty note flags that ORDER targets for Population, Water Area, Discount Applied, Unit Price, Unit Cost are not shown in extracted ops)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty list explicitly states: 'TIE_TARGETS are inferred from ORDER-target patterns; the extracted operations do not show ORDER targets for Population, Water Area, Discount Applied, Unit Price, Unit Cost; confirm or remove.' The extracted atomic operations contain no ORDER-target patterns at all, so TIE_TARGETS is unsupported by evidence.",
+     "requested_revision": "Either remove TIE_TARGETS (and the tie rule) since no ORDER targets are evidenced, or provide the supporting evidence. Do not require the engineer to implement unsupported tie planting."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas includes ShipDate >= OrderDate and DeliveryDate >= ShipDate, but supporting_evidence notes SO-0001003 violates Order<=Ship and 'Compact-row preservation takes precedence'. The program's _apply_rules enforces these on generated rows only (compact rows are copied unchanged by writer.py), which is consistent. However, the spec also lists 'OrderDate >= ProcuredDate rule removed' \u2014 the program's RULES dict indeed omits it, consistent. No issue here, but the spec's date-order rules are only weakly evidenced (2 supporting rows, 1 violating).",
+     "requested_revision": "No change required; note that date-order rules are supported by 2 of 3 cited rows and are applied only to generated rows, which is acceptable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _sample_row is defined but unused; _build_table samples rows directly without retry, then applies _apply_rules with bounded retries. The retry loop re-samples all non-FK columns and re-fills FKs, but does not re-apply _plant_nulls/_plant_duplicates afterward \u2014 those run after the retry loop, so a rule-violating row could be 'fixed' by retry but then a NULL planted on a rule-constrained column (e.g. Discount Applied) is fine since rules treat NULL as pass. However, _plant_duplicates on Regions.Region can set a value outside REGION_ENUM? No \u2014 it copies from existing pool values, which are enum-valid. Acceptable.",
+     "requested_revision": "No change required for this specific point; but confirm that _plant_nulls on FK columns does not violate the 'at least one parent PK reserved childless' guarantee (see earlier issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py copies the compact DB and appends generated rows with foreign_keys=OFF, so FK integrity is not enforced at write time; the program relies on in-memory FK repair. If the repair loop picks a reserved childless PK (see issue 2), the written DB will have a child row referencing a parent that was supposed to be childless, violating the unmatched_join_rows target. Also, writer.py does not verify that generated PKs do not collide with compact PKs \u2014 if the compact DB already contains rows with PKs in the generated range, INSERT will fail and rows will be counted as failed, eroding table sizes below table_sizes_per_instance.",
+     "requested_revision": "Before writing, check generated PKs against existing compact PKs and shift/regenerate collisions. After writing, verify final table sizes equal table_sizes_per_instance and that reserved childless parents have no children."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py load_specification only merges table_sizes from raw JSON; it ignores all other spec fields (enums, ranges, null_targets, boundary_literals, dependencies, etc.). If the harness passes a --spec JSON with different values, they are silently ignored. The built-in defaults happen to mirror the generation spec, so this is not currently a correctness bug, but it is fragile.",
+     "requested_revision": "Either fully merge the raw spec into the defaults, or document that the built-in spec is authoritative and the --spec flag only overrides table sizes. Ensure the built-in defaults exactly match the generation specification (they appear to, but verify WAREHOUSE_ENUM, TIME_ZONE_ENUM, etc.)."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced this round (returncode 2), so integrity constraints, dependent-value consistency, compact-row preservation, and reproducible generation could not be verified by execution.",
+    "Whether the harness invocation supplies --out/--dbname is unknown; the CLI requires them but the harness did not provide them.",
+    "Whether boundary PK literals for Products.ProductID survive dedupe/rule filtering after the fix is unverified.",
+    "Whether the reserved childless parent PK is actually excluded from child draws after the FK repair loop is unverified.",
+    "Whether group-size and aggregate-boundary targets for Customers.CustomerID are realized is unverified (not implemented)."
+   ]
+  }
+ ]
 }

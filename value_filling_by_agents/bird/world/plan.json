@@ -1,50 +1,633 @@
 {
  "db": "world",
- "operator_io_quirks": [
-  "Backtick-quoted identifiers in DDL; generated SQL must double-quote (\"City\", \"CountryCode\") \u2014 sqlite accepts both, but writer must not copy backticks verbatim into INSERT.",
-  "Mixed-case table/column names (City, CountryCode, IsOfficial) \u2014 column lookup must be case-insensitive; keep original spelling in output.",
-  "CountryLanguage has composite PK (CountryCode, Language) \u2014 sample_fresh_primary_keys must dedupe on the tuple, not a single column.",
-  "Country.Capital is an INTEGER that semantically references City.ID but has NO declared FK \u2014 TS will not fill it consistently; it is a dangling logical FK.",
-  "CountryLanguage.CountryCode FK -> Country.Code, and Country.Code is TEXT PK; child draws from parent's FINAL filtered values (upstream order).",
-  "IsOfficial is TEXT with only 'T'/'F' (2 distinct) \u2014 String fuzzer will emit random charset strings, not T/F; no CHECK constraint to catch it.",
-  "IndepYear INTEGER with null_rate 0.197 and values like 1278 (implausible year) \u2014 Number fuzzer, not Date; no year semantics.",
-  "LifeExpectancy/GNPOld/GNP REAL nullable \u2014 Number fuzzer with scale from 'real' (no args) => default scale; nulls only via dropout, not NOT NULL enforcement.",
-  "Country.Capital nullable INTEGER, distinct 232 vs 239 rows \u2014 some NULLs; Number fuzzer will produce values outside City.ID range.",
-  "No views/triggers/indexes in DDL \u2014 writer clone is just 3 CREATE TABLEs; no extra objects to copy.",
-  "All tables small (4079/239/984) \u2014 no max_rows_per_table sampling needed; full read is cheap.",
-  "AUTOINCREMENT on City.ID \u2014 inserting explicit ID values is fine; sqlite_sequence not required for read-only units."
- ],
- "operator_ts_expectations": [
-  "City.ID, Country.Population, Country.Capital, CountryLanguage.Percentage etc. -> Number fuzzer: uniform in [-10^scale,10^scale] then +-1/+-2 perturbation; scale from type args (INTEGER/REAL have none => default).",
-  "City.Name, Country.Name, District, Region, Continent, GovernmentForm, HeadOfState, LocalName, Code2, Language -> String fuzzer: random a-zA-Z 0-9() strings length 0..20, plus 50% contaminate (prefix/suffix/drop char).",
-  "Country.Code, City.CountryCode, CountryLanguage.CountryCode -> String fuzzer but ALSO FK-filled from parent's final values (Country.Code / Country.Code) \u2014 so child values are plausible codes, not random strings.",
-  "CountryLanguage.IsOfficial -> String fuzzer random strings; original only T/F => TS will produce values like 'aB3' \u2014 likely FN driver (queries filtering IsOfficial='T' return wrong counts).",
-  "Country.Continent (7 distinct) and Region (25 distinct) -> String fuzzer random strings; queries grouping/filtering by continent get implausible values => FN.",
-  "Country.IndepYear -> Number fuzzer (INTEGER, no args) => uniform in [-10^scale,10^scale] with scale default; produces negative/huge years => FN on year-range predicates.",
-  "Country.Capital -> Number fuzzer, NOT FK-filled (no declared FK) => values unrelated to City.ID => joins Country.Capital=City.ID mostly empty => FN.",
-  "Composite PK (CountryCode,Language) dedupe keeps first occurrence; with random strings collisions rare => few drops; but FK CountryCode drawn from Country.Code (239 values) with replacement => many duplicate (code,lang) pairs possible if Language also repeats.",
-  "String fuzzer's contaminate (drop first/last char) on short codes like 'AFG' -> 'AF'/'FG' => breaks equality joins to Country.Code => FN.",
-  "Number fuzzer's list_max quirk (overwrites upper bound with full-range max) means even with literal pool, fresh draws span full range => implausible Population/SurfaceArea => FN.",
-  "No NOT NULL/CHECK enforcement in Python: rows violating NOT NULL (e.g. NULL in Name) fail at insert and are skipped => row counts shrink, possibly FP/FN on COUNT queries.",
-  "p=0.2 default, 30% chance whole instance p=0 => sometimes all values come from literal pool + 5 original samples => more plausible, fewer misses; variance across seeds."
- ],
- "challenger_refs": [
-  "G15",
-  "G22",
-  "G11",
-  "G2",
-  "G1",
-  "G6",
-  "G9",
-  "G12",
-  "G21",
-  "G18"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential 1..N per table, never NULL, never reused.",
+   "text_not_null": "Sample from a per-column pool of realistic values; allow near-duplicates (case variants, trailing spaces) at ~5% of rows; never NULL.",
+   "text_nullable": "Same as text_not_null but with NULL share per null_targets.",
+   "real_not_null": "Uniform over a plausible positive range; keep 2 decimals; never NULL.",
+   "real_nullable": "Same as real_not_null but with NULL share per null_targets.",
+   "integer_not_null": "Uniform over a plausible non-negative range; never NULL.",
+   "integer_nullable": "Same as integer_not_null but with NULL share per null_targets.",
+   "flag_text": "Sample from {'T','F'} with ~60% 'T'.",
+   "boundary_numeric": "For each listed literal L, emit rows at L-1, L, L+1 (or L-0.1, L, L+0.1 for REAL); never clamp a specified literal; never emit a literal that violates a stated range rule.",
+   "boundary_text": "For each listed literal L, emit L, L upper, L lower, and LIKE variants L%, %L, %L%.",
+   "tie_order": "For each listed rank r, emit at least two rows sharing the same value at that rank; only on non-UNIQUE columns.",
+   "duplicates_distinct": "Ensure 20-50% of rows share a value with another row on the DISTINCT column; forced boundary literals are pinned and never overwritten by rebalancing.",
+   "unmatched_join": "Emit parent rows with no child rows and child rows whose FK matches a parent (no NULL FK unless nullable).",
+   "null_in_count": "NOT NULL columns never get NULL; COUNT(col) returns full row count.",
+   "rows_with_different_values": "Within each group key named in the exception, emit at least two rows with different values; when no group key is named, the whole table is the group; variation is applied on the non-NULL subset only and preserves the column's declared type and decimal precision.",
+   "reserved_literal": "A reserved literal is emitted exactly once; a second occurrence is perturbed like any other collision."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "Country",
+    "column": "Code",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "CountryLanguage.CountryCode",
+      "City.CountryCode"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Code",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "USA",
+      "usa"
+     ],
+     "reserve_before_uniqueness": true
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Code",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none"
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "CountryCode",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Country.Code",
+      "City.CountryCode"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "CountryCode",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "USA",
+      "usa"
+     ]
+    }
+   },
+   {
+    "table": "City",
+    "column": "CountryCode",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Country.Code",
+      "CountryLanguage.CountryCode"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "Language",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "pin_forced_literals": true
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "Language",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Portuguese",
+      "portuguese",
+      "English",
+      "english"
+     ]
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "rebalance_after_forcing": true,
+     "pin_forced_literals": true
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Cyprus",
+      "cyprus",
+      "Italy",
+      "italy",
+      "China",
+      "china"
+     ]
+    }
+   },
+   {
+    "table": "City",
+    "column": "Population",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">=2 per group with different values",
+     "group_key": "CountryCode"
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "IsOfficial",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "T",
+      "t",
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "table": "Country",
+    "column": "SurfaceArea",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">=2 per group with different values",
+     "group_key": "Continent",
+     "preserve_precision": true
+    }
+   },
+   {
+    "table": "Country",
+    "column": "SurfaceArea",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "preserve_ties_after_variation": true
+    }
+   },
+   {
+    "table": "City",
+    "column": "District",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "City",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%",
+     "pin_forced_literals": true
+    }
+   },
+   {
+    "table": "City",
+    "column": "Name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "PHL",
+      "phl",
+      "%PHL",
+      "%phl",
+      "PHL%",
+      "phl%"
+     ]
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Population",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">=2 per group with different values",
+     "group_key": "Continent"
+    }
+   },
+   {
+    "table": "Country",
+    "column": "LifeExpectancy",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">=2 per group with different values",
+     "group_key": "Continent",
+     "non_null_subset_only": true,
+     "preserve_precision": true
+    }
+   },
+   {
+    "table": "Country",
+    "column": "GNP",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      0,
+      0.1
+     ]
+    }
+   },
+   {
+    "table": "Country",
+    "column": "HeadOfState",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "City",
+    "column": "ID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none"
+    }
+   },
+   {
+    "table": "Country",
+    "column": "LocalName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "table": "Country",
+    "column": "GovernmentForm",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Republic",
+      "republic"
+     ]
+    }
+   },
+   {
+    "table": "Country",
+    "column": "IndepYear",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30%"
+    }
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "Percentage",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">=2 per group with different values",
+     "group_key": "CountryCode"
+    }
+   },
+   {
+    "table": "Country",
+    "column": "GNPOld",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "unordered"
+    }
+   },
+   {
+    "table": "Country",
+    "column": "Region",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Baltic Countries",
+      "baltic countries"
+     ]
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "City.CountryCode",
+    "parent": "Country.Code",
+    "copied_columns": []
+   },
+   {
+    "child": "CountryLanguage.CountryCode",
+    "parent": "Country.Code",
+    "copied_columns": []
+   },
+   {
+    "child": "Country.Capital",
+    "parent": "City.ID",
+    "copied_columns": [],
+    "note": "soft reference; nullable; fill City before Country.Capital or leave NULL"
+   },
+   {
+    "unique": "Country.Code",
+    "table": "Country"
+   },
+   {
+    "unique": "CountryLanguage(CountryCode, Language)",
+    "table": "CountryLanguage"
+   },
+   {
+    "unique": "City.ID",
+    "table": "City"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Country",
+    "column": "Continent",
+    "formula": "Continent IN ('Asia','Europe','North America','South America','Africa','Oceania','Antarctica')"
+   },
+   {
+    "table": "Country",
+    "column": "SurfaceArea",
+    "formula": "SurfaceArea >= 0"
+   },
+   {
+    "table": "Country",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "Country",
+    "column": "LifeExpectancy",
+    "formula": "LifeExpectancy IS NULL OR LifeExpectancy BETWEEN 0 AND 100"
+   },
+   {
+    "table": "Country",
+    "column": "GNP",
+    "formula": "GNP IS NULL OR GNP >= 0"
+   },
+   {
+    "table": "Country",
+    "column": "GNPOld",
+    "formula": "GNPOld IS NULL OR GNPOld >= 0"
+   },
+   {
+    "table": "Country",
+    "column": "IndepYear",
+    "formula": "IndepYear IS NULL OR IndepYear BETWEEN 1000 AND 2100"
+   },
+   {
+    "table": "Country",
+    "column": "Code2",
+    "formula": "length(Code2) = 2"
+   },
+   {
+    "table": "Country",
+    "column": "Code",
+    "formula": "length(Code) = 3"
+   },
+   {
+    "table": "City",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "IsOfficial",
+    "formula": "IsOfficial IN ('T','F','t','f')"
+   },
+   {
+    "table": "CountryLanguage",
+    "column": "Percentage",
+    "formula": "Percentage BETWEEN 0 AND 100"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Country": 40,
+   "City": 120,
+   "CountryLanguage": 80
+  },
+  "null_targets": {
+   "Country.IndepYear": "~20% NULL",
+   "Country.LifeExpectancy": "~7% NULL",
+   "Country.GNPOld": "~25% NULL",
+   "Country.HeadOfState": "~1% NULL",
+   "Country.Capital": "~3% NULL"
+  },
+  "supporting_evidence": {
+   "Country.Continent enum": "7 distinct values in stats; sample rows show Asia, North America, Africa, Europe, South America, Oceania, Antarctica.",
+   "CountryLanguage.IsOfficial enum": "2 distinct values in stats; sample rows show 'T' and 'F'; boundary targets add case variants 't','f' (TEXT column, no CHECK).",
+   "CountryLanguage.Percentage range": "Sample rows 5.3, 9.5, 76.7, 7.4, 0.9, 32.1, 52.4, 1.9 all within [0,100].",
+   "Country.Code length 3": "All sample codes ABW, AFG, AGO, AIA, ALB, AND, ANT, ARE are length 3.",
+   "Country.Code2 length 2": "All sample Code2 values AW, AF, AO, AI, AL, AD, AN, AE are length 2.",
+   "Country.IndepYear range": "Sample values 1919, 1975, 1912, 1278, 1971, 1816, 1991, 1981 within [1000,2100].",
+   "Country.GNP boundary": "Atomic stats show PRED(country.gnp = 0) with targets -0.1, 0, 0.1; -0.1 dropped to keep GNP >= 0 rule consistent (no CHECK in schema, but rule is authoritative).",
+   "Country.SurfaceArea precision": "Sample values 193.0, 652090.0, 1246700.0, 96.0, 28748.0, 468.0, 800.0, 83600.0 are REAL; generation must keep 2-decimal precision and not truncate to integers.",
+   "Country.LifeExpectancy precision": "Sample values 78.4, 45.9, 38.3, 76.1, 71.6, 83.5, 74.7, 74.1 are REAL with 1 decimal; generation must preserve REAL type and 1-decimal precision."
+  },
+  "uncertainty": "Country.Capital is a soft reference to City.ID; generation order must fill City before Country.Capital or leave NULL. No formula links City.Population to Country.Population in the sample, so none is stated. Group keys for rows_with_different_values are inferred (Continent for Country columns, CountryCode for City/CountryLanguage) since the atomic summary does not name them; these group keys are uncertain. Country.Code2 tie target removed because Code2 is UNIQUE (deliberate deviation from atomic stats). The column-vs-column comparison boundary PRED(country.code < countrylanguage.countrycode) is out of scope for literal boundary generation; it is satisfied incidentally by the natural ordering of generated codes and is not explicitly targeted. The writer must run with foreign_keys = ON (or perform an explicit post-write FK check) so that dropped parent rows cannot leave latent FK violations in City/CountryLanguage."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `gnp[0] = -0.1` for the GNP comparison-boundary target, then immediately clamps with `gnp = [max(0.0, x) for x in gnp]`, so the -0.1 literal is never emitted. The specification's per_column_exceptions for Country.GNP lists values [-0.1, 0, 0.1], and the atomic-operation stats show the boundary op `PRED(country.gnp = 0)` with targets including -0.1. The semantic rule `GNP IS NULL OR GNP >= 0` is a CHECK-style rule that under SQL three-valued logic holds when not FALSE, but the program treats it as a hard clamp and silently drops the required boundary value.",
+     "requested_revision": "Either (a) emit -0.1 as a generated GNP value (the schema has no CHECK constraint on GNP, so it is insertable; the semantic rule is a soft rule that holds under 3VL when the operand is non-NULL and the comparison is not FALSE \u2014 but note -0.1 >= 0 is FALSE, so if the rule is meant to be enforced, the spec should drop -0.1 from the GNP boundary targets), or (b) update the specification to remove -0.1 from Country.GNP comparison_boundary targets so spec and program agree. Do not silently clamp a specified literal."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_language_generated` builds `iso` from {'T','F'} only (`iso = [x if x in OFFICIAL else 'F' for x in iso]`), but the specification's per_column_exceptions for CountryLanguage.IsOfficial lists boundary values ['T','t','F','f'] and the atomic-operation stats show comparison ops `PRED(countrylanguage.isofficial = 'T')` and `PRED(countrylanguage.isofficial = 'F')` with targets ['T','t','F','f']. The lowercase variants 't' and 'f' are never generated. The semantic rule `IsOfficial IN ('T','F')` is a soft rule; the spec explicitly asks for the case variants as boundary values.",
+     "requested_revision": "Generate the 't' and 'f' case variants as specified (they are insertable since the column is TEXT with no CHECK), or remove 't'/'f' from the specification's IsOfficial boundary targets. The current code contradicts the spec."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` forces `code_row[1] = 'USA'` and `code_row[2] = 'usa'`, but the uniqueness loop then perturbs any code already in `seen` (which includes compact Country codes). If the compact DB already contains 'USA' (the world DB does), the forced 'USA' is rewritten to e.g. 'USB', so the required join-target literal 'USA' is not guaranteed to appear among generated rows. Similarly the 'usa' variant may be perturbed. The specification's Country.Code comparison_boundary targets are ['USA','usa'] and the unmatched_join_rows target requires parent rows without children.",
+     "requested_revision": "Ensure the forced 'USA'/'usa' codes are actually emitted (e.g. reserve them before the uniqueness pass, or accept that compact rows already supply 'USA' and document that the boundary is satisfied by compact rows). The current code can silently drop the specified literal."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` forces `name_row[k] = v` for forced_names = ['Cyprus','cyprus','Italy','italy','China','china'] at indices 0..5, but `_duplicated` may already have placed those values elsewhere; more importantly, the forced assignment happens after `_duplicated`, so the duplicate-share target (20-50%) is not re-verified after forcing. Also `_duplicated` draws from `names_shared` which includes the forced literals, so the forced rows may coincide with existing duplicates \u2014 acceptable \u2014 but the code does not guarantee the 20-50% share survives the forced overwrite. Minor, but the spec's duplicates_for_distinct target for Country.Name is not guaranteed.",
+     "requested_revision": "Re-verify or re-balance the duplicate share after forcing boundary literals, or document that the forced literals are drawn from the same shared pool so the share is preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `c2[0] = c2[1] = c2_shared[0]` for the Code2 tie-at-rank-1 target, but then the uniqueness loop perturbs any duplicate Code2 value (`if c in seen_c2: ... perturb`). Since Country.Code2 is declared UNIQUE in the dependencies, the tie is immediately broken, so the ties_for_order_limit target for Country.Code2 (tie_at_rank [1], ASC) is never satisfied. The specification lists this target explicitly.",
+     "requested_revision": "Either drop the Code2 tie target from the specification (it conflicts with the UNIQUE constraint on Code2), or remove the UNIQUE dependency on Country.Code2 if the tie is required. The current spec and program are inconsistent: the spec asks for a tie on a UNIQUE column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `sa[0] = sa[1] = sa[2] = tie_v` and `sa[3] = sa[4] = mn` for SurfaceArea ties, but the specification's ties_for_order_limit target for Country.SurfaceArea is tie_at_rank [1] with direction 'ASC and DESC'. The code creates ties at rank 1 for both min and max, which is fine, but the spec's direction 'ASC and DESC' is not separately verified. Minor; the tie exists.",
+     "requested_revision": "No change strictly required, but confirm the tie is at rank 1 in both ASC and DESC orderings (the code's min-tie and max-tie satisfy this)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas includes `Country.GNP IS NULL OR GNP >= 0` and `Country.GNPOld IS NULL OR GNPOld >= 0`, but the per_column_exceptions for Country.GNP lists boundary value -0.1. These two spec entries contradict each other: -0.1 violates the GNP >= 0 rule. The program resolved the contradiction by clamping, which drops the specified literal.",
+     "requested_revision": "Resolve the contradiction in the specification: either remove -0.1 from the GNP boundary targets (if the GNP >= 0 rule is authoritative) or relax the GNP >= 0 rule to allow the boundary literal. The spec must be internally consistent before the program can implement it faithfully."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's dependencies list `{\"unique\": \"Country.Code2\", \"table\": \"Country\"}` and the per_column_exceptions list a ties_for_order_limit target for Country.Code2 (tie_at_rank [1], ASC). A UNIQUE column cannot have a tie at rank 1. The spec is internally inconsistent.",
+     "requested_revision": "Remove the Code2 tie target from the specification, or remove the UNIQUE dependency on Country.Code2. The two cannot both hold."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for CountryLanguage.IsOfficial lists boundary values ['T','t','F','f'], but the semantic rule `IsOfficial IN ('T','F')` excludes 't' and 'f'. The spec is internally inconsistent (the boundary literals violate the enum rule).",
+     "requested_revision": "Either drop 't'/'f' from the IsOfficial boundary targets, or relax the IsOfficial IN ('T','F') rule to allow case variants. The spec must be internally consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `pop[0] = pop[1]` for Country.Population, but the specification's rows_with_different_values target for Country.Population requires '>=2 per group with different values'. The code creates a duplicate but does not guarantee at least two different values per group (there is no grouping for Country.Population in the code). The target is about groups, and the code does not implement grouping for this column.",
+     "requested_revision": "Clarify what 'group' means for Country.Population (the atomic-operation stats show rows_with_different_values with qualifying_rows '>= 2 per group with different values' but no group key is specified). If the group is the whole table, the code's random values already satisfy it; if a group key is intended, the spec must name it and the code must implement it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `le[0] = le[1] = mx` for LifeExpectancy ties, but the specification's rows_with_different_values target for Country.LifeExpectancy requires '>=2 per group with different values'. As with Population, no group key is specified, and the code does not implement grouping. The random values likely satisfy the whole-table interpretation, but the spec is ambiguous.",
+     "requested_revision": "Same as Population: clarify the group key for LifeExpectancy rows_with_different_values, or confirm the whole-table interpretation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_language_generated` sets `pct[idxs[0]]` and `pct[idxs[1]]` for groups with >=2 rows, but the specification's rows_with_different_values target for CountryLanguage.Percentage requires '>=2 per group with different values'. The code groups by CountryCode, which is a reasonable interpretation, but the spec does not name the group key. The code's implementation is plausible but unverified against the spec's intent.",
+     "requested_revision": "Document the group key (CountryCode) in the specification for CountryLanguage.Percentage rows_with_different_values, or confirm the code's interpretation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_city_generated` is defined but `build_spec_instance` only calls it if `cfg['table_sizes'].get('City', 0) > 0`. The specification's table_sizes_per_instance sets City to 120, but SPEC_DEFAULTS sets City to 0 and `_load_spec_tuning` overrides from the spec. The execution feedback shows City: 2400 rows added across 20 instances (120 per instance), so the spec override works. However, the code's `_city_generated` uses `id_max + 1 + i` for IDs, which is correct, but the spec's City.Population rows_with_different_values target is implemented by grouping on CountryCode \u2014 again an unstated group key.",
+     "requested_revision": "Document the group key for City.Population rows_with_different_values in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `cap` from `city_ids` (compact City IDs only), but the specification's dependencies list `{\"child\": \"Country.Capital\", \"parent\": \"City.ID\", \"copied_columns\": [], \"note\": \"soft reference; nullable\"}`. The code correctly uses compact City IDs and NULL, and the execution feedback shows 0 FK violations. However, the code does not include generated City IDs (if City were generated first), which is fine given the generation order (Country first). No issue, but note the soft reference is satisfied.",
+     "requested_revision": "No change required; the soft reference is correctly handled."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `construction_pairs: eligible 265, separated 56`. The specification's atomic-operation stats list 265 pairs, and 56 are separated. The remaining 209 pairs are not separated, which may indicate that some intended value variations are not realized. However, the instructions state that a missing separation alone does not establish a generation error. The program ran without errors and produced valid instances.",
+     "requested_revision": "No blocking change; note that 209 pairs are not separated and may warrant investigation, but this does not block a pass on its own."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows `nullable_columns: []`, meaning no nullable columns were detected in the generated instances. The specification's null_targets include Country.IndepYear (~20% NULL), Country.LifeExpectancy (~7% NULL), Country.GNPOld (~25% NULL), Country.HeadOfState (~1% NULL), Country.Capital (~3% NULL). The code's `_null_mask` ensures at least one NULL per nullable column, so NULLs should be present. The empty `nullable_columns` list may be a reporting artifact of the feedback tool, not a generation error. The instructions state that a nullable column with 'generated rows: NULL 0 / n' may be noted but does not block a pass.",
+     "requested_revision": "No blocking change; note the discrepancy between the spec's null_targets and the feedback's empty nullable_columns list for the engineer to investigate."
+    }
+   ],
+   "unresolved_checks": [
+    "The group key for rows_with_different_values targets (Country.Population, Country.LifeExpectancy, CountryLanguage.Percentage, City.Population) is not specified in the specification; the program uses CountryCode for City/CountryLanguage and no grouping for Country. This ambiguity prevents full verification.",
+    "The construction_pairs separation rate (56/265) is low; without held-out labels, it is unclear whether the unseparated pairs indicate missing value variation or are expected.",
+    "The nullable_columns feedback is empty despite the spec's null_targets; this may be a feedback-tool artifact, but it prevents confirming NULL generation."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `gnp[0] = -0.1` (and the module docstring explicitly says the -0.1 boundary literal is emitted). The specification's `semantic_rules_and_formulas` states `Country.GNP: GNP IS NULL OR GNP >= 0`, and the spec's own `supporting_evidence` says '-0.1 dropped to keep GNP >= 0 rule consistent'. The program therefore contradicts the specification it is supposed to implement, and the generated instances contain GNP = -0.1 rows that violate the stated semantic rule.",
+     "requested_revision": "Remove the -0.1 emission (keep 0 and 0.1) so generated GNP values satisfy GNP >= 0, matching the specification's semantic rule and its stated decision to drop -0.1. Alternatively, if the designer intends to keep -0.1, the specification must be changed to drop the GNP >= 0 rule and the supporting_evidence note; but the current mismatch must be resolved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` forces `name_row[k] = v` for forced_names = ['Cyprus','cyprus','Italy','italy','China','china'] and then calls `_rebalance_duplicates`. `_rebalance_duplicates` only checks the duplicate share and, when dup_rows < lo, copies `rng.choice(shared)` into singleton slots \u2014 it can overwrite the forced boundary literals (they are singletons unless the shared pool happens to contain them). The spec requires `rebalance_after_forcing: true` for Country.Name, i.e. rebalancing must preserve the forced literals. Same pattern applies to City.Name forced literals ('PHL','phl','%PHL',...) and CountryLanguage.Language forced literals ('Portuguese',...), which are also passed through `_rebalance_duplicates` without protection.",
+     "requested_revision": "Make `_rebalance_duplicates` (or the callers) treat the forced boundary literals as pinned: never overwrite indices holding a forced literal, and rebalance only the remaining slots. Apply to Country.Name, City.Name, and CountryLanguage.Language."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` reserves 'USA' and 'usa' by writing `code_row[0]='USA'; code_row[1]='usa'`, then in the uniqueness loop does `seen.discard(r)` for reserved literals and skips the collision check only when `c in reserved`. But `reserved` is a list, and the loop condition `if c in seen and c not in reserved` allows a *second* occurrence of 'USA' (e.g. if `rng.choice` produced 'USA' elsewhere) to be emitted, because `c in reserved` is true for any 'USA'. This can produce duplicate Country.Code values, which the writer then silently drops (execution feedback shows `rows_skipped: {Country: 54}` \u2014 54 of 800 Country rows dropped, consistent with PK/unique collisions). The spec requires `reserve_before_uniqueness: true` for Country.Code, meaning the reserved literals must be emitted exactly once and not collide.",
+     "requested_revision": "Track reserved literals as a set of already-emitted values (e.g. `emitted_reserved = set()`), and in the uniqueness loop treat a reserved literal as allowed only if it has not yet been emitted; otherwise perturb it like any other collision. Also verify the 54 dropped Country rows are not caused by this bug (they may be legitimate PK collisions from the compact DB, but the reserved-literal logic should be fixed regardless)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` computes `sa = _ensure_group_variation(rng, [int(x) for x in sa], groups, 0, 2_000_000)` then `sa = [float(x) for x in sa]`. This truncates SurfaceArea to integers, losing the 2-decimal precision required by the generic rule `real_not_null: keep 2 decimals`. It also overwrites the tie values set earlier (`sa[0]=sa[1]=sa[2]=tie_v`, `sa[3]=sa[4]=mn`) if a group has only one distinct value, potentially destroying the `ties_for_order_limit` target for SurfaceArea. The spec requires both `rows_with_different_values` (grouped by Continent) and `ties_for_order_limit` at rank 1 ASC and DESC.",
+     "requested_revision": "Apply `_ensure_group_variation` to SurfaceArea without integer truncation (use a float-aware variant), and ensure the tie values are preserved (e.g. re-apply ties after group variation, or exclude tie indices from the variation pass)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_country_generated` sets `le = _ensure_group_variation(rng, [x if x is not None else 0.0 for x in le], groups, 0, 100)` then `le = [None if le_null[i] else le[i] for i in range(n)]`. This replaces NULL LifeExpectancy values with 0.0 before group variation, so a group whose only non-NULL values were NULL now gets 0.0 and a perturbed value \u2014 but the NULL mask is re-applied afterward, so the 0.0 may be re-nulled, leaving the group with a single distinct value. More importantly, the spec's `rows_with_different_values` for LifeExpectancy is grouped by Continent and must hold for non-NULL operands; the current code can violate it when NULLs dominate a group. Also `_ensure_group_variation` uses `rng.randint(lo, hi)` which returns ints, so LifeExpectancy (REAL) gets integer values, losing the 1-decimal precision.",
+     "requested_revision": "Compute group variation on the non-NULL subset only, and use a float-aware variation that preserves the REAL type and 1-decimal precision. Ensure at least two distinct non-NULL values per Continent group with >=2 non-NULL rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec_gen.py `_language_generated` builds `fk_pool = list(dict.fromkeys(existing_fk + codes))` where `codes` are the *generated* Country codes. But `build_spec_instance` calls `_language_generated` with `codes = country.get('codes')` \u2014 the generated codes \u2014 and the writer appends Country rows before CountryLanguage rows (table_order). However, the generated Country codes include 'USA' and 'usa', and the compact DB may already contain 'USA'. The writer's `seen_pk` for CountryLanguage is built from `existing[t]` (compact rows) plus the batch, so a generated CountryLanguage row referencing a generated Country code is fine only if that Country row was actually inserted. The execution feedback shows `rows_skipped: {Country: 54}` \u2014 54 Country rows were dropped, so any CountryLanguage row referencing a dropped Country code becomes an FK violation. The feedback reports `fk_violations: 0`, but this is because `pragma foreign_keys = OFF` in the writer; the integrity check may be run separately. This is a latent FK-consistency risk: generated child rows can reference parent codes that the writer dropped.",
+     "requested_revision": "Either (a) ensure generated Country codes are never dropped (fix the reserved-literal bug above and any other PK collision source), or (b) have the writer report which parent keys were dropped and have `_language_generated`/`_city_generated` only reference parent codes that were actually inserted. At minimum, add an explicit post-write FK check (with `pragma foreign_keys = ON`) to the execution feedback so this is verified, not assumed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `per_column_exceptions` includes `Country.Code` with `comparison_boundary` targets `['USA','usa']` and `reserve_before_uniqueness: true`, but the atomic stats show the comparison boundary ops are `PRED(country.code = 'USA')` and `PRED(country.code < countrylanguage.countrycode)` \u2014 the latter is a column-vs-column join predicate, not a literal boundary. The spec does not address the `country.code < countrylanguage.countrycode` boundary (which requires codes that sort before/after each other), and the program does not generate any such ordering relationship. Similarly, `CountryLanguage.CountryCode` comparison boundary includes `PRED(country.code < countrylanguage.countrycode)`, which the spec's `['USA','usa']` targets do not cover.",
+     "requested_revision": "Either add explicit targets for the column-vs-column comparison boundary (e.g. ensure some Country.Code values sort strictly before some CountryLanguage.CountryCode values, and vice versa) or document that this boundary is out of scope. The current spec silently omits it."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` field says group keys for `rows_with_different_values` are 'inferred (Continent for Country columns, CountryCode for City/CountryLanguage) since the atomic summary does not name them'. The atomic stats for `Country.SurfaceArea`, `Country.Population`, `Country.LifeExpectancy` say `qualifying_rows: '>= 2 per group with different values'` but do not name the group key. The spec's inference is plausible but unverified; the program implements it. This is an uncertain pattern, not a confirmed rule.",
+     "requested_revision": "Mark these group keys as uncertain in the spec (they already are in `uncertainty`), and consider whether the atomic stats' `group_sizes: 1` minor pattern (which appears for several columns) implies a different grouping. No code change required if the inference is accepted, but the spec should not present it as certain."
+    }
+   ],
+   "unresolved_checks": [
+    "The execution feedback reports `fk_violations: 0` but the writer runs with `pragma foreign_keys = OFF`; it is unclear whether the integrity check re-enables FK enforcement. The 54 dropped Country rows could cause latent FK violations in CountryLanguage/City if those rows reference dropped codes. This should be verified with an explicit FK check.",
+    "The `construction_pairs` feedback shows 46 of 265 eligible pairs separated, with no per-group breakdown. It is not possible to confirm from the feedback alone which patterns (e.g. `ties_for_order_limit`, `duplicates_for_distinct`, `null_rows`) are actually exercised. The spec's `null_targets` for `Country.HeadOfState` (~1%) and `Country.Capital` (~3%) are small; with n=40, `_null_mask` forces at least one NULL, which is correct per the NULL rule, but the actual share may deviate from the compact share.",
+    "The spec's `Country.GNP` boundary targets in the atomic stats are `[-0.1, 0, 0.1]`, but the spec's `per_column_exceptions` lists only `[0, 0.1]` and the `supporting_evidence` says -0.1 was dropped. The program emits -0.1 anyway. This is the primary blocking issue; the reviewer cannot confirm whether the designer intended -0.1 to be dropped (as the spec says) or kept (as the program does).",
+    "The `Country.Code2` tie target was removed by the designer because Code2 is UNIQUE; the program does not force a tie. This is consistent, but the atomic stats list `ties_for_order_limit` for Code2, so the spec's removal is a deliberate deviation that should be documented as such (it is, in `uncertainty`)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's per_column_exceptions for Country.Code comparison_boundary lists values ['USA','usa'] with reserve_before_uniqueness, but the atomic stats also show a column-vs-column boundary PRED(country.code < countrylanguage.countrycode) which the spec explicitly declares out of scope. The spec's uncertainty section acknowledges this. No rule is violated, but the column-vs-column boundary is not targeted.",
+     "requested_revision": "Optional: document that the column-vs-column comparison boundary is intentionally not targeted (already noted in uncertainty); no change required for pass."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's per_column_exceptions for Country.GNP lists values [0, 0.1] but the atomic stats show targets [-0.1, 0, 0.1]. The spec's supporting_evidence explains -0.1 was dropped to keep GNP >= 0 consistent with the semantic rule. This is a deliberate, documented deviation.",
+     "requested_revision": "No change required; the deviation is justified by the GNP >= 0 semantic rule and documented in supporting_evidence."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec_gen.py _country_generated emits GNP boundaries 0.0 and 0.1 only when n >= 6; with table size 40 this is satisfied. However, the boundary values are placed at fixed indices 0 and 1, which are also used for other pinned values (e.g., SurfaceArea ties at 0,1,2; LifeExpectancy ties at 0,1; GNPOld ties at 0,1). Overlapping pinned indices across columns is fine since they are different columns, but the GNP boundary is not marked pinned against any rebalancing (none applies to GNP). No actual conflict observed.",
+     "requested_revision": "No change required; GNP has no duplicate-rebalancing or group-variation pass that could overwrite the boundary values."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "writer.py reports rows_skipped for Country = 20 across 20 instances (1 per instance). This is the expected behavior from the reserved 'USA'/'usa' handling: the compact DB already contains 'USA', so the first generated 'USA' is allowed (emitted_reserved) but the writer's PK dedup against compact rows drops it. The spec says reserved literals are emitted exactly once and a second occurrence is perturbed; here the compact row already occupies 'USA', so the generated 'USA' is a duplicate of a compact row and is correctly dropped by the writer. This means the boundary literal 'USA' is not actually present as a *generated* row, only as a compact row.",
+     "requested_revision": "No change required for pass: the compact row already provides the 'USA' value, so the boundary is still represented in the instance. If strict 'generated row' presence is desired, the engineer could perturb the compact-colliding reserved literal instead of dropping it, but this is a minor refinement, not a blocker."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec_gen.py _language_generated and _city_generated draw FK values from existing compact FK values plus safe_codes. The safe_codes list is filtered to exclude compact codes, but the FK pool also includes existing compact FK values (existing_fk), which is correct. However, the writer's dropped_parent_keys are not actually fed back into the child FK pools at generation time (the docstring claims pre-filtering by simulating dedup, but the actual filtering only excludes compact codes, not generated codes that the writer might drop). In practice, fk_violations = 0 across all 20 instances, so no violation occurred.",
+     "requested_revision": "No change required for pass given fk_violations = 0. For robustness, the engineer could wire dropped_parent_keys from the writer back into a second-pass FK repair, but the current construction is safe because generated Country codes are made unique against compact codes before being offered to children."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec_gen.py _country_generated sets Capital from compact City.ID values only (city_ids from obs). Since City is generated after Country in build_spec_instance, generated City IDs are not available for Capital. The spec's uncertainty notes Capital is a soft reference and may be NULL or reference existing City rows. This is consistent with the spec.",
+     "requested_revision": "No change required; soft reference handled per spec."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's per_column_exceptions for Country.Code2 ties_for_order_limit was removed (deliberate deviation noted in uncertainty) because Code2 is UNIQUE. The atomic stats show a tie target for Code2, but forcing ties on a UNIQUE column would violate the constraint. The deviation is justified.",
+     "requested_revision": "No change required; deviation is justified by the UNIQUE constraint."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction pairs: 45 of 265 eligible pairs separated (17%). This is a low separation rate, but the instructions state a missing separation alone does not establish a generation error or prove query equivalence. The low rate may reflect the difficulty of separating pairs that differ only in column-vs-column comparisons or in aggregate boundaries not targeted by literal generation. No specific pair was inspected (held-out pairs not used).",
+    "The column-vs-column comparison boundary PRED(country.code < countrylanguage.countrycode) is not explicitly targeted; the spec acknowledges this and relies on incidental natural ordering. Whether this is sufficient for the intended query pairs is not verifiable without held-out labels.",
+    "Country.GNP boundary -0.1 is intentionally dropped; if any query pair depends on -0.1 specifically, it would not be separated. This is a documented, rule-justified deviation."
+   ],
+   "summary": "The program ran successfully (20/20 instances, 0 failures, 0 FK violations, 0 NOT NULL violations, 0 PK duplicates, reproducible). The specification and program are largely consistent: semantic rules (Continent enum, SurfaceArea/Population/GNP >= 0, LifeExpectancy 0-100, IndepYear 1000-2100, Code length 3, Code2 length 2, IsOfficial enum, Percentage 0-100) are implemented; NULL targets match the spec; boundary literals are emitted (with documented deviations for GNP -0.1 and Code2 ties); duplicate-share and group-variation rules are implemented with pinning of forced literals; FK dependencies are respected (fk_violations = 0). Minor issues are documented deviations and a low construction-pair separation rate that does not by itself indicate a generation error. Recommendation: pass."
+  }
+ ]
 }

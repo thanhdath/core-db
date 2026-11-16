@@ -1,5 +1,8 @@
-"""Random instance construction (fuzz/fuzz.py:83-196)."""
-from .values import _init_sampler
+"""Random instance construction (fuzz/fuzz.py:83-196) + round-1 spec construction."""
+from . import spec
+from .values import (_init_sampler, _null_mask, sample_lift, sample_people_birth_date,
+                     sample_people_birth_place, sample_people_height, sample_people_name,
+                     sample_people_weight, sample_total)
 
 
 def _filter(columns: dict, keep: list) -> dict:
@@ -34,7 +37,7 @@ def drop_unique_duplicates(table_meta, columns: dict) -> dict:
 
 
 def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
-    """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
+    """FK child columns draw from the parent's values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
     out = {}
     for cm in schema.tables[table].columns:
         key = (table, cm.name)
@@ -47,8 +50,17 @@ def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, r
 
 
 def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+    """Spec table sizes when known, else upstream rand_lin / level sizes (fuzz.py:83-110)."""
     sizes = {}
+    for lvl in schema.table_order:
+        for t in lvl:
+            if t in spec.TABLE_SIZES:
+                sizes[t] = spec.TABLE_SIZES[t]
+    if sizes:
+        for lvl in schema.table_order:
+            for t in lvl:
+                sizes.setdefault(t, 0)
+        return sizes
     if rng.random() < 0.5:
         for lvl in schema.table_order:
             for t in lvl:
@@ -63,8 +75,36 @@ def choose_table_sizes(schema, rng) -> dict:
     return sizes
 
 
+def _max_pk(schema, table: str) -> int:
+    """Largest existing integer primary-key value in the compact table (0 if none)."""
+    tm = schema.tables[table]
+    if not tm.primary_key:
+        return 0
+    pk = tm.primary_key[0]
+    vals = [v for v in schema.original_values.get((table, pk), []) if isinstance(v, int)]
+    return max(vals) if vals else 0
+
+
+def _spec_columns(schema, table: str, n: int, rng, pool: dict) -> dict:
+    """Spec-driven column values for the named tables (round 1)."""
+    cols: dict = {}
+    if table == 'people':
+        cols['Name'] = sample_people_name(n, rng, pool.get((table, 'Name'), []))
+        cols['Height'] = sample_people_height(n, rng, pool.get((table, 'Height'), []))
+        cols['Weight'] = sample_people_weight(n, rng)
+        cols['Birth_Date'] = sample_people_birth_date(n, rng)
+        cols['Birth_Place'] = sample_people_birth_place(n, rng)
+    elif table == 'body_builder':
+        snatch = sample_lift(n, rng, pool.get((table, 'Snatch'), []))
+        clean = sample_lift(n, rng, pool.get((table, 'Clean_Jerk'), []))
+        cols['Snatch'] = snatch
+        cols['Clean_Jerk'] = clean
+        cols['Total'] = sample_total(n, rng, snatch, clean)
+    return cols
+
+
 def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
+    """Build one random instance (fuzz.py:111-196) with round-1 spec construction."""
     p = 0.0 if rng.random() < 0.3 else 0.2
     order = [t for lvl in schema.table_order for t in lvl]
     samplers = {}
@@ -83,8 +123,27 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
         n = int(size.get(t, 0))
         cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)]
                 for cm in tm.columns if (t, cm.name) in samplers}
+        spec_cols = _spec_columns(schema, t, n, rng, literal_pool)
+        for c, vals in spec_cols.items():
+            if c in cols:
+                cols[c] = vals
+        if tm.primary_key:
+            pk = tm.primary_key[0]
+            base = _max_pk(schema, t)
+            cols[pk] = [base + 1 + i for i in range(n)]
         inst[t] = cols
-        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
+        fk_cols = fill_foreign_keys_consistently(inst, schema, t, n, rng)
+        cols.update(fk_cols)
+        for cm in tm.columns:
+            if (t, cm.name) in schema.fks and not cm.notnull and cm.pk_pos == 0:
+                mask = _null_mask(n, rng)
+                cols[cm.name] = [None if mask[i] else cols[cm.name][i] for i in range(n)]
+        for cm in tm.columns:
+            if cm.notnull or cm.pk_pos > 0 or (t, cm.name) in schema.fks:
+                continue
+            if cm.name in cols and any(v is not None for v in cols[cm.name]):
+                mask = _null_mask(n, rng)
+                cols[cm.name] = [None if mask[i] else cols[cm.name][i] for i in range(n)]
         cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
         cols = drop_unique_duplicates(tm, cols)
         for cm in tm.columns:

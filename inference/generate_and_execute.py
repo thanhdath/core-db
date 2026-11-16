@@ -1,8 +1,4 @@
-"""Generate SQL candidates with vLLM and execute every candidate through the execution API ($SQL_API_URL).
-
-Writes <output-dir>/predicted_sqls.json (reused when present) and <output-dir>/detailed_results.pkl, the input of
-vote_after_verify.py.
-"""
+"""Generate SQL candidates with vLLM and execute every candidate through the execution API ($SQL_API_URL)."""
 import argparse
 import json
 import multiprocessing
@@ -78,7 +74,8 @@ def load_questions(path, limit):
 
 
 def generate(args, questions):
-    """Completions per question: n samples with a fixed seed, in batches of --batch-size prompts."""
+    """Completions per question: n samples with a fixed seed (per request), all prompts in one generate call by
+    default."""
     import torch
     from transformers import AutoTokenizer, set_seed
     from vllm import LLM, SamplingParams
@@ -90,12 +87,14 @@ def generate(args, questions):
     bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     llm = LLM(model=args.model_path, dtype='bfloat16' if bf16 else 'float16', trust_remote_code=True,
               tensor_parallel_size=1, max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True)
+              gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=args.enforce_eager,
+              max_num_seqs=args.max_num_seqs)
     params = SamplingParams(temperature=args.temperature, max_tokens=MAX_TOKENS, stop=['<|endoftext|>'],
                             n=args.num_samples, seed=args.seed)
     completions = []
-    for start in range(0, len(prompts), args.batch_size):
-        outputs = llm.generate(prompts[start:start + args.batch_size], params)
+    batch = args.batch_size or len(prompts)
+    for start in range(0, len(prompts), batch):
+        outputs = llm.generate(prompts[start:start + batch], params)
         completions.extend([c.text for c in output.outputs] for output in outputs)
     return completions
 
@@ -125,7 +124,9 @@ def parse_args():
     parser.add_argument('-n', '--num-samples', type=int, default=30)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--batch-size', type=int, default=8, help='prompts per vLLM generate call')
+    parser.add_argument('--batch-size', type=int, default=0, help='prompts per vLLM generate call; 0 = all')
+    parser.add_argument('--max-num-seqs', type=int, default=512)
+    parser.add_argument('--enforce-eager', action='store_true', help='disable CUDA graphs (low-memory GPUs only)')
     parser.add_argument('--limit', type=int, default=0, help='first N questions only; 0 = all')
     parser.add_argument('--gpu-memory-utilization', type=float, default=0.85)
     parser.add_argument('--max-model-len', type=int, default=4096)

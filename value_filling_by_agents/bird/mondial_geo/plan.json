@@ -1,50 +1,961 @@
 {
  "db": "mondial_geo",
- "operator_io_quirks": [
-  "Mixed-case table names (ethnicGroup, isMember, locatedOn, mergesWith, mountainOnIsland, geo_*) and mixed-case columns (Country1, Population_Growth, Infant_Mortality, SourceLongitude) \u2014 must be double-quoted verbatim.",
-  "FKs declared without explicit parent column (parent_col null) => parent column = child column name; e.g. borders.Country1/Country2 -> country.Code, city.Country -> province.Country AND country.Code (two FKs on same child col).",
-  "city has TWO FKs on Country (to province and to country) and one on Province (to province); located/locatedOn/organization have 5-8 FKs each, several sharing a child column (Province->province, Province->city; Country->province, Country->country).",
-  "Composite PKs everywhere: borders(Country1,Country2), city(Name,Province), encompasses(Country,Continent), geo_*(Province,Country,X), locatedOn(City,Province,Country,Island), mergesWith(Sea1,Sea2), province(Name,Country), language/religion/ethnicGroup(Name,Country).",
-  "Tables with NO primary key: islandIn, located \u2014 sample_fresh_primary_keys must no-op; drop_unique_duplicates only applies to declared unique cols.",
-  "Self-referencing-ish: river.Lake -> lake.Name and lake.River -> river.Name (mutual FK between river and lake) \u2014 process_order must break the cycle deterministically; also river.River -> river.Name is a self-FK on the same table.",
-  "mountain table has 0 rows (empty parent) \u2014 mountainOnIsland.Mountain FK draws from empty parent => NULLs, but Mountain is NOT NULL => all rows fail insert; TS will produce an empty mountainOnIsland.",
-  "organization.Established and politics.Independence are declared DATE but stored as TEXT 'YYYY-MM-DD' (e.g. '1974-02-18'); ts_fuzzer dispatches to Date|Number(int elements) \u2014 first element parses as int? no, so Date fuzzer with template %Y-%m-%d.",
-  "country.Name has UNIQUE constraint (ix_county_Name) and organization.Name has UNIQUE (ix_organization_OrgNameUnique) \u2014 drop_unique_duplicates will thin these tables.",
-  "country.Capital/Province null_rate 0.008, city.Longitude/Latitude null_rate 0.743, islandIn.River null_rate 0.997 (only value 'River'), located.Lake null_rate 0.942 \u2014 heavy NULL columns; TS Number/String samplers drop None elements so fresh draws dominate.",
-  "islandIn has no PK and 4 nullable FKs (Island,Sea,Lake,River) \u2014 every row is a fresh draw; no dedup.",
-  "All declared types are TEXT/REAL/INTEGER/DATE only \u2014 no BOOL/BIT/YEAR/CHAR(n)/VARCHAR(n) args, so Number scale=0 precision=0 for REAL/INTEGER, String length default 20."
- ],
- "operator_ts_expectations": [
-  "String fuzzer for all TEXT columns: 5 original samples + distinct literal-pool values, then w.p. p fresh random strings over 'a-zA-Z 0-9()' length 0-20, then 50% contaminate (suffix/prefix/around/drop-char). Country codes like 'AFG','A' will be replaced by random junk => joins on country.Code still work (FK consistency) but WHERE Code='AFG' style predicates miss.",
-  "Number fuzzer for REAL/INTEGER: scale=0 => range [-1,1] for REAL, [-1,1] for INTEGER (is_int), unsigned false; list range quirk sets upper end to full-range max => fresh draws are tiny floats in [-1,1] plus +-1/+-2 int perturbations. Population/Area/GDP values become ~0-2 => range predicates (Population > 1e6) return nothing => FN.",
-  "Date fuzzer for organization.Established / politics.Independence: template %Y-%m-%d from '1974-02-18' style; range = min..max of parsed elements; fresh dates uniform in that range; p=0.2 means 20% element reuse. Year-extraction queries (strftime('%Y',...)) plausible; but exact-date equality misses.",
-  "FK consistency: child FK columns draw from parent's FINAL filtered values with replacement => many duplicate child rows; composite-PK tables (geo_*, locatedOn, encompasses) get PK-duplicate rows dropped, so effective row count << requested size.",
-  "Empty parent mountain => mountainOnIsland.Mountain all NULL => NOT NULL violation => 0 rows inserted; queries on mountainOnIsland return empty => FN.",
-  "Self-FK river.River -> river.Name: child draws from parent's already-generated Name column (same table, drawn earlier in column order) \u2014 plausible but river.River values are river names, not 'Rhein' style tributary names.",
-  "Mutual river<->lake FK: whichever table is level-0 gets fresh values, the other draws from it; lake.River and river.Lake become consistent but semantically swapped (lake.River = lake names).",
-  "country.Name UNIQUE + organization.Name UNIQUE: drop_unique_duplicates removes rows, so country/organization shrink below requested size; FK children then reference fewer parents.",
-  "islandIn (no PK, 4 nullable FKs): every row independent; Lake/River mostly NULL (parent draws from small sets, but null_rate 0.98/0.997 in original is not reproduced \u2014 TS draws non-null from parent).",
-  "String fuzzer on country.Code: 5 original codes + pool codes, then fresh random strings; FK children (economy.Country, encompasses.Country, etc.) draw from country.Code's final values => consistent but random 3-char junk; queries filtering Code IN ('USA','F','D') miss.",
-  "Number fuzzer on Percentage columns (encompasses, ethnicGroup, language, religion): range [-1,1] fresh draws => percentages outside [0,100] => SUM(Percentage) predicates and >50 filters miss.",
-  "No BOOL/BIT/YEAR columns; no crash-fallback types; no text-stored dates other than the two DATE columns; no storage-class contradictions (all REAL stored as real, INTEGER as integer, TEXT as text)."
- ],
- "challenger_refs": [
-  "G3",
-  "g9a6f846c",
-  "G5",
-  "g6d68be6b",
-  "G9",
-  "G31",
-  "G10",
-  "G25",
-  "G32",
-  "G7"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_primary_key": "Fresh unique token per row: '<table>_<n>' or a realistic name from a small pool; never NULL; never duplicated.",
+   "text_fk": "Copy an existing parent key value; for join columns also emit parent rows without children and (if nullable) NULL foreign keys.",
+   "text_generic": "Short realistic token from a small pool; near-variants (case changes, one-char edits) for equality/LIKE literals; NULL only if column nullable.",
+   "integer_quantity": "Positive integer in [1, 1000000]; boundary values at listed literals and one step on each side.",
+   "integer_population": "Non-negative integer in [0, 1000000000]; boundary values at listed literals and one step on each side.",
+   "real_measure": "Non-negative real in [0, 10000000]; boundary values at listed literals and one step on each side.",
+   "real_percentage": "Real in [0, 100].",
+   "real_coordinate": "Longitude in [-180, 180], Latitude in [-90, 90].",
+   "date_generic": "ISO date 'YYYY-MM-DD' between 1900-01-01 and 2000-12-31.",
+   "null_share": "For each nullable column, at least one NULL row per instance; share follows compact DB share (0.5-30%).",
+   "duplicates_for_distinct": "On DISTINCT-target columns, allow 20-50% duplicate values.",
+   "ties_for_order_limit": "On ORDER-target columns, plant ties at listed ranks (1,3,4) in both ASC and DESC directions.",
+   "aggregate_boundary": "On COUNT-target columns, plant group sizes 0,1,2,4,5,6 to straddle HAVING thresholds.",
+   "unmatched_join_rows": "For each join column, include parent rows with no children and (if nullable) child rows with NULL FK."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "country.Code",
+     "city.Country",
+     "province.Country",
+     "economy.Country",
+     "organization.Country",
+     "politics.Country",
+     "encompasses.Country",
+     "city.Province",
+     "province.Name",
+     "mountain.Name",
+     "geo_mountain.Mountain",
+     "organization.City",
+     "city.Name"
+    ]
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": [
+     "country.Code",
+     "country.Name",
+     "province.Name",
+     "country.Population",
+     "economy.Country",
+     "city.Name",
+     "organization.Country",
+     "politics.Country",
+     "continent.Name",
+     "mountain.Name",
+     "encompasses.Continent",
+     "geo_mountain.Mountain",
+     "economy.GDP",
+     "country.Area",
+     "organization.City"
+    ]
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "country.Name",
+     "organization.Name",
+     "country.Code",
+     "economy.Country",
+     "mountain.Name",
+     "geo_mountain.Mountain",
+     "organization.City"
+    ]
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "country.Name",
+     "country.Population",
+     "organization.Country",
+     "politics.Country",
+     "economy.GDP",
+     "country.Area",
+     "organization.Name"
+    ]
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "country.Name",
+     "organization.Country",
+     "encompasses.Continent"
+    ]
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": [
+     "country.Name",
+     "city.Name",
+     "organization.Name",
+     "organization.Country",
+     "organization.City",
+     "continent.Name",
+     "mountain.Name",
+     "economy.Country",
+     "politics.Country"
+    ]
+   },
+   {
+    "pattern": "null_rows",
+    "targets": [
+     "country.Population",
+     "economy.GDP"
+    ]
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": [
+     "country.Name",
+     "country.Code",
+     "organization.Country"
+    ]
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": [
+     "country.Population",
+     "economy.GDP",
+     "country.Area"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "borders.Country1",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "borders.Country2",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "city.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "city.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "economy.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "encompasses.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "encompasses.Continent",
+    "parent": "continent.Name",
+    "copied": []
+   },
+   {
+    "child": "ethnicGroup.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_desert.Desert",
+    "parent": "desert.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_desert.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_desert.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_estuary.River",
+    "parent": "river.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_estuary.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_estuary.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_island.Island",
+    "parent": "island.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_island.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_island.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_lake.Lake",
+    "parent": "lake.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_lake.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_lake.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_mountain.Mountain",
+    "parent": "mountain.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_mountain.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_mountain.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_river.River",
+    "parent": "river.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_river.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_river.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_sea.Sea",
+    "parent": "sea.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_sea.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_sea.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_source.River",
+    "parent": "river.Name",
+    "copied": []
+   },
+   {
+    "child": "geo_source.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "geo_source.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "islandIn.Island",
+    "parent": "island.Name",
+    "copied": []
+   },
+   {
+    "child": "islandIn.Sea",
+    "parent": "sea.Name",
+    "copied": []
+   },
+   {
+    "child": "islandIn.Lake",
+    "parent": "lake.Name",
+    "copied": []
+   },
+   {
+    "child": "islandIn.River",
+    "parent": "river.Name",
+    "copied": []
+   },
+   {
+    "child": "isMember.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "isMember.Organization",
+    "parent": "organization.Abbreviation",
+    "copied": []
+   },
+   {
+    "child": "language.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "located.City",
+    "parent": "city.Name",
+    "copied": []
+   },
+   {
+    "child": "located.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "located.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "located.River",
+    "parent": "river.Name",
+    "copied": []
+   },
+   {
+    "child": "located.Lake",
+    "parent": "lake.Name",
+    "copied": []
+   },
+   {
+    "child": "located.Sea",
+    "parent": "sea.Name",
+    "copied": []
+   },
+   {
+    "child": "locatedOn.City",
+    "parent": "city.Name",
+    "copied": []
+   },
+   {
+    "child": "locatedOn.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "locatedOn.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "locatedOn.Island",
+    "parent": "island.Name",
+    "copied": []
+   },
+   {
+    "child": "mergesWith.Sea1",
+    "parent": "sea.Name",
+    "copied": []
+   },
+   {
+    "child": "mergesWith.Sea2",
+    "parent": "sea.Name",
+    "copied": []
+   },
+   {
+    "child": "mountainOnIsland.Mountain",
+    "parent": "mountain.Name",
+    "copied": []
+   },
+   {
+    "child": "mountainOnIsland.Island",
+    "parent": "island.Name",
+    "copied": []
+   },
+   {
+    "child": "organization.City",
+    "parent": "city.Name",
+    "copied": []
+   },
+   {
+    "child": "organization.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "organization.Province",
+    "parent": "province.Name",
+    "copied": []
+   },
+   {
+    "child": "politics.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "politics.Dependent",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "population.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "province.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "religion.Country",
+    "parent": "country.Code",
+    "copied": []
+   },
+   {
+    "child": "river.Lake",
+    "parent": "lake.Name",
+    "copied": []
+   },
+   {
+    "child": "target.Country",
+    "parent": "country.Code",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "borders",
+    "column": "Length",
+    "formula": "Length > 0"
+   },
+   {
+    "table": "city",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "city",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "city",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "continent",
+    "column": "Area",
+    "formula": "Area > 0"
+   },
+   {
+    "table": "country",
+    "column": "Area",
+    "formula": "Area > 0"
+   },
+   {
+    "table": "country",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "desert",
+    "column": "Area",
+    "formula": "Area > 0"
+   },
+   {
+    "table": "desert",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "desert",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "economy",
+    "column": "GDP",
+    "formula": "GDP >= 0"
+   },
+   {
+    "table": "economy",
+    "column": "Agriculture",
+    "formula": "Agriculture BETWEEN 0 AND 100"
+   },
+   {
+    "table": "economy",
+    "column": "Service",
+    "formula": "Service BETWEEN 0 AND 100"
+   },
+   {
+    "table": "economy",
+    "column": "Industry",
+    "formula": "Industry BETWEEN 0 AND 100"
+   },
+   {
+    "table": "economy",
+    "column": "Inflation",
+    "formula": "Inflation BETWEEN -100 AND 1000"
+   },
+   {
+    "table": "encompasses",
+    "column": "Percentage",
+    "formula": "Percentage BETWEEN 0 AND 100"
+   },
+   {
+    "table": "ethnicGroup",
+    "column": "Percentage",
+    "formula": "Percentage BETWEEN 0 AND 100"
+   },
+   {
+    "table": "island",
+    "column": "Area",
+    "formula": "Area >= 0"
+   },
+   {
+    "table": "island",
+    "column": "Height",
+    "formula": "Height >= 0"
+   },
+   {
+    "table": "island",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "island",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "lake",
+    "column": "Area",
+    "formula": "Area >= 0"
+   },
+   {
+    "table": "lake",
+    "column": "Depth",
+    "formula": "Depth >= 0"
+   },
+   {
+    "table": "lake",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "lake",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "language",
+    "column": "Percentage",
+    "formula": "Percentage BETWEEN 0 AND 100"
+   },
+   {
+    "table": "mountain",
+    "column": "Height",
+    "formula": "Height >= 0"
+   },
+   {
+    "table": "mountain",
+    "column": "Longitude",
+    "formula": "Longitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "mountain",
+    "column": "Latitude",
+    "formula": "Latitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "population",
+    "column": "Population_Growth",
+    "formula": "Population_Growth BETWEEN -100 AND 100"
+   },
+   {
+    "table": "population",
+    "column": "Infant_Mortality",
+    "formula": "Infant_Mortality >= 0"
+   },
+   {
+    "table": "province",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "province",
+    "column": "Area",
+    "formula": "Area >= 0"
+   },
+   {
+    "table": "religion",
+    "column": "Percentage",
+    "formula": "Percentage BETWEEN 0 AND 100"
+   },
+   {
+    "table": "river",
+    "column": "Length",
+    "formula": "Length >= 0"
+   },
+   {
+    "table": "river",
+    "column": "SourceLongitude",
+    "formula": "SourceLongitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "river",
+    "column": "SourceLatitude",
+    "formula": "SourceLatitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "river",
+    "column": "EstuaryLongitude",
+    "formula": "EstuaryLongitude BETWEEN -180 AND 180"
+   },
+   {
+    "table": "river",
+    "column": "EstuaryLatitude",
+    "formula": "EstuaryLatitude BETWEEN -90 AND 90"
+   },
+   {
+    "table": "sea",
+    "column": "Depth",
+    "formula": "Depth >= 0"
+   },
+   {
+    "table": "isMember",
+    "column": "Type",
+    "formula": "Type IN ('member','nonregional member','observer','National Society','Part I','Category I','National Olympic Committee')"
+   },
+   {
+    "table": "island",
+    "column": "Type",
+    "formula": "Type IN ('volcanic','lime','coral','atoll')"
+   },
+   {
+    "table": "lake",
+    "column": "Type",
+    "formula": "Type IN ('artificial','salt','caldera','impact','acid','crater')"
+   },
+   {
+    "table": "target",
+    "column": "Target",
+    "formula": "Target IN ('Christian','non-Christian')"
+   },
+   {
+    "table": "politics",
+    "column": "Independence",
+    "formula": "Independence <= date('now')"
+   },
+   {
+    "table": "organization",
+    "column": "Established",
+    "formula": "Established <= date('now')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "continent": 5,
+   "country": 40,
+   "province": 80,
+   "city": 120,
+   "economy": 40,
+   "population": 40,
+   "politics": 40,
+   "target": 40,
+   "encompasses": 45,
+   "ethnicGroup": 60,
+   "language": 50,
+   "religion": 60,
+   "borders": 50,
+   "desert": 15,
+   "island": 30,
+   "lake": 25,
+   "mountain": 30,
+   "river": 30,
+   "sea": 15,
+   "organization": 30,
+   "isMember": 200,
+   "geo_desert": 30,
+   "geo_estuary": 30,
+   "geo_island": 30,
+   "geo_lake": 30,
+   "geo_mountain": 30,
+   "geo_river": 40,
+   "geo_sea": 40,
+   "geo_source": 30,
+   "islandIn": 40,
+   "located": 60,
+   "locatedOn": 50,
+   "mergesWith": 20,
+   "mountainOnIsland": 20
+  },
+  "null_targets": [
+   "country.Capital",
+   "country.Province",
+   "city.Population",
+   "city.Longitude",
+   "city.Latitude",
+   "economy.GDP",
+   "economy.Agriculture",
+   "economy.Service",
+   "economy.Industry",
+   "economy.Inflation",
+   "island.Islands",
+   "island.Area",
+   "island.Height",
+   "island.Type",
+   "lake.Depth",
+   "lake.Altitude",
+   "lake.Type",
+   "lake.River",
+   "river.River",
+   "river.Lake",
+   "river.Sea",
+   "river.Mountains",
+   "river.SourceAltitude",
+   "organization.City",
+   "organization.Country",
+   "organization.Province",
+   "organization.Established",
+   "politics.Independence",
+   "politics.Dependent",
+   "politics.Government",
+   "population.Population_Growth",
+   "population.Infant_Mortality",
+   "province.Area",
+   "province.Capital",
+   "province.CapProv",
+   "islandIn.Sea",
+   "islandIn.Lake",
+   "islandIn.River",
+   "located.River",
+   "located.Lake",
+   "located.Sea"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "economy.Agriculture BETWEEN 0 AND 100",
+    "rows": [
+     "A:2.0",
+     "AFG:65.0",
+     "AL:55.0"
+    ]
+   },
+   {
+    "formula": "economy.Service BETWEEN 0 AND 100",
+    "rows": [
+     "A:34.0",
+     "AFG:15.0",
+     "AL:56.0"
+    ]
+   },
+   {
+    "formula": "economy.Industry BETWEEN 0 AND 100",
+    "rows": [
+     "A:64.0",
+     "AFG:20.0",
+     "AL:32.0"
+    ]
+   },
+   {
+    "formula": "encompasses.Percentage BETWEEN 0 AND 100",
+    "rows": [
+     "A:100.0",
+     "AFG:90.0",
+     "AG:10.0"
+    ]
+   },
+   {
+    "formula": "ethnicGroup.Percentage BETWEEN 0 AND 100",
+    "rows": [
+     "GE:1.8",
+     "EAU:4.0",
+     "DJI:35.0"
+    ]
+   },
+   {
+    "formula": "language.Percentage BETWEEN 0 AND 100",
+    "rows": [
+     "AFG:50.0",
+     "NAM:60.0",
+     "MK:21.0"
+    ]
+   },
+   {
+    "formula": "religion.Percentage BETWEEN 0 AND 100",
+    "rows": [
+     "BERM:11.0",
+     "AUS:26.1",
+     "AXA:29.0"
+    ]
+   },
+   {
+    "formula": "borders.Length > 0",
+    "rows": [
+     "A-CH:164.0",
+     "AFG-CZ:362.0",
+     "AL-D:784.0"
+    ]
+   },
+   {
+    "formula": "river.Length >= 0",
+    "rows": [
+     "Aare:288.0",
+     "Adda:313.0",
+     "Akagera:275.0"
+    ]
+   },
+   {
+    "formula": "sea.Depth >= 0",
+    "rows": [
+     "Andaman Sea:3113.0",
+     "Arabian Sea:5203.0",
+     "Arctic Ocean:5608.0"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "mountain table is empty in the sample; its range rules are inferred from geo_mountain and general conventions.",
+   "isMember.Type has 24 distinct values in the sample; the enum lists the 7 shown values only.",
+   "island.Type and lake.Type enums list only the values shown in the sample.",
+   "target.Target enum lists only the 2 shown values.",
+   "Date order rules for politics.Independence and organization.Established use date('now') as upper bound; no paired date columns exist.",
+   "No calculated-column formulas were found in the sample; all rules are range/enum/order constraints."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "responsible_agent": "engineer",
+     "title": "Foreign keys are resolved against the wrong parent column because of dangling-FK dropping, so FK children reference non-existent parents",
+     "evidence": "Execution feedback: every instance has new_fk_violations (e.g. unit 0000: 1925), aggregate 39717 FK violations; top violations: isMember.Country -> country.Code (3070 rows), isMember.Organization -> organization.Abbreviation (2571), city.Province,Country -> province.Name,Country (2204), province.Country -> country.Code (1253), located.City,Province -> city.Name,Province (1156). All 20 of 20 instances are invalid with reason new_integrity_failures. Stderr shows schema.py dropping FKs: 'dropping dangling FK province.Country -> country.Country', 'population.Country -> country.Country', 'religion.Country -> country.Country', 'target.Country -> country.Country', 'river.Lake -> lake.Lake'. The schema.sql declares these as references to country (primary key Code) and lake (primary key Name), so the parent column names are 'Country'/'Lake' rather than 'Code'/'Name'. read_schema resolves parent column via r[4] if present else r[3]; when the declared referenced table exists but the referenced column name does not match, the code drops the FK instead of falling back to the referenced table's primary key. Consequently schema.fks lacks entries like (province,'Country')->(country,'Code'), (isMember,'Country')->(country,'Code'), (city no longer gets correct multi-column FK), etc. fill_foreign_keys_consistently only fills columns that are in schema.fks; missing entries fall back to generic samplers (random text/number), producing orphan FKs. Furthermore, city.Province/Country is a composite FK (Province,Country)->province(Name,Country); even when the single-column FK resolves, the composite-pair constraint is violated because children draw each column independently (city.Province via sampler, and its Country not constrained to the same province row). Same for located.City,Province -> city.Name,Province.",
+     "requested_revision": "Fix schema.read_schema so that a declared REFERENCES parent(Col) whose referenced column name does not match is resolved to the parent table's primary key column(s), only dropping the FK when the parent table itself is missing. Then implement composite-FK generation: for every multi-column FK (child columns resolving to a parent primary key of size>1), draw the tuple jointly from parent key tuples (compact + generated), not per-column. Verify by running with PRAGMA foreign_keys=ON during the check and asserting zero new FK violations across all instances. Also serialize UNMATCHED_JOIN/nullable child rows so they do not break the FK (NULL FK must be the whole composite, and parent-without-children must still be a real parent row)."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "NOT NULL / PK column constraints and matrix of NULLs must not be masked by FK-off writes; program disables foreign_keys during writing",
+     "evidence": "writer.write_instance_sqlite executes 'pragma foreign_keys = OFF', then executemany, and reports rows_ok = len(rows) even when no FK check runs. The construction feedback shows a stale 'rows_skipped': {} in the summary while integrity shows 39717 FK violations; the program therefore never detects the integrity errors it produces. The 0/20 valid instances follow directly.",
+     "requested_revision": "Keep foreign_keys=ON during writing (or validate in a second pass with a validator); report rows_skipped per table from real constraint failures; the CLI summary should include rows_added/rows_skipped counts, not just empty dicts. Add a validation step in the writer that counts FK and composite-FK violations for the written instance before os.replace, and raise/skip on non-zero."
+    },
+    {
+     "responsible_agent": "designer",
+     "title": "Specification asserts 'mountain table is empty in the sample' and gives an empty Conceptual framework, yet DB schema defines columns; NULL rule cannot be satisfied for many nullable columns because RANGES covers only a subset",
+     "evidence": "Execution feedback nullable_columns lines: borders.Length NULL 0/987, continent.Area 0/90, country.Area 0/321, country.Population 0/321, encompasses.Percentage 0/940, ethnicGroup.Percentage 0/1192, isMember.Type 0/3761, language.Percentage 0/960, province.Population 0/1555, religion.Percentage 0/1245, sea.Depth 0/286, target.Target 0/682, etc. These columns are nullable per schema but are not in NULL_TARGETS. The program's _plant_nulls only applies when key is in S.NULL_TARGETS and column is not NOT NULL and pk_pos==0, so un-listed nullable columns get 0 NULLs. The specification's generic 'null_share' rule says 'for each nullable column, at least one NULL row per instance', and the interface rule #7 reiterates this. The generated DB therefore violates the interface NULL rule for ~30 nullable columns. mountain.Type/Mountains are nullable and absent from NULL_TARGETS and RANGES/ENUMS.",
+     "requested_revision": "Either (a) enumerate all nullable columns in NULL_TARGETS (or derive NULL_TARGETS from the schema in the program rather than from an explicit list, treating primary-key/NOT NULL as exclusion), or (b) explicitly scope the null rule to a subset and document it. The interface rule states every nullable column must have at least one NULL row; do not leave nullable columns with 0 NULLs. Add mountain and mountain.Mountains/Type to NULL_TARGETS and provide a range for mountain.Height, mountain.Longitude/Latitude (they already exist in RANGES, but mountain rows are apparently not emitted, see row counts: None for mountain)."
+    },
+    {
+     "responsible_agent": "designer",
+     "title": "NULL rule and per-column exception design omit NOT NULL columns incorrectly vs. the DB schema",
+     "evidence": "NULL_TARGETS includes 'organization.Country', 'organization.City', 'politics.Dependent' \u2014 organization.Country is documented in the schema as NOT NULL in the FK creation? No, the schema for organization has Country TEXT with FK to country and is nullable. However, NULL_TARGETS does not include isMember.Type (which is NOT NULL per 'Type TEXT default 'member''), yet the spec says 'Type IN (member,...)' enum. The semantic enum for isMember.Type is present, but isMember.Type is NOT NULL \u2014 isMember appears only in NULL_TARGETS? It is not. In the execution feedback isMember.Type gets 0 NULLs, which is correct."
+    },
+    {
+     "responsible_agent": "designer",
+     "title": "Specification NULL_TARGETS does not distinguish the *whole composite-key column* vs. single-column nulls, causing composite PK/FK partial-null",
+     "evidence": "For located (City, Province) is FK to city and (Province, Country) is FK to province. In and of itself a null in located.City or located.Province will produce an underspecified FK; in SQLite a composite FK with a NULL component is not NULL-tolerated unless all referenced columns are NULL. The NULL_TARGETS adds 'located.River', 'located.Lake', 'located.Sea' only, so this is not the null target, but the underlying schema FK here cannot be satisfied without composite-key coherence. This is subsumed by the composite-FK issue but is worth being explicit in the specification: composite FKs must treat the whole tuple as the atomic unit for both NULLS and parent lookups."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "Group-size planting contradicts the stated intent; the function produces a single group of size 6, not groups of sizes 1,2,3",
+     "evidence": "instance.py _plant_group_sizes: out[1]=out[0]; out[2]=out[0]; out[3]=out[0]; out[4]=out[0]; out[5]=out[0] \u2014 this sets six entries to the value of the first element. The comment says 'make the first 6 values form groups of sizes 1,2,3' \u2014 that's false. Zero elements remain for group size 1 or 2 (there is no distinct value). With a starting value it forces one group of size 6, and no 'straddling' group sizes 0,1,2. The specified aggregate_boundary requires values 0,1,2,4,5,6 to straddle HAVING thresholds. The current implementation violates that."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "Forced minimum of at least one NULL row per nullable column regardless of compact-DB share introduces NULL rows in columns where the compact database has zero NULLs",
+     "evidence": "instance._plant_nulls: 'k = max(1, int(round(share * n)))' \u2014 round(share*n) can be 0 for small n or small share, and _null_share clamps to [0.005, 0.30]. For n small (e.g., n < 100) with share 0.005, k = 1. That tallies with the interface (at least one NULL), and is fine. But there are many nullable columns where both _null_share returns 0.05 default (because original_values is empty or all NULL/non-null): country.Capital get 10/321, country.Province 7/321. Actually looks fine for the columns listed in NULL_TARGETS. The issue is columns NOT listed; the interface wants them to get NULLs. That is the designer issue above."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "Unique constraints and duplicates: DUP_TARGETS includes 'country.Name', but country.Name is UNIQUE in schema \u2014 duplicates would violate unique constraint; currently no violation because the generator's 'sample_fresh_primary_keys' + generic samplers happen to produce distinct values, but the intent is not honored",
+     "evidence": "Execution feedback shows 0 new_duplicate_keys and 0 not_null violations, but the DUP_TARGETS ethic is to plant 20-50% duplicate values on DISTINCT-target columns. country.Name is UNIQUE per schema (constraint ix_county_Name). It is impossible to have duplicates. Yet DUP_TARGETS includes 'country.Name', 'country.Code', 'organization.Name' \u2014 these are all UNIQUE/PK columns. So DUP_TARGETS overlaps with UNIQUE/PK constraints and cannot be safely enforced. The program avoids enforcement by drop_unique_duplicates and sample_fresh_primary_keys filtering, so only columns not actually UNIQUE get duplicates (e.g., 'mountain.Name' PK? yes PK; 'economy.Country' PK; 'geo_mountain.Mountain' is part of a PK \u2014 duplicates there require variation of the composite tuple (Province, Country, Mountain) to stay unique, which the writer's PK-uniqueness filter should handle)."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "Mountain rows not emitted / referenced consistently in schema/feedback",
+     "evidence": "column statistics reference mountain.Name and mountain.Height patterns, and specification has mountain.Height and geometry rules; but nullable_columns and construction feedback do not show any 'mountain' row counts in generated rows (feedback lists mountain.Type 0/415). Yet aggregate counts show 415 mountain rows. That is not a bug per se. However, the specification's uncertainty states 'mountain table is empty in the sample'. If it were empty and there are semantic rules requiring the mountain table populated, that's inconsistent; rules and dependencies (mountainOnIsland -> mountain) would fail if mountain is empty. Since the generated DB shows mountain rows, the sampler covers it \u2014 but spec should be updated to reflect that mountain can be non-empty."
+    },
+    {
+     "responsible_agent": "designer",
+     "title": "Specification enumerates STRING_VARIANTS for equality/like but the program merges this with the elements pool; however the specification's example pairs need to be present as strings in the generated columns, only they route to FK roots via string values, which is not enforced for non-FK string columns",
+     "evidence": "literals.seed_literal_pool_from_queries routes to FK-root columns. The literal pool anchors on column-name match; for 'United States'/'Baghdad'/'Kerinci' etc., only country.Name, city.Name, continent.Name, mountain.Name, organization.City, ethnicGroup.Name, language.Name, located.Province are anchored. But specification's comparison_boundary for 'country.Name' includes 'United States' pattern with VALUES and also 'PRED(country.code >= ethnicgroup.country)'. The program does not produce 'United States' unless it appears in the literal pool via queries (it should, since queries likely contain 'United States')."
+    },
+    {
+     "responsible_agent": "engineer",
+     "title": "sample_fresh_primary_keys drops rows referencing the 'first kept' policy; combined with FK-consistent fill it may produce foreign rows that survive but point to pruned parents \u2014 not checked",
+     "evidence": "In write_instance, tables are written in topological order (dict insertion from schema.table_order, then parent-first). But FK fill for child rows draws from compact_parent + instance (already-produced child tables), not the *final* pruned set (sample_fresh_primary_keys/drop_unique_duplicates run after FK fill). For self- and cross-FKs, if sample_fresh_primary_keys drops parent rows, the child rows referencing them become orphans. This is a design bug: FK fill must occur after final parent pruning, or parents must be pruned by predicate that doesn't drop referenced rows. The execution feedback shows 39717 FK violations across all instances \u2014 consistent with this (and the schema FK-dropping bug above).",
+     "requested_revision": "Do FK fill *after* the parent table is finalized (after sample_fresh_primary_keys and drop_unique_duplicates). This is required even if the schema.py FK-dropping bug is fixed. Note the writer disables FKs, so this bug is silent."
+    }
+   ],
+   "unresolved_checks": [
+    "Concrete literal and boundary values required by the semantic rules (e.g., country.Population <= 5000000, country.Area > 10000000, economy.GDP > 1000000) were not explicitly verified in the generated instances because the check harness did not return per-column planted-literal presence. Request reviewer-run analysis of the instance files at the given paths.",
+    "The stratification of table sizes in choose_table_sizes (jitter * 0.5..1.5 vs 0.8..1.2) allows up to 2500 rows; the spec TABLE_SIZES is much smaller (e.g. country 40) \u2014 jitter fine, capped at 2500. The 1356 rows_added per instance in feedback is consistent with TABLE_SIZES after pruning; not clearly a violation, but the sizes for aggregate_boundary (country.name with HAVING COUNT(*) > 5, group sizes 0/1/2/4/5/6) may be too small in some instances to test HAVING thresholds robustly.",
+    "Whether the planted ties in TIE_TARGETS are actually placed at ranks 1,3,4 depends on subsequent order by \u2014 not directly verifiable from the summary. No per-instance tie analysis provided.",
+    "Data provenance for STRING_VARIANTS such as 'United States', 'Baghdad', 'Kerinci', 'Washington', etc. depends on the queries; the pool does include 2945 SQLs with 10917 values. The program routes them through FK roots only; whether the exact variants are present in the shipped instance is not directly measured in the feedback."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback: 'located.City: generated rows: NULL 0 / 22'. located.City is a nullable FK column (no NOT NULL in DDL) and the NULL rule requires at least one NULL row per nullable column per instance. The program's _is_nullable() returns (not cm.notnull) and cm.pk_pos == 0, so located.City should be eligible; the 0/22 count is likely because located rows are mostly skipped (1150 skipped / 22 added) and the surviving rows happen to be non-NULL. Per instruction 7 this is noted, not blocking.",
+     "requested_revision": "No blocking change required. Optionally ensure the NULL planting for located.City survives the row-skipping path (e.g. plant NULLs after FK fill and before the writer's per-row fallback), so the 'NULL 0 / n' line disappears."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows large rows_skipped counts for many tables (borders 290, city 799, geo_* 250-600, located 1150, locatedOn 984, isMember 993, organization 274). The writer falls back to row-by-row inserts and counts failures, so integrity is preserved (fk_violations 0, not_null 0, pk_duplicates 0), but a substantial fraction of generated rows are discarded. This is consistent with the specification's unmatched-join / NULL-FK rules interacting with composite FKs (e.g. geo_* tables require (Province, Country) to exist in province), but it reduces effective table sizes below TABLE_SIZES.",
+     "requested_revision": "No blocking change. Consider drawing composite-FK tuples only from parent key tuples that actually exist in the final parent set (the code already does this via _parent_key_tuples, but the parent set is pruned by sample_fresh_primary_keys/drop_unique_duplicates after FK fill), or re-filling FKs after pruning, to reduce skipped rows."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification uncertainty notes: 'mountain table is empty in the sample; its range rules are inferred', 'isMember.Type has 24 distinct values in the sample; the enum lists the 7 shown values only', 'island.Type and lake.Type enums list only the values shown', 'target.Target enum lists only the 2 shown values'. The program's ENUMS in specification.py encode exactly these partial enums, so generated values are restricted to a subset of the true domain. This is a documented uncertainty, not an error.",
+     "requested_revision": "No blocking change. If broader coverage is desired, widen the enums to the full observed distinct sets (e.g. isMember.Type 24 values) or fall back to the string sampler for enum columns with incomplete evidence."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "specification.py NULL_TARGETS includes 'city.Country' and 'organization.City' (duplicated) and omits several nullable columns present in the DDL (e.g. located.City, located.Province, located.Country, islandIn.Island, mountain.Mountains/Type/Height/Longitude/Latitude, borders.Length, continent.Area, country.Area/Population, encompasses.Percentage, ethnicGroup.Percentage, isMember.Type, language.Percentage, province.Population, religion.Percentage, sea.Depth, target.Target, desert.*, island.Longitude/Latitude, lake.Longitude/Latitude, river.*). The program derives the actual NULL targets at runtime from the schema (_is_nullable), so the static set is documentation only and does not affect behavior.",
+     "requested_revision": "No blocking change. Align the documented NULL_TARGETS set with the runtime-derived set to avoid confusion."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "construction_pairs: eligible 442, separated 106, unknown_executions 0. About 24% of eligible pairs are separated. Per instruction 4, a missing separation alone does not establish a generation error; the program implements the specified domains, boundaries, duplicates, ties, group sizes and unmatched-join rules by construction, and the execution feedback shows no integrity failures.",
+     "requested_revision": "No blocking change. If higher separation is desired, review whether boundary literals (BOUNDARIES) and string variants (STRING_VARIANTS) are actually reaching the generated rows for the specific columns involved; the samplers fold them into element pools but the p=0.2 fresh-draw path may bypass them."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 106/442 separated construction pairs cover the intended query families; held-out pairs were not inspected per instruction 6.",
+    "Whether the large rows_skipped counts materially reduce the effective table sizes below the specification's TABLE_SIZES for the affected tables (borders, city, geo_*, located, locatedOn, isMember, organization)."
+   ],
+   "summary": "The program ran successfully (20/20 valid instances, 0 failures, 0 FK/not-null/PK violations, compact rows preserved, reproducible). The specification's value domains (RANGES, ENUMS, BOUNDARIES, STRING_VARIANTS), table sizes, NULL rule, DISTINCT/ORDER/GROUP targets and unmatched-join targets are implemented by construction in specification.py, values.py and instance.py. Semantic rules have supporting evidence in the specification's supporting_evidence section; uncertain patterns (empty mountain table, partial enums) are documented as uncertainty. Minor issues noted (located.City NULL 0/22, high skip rates, partial enums, stale NULL_TARGETS documentation) do not block a pass."
+  }
+ ]
 }

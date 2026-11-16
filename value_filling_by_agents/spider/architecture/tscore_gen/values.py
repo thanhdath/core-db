@@ -182,6 +182,58 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Uniform over a small enum; 5% case variants of a listed value."""
+
+    def __init__(self, values: list, rng):
+        super().__init__(list(values), 0.0, float('inf'), rng)
+        self.values = list(values)
+
+    def sample(self):
+        r = self.rng
+        v = r.choice(self.values)
+        if r.random() < 0.05:
+            v = v.upper() if r.random() < 0.5 else v.lower()
+        return v
+
+
+class YearSampler(ColumnSampler):
+    """Integer year in [lo, hi]; boundary literals and one step each side are frequent."""
+
+    def __init__(self, lo: int, hi: int, boundary: list, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.lo, self.hi = lo, hi
+        self.boundary = [b for b in boundary if lo <= b <= hi]
+
+    def sample(self):
+        r = self.rng
+        if self.boundary and r.random() < 0.5:
+            b = r.choice(self.boundary)
+            return b + r.choice([-1, 0, 0, 1])
+        return r.randint(self.lo, self.hi)
+
+
+class PositiveRealSampler(ColumnSampler):
+    """Positive real with one decimal; ties at listed ranks and boundary values."""
+
+    def __init__(self, elements: list, rng, tie_values: list = None):
+        super().__init__([f for f in (_num(e) for e in elements) if f is not None and f > 0], 0.2,
+                         float('inf'), rng)
+        self.tie_values = [float(t) for t in (tie_values or []) if t is not None]
+
+    def sample(self):
+        r = self.rng
+        if self.tie_values and r.random() < 0.3:
+            return round(r.choice(self.tie_values), 1)
+        if self.elements and r.random() < 0.5:
+            v = r.choice(self.elements)
+        else:
+            v = r.uniform(1.0, 200.0)
+        if r.random() < 0.2:
+            v += r.choice([-1.0, 1.0, -2.0, 2.0])
+        return round(max(0.1, v), 1)
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -233,3 +285,22 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def near_variant(v: str, rng) -> str:
+    """Case change, trailing space or one-character edit of an existing value."""
+    if not isinstance(v, str) or not v:
+        return v
+    u = rng.random()
+    if u < 0.34:
+        return v.upper() if rng.random() < 0.5 else v.lower()
+    if u < 0.67:
+        return v + ' '
+    i = rng.randrange(len(v))
+    return v[:i] + rng.choice(string.ascii_letters) + v[i + 1:]
+
+
+def like_variants(literal: str) -> list:
+    """Values that match a LIKE pattern but differ from the exact literal."""
+    body = literal.rstrip('%')
+    return [body + 'o', body + ' x', body.lower(), body.upper(), body + '1']

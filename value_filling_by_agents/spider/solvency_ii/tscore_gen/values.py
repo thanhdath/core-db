@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -68,6 +70,32 @@ class NumberSampler(ColumnSampler):
         elif r.random() < 1 / 3:
             v -= 2 * d
         return self._cast(v)
+
+
+class PriceSampler(ColumnSampler):
+    """Products.Product_Price: uniform in [0.01, 5000.00] rounded to 4 decimals."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            v = r.choice(self.elements)
+        else:
+            v = self._fresh_or_reuse(lambda: r.uniform(spec.PRICE_LO, spec.PRICE_HI))
+        return round(max(spec.PRICE_LO, min(spec.PRICE_HI, v)), spec.PRICE_DECIMALS)
+
+
+class EnumSampler(ColumnSampler):
+    """CHAR code drawn from a small enumeration (semantic_rules_and_formulas)."""
+
+    def __init__(self, elements, p, max_l0, rng, values):
+        super().__init__(list(values), p, max_l0, rng)
+        self.values = list(values)
+
+    def sample(self):
+        return self.rng.choice(self.values)
 
 
 class StringSampler(ColumnSampler):
@@ -184,6 +212,11 @@ class BoolSampler(ColumnSampler):
 
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
+    key = (column.table, column.name)
+    if key in spec.ENUMS:
+        return EnumSampler(elements, p, max_l0, rng, spec.ENUMS[key])
+    if key == ('Products', 'Product_Price'):
+        return PriceSampler(elements, p, max_l0, rng)
     els = [e for e in elements if rng.random() < 0.9]
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []

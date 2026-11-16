@@ -1,49 +1,384 @@
 {
  "db": "dorm_1",
- "operator_io_quirks": [
-  "Mixed-case table names (Student, Dorm, Dorm_amenity, Has_amenity, Lives_in) and mixed-case columns (StuID, LName, Fname, city_code, dormid, amenid, stuid, room_number) \u2014 must quote with original spelling, compare .lower().",
-  "DDL uses backtick-quoted FK parents (`Dorm`(dormid)) \u2014 sqlite_master text must be replayed verbatim; backticks are valid sqlite quoting.",
-  "Dorm, Dorm_amenity, Has_amenity, Lives_in have NO primary key (pk=[]); only Student has PK StuID. sample_fresh_primary_keys must no-op on empty PK.",
-  "All columns notnull=0 (declared nullable) and null_rate=0.0 in original \u2014 TS will still emit NULLs from empty-parent FK draws and String/Number samplers; inserts succeed since NOT NULL is not declared.",
-  "Dorm.dormid is INTEGER but NOT declared PK/UNIQUE \u2014 FK parents Dorm(dormid) and Dorm_amenity(amenid) are non-unique parents; TS draws with replacement so child FK values may repeat, fine for sqlite (no FK enforcement).",
-  "Has_amenity and Lives_in are pure junction tables with composite FKs and no PK \u2014 duplicate (dormid,amenid) / (stuid,dormid) rows are possible and legal.",
-  "Lives_in.stuid distinct=31 vs Student rows=34 \u2014 some students have no dorm; FK child draws from parent's FINAL filtered values, so orphan-free but not surjective.",
-  "VARCHAR(1) columns Sex and Dorm.gender: TS String fuzzer with length range from elements (len 1) \u2014 fresh strings will be 1 char from CHARSET, not restricted to {F,M,X}.",
-  "VARCHAR(3) city_code: TS String length range [3,4) from elements \u2014 fresh values are 3-char random strings, not IATA-like.",
-  "Dorm.gender has 3 distinct values (X,M,F) while Student.Sex has 2 (F,M) \u2014 no cross-table constraint; TS treats them independently.",
-  "All storage classes match declared types (integer/text) \u2014 no affinity contradictions to survive.",
-  "Tiny tables (7\u201340 rows): choose_table_sizes level-0 = 1+30u and x4 per level will produce instances far larger than originals; no huge-table sampling path exercised here."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on StuID, Age, Major, Advisor, dormid, amenid, student_capacity, room_number: uniform in [-10^scale,10^scale] with scale=0 \u2192 integers in [-1,1] plus \u00b11/\u00b12 perturbation; list range overwritten to full range (upstream quirk) \u2192 fresh draws cluster near 0, not near original 1001/600/900.",
-  "StuID is single-column PK \u2192 max_l0=inf, so fresh PK draws never reuse; but Number range [-1,1] means PKs collide heavily \u2192 sample_fresh_primary_keys drops most rows, shrinking Student drastically.",
-  "String fuzzer on LName/Fname/dorm_name/amenity_name: 5 sampled originals + pool literals, p=0.2 fresh random over a-zA-Z 0-9() with length from element lengths, then 50% contaminate (suffix/prefix/drop) \u2192 implausible names, likely FN source for name-equality predicates.",
-  "String on Sex/gender (len 1): fresh 1-char strings from full charset \u2192 'F'/'M'/'X' predicates miss; FP risk when a random char coincidentally equals a queried value.",
-  "String on city_code (len 3): fresh 3-char strings, not real codes \u2192 city_code='BAL' style predicates mostly miss (FN).",
-  "FK columns (Has_amenity.dormid/amenid, Lives_in.stuid/dormid) draw from parent's final values with replacement \u2192 referential integrity holds but join cardinalities differ from original (Lives_in may have many rows per student).",
-  "Dorm and Dorm_amenity have no PK \u2192 no PK filtering; their dormid/amenid values come from Number sampler (near 0) while Has_amenity/Lives_in FK draws copy those same near-0 values \u2192 joins still match, but original 100/900 ranges lost.",
-  "No CHECK/UNIQUE constraints in DDL \u2192 drop_unique_duplicates is a no-op; all rows survive except PK-duplicate drops on Student.",
-  "Age/Major/Advisor near-0 values make range predicates (Age>20, Major=600) mostly false \u2192 FN; occasional \u00b11/\u00b12 perturbation gives spurious matches \u2192 FP.",
-  "student_capacity near-0 vs original 85\u2013400 \u2192 capacity comparisons (capacity>100) flip to mostly false.",
-  "No Date/Time/Bool/Bit columns \u2192 those fuzzers unused; no crash-fallback types (all dispatch cleanly to Number/String)."
- ],
- "challenger_refs": [
-  "G8",
-  "G9",
-  "G17",
-  "G6",
-  "G13",
-  "G14",
-  "G7",
-  "G16",
-  "G11",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_primary_key": "Sequential or random unique integers within a plausible range; never NULL; no duplicates; never overwritten by duplicate/group/null perturbations.",
+   "integer_foreign_key": "Sample from parent key pool; include NULL rows where nullable; include some values not present in parent (orphan) only if FK not enforced, otherwise always valid parent key.",
+   "integer_numeric": "Uniform random integer within [min, max] derived from statistics; include boundary values min and max and one step inside/outside where relevant.",
+   "varchar_short": "Random strings of length 1-12 from a small alphabet; include near-duplicate variants (case changes, one-character edits) and exact duplicates for DISTINCT columns.",
+   "varchar_code": "Random 3-letter uppercase codes; include duplicates and near-variants.",
+   "varchar_enum": "Uniform choice from the enumerated value list; include case variants where comparison boundary patterns exist.",
+   "null_share": "For nullable non-PK columns, generate at least one NULL row per instance; NULL share approximately matches the compact database share (0.0 in observed data, so use a small share like 5-10% to satisfy the NULL generation requirement). Primary-key and NOT NULL columns never receive NULL.",
+   "table_size_policy": "Generated rows per instance are drawn from the table_sizes_per_instance ranges; parent tables are filled before children; compact rows are copied first and never deleted or changed; generated rows are appended."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Dorm.dormid",
+    "pattern": "unmatched_join_rows, group_sizes, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "Has_amenity.dormid",
+      "Lives_in.dormid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ],
+     "note": "duplicates_for_distinct applies to the join result (COUNT(DISTINCT dorm.dormid) over Has_amenity join), not to the PK column itself"
+    }
+   },
+   {
+    "column": "Has_amenity.dormid",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, comparison_boundary, ties_for_order_limit",
+    "targets": {
+     "joins_with": [
+      "Dorm.dormid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "duplicate_share": "20-50 %",
+     "equal_and_one_step_from": [
+      "Has_amenity.dormid"
+     ],
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Dorm_amenity.amenity_name",
+    "pattern": "comparison_boundary, duplicates_for_distinct",
+    "targets": {
+     "values": [
+      "TV Lounge",
+      "tv lounge",
+      "Study Room",
+      "study room"
+     ],
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Has_amenity.amenid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Dorm_amenity.amenid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Dorm_amenity.amenid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Has_amenity.amenid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "note": "duplicates_for_distinct applies to the join result, not to the PK column"
+    }
+   },
+   {
+    "column": "Dorm.student_capacity",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Student.StuID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Lives_in.stuid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Lives_in.dormid",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Dorm.dormid"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Lives_in.stuid",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct",
+    "targets": {
+     "joins_with": [
+      "Student.StuID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true,
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Student.Fname",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Student.LName",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Student.Major",
+    "pattern": "group_sizes, rows_with_different_values, ties_for_order_limit",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "qualifying_rows": ">= 2 per group with different values",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Dorm.dorm_name",
+    "pattern": "group_sizes, like_near_variant",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "like_variants": [
+      "%onor%",
+      "%Donor%"
+     ]
+    }
+   },
+   {
+    "column": "Student.Sex",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "M",
+      "m"
+     ]
+    }
+   },
+   {
+    "column": "Student.Age",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Dorm.gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "F",
+      "f"
+     ]
+    }
+   },
+   {
+    "column": "Student.city_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "Has_amenity.dormid",
+    "parent_table": "Dorm",
+    "parent_column": "dormid",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Has_amenity.amenid",
+    "parent_table": "Dorm_amenity",
+    "parent_column": "amenid",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Lives_in.stuid",
+    "parent_table": "Student",
+    "parent_column": "StuID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Lives_in.dormid",
+    "parent_table": "Dorm",
+    "parent_column": "dormid",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Student",
+    "column": "Age",
+    "formula": "Age BETWEEN 16 AND 26",
+    "evidence": "Rows: 18,19,21,20,26,17,22,16 all within 16-26."
+   },
+   {
+    "table": "Student",
+    "column": "Sex",
+    "formula": "Sex IN ('F', 'M')",
+    "evidence": "Rows: F, M only."
+   },
+   {
+    "table": "Dorm",
+    "column": "gender",
+    "formula": "gender IN ('X', 'M', 'F')",
+    "evidence": "Rows: X, M, F only."
+   },
+   {
+    "table": "Dorm",
+    "column": "student_capacity",
+    "formula": "student_capacity > 0",
+    "evidence": "Rows: 85,116,355,400,128,40,256 all > 0."
+   },
+   {
+    "table": "Lives_in",
+    "column": "room_number",
+    "formula": "room_number > 0",
+    "evidence": "Rows: 105,112,124,215,333,113,334,332 all > 0."
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Student": 34,
+   "Dorm": 7,
+   "Dorm_amenity": 12,
+   "Has_amenity": 40,
+   "Lives_in": 31
+  },
+  "null_targets": [
+   "Student.LName",
+   "Student.Fname",
+   "Student.Age",
+   "Student.Sex",
+   "Student.Major",
+   "Student.Advisor",
+   "Student.city_code",
+   "Dorm.dorm_name",
+   "Dorm.student_capacity",
+   "Dorm.gender",
+   "Dorm_amenity.amenity_name",
+   "Has_amenity.dormid",
+   "Has_amenity.amenid",
+   "Lives_in.stuid",
+   "Lives_in.dormid",
+   "Lives_in.room_number"
+  ],
+  "supporting_evidence": {
+   "Student.Age": "Rows: (18,19,21,20,26,17,22,16) all within 16-26.",
+   "Student.Sex": "Rows: F, M only.",
+   "Dorm.gender": "Rows: X, M, F only.",
+   "Dorm.student_capacity": "Rows: 85,116,355,400,128,40,256 all > 0.",
+   "Lives_in.room_number": "Rows: 105,112,124,215,333,113,334,332 all > 0."
+  },
+  "uncertainty": "NULL shares are 0.0 in observed data but instruction 10 requires at least one NULL per nullable column; a small share (5-10%) is used. Primary-key columns (Dorm.dormid, Dorm_amenity.amenid, Student.StuID) and NOT NULL columns never receive NULL. Foreign key enforcement assumed; orphan rows only if FK not enforced. No formulas found beyond range/enum rules. Table sizes are fixed per instance as in the compact database; the generator must honor these sizes rather than randomizing them."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.valid = 0, validity.invalid = 20, reasons.compact_rows_missing = 20. The writer (tscore_gen/writer.py) is called from cli.py as `write_instance_sqlite(_G['schema'], inst, p)` with no `orig_path` argument, so `orig_path` defaults to None and the compact database is never copied. The function then only creates the schema DDL and inserts generated rows, so every instance lacks the original compact rows. This contradicts the writer docstring ('Copy the compact database, append generated rows') and the spec's intent that generated rows augment the compact database.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. add orig_path to the args dict in cli.py and call write_instance_sqlite(schema, inst, p, orig_path=a['orig'])), so each unit is a copy of the compact database with generated rows appended. Re-run and confirm validity.valid > 0 and compact_rows_missing = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_null_rule` plants NULLs on every column in spec['null_targets'], which includes primary-key and NOT NULL columns: Dorm.dormid (PK), Dorm_amenity.amenid (PK), Student.StuID is not in the list but Dorm.dormid and Dorm_amenity.amenid are. Execution feedback confirms NULLs were generated on Dorm.dormid (118/1340) and Dorm_amenity.amenid (162/1882). The NULL rule states NOT NULL / primary-key columns never get NULL. Integrity currently shows 0 not_null_violations only because the writer runs with `pragma foreign_keys = OFF` and SQLite does not enforce NOT NULL on INTEGER PRIMARY KEY the same way; the generated data still violates the stated rule.",
+     "requested_revision": "In `_apply_null_rule`, skip columns that are primary keys or declared NOT NULL (check schema ColumnMeta.pk_pos > 0 or notnull). Remove Dorm.dormid and Dorm_amenity.amenid from null_targets in spec.py (and specification.json if present). Re-run and confirm no NULLs on PK/NOT NULL columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_duplicates_for_distinct` and `_apply_group_sizes` overwrite values on columns that are primary keys or foreign keys (e.g. Dorm.dormid, Dorm_amenity.amenid, Lives_in.stuid). For Dorm.dormid this forces duplicate PK values, which are then only partially removed by `sample_fresh_primary_keys` (first occurrence kept), silently shrinking the table and breaking the intended group-size/duplicate-share patterns. For Lives_in.stuid, forcing duplicates is fine, but for Dorm.dormid the duplicate-share target conflicts with the PK uniqueness requirement. The spec lists Dorm.dormid with both `duplicates_for_distinct` and PK semantics; the program cannot satisfy both.",
+     "requested_revision": "Do not apply `duplicates_for_distinct` to primary-key columns; instead satisfy the duplicate-share pattern on a non-key column or via the join/group patterns. Update spec.py per_column for Dorm.dormid to drop `duplicates_for_distinct` (or document that the duplicate share is measured on the join result, not the PK column). Ensure `sample_fresh_primary_keys` does not silently drop rows that were meant to satisfy other patterns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_apply_rows_with_different_values` contains dead code: `if _is_int_type(next((cm.type_str for cm in []), '')): pass` \u2014 the generator is always empty, so the branch never runs and the perturbation logic is effectively a no-op for the intended type check. Also `_apply_unmatched_join_rows` is a `pass` stub, so the `unmatched_join_rows` pattern (parent rows without children, child rows with NULL FK) is only incidentally satisfied by random FK drawing, not by construction as the spec requires.",
+     "requested_revision": "Fix `_apply_rows_with_different_values` to use the actual column type (pass column metadata into the function) and remove the dead branch. Implement `_apply_unmatched_join_rows` to explicitly reserve at least one parent key unused by children and at least one child row with NULL FK per FK relationship, per the spec targets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `null_targets` list includes primary-key columns (Dorm.dormid, Dorm_amenity.amenid) and the `per_column` entry for Dorm.dormid combines `duplicates_for_distinct` with primary-key uniqueness, which is internally inconsistent. The spec also lists `Student.StuID` under `unmatched_join_rows` but not under `null_targets`, while `Lives_in.stuid` is under both \u2014 the NULL rule for nullable FKs is not consistently specified.",
+     "requested_revision": "Revise the specification so `null_targets` contains only nullable, non-PK columns; remove Dorm.dormid and Dorm_amenity.amenid. Remove `duplicates_for_distinct` from Dorm.dormid (or clarify it applies to the join result). Make the nullable-FK NULL rule explicit for Lives_in.stuid, Lives_in.dormid, Has_amenity.dormid, Has_amenity.amenid."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `table_sizes_per_instance` gives fixed sizes (Student 34, Dorm 7, etc.), but instance.py `_choose_table_sizes` overrides them with `rng.randint(0, 230)` or `n*4` (up to 2500). Execution feedback shows generated rows far exceeding the spec sizes (e.g. Dorm 1480, Dorm_amenity 2042). The spec does not authorize this variation, and the resulting instances no longer match the compact database's scale, which affects the duplicate-share and group-size targets.",
+     "requested_revision": "Either add an explicit `table_size_variation` rule to the specification (with allowed ranges) or change `_choose_table_sizes` to honor the specified sizes. Document the intended per-instance size policy so the engineer's implementation matches the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction pairs: 49/99 separated, 9 unknown executions. Separation is not required for a pass, but the 9 unknown executions could not be verified; they do not by themselves indicate a generation error.",
+    "The `comparison_boundary` pattern for Has_amenity.dormid (`PRED(dorm.dormid >= has_amenity.dormid)`) is not explicitly implemented in instance.py; it is only incidentally satisfied by random FK drawing. This is a minor gap, not blocking.",
+    "The `like_near_variant` pattern plants `%onor%`/`%Donor%` bodies but does not guarantee both variants coexist in the same instance; the spec target is not fully verified."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's semantic_rules_and_formulas lists Student.Age BETWEEN 16 AND 26, Student.Sex IN ('F','M'), Dorm.gender IN ('X','M','F'), Dorm.student_capacity > 0, Lives_in.room_number > 0, each backed by the observed compact rows (supporting_evidence). These are range/enum rules with direct row evidence; no other formulas are claimed. The 'uncertainty' field correctly flags that NULL shares are 0.0 in observed data and that a small share is used to satisfy the NULL rule.",
+     "requested_revision": "No change required. The rules are supported by the compact rows; the only uncertain item (NULL share) is explicitly documented and handled by the NULL rule."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows 'Dorm.dormid: generated rows: NULL 0 / 936' and 'Dorm_amenity.amenid: generated rows: NULL 0 / 1223'. These are primary-key columns, so NULL 0 is correct per the NULL rule (PK/NOT NULL never get NULL). All other nullable columns show a non-zero NULL count (e.g. Student.Advisor 16/234, Has_amenity.dormid 120/1377), satisfying 'at least one NULL per nullable column'. instance.py _apply_null_rule skips _is_key_column (pk_pos>0 or notnull), and spec.py null_targets excludes the two PKs.",
+     "requested_revision": "No change required; the two 'NULL 0 / n' lines are PK columns and are expected."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "rows_skipped shows Student: 242 skipped rows across 20 instances (rows_added Student 411). This is consistent with sample_fresh_primary_keys/drop_unique_duplicates dropping duplicate PK/UNIQUE tuples after pattern application (instance.py), and writer.py counting failures. Integrity feedback reports pk_duplicates 0, fk_violations 0, not_null_violations 0, not_ok 0, valid 20/20.",
+     "requested_revision": "No change required; skipped rows are the intended PK/UNIQUE dedup and integrity is clean."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "construction_pairs: eligible 99, separated 48, unknown_executions 4. Per instruction 4, missing separation alone does not establish a generation error. The program implements the specified patterns by construction (duplicates_for_distinct, group_sizes, comparison_boundary, like_near_variant, rows_with_different_values, ties_for_order_limit, unmatched_join_rows via reserved parent key + NULL FK).",
+     "requested_revision": "No change required; separation is partial but the patterns are implemented by construction and the remaining gap is not proven to be a generation error."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "spec.py _DEFAULT.table_size_variation uses keep_prob 0.5, jitter 3, random_max 230, and _choose_table_sizes applies it. The generation specification's table_sizes_per_instance states fixed sizes (Student 34, Dorm 7, ...) and 'the generator must honor these sizes rather than randomizing them', while the generic_sampling_rules table_size_policy says sizes are drawn from ranges. These two statements in the spec are in tension; the program follows the variation policy.",
+     "requested_revision": "Designer should reconcile the fixed-size statement in table_sizes_per_instance with the table_size_variation policy (or confirm variation is intended). Not blocking: the program is internally consistent and integrity/validity pass."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs separated 48/99 with 4 unknown executions: partial separation is noted but not proven to be a generation defect (per instruction 4).",
+    "Specification contains both a fixed table_sizes_per_instance and a table_size_variation policy; the program implements variation. This is a spec-internal inconsistency, not a program error."
+   ]
+  }
+ ]
 }

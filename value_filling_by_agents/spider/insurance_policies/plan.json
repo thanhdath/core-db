@@ -1,52 +1,593 @@
 {
  "db": "insurance_policies",
- "operator_io_quirks": [
-  "All identifiers are mixed-case (Customers, Customer_Policies, Policy_Type_Code, Date_Claim_Made); must be double-quoted with original spelling in generated SQL.",
-  "Tiny DB: every table has exactly 15 rows; original_values lists are short (<=15), so rng.choices(k=min(5,len)) draws heavily from a handful of values.",
-  "DATE columns are declared DATE but stored as TEXT 'YYYY-MM-DD' (e.g. '2018-01-21'); storage class contradicts declared type.",
-  "DATE columns dispatch to 'Date|Number(int elements)' \u2014 first element '2018-01-21' does not parse as int, so Date fuzzer with template %Y-%m-%d is chosen.",
-  "CHAR(15) Policy_Type_Code and VARCHAR(255) Payment_Method_Code are short enums (4 distinct each: Car/Life/Property/Travel; MasterCard/Discover Card/Visa/American Express).",
-  "Settlements.Customer_Policy_ID is INTEGER NOT NULL but has NO declared FK (dangling semantic reference to Customer_Policies.Policy_ID); upstream treats it as a plain Number column.",
-  "FK chain Customers -> Customer_Policies -> Claims -> Settlements -> Payments is a clean linear DAG; no self-references, no composite keys, no missing parents.",
-  "FK child columns are NOT NULL (Customer_ID, Policy_ID, Claim_ID, Settlement_ID) but upstream does not enforce NOT NULL in Python; rows violating it fail at insert and are skipped.",
-  "All PKs are single-column INTEGER NOT NULL; Number fuzzer with scale=0 gives range [-1,1] plus +-1/+-2 perturbations, so PK collisions are frequent and sample_fresh_primary_keys will drop many rows.",
-  "Amount_Claimed/Amount_Settled/Amount_Payment are INTEGER with values in the 10^3..10^6 range; Number fuzzer scale=0 will produce tiny values (near -1..1) \u2014 implausible magnitudes.",
-  "No views, triggers, or indexes beyond PKs; DDL is simple CREATE TABLE only.",
-  "null_rate is 0.0 everywhere in the original, but several columns are declared nullable (Start_Date, End_Date, Amount_*, Date_*); TS may emit NULLs via empty parent FK draws."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer with template %Y-%m-%d on all DATE columns; range from min/max of the 5 sampled originals (roughly 2016-2018), so fresh dates stay in that window \u2014 plausible.",
-  "String fuzzer on Customer_Details (VARCHAR(255)): random strings over a-zA-Z 0-9() of length 0..20 plus contaminate; will produce implausible names but that is TS behaviour.",
-  "String fuzzer on Policy_Type_Code (CHAR(15)) and Payment_Method_Code (VARCHAR(255)): length range from originals (3..7 / 4..15), so fresh strings are short but not the 4 enum values \u2014 drives FN on equality filters like Policy_Type_Code='Car'.",
-  "Number fuzzer on INTEGER columns with scale=0: full range [-1,1], list range [min(el), 1]; PKs and amounts get tiny/negative values, so Amount_Claimed > 50000 style predicates return empty \u2014 FN.",
-  "Number fuzzer on FK columns (Customer_ID, Policy_ID, Claim_ID, Settlement_ID) is bypassed: fill_foreign_keys_consistently draws from parent's final values, so FK joins are consistent \u2014 good for join queries.",
-  "Settlements.Customer_Policy_ID is a plain Number column (no FK), so it gets random tiny ints unrelated to Customer_Policies.Policy_ID \u2014 any query joining on it returns empty (FN).",
-  "PK collisions: Number scale=0 on 15-row tables with max_l0 cap often reuses fresh draws, so sample_fresh_primary_keys drops many rows; final table sizes may be much smaller than chosen (e.g. 1-5 rows).",
-  "drop_unique_duplicates on single-column PKs is redundant (PK already unique) but harmless.",
-  "Empty parent FK draws: if a parent table's PK filtering leaves 0 rows, child FK columns become NULL \u2014 but child FK columns are NOT NULL, so those rows fail at insert and are skipped, shrinking child tables.",
-  "Literal pool from train SQL will contain 'Car','Life','Property','Travel','MasterCard','Visa', etc.; String fuzzer picks these w.p. 1-p (0.8) so enum values DO appear \u2014 good for equality predicates.",
-  "Date literal pool from train SQL (e.g. '2018-01-21') feeds the Date fuzzer's element list, so template and range are anchored to real dates \u2014 plausible.",
-  "Known FP source: TS does not enforce Amount_Settled <= Amount_Claimed or Start_Date <= End_Date; queries with such predicates may return rows the original would not \u2014 but original also has no such constraint, so this is a tie/duplicate issue not a constraint issue."
- ],
- "challenger_refs": [
-  "G4",
-  "G5",
-  "G3",
-  "G1",
-  "G2",
-  "g97c08180",
-  "gd784150d",
-  "g25d1f39c",
-  "g88ffaacb",
-  "g88ffaacb",
-  "g88ffaacb",
-  "g2fb65b9f"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential unique integers starting at 1, step 1; never NULL; never reused; never participate in any group-size, duplicate, or tie plan.",
+   "integer_fk": "Copy an existing parent key value chosen uniformly; allow parent rows without children; do not produce NULL because these FKs are NOT NULL.",
+   "integer_amount": "Uniform integer in [1, 100000]; amounts >= 0; allow duplicates where a DISTINCT-target pattern requires a 20-50% duplicate share.",
+   "integer_small": "Uniform integer in [1, 2000].",
+   "varchar_name": "Random first + last name from a fixed pool of 40 names; length <= 255; duplicates allowed per the DISTINCT-target 20-50% share.",
+   "varchar_code": "Random choice from the column's enum pool; length <= 255.",
+   "char_code": "Random choice from the column's enum pool, right-padded to declared length.",
+   "date_iso": "Random date in [2016-01-01, 2018-12-31], format %Y-%m-%d; duplicates allowed where a DISTINCT-target pattern requires them.",
+   "date_order": "When a table has a start/end or made/settled pair, sample the earlier date first, then the later date in [earlier, earlier+400 days]; applied only to independently sampled pairs, never to copied columns.",
+   "boundary_numeric": "For each listed literal L, include L-1, L, L+1 in the pool.",
+   "boundary_date": "For each listed literal L, include L-1 day, L, L+1 day, keeping the table's date-order rule.",
+   "tie_order": "For ORDER targets tie_on a column value: at least two rows share the value at the listed LIMIT rank. For ORDER targets tie_on COUNT(*)/COUNT(<col>): the value multiset is built so at least two distinct values share the rank-1 group frequency (do not merely duplicate the min/max value).",
+   "null_share": "Nullable columns get a fixed share of NULL rows (~10%, at least one NULL row per nullable column per instance); the compact database per-column NULL share is unavailable so a fixed share is used. NOT NULL and PRIMARY KEY columns never get NULL. Planted NULLs are never replaced to satisfy a rule.",
+   "group_size_plan": "Deterministically assign exactly one row per representative value, exactly two rows for a second representative, and >= 3 rows for a third representative; fill remaining rows without breaking the planted sizes. Never applied to PRIMARY KEY columns.",
+   "copy_from_parent": "Copied columns are retrieved by looking up the specific parent row via the child's FK value (dict parent_key -> parent_row tuple), not by positional index; copied NULL propagates when the parent value is NULL.",
+   "generation_order": "Fill parents before children: Customers -> Customer_Policies -> Claims -> Settlements -> Payments. Copied-column steps run after the child's FK value is fixed and are not overwritten by date-order or null-plan steps."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Claims.Date_Claim_Made",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Claims.Date_Claim_Made",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Claims.Date_Claim_Made",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.Customer_Details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Customers.Customer_Details",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Customers.Customer_Details",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "literal": "''",
+     "near": "<> ''"
+    }
+   },
+   {
+    "column": "Settlements.Settlement_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Payments.Settlement_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Claims.Claim_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)",
+      "COUNT(claims.claim_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "note": "PK unique; group_sizes is trivially size 1 and is not planted"
+    }
+   },
+   {
+    "column": "Payments.Settlement_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Settlements.Settlement_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Customers.Customer_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "column": "Payments.Payment_Method_Code",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Payments.Payment_Method_Code",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Customer_Policies.Customer_ID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Customer_Policies.Policy_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(customer_policies.policy_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "column": "Payments.Date_Payment_Made",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Payments.Date_Payment_Made",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Payments.Amount_Payment",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Settlements.Claim_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Claims.Amount_Claimed",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Claims.Amount_Settled",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Claims.Date_Claim_Settled",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Claims.Policy_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC"
+    }
+   },
+   {
+    "column": "Customer_Policies.Policy_Type_Code",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(customer_policies.customer_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "Customer_Policies.Policy_Type_Code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "Car",
+      "Life",
+      "Property",
+      "Travel"
+     ]
+    }
+   },
+   {
+    "column": "Payments.Payment_Method_Code",
+    "pattern": "enum",
+    "targets": {
+     "values": [
+      "MasterCard",
+      "Discover Card",
+      "Visa",
+      "American Express"
+     ]
+    }
+   },
+   {
+    "column": "Payments.Payment_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "note": "PK unique; DISTINCT trivially returns all rows; no duplicate plan applied"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Customer_Policies.Customer_ID",
+    "parent_table": "Customers",
+    "parent_column": "Customer_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Claims.Policy_ID",
+    "parent_table": "Customer_Policies",
+    "parent_column": "Policy_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "Settlements.Claim_ID",
+    "parent_table": "Claims",
+    "parent_column": "Claim_ID",
+    "copied_columns": [
+     "Date_Claim_Made",
+     "Date_Claim_Settled",
+     "Amount_Claimed",
+     "Amount_Settled"
+    ]
+   },
+   {
+    "child": "Payments.Settlement_ID",
+    "parent_table": "Settlements",
+    "parent_column": "Settlement_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Customer_Policies",
+    "column": "Start_Date",
+    "formula": "Start_Date <= End_Date",
+    "evidence": "assumed semantic constraint; compact sample rows contradict it (e.g. 2018-01-21 > 2017-12-15), generation enforces it"
+   },
+   {
+    "table": "Claims",
+    "column": "Date_Claim_Made",
+    "formula": "Date_Claim_Made <= Date_Claim_Settled",
+    "evidence": "Claims rows 143, 423, 442 all satisfy the order"
+   },
+   {
+    "table": "Claims",
+    "column": "Amount_Claimed",
+    "formula": "Amount_Claimed >= 0"
+   },
+   {
+    "table": "Claims",
+    "column": "Amount_Settled",
+    "formula": "Amount_Settled >= 0"
+   },
+   {
+    "table": "Settlements",
+    "column": "Date_Claim_Made",
+    "formula": "Settlements.Date_Claim_Made = Claims.Date_Claim_Made",
+    "evidence": "copied from parent claim via Claim_ID"
+   },
+   {
+    "table": "Settlements",
+    "column": "Date_Claim_Settled",
+    "formula": "Settlements.Date_Claim_Settled = Claims.Date_Claim_Settled",
+    "evidence": "copied from parent claim via Claim_ID"
+   },
+   {
+    "table": "Settlements",
+    "column": "Amount_Claimed",
+    "formula": "Settlements.Amount_Claimed = Claims.Amount_Claimed",
+    "evidence": "copied from parent claim via Claim_ID"
+   },
+   {
+    "table": "Settlements",
+    "column": "Amount_Settled",
+    "formula": "Settlements.Amount_Settled = Claims.Amount_Settled",
+    "evidence": "copied from parent claim via Claim_ID"
+   },
+   {
+    "table": "Payments",
+    "column": "Amount_Payment",
+    "formula": "Amount_Payment >= 0"
+   },
+   {
+    "table": "Customer_Policies",
+    "column": "Policy_Type_Code",
+    "formula": "Policy_Type_Code IN ('Car','Life','Property','Travel')"
+   },
+   {
+    "table": "Payments",
+    "column": "Payment_Method_Code",
+    "formula": "Payment_Method_Code IN ('MasterCard','Discover Card','Visa','American Express')"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Customers": 15,
+   "Customer_Policies": 15,
+   "Claims": 15,
+   "Settlements": 15,
+   "Payments": 15
+  },
+  "null_targets": [
+   "Claims.Date_Claim_Made",
+   "Claims.Date_Claim_Settled",
+   "Claims.Amount_Claimed",
+   "Claims.Amount_Settled",
+   "Customer_Policies.Start_Date",
+   "Customer_Policies.End_Date",
+   "Payments.Payment_Method_Code",
+   "Payments.Date_Payment_Made",
+   "Payments.Amount_Payment",
+   "Settlements.Date_Claim_Made",
+   "Settlements.Date_Claim_Settled",
+   "Settlements.Amount_Claimed",
+   "Settlements.Amount_Settled"
+  ],
+  "supporting_evidence": {
+   "Settlements copied from Claims": "Settlements rows 357/486, 516/569, 564/571 show Claim_ID linkage; copied columns follow parent claim values when resolved by Claim_ID lookup.",
+   "Date order Claims": "Claims rows 143 (2017-03-11 <= 2017-11-03), 423 (2016-08-12 <= 2018-01-27), 442 (2017-02-24 <= 2018-01-21) satisfy Date_Claim_Made <= Date_Claim_Settled.",
+   "Amounts nonnegative": "All shown Claims.Amount_Claimed and Amount_Settled values are >= 0 (e.g. 43884, 1085, 79134, 1724).",
+   "Enums": "Policy_Type_Code values {Car, Life, Property, Travel}; Payment_Method_Code values {MasterCard, Discover Card, Visa, American Express}."
+  },
+  "uncertainty": "Customer_Policies Start_Date <= End_Date is assumed and enforced by generation but contradicted by the compact sample (e.g. 2018-01-21 > 2017-12-15). Compact per-column NULL shares unavailable; fixed ~10% share used. Settlements.Customer_Policy_ID has no declared FK, treated as free integer. Amount_Settled is much smaller than Amount_Claimed in sample; no ratio formula asserted. Settlements copied columns are nullable in the compact data; NULL is propagated from the parent claim rather than independently planted, so they remain listed in null_targets."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py defines GROUP_SIZE_TARGETS including ('Claims','Claim_ID') and ('Payments','Payment_Method_Code'), and instance.py calls _apply_group_size_plan for every column. But _apply_group_size_plan only plants groups of sizes [1,2,3] using distinct representatives drawn from the sampled values; for Claims.Claim_ID the PK is assigned sequentially (range(1,n+1)) so all values are distinct and the plan overwrites them with reps[gi % len(reps)] \u2014 this can collapse PK uniqueness. More importantly, the plan is applied to Claims.Claim_ID which is a PRIMARY KEY; the spec's group_sizes target for Claim_ID is about GROUP BY on the PK (trivially all size 1), so planting groups of size 2/3 on a PK is semantically wrong and can produce duplicate PKs before sample_fresh_primary_keys drops rows, silently shrinking the table below the specified 15 rows.",
+     "requested_revision": "Do not apply group-size/duplicate/tie plans to primary-key columns (Claims.Claim_ID, Customers.Customer_ID, Customer_Policies.Policy_ID, Settlements.Settlement_ID, Payments.Payment_ID). The group_sizes target on Claims.Claim_ID is satisfied trivially by a unique PK; remove it from GROUP_SIZE_TARGETS or guard _apply_group_size_plan to skip PK columns. Verify table sizes remain exactly 15 after dedup."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_table_rows step 5 copies Settlements columns from parent_rows['Claims'] by index i (src[i] if i < len(src)). But Settlements.Claim_ID is drawn randomly from Claims.Claim_ID (step 4), so row i of Settlements does not correspond to row i of Claims. The copied Date_Claim_Made/Date_Claim_Settled/Amount_Claimed/Amount_Settled therefore do NOT match the parent claim referenced by Claim_ID, violating the semantic_rules_and_formulas 'Settlements.X = Claims.X copied from parent claim via Claim_ID'.",
+     "requested_revision": "After drawing Settlements.Claim_ID, look up the parent Claims row by Claim_ID and copy the four columns from that specific parent row (build a dict claim_id -> (dates, amounts) from the Claims instance). Do not copy by positional index."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DATE_PAIRS includes ('Settlements','Date_Claim_Made','Date_Claim_Settled') and instance.py _apply_date_order resamples these columns independently of the copied Claims values. Combined with the index-copy bug above, Settlements dates are both inconsistent with the parent and re-sampled, so the copied-column formula and the date_order rule conflict. Also _apply_date_order for the 'later' column reads pair_values.get(a) but for Settlements the earlier column may already have been overwritten by the copy step ordering (copy happens in step 5, after date-order in step 2), so the order rule is applied to pre-copy values.",
+     "requested_revision": "For Settlements, derive Date_Claim_Made/Date_Claim_Settled/Amount_* solely from the parent claim (copy step), and skip the independent date_order resampling for those columns. Ensure the copy step runs before any plan that could overwrite them, or exclude copied columns from _apply_date_order/_apply_null_plan."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULLABLE includes Settlements.Date_Claim_Made, Date_Claim_Settled, Amount_Claimed, Amount_Settled, and instance.py _apply_null_plan sets ~10% of these to NULL. But these columns are declared as copied from Claims (dependencies.copied_columns). Setting them NULL breaks the copy formula for those rows. The spec's null_targets list does include them, so the two rules are in tension; the program resolves it by nulling after copying, silently violating the copy rule.",
+     "requested_revision": "Clarify in the specification whether copied Settlements columns may be NULL. If they must equal the parent, either (a) remove them from NULLABLE/null_targets, or (b) propagate NULL from the parent claim (copy NULL when parent is NULL) rather than independently nulling. Implement the chosen resolution consistently."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_tie_plan for ('Payments','Payment_Method_Code') and ('Customer_Policies','Policy_Type_Code') uses tie_on COUNT(*)/COUNT(customer_id), i.e. the tie is on a group count, not on the column value. The implementation instead forces two rows to share the rank-1 column value (min/max of the column), which does not create a tie in COUNT(*) at LIMIT rank 1. The tie_on semantics are ignored.",
+     "requested_revision": "For tie targets with tie_on COUNT(*), construct the value multiset so that at least two distinct values have the same (maximal or rank-1) frequency, rather than duplicating the min/max value. For tie_on COUNT(customer_policies.customer_id) on Policy_Type_Code, ensure two policy-type groups have equal counts at the top rank."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_group_size_plan builds `distinct` list but never uses it; the loop `for _ in range(len(set(id(x) for x in plan)))` is dead code. The actual assignment uses reps[gi % len(reps)] for the first len(sizes) groups then random reps for the rest, so the guaranteed groups of size 1, 2, >=3 are only planted if n >= 6 and reps has >= 3 distinct values; with n=15 this is usually fine but the >=3 group is exactly 3 and remaining rows are random, so a group of size >=3 is not guaranteed to survive if random assignment merges groups. The plan is fragile and the dead code indicates the intent was not implemented.",
+     "requested_revision": "Rewrite _apply_group_size_plan to deterministically assign: pick 3 distinct representative values, assign exactly 1 row to rep0, 2 rows to rep1, and >=3 rows to rep2, then fill remaining rows from these reps (or additional values) without breaking the planted group sizes. Remove dead code."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_duplicate_plan for DISTINCT_TARGETS includes ('Payments','Payment_ID'), which is a PRIMARY KEY. Duplicating a PK value then relying on sample_fresh_primary_keys to drop rows shrinks Payments below 15. The spec's duplicates_for_distinct on Payment_ID is a DISTINCT-target pattern (duplicate_share 20-50%), but a PK cannot have duplicates; the pattern is about the DISTINCT query returning fewer rows than the table, which is impossible for a PK. This target is mis-specified.",
+     "requested_revision": "Remove ('Payments','Payment_ID') from DISTINCT_TARGETS (a PK is unique by definition; DISTINCT on it always returns all rows). If the intent is that DISTINCT on Payment_ID is exercised, note it is trivially satisfied. Do not apply duplicate plans to PK columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "supporting_evidence states 'All shown rows have Start_Date <= End_Date (e.g. 2018-01-21 <= 2017-12-15 is violated in sample; rule kept as semantic constraint, sample rows are noisy)'. The example given actually violates the rule, and the uncertainty note admits sample rows contradict it. The semantic rule Start_Date <= End_Date is therefore not supported by the compact data; it is an assumed constraint.",
+     "requested_revision": "Mark the Customer_Policies Start_Date <= End_Date rule as uncertain/assumed rather than supported, or drop it. If retained, state explicitly that it is enforced by generation but not evidenced by the compact database, so downstream equivalence checks relying on it are conditional."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's null_targets include Settlements copied columns and Claims date/amount columns, but the compact database's actual NULL share per column is not reported (nullable_columns is empty in execution feedback, and no per-column NULL share from the compact DB is given). The generic rule says 'NULL share following the compact database's share for that column', but the program uses a fixed 10% (spec.NULL_SHARE) regardless of the compact share.",
+     "requested_revision": "Either report the compact database's per-column NULL share and have the program match it, or state in the specification that a fixed ~10% share is used because the compact share is unavailable. Align spec.NULL_SHARE with the stated rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows construction_pairs eligible=53, separated=12, and construction_pairs_by_group is empty. 41 of 53 eligible pairs are not separated. While a missing separation alone does not prove an error, the combination with the copy-by-index bug (Settlements vs Claims), the PK group-size/duplicate plans, and the tie_on mismatch means several patterns are likely not actually realized. The empty by-group breakdown prevents diagnosing which patterns fail.",
+     "requested_revision": "After fixing the copy, PK-plan, and tie_on issues, re-run and report construction_pairs_by_group so each pattern's separation can be verified. Confirm that group_sizes, duplicates_for_distinct, ties_for_order_limit, and unmatched_join_rows targets are each realized in at least one instance."
+    }
+   ],
+   "unresolved_checks": [
+    "Compact database per-column NULL shares were not provided; cannot verify the NULL rule matches the compact share.",
+    "construction_pairs_by_group is empty; per-pattern separation could not be attributed.",
+    "Whether Settlements copied columns are intended to be nullable (spec lists them in null_targets but also as copied) is unresolved in the specification.",
+    "Whether the Customer_Policies Start_Date <= End_Date rule is a real constraint or an assumption is unresolved (evidence contradicts it)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/spec.py defines NULLABLE = {('Claims','Date_Claim_Made'),('Claims','Date_Claim_Settled'),('Claims','Amount_Claimed'),('Claims','Amount_Settled'),('Customer_Policies','Start_Date'),('Customer_Policies','End_Date'),('Payments','Payment_Method_Code'),('Payments','Date_Payment_Made'),('Payments','Amount_Payment')}. The generation specification's null_targets include the four Settlements copied columns (Date_Claim_Made, Date_Claim_Settled, Amount_Claimed, Amount_Settled). instance.py only propagates NULLs from the parent claim, so Settlements NULL columns are not planted as specification requires (\"each instance contains generated rows with NULL and rows with non-NULL values\"). The provided nullable_columns execution feedback is empty, which may mean the checker cannot verify any nullable column. Also spec.py's NULL_SHARE=0.10 is described as a fixed share, while the interface says the NULL share should follow the compact database's share for that column.",
+     "requested_revision": "Either (a) add the four Settlements copied columns to NULLABLE and add an explicit NULL-plant step to those columns (after copy) that honours the compact share and at least one NULL; or (b) if copy-NULL propagation is intended, change the specification to remove them from null_targets and document the semantic. In both cases, ensure that the interface's 'rows with NULL and non-NULL per nullable column' condition is verifiable (a non-empty nullable_columns feedback). Also make the NULL share derive from the compact per-column share (with a floor) instead of the fixed 0.10."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _build_table_rows step 4 fills FK columns by rng.choice from parent rows. _ensure_unmatched_parents forces at most one parent to be unmatched by pointing one child at another parent. spec.py PARENT_WITHOUT_CHILDREN includes ('Customers','Customer_Policies') and ('Claims','Settlements') and ('Settlements','Payments'). But fill_foreign_keys_consistently and _ensure_unmatched_parents do not guarantee an unmatched parent per target: for Customers->Customer_Policies, if Customers have 15 rows, at least one will typically be unmatched because Customer_Policies has 15 rows drawn uniformly, but the small-sample probabilities are not guaranteed; _ensure_unmatched_parents only adjusts if there is no unmatched parent AND parent_vals has >= 2 elements, which is not guaranteed to be true often but is with 15 parents. More importantly, _ensure_unmatched_parents runs once on the whole instance, but table sizes are chosen per table independently; if a child table has 0 rows the invariant cannot be met. The default size is spec.TABLE_SIZES which is 15 for all, so this is fine in the default run, but the specification allows the caller to pass arbitrary size. The generation program does not verify the invariant per instance.",
+     "requested_revision": "Add a per-instance assertion after build_random_instance that every (parent, child) pair in PARENT_WITHOUT_CHILDREN has at least one unmatched parent row, and raise a clarifying error if the caller-supplied sizes make it impossible. Also make fill_foreign_keys_consistently reserve at least one unmatched parent by design (e.g., reserve one parent index that is never chosen) rather than fixing up post hoc."
+    },
+    {
+     "agent": "designer",
+     "evidence": "aggregate_boundary for Claims.Claim_ID and Customers.Customer_ID is described in the extraction with values [0,1,2,3] (Has aggregate results with COUNT(*) = 0, 1, 2, 3). spec.py AGG_BOUNDARY_VALUES = [0,1,2,3] but nothing enforces that a query on Claims.Claim_ID or Customers.Customer_ID can return 0 (i.e., that there is a group with 0 rows). Since both are primary keys and unique, a GROUP BY always returns groups of size 1; a HAVING(COUNT(*)=0) can never match on a non-empty table. The spec's per_column_exceptions claim 'PK unique; group_sizes is trivially size 1 and is not planted'; but HAVING(COUNT(*)=0) is the boundary with a value 0 that is trivially false. The specification does not document how value 0 is made reachable. This is a designer gap, not an engineer defect, because the source stats show this boundary but the semantics is unclear.",
+     "requested_revision": "Either (a) document in the design that the boundary values [0,1,2,3] are unreachable for PK count aggregates (only 1 is reachable) and remove value 0 from the target; or (b) add a supporting instance structure (e.g., a nullable refund group or a WHERE clause) that allows COUNT(*)=0. Also explain in generation specification how the per_column_exceptions' aggregate_boundary for Customers.Customer_ID (which has a single COUNT(*) boundary) is satisfied by the generator."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py _apply_tie_plan with tie_on='COUNT' assigns counts[distinct[0]] = counts[distinct[1]] = top = max(2, n // max(2, len(distinct))). With n=15 and 4 distinct enum values for Policy_Type_Code or Payment_Method_Code, top = 15 // 4 = 3, so counts are 3 and 3 (top-tied). For the other two distinct values, remaining = 15 - 6 = 9 is filled with c = min(9, 2) = 2 then 2 then 5 (the last one gets c = min(9-4, 2) = 2). Total is 3+3+2+2 = 10 and remaining = 5 is dumped onto distinct[0], making counts {3+5=8, 3, 2, 2} = 15. This breaks the tie at rank-1 count! The comment 'if still remaining, add to distinct[0] (keeps tie at top)' is wrong because adding to distinct[0] strictly increases its group count above distinct[1].",
+     "requested_revision": "Fix _apply_tie_plan tie_on='COUNT' so that remaining rows are added to two values equally (or to fresh distinct values) so that the top-count tie is preserved. Add a post-condition check (assert distinct[0]-count == distinct[1]-count) and verify tie at rank-1 count with GROUP BY on the affected column. Similar concern for duplicates: _apply_duplicate_plan may interact with _apply_group_size_plan for Customer_Details and Payments.Date_Payment_Made, which are both DISTINCT targets and GROUP_SIZE targets \u2014 the code applies group_size_plan first, then duplicate_plan, which overwrites values and can break the planted group sizes. Document the intended precedence."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification declares 'semantic_rules_and_formulas' including Customer_Policies.Start_Date <= End_Date and evidences for Claims.Date_Claim_Made <= Date_Claim_Settled. The Date_Pairs and semantic rules are implemented via spec.DATE_PAIRS in instance._apply_date_order. But the compact sample evidence is contradicted (Start_Date <= End_Date violated in the sample). The specification's 'uncertainty' notes: 'Start_Date <= End_Date is assumed and enforced by generation but contradicted by the compact sample'. There is no execution evidence (construction_pairs separated 11 out of 53) that the constraint can actually be invalidated to exercise the assumption, nor is the corrected semantic supported by other sample rows.",
+     "requested_revision": "Add executed-query evidence that the assumed constraint (Customer_Policies.Start_Date <= End_Date) produces distinct denotations between the constraint-hold variant and the violated variant on generated instances, so the assumed rule is testable. Alternatively downgrade the rule to 'uncertain' in the specification and document that generation does not enforce it (making the compact contradiction preserved)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite inserts rows per table without ordering across tables for dependent rows, but the schema DDL is copied from the original compact DB with FKs. The compact DB likely has FOREIGN KEY constraints; the writer sets PRAGMA foreign_keys = OFF. Execution feedback reports fk_violations=0 and integrity ok, so this is not currently a defect \u2014 but PRAGMA foreign_keys = OFF means the appended rows are not validated by SQLite. Verify that the FK columns of appended rows actually reference existing parent rows after appending, including when parent tables have 0 generated rows (e.g., Customers may end up with 0 new rows due to PK duplicate skipping). The rows_added feedback shows Customers: 80 added, 220 skipped (20 instances * 15 = 300 targeted, only 80 succeeded). Each instance appends up to 15 Customers, but the compact DB likely already contains Customer_IDs starting at 1, causing PK conflicts with the generated PKs starting at 1. This means many appended Customer rows are silently skipped, which means Customer_Policies FK values may reference Customers not newly added (fine, they hit existing) but the count of newly-generated Customers is much lower than the specification's 15/instance, distorting Customer_ID aggregate/groups-size plans and possibly FK bias.",
+     "requested_revision": "Resolve PK conflicts with the compact DB: either (a) start generated PKs at MAX(compact_pk)+1, or (b) shift compact rows' PKs. Confirm per-instance rows_added equals table_sizes_per_instance for each table. Also verify each appended row's FK resolves to a compact or generated parent, or document intentional drops. Use PRAGMA foreign_key_check after insert to assert zero FK violations before commit."
+    }
+   ],
+   "unresolved_checks": [
+    "Construction separation was only 11/53 with empty construction_pairs_by_group; the groups breakdown was not provided, so per-pattern pass/fail cannot be assessed. This is not a defect by itself (per instructions a missing separation alone does not establish generation error).",
+    "nullable_columns execution feedback is empty; cannot confirm the NULL/NON-NULL presence per nullable column or the compact-derived NULL share. The reviewer flags the Settlements-copied NULL columns as a specification defect above.",
+    "Settlements.Customer_Policy_ID is declared as NOT NULL with no FK; the generator treats it via generic integer sampling (never NULL) \u2014 consistent. Not resolving further.",
+    "The exact compact per-column NULL shares were not visible; the fixed 0.10 share cannot be compared without that data, but the reviewer requests specification-level derivation."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with AssertionError('tie_plan_count: top counts differ') (n_ok=0, n_fail=20). In values.py tie_plan_count, when n is small relative to the number of distinct values, `top = max(2, n // max(2, len(distinct)))` can be 2, and the loop `while remaining > 0 and idx < len(distinct)` assigns `c = min(remaining, max(1, top - 1))` = 1 to a third value, giving counts {v0:2, v1:2, v2:1}; then the leftover branch adds `half = remaining // 2` to v0 and `remaining - half` to v1, which for odd remaining makes the two top counts unequal (e.g. remaining=1 -> v0 gets 0, v1 gets 1, so v0=2, v1=3). The post-condition assert then fires. This is a deterministic bug in the tie construction, not a data-dependent edge case, and it blocks generation entirely.",
+     "requested_revision": "Fix tie_plan_count so the two top-tied values always end with equal counts: distribute any leftover rows in pairs (add 1 to each of the two top values, or add 2 to one and 0 to the other only if that keeps them equal), or add leftovers to fresh distinct values instead of the tied pair. Add a unit test that exercises n=15 with 4 distinct enum values (the actual Payments.Payment_Method_Code / Customer_Policies.Policy_Type_Code case) and asserts the top-2 counts are equal before returning. Re-run generation and confirm n_ok>0 and fk_violations=0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_build_table_rows` step 4 reserves an unmatched parent by using `choosable = pv[:-1]` (never choosing the last parent value). But `_ensure_unmatched_parents` then checks `unmatched = [v for v in parent_vals if v not in child_vals]` and, if empty, rewrites a child FK. With the reserve-by-position approach the last parent value is guaranteed unmatched only if `pv` is the full parent PK list in the same order used by `_ensure_unmatched_parents`; however `parent_rows` is built as `{pt: inst.get(pt, {})}` and `pv = parent_rows.get(pt, {}).get(pc)`, which is the generated parent column list \u2014 consistent \u2014 but the reserve is skipped when `len(pv) < 2`, and `_assert_unmatched_parents` raises `ValueError('unmatched-parent invariant impossible ...')` in that case. With table_sizes_per_instance=15 this is not triggered, but the spec's generic_sampling_rules.integer_fk requires the program to 'raise a clarifying error' when caller-supplied sizes make the invariant impossible; the current code raises a generic ValueError from the assertion rather than a clarifying error, and the reserve-by-position logic is fragile (it assumes the parent PK list order matches the child's chosen values).",
+     "requested_revision": "Make the unmatched-parent reservation explicit: pick a designated parent PK value (e.g. the first parent PK) and exclude it from the FK sampler, then assert that designated value is absent from the child FK column. Raise a clear, named error (e.g. `UnmatchedParentImpossible`) when the parent has fewer than 2 rows, per the spec. This is a robustness fix; it does not block the current 15-row instances but is required by the specification."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `semantic_rules_and_formulas` includes `Customer_Policies.Start_Date <= End_Date` marked uncertain (compact sample violates it, e.g. 2018-01-21 > 2017-12-15), and the generator correctly does not enforce it. However, `Claims.Date_Claim_Made <= Date_Claim_Settled` is listed as a supported rule with evidence from three rows, and the generator enforces it via `DATE_PAIRS` + `_apply_date_order`. The `_apply_date_order` for the later column uses `earlier[i]` from the already-sampled earlier column, but the earlier column may have been NULL-planted (Claims.Date_Claim_Made is in NULLABLE) before the pair step runs \u2014 actually the pair step (step 2) runs before the NULL plan (step 3), so `earlier[i]` is non-NULL at that point. This is consistent. No issue here; noting the uncertain rule is correctly downgraded.",
+     "requested_revision": "No change required; the uncertain Start_Date/End_Date rule is correctly not enforced and the supported Claims date-order rule is enforced. Confirm in the spec text that the Claims date-order rule is treated as supported (it is)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's `null_share` rule says 'the NULL share is derived from the compact database's per-column share ... with a floor of at least one NULL row per column per instance'. `_compact_null_share` returns `nulls / len(vals) if nulls else spec.NULL_SHARE` \u2014 i.e. when the compact column has zero NULLs it falls back to 0.10, which is fine. But `null_plan` uses `k = max(1, int(round(share * n)))`, so with share=0.10 and n=15, k=2, giving 2 NULLs \u2014 satisfies the floor. However, for copied Settlements columns the explicit NULL-plant step in `_build_table_rows` step 5 only guarantees at least one NULL and one non-NULL, not the compact share; this is a minor deviation from the spec's 'NULL share following the compact database's share' for copied columns. The spec's per_column_exceptions for Settlements copied columns only require 'at least one NULL and one non-NULL per instance', so this is consistent with the per-column exception. No blocking issue.",
+     "requested_revision": "No change required; the copied-column NULL handling matches the per-column exception. Optionally document that copied columns use the floor-of-one rule rather than the compact share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py runs `pragma foreign_keys = OFF` during insert and then `pragma foreign_key_check` after commit, reporting `fk_violations`. This satisfies the spec's requirement to run PRAGMA foreign_key_check after insert. However, the spec's integer_pk rule also requires the program to 'verify per-instance rows_added and run PRAGMA foreign_key_check after insert' \u2014 rows_added is reported per table in `rows_ok`, but there is no assertion that `rows_ok[t] == table_sizes_per_instance[t]`. The writer counts `ok[t] = len(rows)` on successful executemany, but if some rows fail (bad[t] > 0) the per-instance row count would be less than the target, and the spec requires the per-instance row count to equal table_sizes_per_instance. No assertion enforces this.",
+     "requested_revision": "Add a post-insert assertion in writer.py (or instance.py) that for each table `rows_ok[t] + compact_rows[t] == table_sizes_per_instance[t]` (or that `rows_ok[t] == table_sizes_per_instance[t]` for appended rows), and raise a clear error if not. This is required by the spec's integer_pk rule and is currently unverified."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify per-instance row counts equal table_sizes_per_instance because generation failed before any instance was written (n_ok=0).",
+    "Could not verify FK integrity (fk_violations) on actual instances because no instances were produced.",
+    "Could not verify preservation of compact rows (compact rows never deleted/changed) on actual instances because no instances were produced.",
+    "Could not verify reproducible generation (same seed -> same instance) because generation failed.",
+    "Could not verify the intended value variation (group sizes 1/2/>=3, duplicate share 20-50%, tie at rank 1) on actual instances because generation failed."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, all errors are TypeError('expected str, bytes or os.PathLike object, not NoneType'). In cli.py, _one() calls build_random_instance(..., None, rng) and write_instance_sqlite(..., orig=a['orig']) \u2014 but build_random_instance's `orig` parameter is None, so inside _build_table_rows every call to _compact_max_pk(orig,...), _compact_null_share(orig,...), _compact_pk_values(orig,...), and _compact_rows(orig,...) opens sqlite3.connect(orig) with orig=None, which raises the TypeError. The same occurs in _ensure_unmatched_parents when it reads parent rows (it does not, but the FK sampler already fails first).",
+     "requested_revision": "In cli._one, pass the compact database path (a['orig']) to build_random_instance instead of None, and ensure build_random_instance forwards it to _build_table_rows and _ensure_unmatched_parents. Additionally, seed_literal_pool_from_queries returns only 27 values over 257 SQLs; verify that literal routing does not starve value pools, but this is secondary to the TypeError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite performs row-count assertion: `total = compact + ok.get(t,0)` and compares with spec.TABLE_SIZES.get(t) which is 15 per table. But compact databases already contain all 15 rows per table, so compact=15 and any generated row makes total > 15, which will raise AssertionError('row-count mismatch...') on every successful instance. The program therefore cannot produce any instance even after the TypeError is fixed: the spec says 'per-instance row count equals table_sizes_per_instance' by offsetting PKs past compact MAX(pk), but the original row count is not subtracted.",
+     "requested_revision": "Align writer and spec: either (a) change the assertion to compare generated rows only (ok[t] == TABLE_SIZES[t]) since the spec's 'offset PKs past compact MAX(pk)' language is inconsistent with the compact-copy model; or (b) explicitly define table_sizes_per_instance as the *generated* row count and remove the compact term from the check. Also update the spec's integer_pk wording ('offset generated PKs by compact MAX(pk)') so it matches whichever convention is chosen."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._build_table_rows step 4 initializes all independent columns, then step 5 applies group_size_plan to (Settlements, Claim_ID) even though Claim_ID is a FK column. spec.GROUP_SIZE_COLUMNS contains ('Settlements','Claim_ID'), which will overwrite the FK value chosen in step 2, breaking the parent provenance needed for copied-column lookups: copied values were already looked up in step 3 using the pre-plan FK values. As a result Settlements.Date_Claim_Made etc. will not match their FK's parent claim, violating the stated semantic rule 'Settlements.Date_Claim_Made = Claims.Date_Claim_Made'.",
+     "requested_revision": "Remove ('Settlements','Claim_ID') from GROUP_SIZE_COLUMNS (a FK column cannot be re-planted after copying), or move the FK-reassignment before the copied-column lookup and re-run the lookup after any plan that alters the FK. Also verify that step 7 tie plans and step 5/6 plans never modify FK columns (Claims.Policy_ID is in TIE_COLUMNS too and will break Claims.Policy_ID \u2192 Customer_Policies)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance._ensure_unmatched_parents asserts an unmatched parent per PF pair and, if none exists, rewrites child FK `cv[0] = designated` where `parent_vals[0]` may be a compact-row PK, not the designated value used by the FK sampler (which offsets past compact MAX). cv[0]=designated will not be a valid FK because the designated value is not in child FK range; worse, this rewrite runs after copied columns are computed and would again desynchronize Settlements copied columns. Also, since _build_table_rows reserves parent PKs.pv[0]=designated only among *generated* parent rows, an unmatched parent exists only if some generated parent PK is missing from child FKs by chance \u2014 the program never restricts generation to guarantee it, only asserts it and rewrites as a fallback.",
+     "requested_revision": "Implement the unmatched-parent reservation as the spec demands: after generating FK child values, ensure the designated parent PK (first parent PK used in the sampler) is excluded from child FKs; if not, replace a random child FK with a different choosable value, and rerun the copied-column lookup so Settlements values stay consistent with the (unchanged) FK. Do not rewrite cv[0] to the designated value after the fact without re-copying."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tie_plan_count in values.py: after building `seq`, it truncates with `seq = seq[:n]` and then pads with top_vals[0]; truncation can drop rows from one of the two tied values, making the top-2 counts unequal. Example: n=5, top=2, remaining=1 \u2192 assigned to a fresh value; counts = {v1:2, v2:2, fresh:1}; after shuffle this is fine. But n=4, top=2, remaining=0, distinct has 2 values \u2192 counts v1:2, v2:2, seq = [v1,v1,v2,v2], fine. For n=3, top=2 is reduced to 1 (2*1=2<=3), remaining=1; if remaining goes to a fresh value \u2192 v1:1, v2:1, fresh:1, top-2 tie holds. But if `remaining` was added to pairs, e.g. n=6, top=2, remaining=2, pairs=1 \u2192 v1:3, v2:3, ok. However when `distinct` has many values and `remaining > 0` distributes to others first (top-1 each), the `top` value was computed as max(2, n//len(distinct)) \u2014 with n=15 and len(distinct)=2, top=7, remaining=1 \u2192 goes to fresh; top-2 tie survived by chance. However if an intermediate assignment makes a fresh value count equal to `top`, the assertion at the end may either pass (3-way tie, allowed) or fail if a truncated seq drops rows unevenly. Slice `seq = seq[:n]` is dangerous because truncation on a shuffled list is non-deterministic w.r.t. counts.",
+     "requested_revision": "After seq is built and before shuffling, assert sum(seq)==n without truncation; if padding is needed use a value that preserves the tie (add pairs) and never slice. Verify the assertion top2[0][1]==top2[1][1] is always reached, and adjust the `top` computation so 2*top \u2264 n strictly (already partially done). Add a regression test covering len(distinct)=2 and small n."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In _build_table_rows step 6, when a column is both a DISTINCT target and in GROUP_SIZE_COLUMNS, duplicate_plan is skipped. But spec.duplicates_for_distinct also includes Payments.Amount_Payment which is not in GROUP_SIZE_COLUMNS, so duplicate share is applied. However the spec \u00a7tie_order precedence and NULL rule precedence ('group-size plan first, then duplicate plan only to values that do not disturb planted group sizes; otherwise skip') is not implemented for any column except by skipping entirely; if a column were in both lists, only group-size runs. This is conservative but per spec allowed. Not a blocker on its own, but combined with the lack of tie-on-count attempt on Customer_Policies.Policy_Type_Code having only 4 enum values and n=15, ties may or may not appear. The real defect: spec.TIE_COUNT_COLUMNS contains ('Customer_Policies','Policy_Type_Code') but Customer_Policies group_sizes plan is not applied to that column (not in GROUP_SIZE_COLUMNS); tie_plan_count will replace the enum values with _fresh_value suffixed strings, violating the enum constraint 'Policy_Type_Code IN (Car,Life,Property,Travel)'.",
+     "requested_revision": "tie_plan_count must not invent fresh values for enum-constrained columns: it must only choose among the enum pool. Pass a `valuedomain` (enum values) into tie_plan_count and use those exclusively. Do the same for Payments.Payment_Method_Code. Verify the resulting top-tied groups are drawn from the enum and still satisfy the tie; if the enum has too few values, relax by allowing more ties or raising a clear error (still leaving at least one group with size < top)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Settlements.Customer_Policy_ID is declared NOT NULL in the schema and has no FK, declared as 'free integer'. The spec does not list a sampler for it in generic_sampling_rules (only integer_small, integer_amount, etc.). In _build_table_rows, step 4 handles it under the 'INT' branch: since name contains neither AMOUNT nor PAYMENT, rand_small is used. That is fine, but the semantic uncertainty note says 'treated as a free integer' \u2014 no rule violated. Not an issue.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec asserts 'Claims.Date_Claim_Made <= Date_Claim_Settled' as supported/enforced, but the DATE_PAIRS plan in instance.py samples later date from [earlier, earlier+400 days] which can exceed Date_Claim_Settled's own compact range. But there is a stronger conflict: Claims.Date_Claim_Made is both in GROUP_SIZE_COLUMNS and TIE_COLUMNS. Step 5 applies group_size_plan (creating groups of size 1,2,>=3 with `_distinct_base_values` fresh values), step 7 tie_plan then overwrites rank-1 rows to share `anchor` \u2014 this collapses the size-1 group and may break the group-size plan. The spec \u00a7tie_order precedence governs DISTINCT vs GROUP_SIZE, not TIE vs GROUP_SIZE. Additionally, DATE_PAIRS runs after TIE and will overwrite Date_Claim_Settled with rand_date_after(e, up to 400 days), which destroys the group_size_plan for Date_Claim_Settled.",
+     "requested_revision": "Specify interaction order between tie_plan, group_size_plan, date_order and null_plan for columns belonging to multiple plans. Practically: apply DATE_PAIRS before GROUP_SIZE/TIE, then re-derive (or forbid) collisions. Ensure tie and group-size plans do not clobber each other on the same column by assigning distinct disjoint rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules in the spec: Customer_Policies.Start_Date <= End_Date is declared 'uncertain, contradicted by the compact sample, generator does not enforce it' \u2014 acceptable; Claims.Date_Claim_Made <= Date_Claim_Settled is 'supported and enforced', with evidence from 3 specific rows \u2014 reasonable. Amount nonnegativity: supported. Enum values: supported. However, Settlements.Date_Claim_Made = Claims.Date_Claim_Made etc. are supported by only 3 paired rows (357/486, 516/569, 564/571), and the claim 'copied from parent claim via Claim_ID' is a strong extrapolation from that sample. Given the schema allows multiple Settlements per Claim, the copy rule is plausible but should be labeled 'strongly supported, low confidence on exact-match' rather than 'supported'. This won't block pass, but should be reflected in the spec.",
+     "requested_revision": "Downgrade the Settlements\u2192Claims copy rule evidence confidence OR increase evidence from more rows; add a note that non-NULL copied values are constrained equal only because the compact sample consistently ties them, and that the copy relationship is not schema-enforced."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's integer_pk rule says 'Sequential unique integers starting at 1, step 1' but also 'offset generated PKs by the compact MAX(pk) ... so the per-instance row count equals table_sizes_per_instance'. These two statements are contradictory: starting at 1 offset by compact MAX means the generated PKs do not start at 1, and the row-count claim is only true if compact row count is subtracted from the target. The spec should state table_sizes_per_instance means *generated* row count, and must articulate how writer's row-count assertion should be computed (see engineer issue above).",
+     "requested_revision": "Rename/clarify: integer_pk = 'sequential unique integers starting at compact MAX(pk)+1, step 1; per-instance *generated* row count equals table_sizes_per_instance[t]; per-instance total row count = compact_count + generated_count'. Fix the writer assertion accordingly."
+    }
+   ]
+  }
+ ]
 }

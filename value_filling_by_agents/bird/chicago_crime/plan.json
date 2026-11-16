@@ -1,50 +1,556 @@
 {
  "db": "chicago_crime",
- "operator_io_quirks": [
-  "Table/column names are mixed-case (Community_Area, FBI_Code, Population, report_no); must double-quote and match case-insensitively.",
-  "Crime has 268002 rows > max_rows_per_table 300000? no, under cap, but largest table; read once per worker, rowid%k sampling.",
-  "Crime.date is TEXT storing '1/1/2018 2:46' (M/D/YYYY H:MM, no leading zeros) \u2014 declared TEXT so TS dispatches String, not Date.",
-  "Crime.latitude/longitude are TEXT holding decimal strings ('41.94456125','-87.72668181') \u2014 String fuzzer, not Number.",
-  "Community_Area.population is TEXT with comma-grouped numbers ('54,991') \u2014 String fuzzer; numeric comparisons would need CAST.",
-  "Crime.arrest/domestic are TEXT 'TRUE'/'FALSE' (not bool/bit) \u2014 String fuzzer, not Bool.",
-  "Crime.iucr_no TEXT values ('110','143B','1310') differ in shape from IUCR.iucr_no ('031A','031B') \u2014 FK child/parent value sets not identical; some Crime.iucr_no may not match IUCR (dangling FK).",
-  "Crime.fbi_code_no samples include '15','14','18' (no letter) vs FBI_Code '01A','01B' \u2014 FK parent may be missing for some child values.",
-  "Crime.ward_no storage includes null though null_rate 0.0 reported; FK to Ward(ward_no) \u2014 nullable FK child.",
-  "Ward.alderman_name_suffix null_rate 0.9, distinct 1 ('Jr.') \u2014 near-constant column; String fuzzer will mostly generate junk.",
-  "District.email/twitter samples start with U+00A0 non-breaking space; Ward addresses contain U+00A0 \u2014 String fuzzer charset lacks it.",
-  "Neighborhood PK is neighborhood_name (TEXT), FK community_area_no -> Community_Area; Crime has no FK to Neighborhood (no neighborhood_name column)."
- ],
- "operator_ts_expectations": [
-  "All TEXT columns (date, latitude, longitude, arrest, domestic, population, zip_code-as-text) get String fuzzer: random a-zA-Z0-9() strings + contaminate \u2014 implausible for dates/coords/booleans -> likely FN on date-range, lat/lon-range, arrest='TRUE' predicates.",
-  "Number fuzzer on INTEGER PKs (community_area_no, district_no, ward_no, report_no) draws uniform in [-10^scale,10^scale] then +-1/+-2 perturbation \u2014 values far outside 1..77/1..50/1..22/1..268002 -> FN on range/equality predicates.",
-  "FK child columns (Crime.ward_no etc.) draw from parent's FINAL filtered values with replacement \u2014 ties/duplicates preserved, good for joins; but parent PK filtering may shrink parent below child cardinality.",
-  "String fuzzer on iucr_no/fbi_code_no generates random strings not matching parent code shapes -> join predicates on these FKs may return empty -> FN.",
-  "String fuzzer on arrest/domestic generates random strings, never 'TRUE'/'FALSE' -> predicates arrest='TRUE' return empty -> FN.",
-  "String fuzzer on date generates random strings, never 'M/D/YYYY H:MM' -> date LIKE/range predicates return empty -> FN.",
-  "Number fuzzer on zip_code (INTEGER) draws huge ints, not 606xx -> zip predicates FN.",
-  "String fuzzer on latitude/longitude (TEXT) generates random strings, not decimal coords -> coordinate predicates FN.",
-  "PK uniqueness enforced by sample_fresh_primary_keys; unique columns dropped \u2014 but no unique columns besides PKs here, so few FP from missing ties.",
-  "Small tables (Community_Area 77, District 22, Ward 50, FBI_Code 26) get sizes from choose_table_sizes (30..2500) \u2014 may exceed original cardinality, creating duplicate-ish rows but PK filter caps.",
-  "String fuzzer on side (9 distinct) / index_code (2 distinct) / crime_against (4 distinct) generates random strings, losing the small enum -> FN on side='North' etc.",
-  "Number fuzzer on city_hall_office_room (4 distinct: 200,305,300,302) draws wide ints -> FN on room predicates."
- ],
- "challenger_refs": [
-  "G1",
-  "G9",
-  "G6",
-  "G3",
-  "G15",
-  "G19",
-  "G21",
-  "G18",
-  "G14",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "text_pk": "Short unique token built from a table prefix and a counter (e.g. 'IUCR0001'); never NULL.",
+   "text_generic": "Draw from a small pool of realistic literals for the column's meaning; 5% of rows get a near-variant (case change, trailing space, or one-character edit) of a pool value.",
+   "text_enum": "Draw uniformly from the enum list; 5% of rows get a case-variant of a listed value.",
+   "integer_generic": "Uniform integer in [1, 1000] unless a per-column exception gives a range.",
+   "numeric_boundary": "For each listed boundary literal L, generate rows at L-1, L, L+1 (or the date equivalent) so that both sides of the comparison are populated; the boundary must be emitted in the column's storage format (e.g. comma-formatted TEXT for Community_Area.population).",
+   "null_share": "For each nullable column in null_targets, 5% of generated rows get NULL (at least one row per instance); NOT NULL and PK columns never get NULL; columns not listed in null_targets are never NULL.",
+   "duplicates_for_distinct": "On non-PK columns flagged for DISTINCT, repeat 20-50% of values so that COUNT(DISTINCT) < COUNT(*); never apply to primary-key columns.",
+   "ties_for_order_limit": "On columns flagged for ORDER/LIMIT, plant at least two rows sharing the top count (rank-1 tie) and, where listed, the 5th rank, so the requested rank ties occur on the aggregate.",
+   "unmatched_join_rows": "For each FK column, 5% of child rows get a NULL FK; parent rows without children are achieved by not referencing every parent (no orphan keys are created).",
+   "date_text": "Format 'M/D/YYYY H:MM' as in the sample; dates spread over 2018-01-01..2018-12-31.",
+   "like_near_variant": "For each LIKE literal, generate the exact literal plus variants that match and variants that differ by one character or case; the variants are produced in the column's date/text format."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Community_Area.community_area_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Near North Side",
+     "near north side",
+     "North Lawndale",
+     "north lawndale",
+     "Roseland",
+     "roseland"
+    ]
+   },
+   {
+    "column": "Community_Area.population",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "49,999",
+     "50,000",
+     "50,001"
+    ],
+    "note": "stored as TEXT with comma formatting; comparison uses CAST(REPLACE(population,',','') AS INTEGER)"
+   },
+   {
+    "column": "Crime.arrest",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "TRUE",
+     "true",
+     "FALSE",
+     "false"
+    ]
+   },
+   {
+    "column": "Crime.domestic",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "TRUE",
+     "true",
+     "FALSE",
+     "false"
+    ]
+   },
+   {
+    "column": "Crime.report_no",
+    "pattern": "comparison_boundary",
+    "targets": [
+     23777,
+     23778,
+     23779,
+     23842,
+     23843,
+     23844
+    ]
+   },
+   {
+    "column": "Crime.location_description",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "HOUSE",
+     "house",
+     "STREET",
+     "street",
+     "ABANDONED BUILDING",
+     "abandoned building"
+    ]
+   },
+   {
+    "column": "Crime.location_description",
+    "pattern": "like_near_variant",
+    "targets": [
+     "AIRCRAFT%"
+    ]
+   },
+   {
+    "column": "Crime.date",
+    "pattern": "like_near_variant",
+    "targets": [
+     "5/%/2018%",
+     "1/1/20%",
+     "1/1/2018%",
+     "9/8/2018%",
+     "%9/8/2018%",
+     "%%"
+    ]
+   },
+   {
+    "column": "Crime.beat",
+    "pattern": "comparison_boundary",
+    "targets": [
+     999,
+     1000,
+     1001
+    ]
+   },
+   {
+    "column": "Crime.iucr_no",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "141",
+     "142",
+     "143"
+    ]
+   },
+   {
+    "column": "Crime.case_number",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "5-30% NULL"
+    ]
+   },
+   {
+    "column": "Crime.case_number",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "Crime.district_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "Crime.community_area_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "Crime.fbi_code_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "District.district_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "District.district_no",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 DESC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "District.district_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Central",
+     "central",
+     "Calumet",
+     "calumet"
+    ]
+   },
+   {
+    "column": "District.district_name",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 ASC and DESC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "District.commander",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "FBI_Code.title",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Larceny",
+     "larceny",
+     "Misc Non-Index Offense",
+     "misc non-index offense",
+     "Weapons Violation",
+     "weapons violation"
+    ]
+   },
+   {
+    "column": "FBI_Code.fbi_code_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "IUCR.secondary_description",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "SIMPLE",
+     "simple",
+     "SOLICIT FOR PROSTITUTE",
+     "solicit for prostitute",
+     "SOLICIT ON PUBLIC WAY",
+     "solicit on public way"
+    ]
+   },
+   {
+    "column": "Neighborhood.neighborhood_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "Ward.alderman_last_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Burke",
+     "burke",
+     "Dowell",
+     "dowell",
+     "Reilly",
+     "reilly"
+    ]
+   },
+   {
+    "column": "Ward.Population",
+    "pattern": "comparison_boundary",
+    "targets": [
+     -1,
+     0,
+     1,
+     49999,
+     50000,
+     50001
+    ]
+   },
+   {
+    "column": "Ward.ward_no",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "rank 1 and 5 ASC and DESC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "Ward.ward_office_address",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "Community_Area.community_area_no",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Neighborhood.community_area_no",
+    "parent": "Community_Area.community_area_no",
+    "copied": []
+   },
+   {
+    "child": "Crime.ward_no",
+    "parent": "Ward.ward_no",
+    "copied": []
+   },
+   {
+    "child": "Crime.iucr_no",
+    "parent": "IUCR.iucr_no",
+    "copied": []
+   },
+   {
+    "child": "Crime.district_no",
+    "parent": "District.district_no",
+    "copied": []
+   },
+   {
+    "child": "Crime.community_area_no",
+    "parent": "Community_Area.community_area_no",
+    "copied": []
+   },
+   {
+    "child": "Crime.fbi_code_no",
+    "parent": "FBI_Code.fbi_code_no",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Community_Area",
+    "column": "community_area_no",
+    "formula": "community_area_no > 0"
+   },
+   {
+    "table": "Community_Area",
+    "column": "side",
+    "formula": "side IN ('Far North','North','Central','Northwest','West','South','Far Southeast','Southwest')"
+   },
+   {
+    "table": "District",
+    "column": "district_no",
+    "formula": "district_no BETWEEN 1 AND 25"
+   },
+   {
+    "table": "District",
+    "column": "zip_code",
+    "formula": "zip_code BETWEEN 60000 AND 60999"
+   },
+   {
+    "table": "FBI_Code",
+    "column": "crime_against",
+    "formula": "crime_against IN ('Persons','Property','Society','Persons and Society')"
+   },
+   {
+    "table": "IUCR",
+    "column": "index_code",
+    "formula": "index_code IN ('I','N')"
+   },
+   {
+    "table": "Ward",
+    "column": "ward_no",
+    "formula": "ward_no BETWEEN 1 AND 50"
+   },
+   {
+    "table": "Ward",
+    "column": "Population",
+    "formula": "Population >= 0"
+   },
+   {
+    "table": "Crime",
+    "column": "arrest",
+    "formula": "arrest IN ('TRUE','FALSE')"
+   },
+   {
+    "table": "Crime",
+    "column": "domestic",
+    "formula": "domestic IN ('TRUE','FALSE')"
+   },
+   {
+    "table": "Crime",
+    "column": "beat",
+    "formula": "beat > 0"
+   },
+   {
+    "table": "Crime",
+    "column": "latitude",
+    "formula": "CAST(latitude AS REAL) BETWEEN 41.6 AND 42.1"
+   },
+   {
+    "table": "Crime",
+    "column": "longitude",
+    "formula": "CAST(longitude AS REAL) BETWEEN -87.95 AND -87.5"
+   },
+   {
+    "table": "Crime",
+    "column": "district_no",
+    "formula": "district_no IN (SELECT district_no FROM District)"
+   },
+   {
+    "table": "Crime",
+    "column": "ward_no",
+    "formula": "ward_no IN (SELECT ward_no FROM Ward)"
+   },
+   {
+    "table": "Crime",
+    "column": "community_area_no",
+    "formula": "community_area_no IN (SELECT community_area_no FROM Community_Area)"
+   },
+   {
+    "table": "Crime",
+    "column": "fbi_code_no",
+    "formula": "fbi_code_no IN (SELECT fbi_code_no FROM FBI_Code)"
+   },
+   {
+    "table": "Crime",
+    "column": "iucr_no",
+    "formula": "iucr_no IN (SELECT iucr_no FROM IUCR)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Community_Area": 77,
+   "District": 22,
+   "FBI_Code": 26,
+   "IUCR": 401,
+   "Neighborhood": 246,
+   "Ward": 50,
+   "Crime": 230
+  },
+  "null_targets": [
+   "Crime.case_number",
+   "Crime.location_description",
+   "Crime.latitude",
+   "Crime.longitude",
+   "District.tty",
+   "Ward.alderman_name_suffix",
+   "Ward.ward_office_address",
+   "Ward.ward_office_zip",
+   "Ward.ward_email",
+   "Ward.ward_office_phone",
+   "Ward.ward_office_fax",
+   "Ward.city_hall_office_phone",
+   "Ward.city_hall_office_fax"
+  ],
+  "supporting_evidence": [
+   "Community_Area.population stored as TEXT with commas; comparison uses CAST(REPLACE(population,',','') AS INTEGER) per atomic op.",
+   "Crime.arrest and Crime.domestic are TEXT flags with values TRUE/FALSE (sample rows).",
+   "Crime.date format 'M/D/YYYY H:MM' from sample rows (e.g. '1/1/2018 2:46').",
+   "Crime.latitude/longitude are TEXT decimals around 41.7-41.9 / -87.6 to -87.8 (sample rows).",
+   "Ward.Population is INTEGER (sample values 56149..51687).",
+   "IUCR.index_code has two values I/N (sample rows).",
+   "FBI_Code.crime_against has four values (sample rows).",
+   "District.district_no range 1..22 from statistics (22 rows).",
+   "Ward.ward_no range 1..50 from statistics (50 rows)."
+  ],
+  "uncertainty": [
+   "Exact enum lists for Crime.location_description and Crime.iucr_no are large; only boundary literals are pinned.",
+   "Community_Area.side has 9 distinct values in stats but only 8 shown; the ninth is unknown and drawn from the shown pool.",
+   "Ward.city_hall_office_room has only 4 distinct values; the full set is not shown.",
+   "Crime.report_no distinct count (44750) is below row count (268002), so duplicates exist in the original; generation keeps report_no unique as PK."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=231 and validity.invalid=20 with reason 'new_integrity_failures' for every instance. The generator deliberately plants orphan FK values: instance.py fill_foreign_keys_consistently() writes a non-existent parent key for ~5% of child rows (spec['fk_orphan']=0.05), and _orphan_value() returns max(parent_vals)+randint(1,50) or str(sample)+'_x'. writer.py sets 'pragma foreign_keys = OFF' before inserting, so these orphans are committed silently. The schema declares real FOREIGN KEY constraints on Crime.ward_no/iucr_no/district_no/community_area_no/fbi_code_no and Neighborhood.community_area_no, so every generated instance now violates the declared integrity constraints.",
+     "requested_revision": "Reconcile the 'unmatched_join_rows' rule with the declared FK constraints. Either (a) drop the orphan-FK planting (set fk_orphan=0 and remove _orphan_value usage) so generated child rows only reference existing parents, or (b) if orphan rows are genuinely required by the specification, the specification must state that FK constraints are intentionally violated and the validity checker must be told so. As written, the program produces instances that fail the schema's own integrity constraints, which blocks a pass. Also stop disabling 'pragma foreign_keys' in writer.py so violations are surfaced rather than hidden."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "rows_skipped shows large silent losses: Community_Area 193 skipped, District 77, Neighborhood 955, Ward 104 (out of ~243/101/2089/141 attempted). These are rows rejected by the writer's per-row retry loop (writer.py) after executemany fails, most likely PK collisions with compact keys or NOT NULL/unique violations. The specification's table_sizes_per_instance (Community_Area 77, District 22, Neighborhood 246, Ward 50) is meant to be the generated size, but the actual appended counts are far below it, and the sampler's choose_table_sizes() also varies sizes to 0.5x-1.5x of the declared value, contradicting 'table_sizes_per_instance'.",
+     "requested_revision": "Make generated row counts match table_sizes_per_instance (or document that these are target sizes and the sampler may vary them). Fix the PK-collision / constraint failures that cause rows to be dropped so that rows_skipped is ~0 for tables without intentional orphan rows. If drops are expected, the specification must state the intended skip behavior; otherwise the program is not implementing the declared sizes."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's 'unmatched_join_rows' rule (generic_sampling_rules and per_column_exceptions for Crime.district_no, Crime.community_area_no, Crime.fbi_code_no, District.district_no, FBI_Code.fbi_code_no, Community_Area.community_area_no) asks for 'child_rows_with_null_fk' and 'parent_rows_without_children', but the schema declares NOT NULL-free FK columns that are still constrained by FOREIGN KEY. The rule as written is inconsistent with the DDL: a non-existent parent key is a constraint violation, not a valid 'unmatched join' scenario. The atomic-op targets also list 'parent_rows_without_children' which is satisfiable without orphans (just don't reference some parents), but the program additionally plants orphan children.",
+     "requested_revision": "Clarify the unmatched_join_rows rule: 'parent_rows_without_children' can be achieved by simply not referencing every parent (no orphans needed), while 'child_rows_with_null_fk' is fine for nullable FKs. Remove the 'non-existent parent key' requirement, or explicitly state that FK constraints are to be violated and adjust the validity criteria accordingly. The current spec text drives the engineer's orphan planting that breaks integrity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires 'each instance contains generated rows with NULL and rows with non-NULL values' for every nullable column. Feedback shows several nullable columns with NULL 0 / n: 'District.commander: generated rows: NULL 0 / 29'. Also many columns get NULLs that are not in null_targets (e.g. Community_Area.community_area_name NULL 11/172, Community_Area.side NULL 15/172, District.district_name NULL 3/29, FBI_Code.title NULL 20/329, IUCR.index_code NULL 20/2985, Ward.alderman_last_name NULL 9/47, Ward.Population NULL 4/47). _apply_null_rule() applies a default 5% NULL to every nullable column not in the spec, which contradicts the specification's explicit null_targets list and the semantic formulas (e.g. side IN (...), index_code IN ('I','N'), Population >= 0) that should hold for non-NULL operands but are being applied to columns the spec did not mark nullable.",
+     "requested_revision": "Restrict NULL generation to the columns listed in null_targets (plus nullable FKs), and ensure at least one NULL row per such column per instance (District.commander shows 0). Do not inject NULLs into columns the specification treats as always-populated (enum/range columns like side, index_code, Population, title, district_name, alderman_last_name) unless the spec lists them as nullable. Note: per instruction 7, a 'NULL 0 / n' line alone is a note, but the broader mismatch between null_targets and the default-5%-everywhere behavior is a spec/program inconsistency."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification pins boundary literals for many columns (e.g. Crime.report_no targets [23777,23778,23779,23842,23843,23844], Crime.beat [999,1000,1001], Ward.Population [-1,0,1,49999,50000,50001], Community_Area.population ['49999','50000','50001']). BoundarySampler plants L-1/L/L+1 for numeric literals, but for Community_Area.population the targets are strings '49999' etc. and the note says comparison uses CAST(REPLACE(population,',','') AS INTEGER); BoundarySampler treats them as strings and emits '49999','49999'.lower() etc., never the comma-formatted TEXT the column actually stores, and never the L-1/L+1 around the cast value. Similarly Crime.report_no is an INTEGER PK; BoundarySampler will emit 23776..23845 but sample_fresh_primary_keys then drops any that collide with compact keys, and the PK sampler (NumberSampler with range (1,10^7)) may not actually produce the boundary values because BoundarySampler wraps the base but the base is a NumberSampler whose own range dominates. There is no evidence in the feedback that boundary values are actually present in generated rows.",
+     "requested_revision": "Make BoundarySampler honor the column's storage format: for Community_Area.population emit comma-formatted TEXT around the cast boundary (e.g. '49,999','50,000','50,001'); for Crime.report_no ensure the planted boundary integers survive PK-freshness filtering (or document that compact rows already cover them). Add a check that boundary literals appear in generated rows. Also confirm the '49999'/'50000'/'50001' string targets are converted to the cast comparison domain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's like_near_variant targets for Crime.date are ['5/%/2018%','1/1/20%','1/1/2018%','9/8/2018%','%9/8/2018%','%%'] and for Crime.location_description ['AIRCRAFT%']. LikeSampler strips '%' and emits body, body+' x', body[:-1], body.upper(), body.lower(). For '%%' the body is empty and is skipped; for '5/%/2018%' the body '5//2018' is emitted but the date column is generated by DateSampler with template '%m/%d/%Y' (or similar), so the LIKE variants are not integrated with the date format and may not match the intended '5/%/2018%' pattern. The date_text rule says format 'M/D/YYYY H:MM' spread over 2018, but DateSampler's template is chosen from the compact values and may not be 'M/D/YYYY H:MM'.",
+     "requested_revision": "Ensure Crime.date generation uses the 'M/D/YYYY H:MM' format stated in the spec and that LikeSampler variants for date patterns are produced in that format (e.g. '5/1/2018 2:46', '5/15/2018 9:00'). Handle the '%%' pattern explicitly (it matches everything, so any date is fine, but the sampler should not silently drop it). Verify the AIRCRAFT% variants actually appear in Crime.location_description."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty section admits: 'Community_Area.side has 9 distinct values in stats but only 8 shown; the ninth is unknown and drawn from the shown pool.' The semantic rule side IN (8 values) is therefore incomplete relative to the compact data. Similarly 'Ward.city_hall_office_room has only 4 distinct values; the full set is not shown.' These are acknowledged gaps but the spec still asserts closed enum domains.",
+     "requested_revision": "Either recover the missing enum values from the compact database (the program has read access via schema.original_values) and add them to the spec, or mark these domains as open (draw from compact values plus the listed ones) rather than closed IN-lists. The current spec under-specifies these domains while the program's EnumSampler draws only from the listed values, so generated rows will never contain the ninth side value."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's ties_for_order_limit targets include 'rank 1 and 5 ASC and DESC on COUNT(*)' for Ward.ward_no and 'rank 1 ASC and DESC' for District.district_name, but _apply_tie_rule() only plants a single pair of equal values (a,b = rng.sample(range(n),2); cols[c][b]=cols[c][a]). This creates at most a rank-1 tie on the column value, not the required rank-1 and rank-5 ties, and does not control the direction (ASC/DESC) or the COUNT(*) aggregate over joined Crime rows. The construction_pairs feedback shows separated=63/400 with no per-group breakdown, so it is unclear whether the tie targets are met.",
+     "requested_revision": "Extend _apply_tie_rule to plant the specific tie ranks requested (e.g. at least two rows sharing the top count and two sharing the 5th count for Ward.ward_no), and to do so on the aggregate COUNT(*) over the relevant join, not just on the raw column value. Add a verification that the intended rank ties occur in generated instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's duplicates_for_distinct targets require '20-50% duplicate share' on Crime.case_number, District.commander, Neighborhood.neighborhood_name. _apply_duplicate_rule copies values from a random source index to a destination index, but it runs after sample_fresh_primary_keys and drop_unique_duplicates, and for Neighborhood.neighborhood_name (a TEXT primary key) the duplicate rule would create duplicate PKs that are then rejected by the writer (contributing to the 955 skipped Neighborhood rows). For Crime.case_number the rule is applied but the column is not a PK, so it should work; however the feedback does not show a duplicate-share check.",
+     "requested_revision": "Do not apply duplicates_for_distinct to primary-key columns (Neighborhood.neighborhood_name is the PK of Neighborhood). For non-PK flagged columns, verify the resulting duplicate share is in 20-50%. The current code both breaks PK uniqueness on Neighborhood and lacks verification of the duplicate share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include Crime.latitude BETWEEN 41.6 AND 42.1 and Crime.longitude BETWEEN -87.95 AND -87.5, but the program's spec.normalise() only parses BETWEEN for integer bounds (re.search(r'BETWEEN\\s+(-?\\d+)\\s+AND\\s+(-?\\d+)')) and only parses '>=' for lower bounds. The latitude/longitude rules use decimal bounds and CAST(... AS REAL), which the regex does not match, so no range is applied and the StringSampler/NumberSampler for these TEXT columns will produce arbitrary values outside the Chicago bounding box. Similarly Crime.beat > 0 is parsed as range (1,10^6) but the spec's boundary targets [999,1000,1001] are handled separately.",
+     "requested_revision": "Extend spec.normalise() to parse decimal BETWEEN bounds and CAST(... AS REAL) formulas so latitude/longitude ranges are enforced, or add explicit per-column range exceptions for them. Verify generated latitude/longitude fall in the stated bounding box."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether boundary literals (Crime.report_no 23777-23844, Crime.beat 999-1001, Ward.Population -1/0/1/49999-50001, Community_Area.population 49999-50001) actually appear in generated rows after PK-freshness filtering and format handling.",
+    "Whether the 63/400 separated construction pairs correspond to the intended patterns; no per-group breakdown was provided.",
+    "Whether the compact rows are preserved unchanged (writer copies the file and only appends, which looks correct, but no explicit before/after row-count check was reported).",
+    "Whether the 'parent_rows_without_children' half of unmatched_join_rows is satisfied without orphans (it can be, by not referencing every parent, but this is not verified).",
+    "Whether the ninth Community_Area.side value and the full Ward.city_hall_office_room domain can be recovered from the compact DB."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's `uncertainty` list admits that `Community_Area.side` has 9 distinct values in the compact data but only 8 are listed in the semantic rule `side IN ('Far North','North','Central','Northwest','West','South','Far Southeast','Southwest')`. The program handles this via `_extra_enum_values` / `EnumSampler.extra` (values.py), drawing the 9th value from the compact DB, so the enum is treated as open. This is a reasonable resolution but the specification itself is internally inconsistent (a closed IN-list that excludes a value present in the data).",
+     "requested_revision": "Designer should either extend the `side` IN-list to include the 9th observed value or explicitly mark the domain as open in the specification, so the semantic rule and the data agree."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "The specification's `uncertainty` notes `Crime.report_no` has distinct count (44750) below row count (268002) in the original, i.e. duplicates exist, yet the schema declares it a PRIMARY KEY. The program keeps report_no unique (sample_fresh_primary_keys) and the execution feedback shows `pk_duplicates: 0`. This is the correct choice for integrity, but the specification's boundary targets for report_no (23777..23844) are planted as PK values, which is fine; the note is informational only.",
+     "requested_revision": "No change required; designer may clarify that report_no is treated as a unique PK despite the original duplicate observation."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows several nullable columns with 'generated rows: NULL 0 / n' (e.g. Community_Area.community_area_name, District.address, FBI_Code.title, IUCR.index_code, Ward.Population). Per the NULL rule these are nullable columns not in `null_targets`, so the program correctly never NULLs them (`_apply_null_rule` skips columns not in null_targets and not FK). This is consistent with the interface rule and does not block a pass, but is noted for the engineer.",
+     "requested_revision": "None blocking; engineer may confirm these columns are intentionally excluded from null_targets."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution feedback shows `rows_skipped` for Community_Area (177), District (71), Ward (109) \u2014 rows dropped by `sample_fresh_primary_keys` / `drop_unique_duplicates` because generated PKs collided with compact keys or unique columns. This is expected behavior (PK freshness against compact keys) and is counted, not silent. However, the effective generated row counts for these small tables are lower than the declared `table_sizes_per_instance` (e.g. Community_Area 77 declared, 66 added).",
+     "requested_revision": "None blocking; engineer may consider oversampling small tables to hit declared sizes, but integrity is preserved and counts are reported."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "`construction_pairs` shows 51/400 separated with 0 unknown executions. This is a low separation rate but, per instruction 4, a missing separation alone does not establish a generation error. The boundary samplers (BoundarySampler, LikeSampler) and enum case-variants are implemented, so value variation remains possible; the low separation likely reflects query pairs whose predicates are not exercised by the planted boundaries rather than a program defect.",
+     "requested_revision": "None blocking; engineer may review whether boundary planting probability (0.5 in BoundarySampler, 0.4 in LikeSampler) is sufficient to separate more pairs, but this is an optimization, not a correctness error."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 9th Community_Area.side value is correctly drawn from compact data in all instances (program logic supports it; not directly verified in feedback).",
+    "Whether boundary literals for TEXT-stored numeric columns (Community_Area.population '49,999'/'50,000'/'50,001') are emitted with comma formatting as required \u2014 code path `_fmt_boundary` handles this, but execution feedback does not show per-value samples.",
+    "Whether LIKE date variants ('5/%/2018%' etc.) produce both matching and near-miss literals in 'M/D/YYYY H:MM' format \u2014 `_date_like_variants` implements this, but not directly confirmed in feedback."
+   ],
+   "summary": "The program ran successfully (20/20 valid instances, 0 FK/not-null/PK violations, reproducible), preserves compact rows (append-only copy), and implements the specification's value domains, boundary planting, NULL rule (restricted to null_targets + nullable FKs), duplicate and tie rules, and FK dependencies without orphan keys. Semantic rules are supported by the schema and sample evidence; the only uncertainties are the open `side` enum and the report_no duplicate note, both handled reasonably by the program. No blocking errors found."
+  }
+ ]
 }

@@ -1,49 +1,582 @@
 {
  "db": "language_corpus",
- "operator_io_quirks": [
-  "langs has exactly 1 row (lid=1, lang='ca', locale='ca_ES'); every FK to langs collapses to a single value, so child tables are effectively single-language.",
-  "pages_words has 129M rows and biwords 21M: read_schema must rowid-sample (max_rows_per_table) or it will hang; original_sizes still needs full count(*).",
-  "pages_words.pid distinct=336 and wid distinct=53644 in samples but table has 129M rows: distinct counts are from the sampled slice, not the full table.",
-  "langs_words, pages_words, biwords are WITHOUT ROWID composite-PK tables; rowid-based sampling (rowid % k) is invalid there \u2014 need a fallback (e.g. ORDER BY pk LIMIT).",
-  "AUTOINCREMENT on langs.lid, pages.pid, words.wid: inserting explicit PK values is fine, but the sqlite_sequence table exists in the DDL clone and must be tolerated.",
-  "Five triggers (ins_page/del_page/ins_lang_word/del_lang_word/ins_page_word/del_page_word) fire on INSERT and UPDATE langs.pages/words counters; TS inserts will mutate langs.pages/words away from the original 1129144/2764996.",
-  "pages has UNIQUE(lid,page,title) \u2014 a 3-column unique constraint, not a single-column unique; upstream's line-based 'unique' scan will mark the first token of that line (lid) as unique, which is wrong.",
-  "langs.lang and langs.locale are single-column UNIQUE; words.word is UNIQUE; with 1-row langs, drop_unique_duplicates will keep at most 1 row in langs.",
-  "pages.title samples are accented Catalan words (\u00c0bac, Addicci\u00f3) \u2014 text storage, no date-like strings; declared TEXT dispatches to String fuzzer.",
-  "All declared types are INTEGER or TEXT; no date/time/bool/bit/year columns, so Date/Time/Bool/Bit fuzzers are never exercised here.",
-  "pages.lid FK to langs(lid) with ON UPDATE/DELETE CASCADE; langs has 1 row so pages.lid is always 1 in the original \u2014 TS will draw from the (filtered) langs.lid column.",
-  "biwords has two FKs to words (w1st, w2nd) \u2014 same parent table twice; fill_foreign_keys_consistently must handle two child columns drawing from the same parent column independently."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER columns: uniform in [-10^scale, 10^scale] with scale from type args (none here -> default), then +-1/+-2 perturbation; produces huge values far from the original 1..2.7M range.",
-  "String fuzzer on lang/locale/title/word: random a-zA-Z 0-9() strings of length 0..20 with 50% contaminate (prefix/suffix/drop char); 'ca_ES' style locales and accented Catalan titles will not be reproduced.",
-  "langs gets size 1..~2500 by choose_table_sizes; with 1 original row and UNIQUE lang/locale, drop_unique_duplicates will cut it to 1 row, so pages.lid FK has a single parent value.",
-  "pages_words and biwords are huge in the original but TS sizes them like any table (<=2500 rows), so joins that in the original return millions of rows return a handful \u2014 a likely FP source for aggregate/count queries.",
-  "Composite PKs (langs_words, pages_words, biwords) get max_l0=30 fresh draws per member; sample_fresh_primary_keys drops duplicate PK tuples, so the effective row count is far below the requested size.",
-  "FK columns draw from the parent's FINAL filtered column with replacement; with langs=1 row, pages.lid, langs_words.lid, biwords.lid are all 1, so any query grouping by language sees one group.",
-  "Triggers increment langs.pages/words on every inserted page/lang_word; TS-inserted langs.pages/words will not match the original 1129144/2764996, so queries comparing pages count to langs.pages will disagree \u2014 likely FN/FP driver.",
-  "words.word UNIQUE with random strings: collisions rare, but drop_unique_duplicates keeps ~all rows; word values are implausible ('aB3()x') so LIKE/equality on real words fails \u2014 FN driver.",
-  "pages UNIQUE(lid,page,title): upstream marks lid as unique (line-based scan), so drop_unique_duplicates may keep only 1 page row \u2014 a severe under-population of pages, likely FP for count/join queries.",
-  "No date/time columns: Date/Time fuzzers unused; any gold SQL with date literals would rely on the literal pool only.",
-  "pages.revision and pages.page are INTEGER with distinct=200000 in samples; TS Number fuzzer will produce values outside the original 1..200000 / 24M..28M ranges \u2014 implausible for range predicates."
- ],
- "challenger_refs": [
-  "G4",
-  "G6",
-  "G3",
-  "G7",
-  "G8",
-  "G11",
-  "G13",
-  "G1",
-  "G2",
-  "G5"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": null,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "pk_autoincrement": "Generate fresh sequential integers starting at 1, never NULL, never reusing original values. Parent tables are generated and finalized first; child foreign keys are sampled only from the FINAL written parent key set (after all writer drops and PK reassignment).",
+   "fk_nullable": "For nullable FK columns emit NULL with probability equal to the compact database's NULL share for that column (at least one NULL row per instance); otherwise copy a valid FINAL parent key. For NOT NULL FK columns always copy a valid FINAL parent key.",
+   "integer_quantity": "Sample integers >= 0 with a long tail; include 0 and small values; plant boundary values literal-1, literal, literal+1 around each listed literal.",
+   "integer_count": "Sample integers >= 0; include 0 and small values; produce ties at listed LIMIT ranks by repeating the same value across >= 2 rows.",
+   "text_unique": "Sample from a pool of synthetic tokens; ensure UNIQUE columns get distinct values; near-variants (case flips, appended suffix) only for non-unique text columns.",
+   "text_generic": "Sample short synthetic strings; with probability ~0.1 emit a case-variant or LIKE-near-variant of a listed literal; NULL only if nullable.",
+   "text_title": "Sample synthetic titles; include case-variants and LIKE-near-variants of listed literals; allow duplicates on non-unique title columns.",
+   "null_share": "For every nullable column, each instance contains rows with NULL and rows with non-NULL values; the NULL share follows the compact database's share for that column (schema.original_values), with at least one NULL row per nullable column per instance. NOT NULL and PK columns never get NULL.",
+   "boundary_and_tie": "For each column with listed comparison targets, plant literal-1, literal, literal+1 (or one-char variants) and duplicate values at listed LIMIT ranks; boundary values are planted as actual written PKs and child FKs are derived from the final PK set.",
+   "final_row_authority": "The writer is the single source of truth for the final row set. After the writer drops rows and reassigns PKs, the instance builder re-runs FK sampling and recomputes all trigger-maintained aggregates from the FINAL written rows; no FK may reference a dropped parent row.",
+   "exact_table_sizes": "Generate exactly the table_sizes_per_instance counts (no jitter); every table named in a formula gets a non-zero count."
+  },
+  "per_column_exceptions": [
+   {
+    "columns": [
+     "langs.lid",
+     "pages.lid",
+     "langs_words.lid",
+     "biwords.lid"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     0,
+     1,
+     2
+    ]
+   },
+   {
+    "columns": [
+     "langs.lang"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "ca",
+     "CA"
+    ]
+   },
+   {
+    "columns": [
+     "words.wid"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     7,
+     8,
+     9,
+     8967,
+     8968,
+     8969
+    ]
+   },
+   {
+    "columns": [
+     "langs_words.occurrences"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     179,
+     180,
+     181,
+     199999,
+     200000,
+     200001
+    ]
+   },
+   {
+    "columns": [
+     "words.word"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "\u00e0bac",
+     "\u00c0BAC",
+     "xin\u00e8s",
+     "XIN\u00c8S",
+     "grec",
+     "GREC"
+    ]
+   },
+   {
+    "columns": [
+     "biwords.w1st"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     0,
+     1,
+     2,
+     85,
+     86,
+     87
+    ]
+   },
+   {
+    "columns": [
+     "pages.title"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Llista de conflictes armats",
+     "llista de conflictes armats",
+     "Anys 90",
+     "anys 90",
+     "Afluent",
+     "afluent"
+    ]
+   },
+   {
+    "columns": [
+     "pages.title"
+    ],
+    "pattern": "like_near_variant",
+    "targets": [
+     "%Art%",
+     "%Art",
+     "Art%",
+     "Art",
+     "Aru",
+     "Art x",
+     "art",
+     "x Art"
+    ]
+   },
+   {
+    "columns": [
+     "words.occurrences"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     15999,
+     16000,
+     16001,
+     199999,
+     200000,
+     200001
+    ]
+   },
+   {
+    "columns": [
+     "biwords.w2nd"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     108,
+     109,
+     110,
+     8967,
+     8968,
+     8969
+    ]
+   },
+   {
+    "columns": [
+     "pages.words"
+    ],
+    "pattern": "comparison_boundary",
+    "targets": [
+     9,
+     10,
+     11,
+     9999,
+     10000,
+     10001
+    ]
+   },
+   {
+    "columns": [
+     "pages.pid"
+    ],
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "columns": [
+     "pages.title"
+    ],
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "columns": [
+     "words.occurrences"
+    ],
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     1,
+     3
+    ]
+   },
+   {
+    "columns": [
+     "langs_words.occurrences"
+    ],
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   },
+   {
+    "columns": [
+     "langs.lid",
+     "pages.lid",
+     "langs_words.lid",
+     "biwords.lid"
+    ],
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children",
+     "child rows with NULL FK (nullable only)"
+    ]
+   },
+   {
+    "columns": [
+     "words.wid",
+     "langs_words.wid",
+     "biwords.w1st",
+     "biwords.w2nd"
+    ],
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "columns": [
+     "langs.lang",
+     "words.word",
+     "pages.title"
+    ],
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "case-variant duplicates allowed on non-unique text"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "pages.lid",
+    "parent": "langs",
+    "parent_column": "lid",
+    "copied": []
+   },
+   {
+    "child": "langs_words.lid",
+    "parent": "langs",
+    "parent_column": "lid",
+    "copied": []
+   },
+   {
+    "child": "langs_words.wid",
+    "parent": "words",
+    "parent_column": "wid",
+    "copied": []
+   },
+   {
+    "child": "pages_words.pid",
+    "parent": "pages",
+    "parent_column": "pid",
+    "copied": []
+   },
+   {
+    "child": "pages_words.wid",
+    "parent": "words",
+    "parent_column": "wid",
+    "copied": []
+   },
+   {
+    "child": "biwords.lid",
+    "parent": "langs",
+    "parent_column": "lid",
+    "copied": []
+   },
+   {
+    "child": "biwords.w1st",
+    "parent": "words",
+    "parent_column": "wid",
+    "copied": []
+   },
+   {
+    "child": "biwords.w2nd",
+    "parent": "words",
+    "parent_column": "wid",
+    "copied": []
+   },
+   {
+    "unique": "langs(lang)"
+   },
+   {
+    "unique": "langs(locale)"
+   },
+   {
+    "unique": "words(word)"
+   },
+   {
+    "unique": "pages(lid, page, title)"
+   },
+   {
+    "unique": "langs_words(lid, wid)"
+   },
+   {
+    "unique": "pages_words(pid, wid)"
+   },
+   {
+    "unique": "biwords(lid, w1st, w2nd)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "langs",
+    "column": "pages",
+    "formula": "pages >= 0",
+    "evidence": "trigger ins_page/del_page maintain count"
+   },
+   {
+    "table": "langs",
+    "column": "words",
+    "formula": "words >= 0",
+    "evidence": "trigger ins_lang_word/del_lang_word maintain count"
+   },
+   {
+    "table": "pages",
+    "column": "words",
+    "formula": "words >= 0",
+    "evidence": "trigger ins_page_word/del_page_word maintain count"
+   },
+   {
+    "table": "words",
+    "column": "occurrences",
+    "formula": "occurrences >= 0",
+    "evidence": "soft: no CHECK/trigger in DDL"
+   },
+   {
+    "table": "langs_words",
+    "column": "occurrences",
+    "formula": "occurrences >= 0",
+    "evidence": "soft: no CHECK/trigger in DDL"
+   },
+   {
+    "table": "pages_words",
+    "column": "occurrences",
+    "formula": "occurrences >= 0",
+    "evidence": "soft: no CHECK/trigger in DDL"
+   },
+   {
+    "table": "biwords",
+    "column": "occurrences",
+    "formula": "occurrences >= 0",
+    "evidence": "soft: no CHECK/trigger in DDL"
+   },
+   {
+    "table": "langs",
+    "column": "pages",
+    "formula": "COUNT(pages.pid) GROUP BY pages.lid",
+    "evidence": "trigger-maintained aggregate; hard rule; must hold on FINAL written rows"
+   },
+   {
+    "table": "langs",
+    "column": "words",
+    "formula": "COUNT(langs_words.wid) GROUP BY langs_words.lid",
+    "evidence": "trigger-maintained aggregate; hard rule; must hold on FINAL written rows"
+   },
+   {
+    "table": "pages",
+    "column": "words",
+    "formula": "COUNT(pages_words.wid) GROUP BY pages_words.pid",
+    "evidence": "trigger-maintained aggregate; hard rule; must hold on FINAL written rows"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "langs": 1,
+   "words": 200,
+   "pages": 120,
+   "langs_words": 200,
+   "pages_words": 230,
+   "biwords": 230
+  },
+  "null_targets": [
+   "langs.lang",
+   "langs.locale",
+   "langs.pages",
+   "langs.words",
+   "pages.lid",
+   "pages.page",
+   "pages.revision",
+   "pages.title",
+   "pages.words",
+   "words.word",
+   "words.occurrences",
+   "langs_words.occurrences",
+   "pages_words.occurrences",
+   "biwords.occurrences"
+  ],
+  "supporting_evidence": [
+   "langs row: lid=1, lang='ca', locale='ca_ES', pages=1129144, words=2764996",
+   "pages rows: pid 1..8, lid=1, page 1,2,8,9,10,11,14,15, words 1081,68,304,453,1468,3,1322,148",
+   "words rows: wid 2148990..1652191, occurrences 242..115938",
+   "langs_words rows: lid=1, wid 1..8, occurrences 242..115938",
+   "pages_words rows: pid 1..8, wid 1..8, occurrences 30,8,2,5,21,1,7,13",
+   "biwords rows: lid=1, w1st 1..8, w2nd 2,4,25,34,51,66,86,89, occurrences 4,3,13,29,14,1,5,2",
+   "aggregate formulas checked against trigger DDL ins_page/del_page, ins_lang_word/del_lang_word, ins_page_word/del_page_word"
+  ],
+  "uncertainty": [
+   "Trigger-maintained aggregates (langs.pages, langs.words, pages.words) are hard rules per DDL; the writer must disable triggers during insertion and recompute aggregates from the FINAL written rows, not the in-memory rows.",
+   "Original table sizes are far larger than the per-instance sizes; generated instances are compact and do not reproduce the full distribution.",
+   "NULL shares follow the compact database's per-column share (observed null_rate 0.0 in sample but columns declared nullable); at least one NULL row per nullable column per instance.",
+   "The 'occurrences >= 0' rules are soft: no CHECK constraint or trigger evidence in the DDL.",
+   "PK boundary targets [0,1,2] for lid columns and [7,8,9,8967,8968,8969] for words.wid are planted as actual written PKs; child FKs are derived from the FINAL PK set after writer drops and PK reassignment.",
+   "The writer must not drop parent rows referenced by FK columns, or the instance builder must re-run FK sampling after the writer's final row set is known; the final written row set is the single source of truth for FK and aggregate consistency."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "feaf27a71b480913"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [],
+   "note": "unparseable report"
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "title": "Compact rows are modified/deleted, violating preservation of D_c",
+     "evidence": "Execution feedback: every one of 20 instances reports 'compact_rows_missing' (dc_rows_missing_or_changed: pages 297 rows across 20 instances, langs 2 rows across 2 instances). The writer copies the compact DB then appends rows, but the schema has triggers (ins_page/del_page, ins_lang_word/del_lang_word, ins_page_word/del_page_word) that UPDATE langs.pages, langs.words, pages.words on every insert. Because the generated rows are inserted into the copied DB, the trigger-maintained aggregate columns of the *compact* langs/pages rows are mutated (e.g. langs.pages, langs.words, pages.words change), so the original D_c rows are no longer identical. The program computes aggregates in Python (_recompute_aggregates) but never disables the triggers, so the DB triggers fire on insert and overwrite the compact values.",
+     "requested_revision": "Preserve compact rows exactly. Either (a) insert generated rows with the triggers disabled (e.g. drop/recreate triggers around the insert, or use a mechanism that does not fire them), or (b) do not rely on the DB triggers at all and instead insert generated rows into a fresh DB that contains the compact rows plus generated rows with aggregates computed in Python, ensuring the compact rows' aggregate columns are restored to their original values after insertion. Verify with a check that every D_c row is byte-identical to the original."
+    },
+    {
+     "agent": "engineer",
+     "title": "Massive foreign-key violations in generated rows",
+     "evidence": "Execution feedback: fk_violations 12607 total; per-constraint: pages_words.pid->pages.pid 3407 rows (20 instances), pages_words.wid->words.wid 3156, langs_words.wid->words.wid 2024, biwords.w2nd->words.wid 1142 (7 instances), biwords.lid->langs.lid 1122 (5 instances). The writer sets 'pragma foreign_keys = OFF' and inserts rows whose FK values were drawn from in-memory parent lists, but the in-memory parent lists include generated parent rows that were later dropped (by sample_fresh_primary_keys / drop_unique_duplicates / drop_unique_tuples) or whose PKs were reassigned by _fresh_pk in the writer. Specifically: (1) fill_foreign_keys_consistently draws from instance[pt][pc] before dedup, so dropped parent rows leave dangling child FKs; (2) the writer's _fresh_pk reassigns AUTOINCREMENT PKs of langs/words/pages to fresh sequential integers, but child FK columns were already sampled from the *old* in-memory PK values, so they no longer match; (3) biwords.lid/w2nd sampled from langs/words in-memory values that were reassigned.",
+     "requested_revision": "Make FK values consistent with the final written parent keys. Compute the final parent PK values (after _fresh_pk reassignment) before sampling child FKs, or sample child FKs from the final parent key set. Ensure every child FK value references an actually-inserted parent row (or is NULL for nullable FKs). Re-run and confirm fk_violations == 0."
+    },
+    {
+     "agent": "engineer",
+     "title": "AUTOINCREMENT PK reassignment breaks FK consistency and boundary targets",
+     "evidence": "writer._fresh_pk replaces generated PKs with fresh sequential integers starting after max(existing). But instance.py's BOUNDARIES for langs.lid/pages.lid/langs_words.lid/biwords.lid include [0,1,2] and words.wid includes [7,8,9,8967,8968,8969]; these boundary values are planted in the in-memory instance but then overwritten by _fresh_pk in the writer, so the specified comparison-boundary targets for PK columns are never actually present in the written DB. Also, child FKs sampled from the pre-reassignment values become dangling (see FK issue).",
+     "requested_revision": "Reconcile the AUTOINCREMENT rule with the boundary targets. Either plant boundary values as the actual written PKs (and derive child FKs from them), or document that PK boundary targets are advisory and ensure child FKs are re-derived from the final PKs. The specification's integer_pk rule ('sample fresh sequential integers not present in the original rows') conflicts with per_column_exceptions planting 0/1/2 for lid columns; resolve this contradiction in the specification and implement consistently."
+    },
+    {
+     "agent": "designer",
+     "title": "Specification contradiction: PK boundary targets vs AUTOINCREMENT fresh-PK rule",
+     "evidence": "generic_sampling_rules.integer_pk says 'sample fresh sequential integers not present in the original rows; never NULL', while per_column_exceptions lists comparison_boundary targets [0,1,2] for langs.lid, pages.lid, langs_words.lid, biwords.lid and [7,8,9,8967,8968,8969] for words.wid. These cannot both hold for the same column. The program resolves it by planting boundaries in memory then overwriting with fresh PKs in the writer, which silently drops the boundary targets.",
+     "requested_revision": "Clarify which rule wins for PK columns. If boundary targets are required, the integer_pk rule must allow them (e.g. 'fresh sequential integers, plus planted boundary values where listed'). If fresh PKs win, remove the PK boundary targets from per_column_exceptions. Update the program to match."
+    },
+    {
+     "agent": "engineer",
+     "title": "Trigger-maintained aggregates computed in Python but DB triggers still fire, double-counting",
+     "evidence": "instance._recompute_aggregates sets langs.pages, langs.words, pages.words from in-memory rows. The writer then inserts rows into a DB that still has the ins_page/ins_lang_word/ins_page_word triggers active, so the DB triggers increment the aggregate columns again on top of the Python-computed values. This both corrupts the compact rows (see preservation issue) and makes the written aggregate columns inconsistent with the actual child counts.",
+     "requested_revision": "Choose one mechanism: either let the DB triggers maintain aggregates (and do not pre-compute them in Python, and do not insert into a DB whose compact rows must stay unchanged), or disable the triggers during insertion and rely on the Python-computed values. Verify that langs.pages = COUNT(pages), langs.words = COUNT(langs_words), pages.words = COUNT(pages_words) hold in every written instance."
+    },
+    {
+     "agent": "engineer",
+     "title": "High row-skip rate indicates many generated rows are invalid",
+     "evidence": "Execution feedback rows_skipped: words 272, langs_words 872, pages_words 1201, biwords 3227 out of rows_added 1125/390/3145/1313. The writer falls back to row-by-row insert and silently skips failing rows. This means a large fraction of generated rows violate constraints (likely UNIQUE/PK collisions after _fresh_pk or FK issues), and the reported 'rows_added' understates intended sizes. The specification's table_sizes_per_instance (words 200, langs_words 200, pages_words 230, biwords 230) are not met.",
+     "requested_revision": "Fix the root causes of skipped rows (FK consistency, PK reassignment, unique-tuple dedup ordering) so that generated rows are valid by construction and the per-instance table sizes match the specification. Report skipped rows as an error rather than silently dropping them, or ensure the dedup/sampling produces valid rows."
+    },
+    {
+     "agent": "designer",
+     "title": "Semantic rules lack sufficient evidence for some formulas",
+     "evidence": "The specification lists trigger-maintained aggregate formulas (langs.pages = COUNT(pages), langs.words = COUNT(langs_words), pages.words = COUNT(pages_words)) as 'advisory' in uncertainty, yet the schema clearly defines triggers ins_page/del_page, ins_lang_word/del_lang_word, ins_page_word/del_page_word that maintain exactly these. These are well-supported by the DDL and should be treated as hard rules, not advisory. Conversely, the 'occurrences >= 0' rules for words/langs_words/pages_words/biwords have no CHECK constraint or trigger evidence in the schema; they are plausible but unsupported by the DDL.",
+     "requested_revision": "Promote the trigger-maintained aggregate formulas to hard rules (they are directly evidenced by the triggers). Mark the 'occurrences >= 0' rules as uncertain/soft unless a CHECK constraint or trigger is found. The program should enforce the hard aggregate rules (see aggregate issue)."
+    },
+    {
+     "agent": "engineer",
+     "title": "NULL rule not verifiably implemented for nullable FK columns",
+     "evidence": "The program's _plant_nulls plants NULLs for nullable non-PK columns, but fill_foreign_keys_consistently draws from parent values with replacement and never emits NULL for nullable FKs (the spec's integer_fk rule says 'with probability ~0.05 emit NULL when the column is nullable'). The execution feedback reports nullable_columns: [] and no not_null violations, but the FK columns (pages.lid, langs_words.lid/wid, pages_words.pid/wid, biwords.lid/w1st/w2nd) are declared nullable in the schema and should receive ~5% NULLs. The program does not implement the integer_fk NULL rule.",
+     "requested_revision": "Implement the integer_fk NULL rule: for nullable FK columns, emit NULL with ~5% probability (and at least one NULL row per nullable FK column per instance), while ensuring non-NULL FK values reference valid parents. Ensure NOT NULL/PK columns never get NULL."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's original aggregate columns (langs.pages, langs.words, pages.words) can be preserved while still inserting rows that fire triggers \u2014 requires a concrete mechanism (trigger disable/restore) not present in the program.",
+    "Whether the intended value variation (construction_pairs separated 97/229) is sufficient \u2014 separation alone does not prove equivalence, and the FK/preservation failures may mask whether boundary values are actually reachable in written instances.",
+    "Whether the 'occurrences >= 0' rules are truly enforced by the DB (no CHECK/trigger evidence found in the supplied DDL)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows 2804/2804 FK violations across all 20 instances, all on the FK columns that point to words.wid: langs_words.wid -> words.wid (1883), biwords.w2nd -> words.wid (319), biwords.w1st -> words.wid (303), pages_words.wid -> words.wid (299). Every instance is invalid (new_fk_violations 111-184). The generator reports rows_skipped for words (365), langs_words (547), pages_words (687), biwords (977) \u2014 i.e. many rows were rejected by the writer, but the FK columns still reference words.wid values that were not actually written.",
+     "requested_revision": "In instance.py, fill_foreign_keys_consistently samples FK values from _final_parent_keys(inst, schema, pt, pc), which returns the parent's in-memory values (inst['words']['wid']) PLUS the compact original values. But the writer then drops rows (drop_unique_duplicates, drop_unique_tuples, sample_fresh_primary_keys, and row-level failures) that were in the in-memory set, so the sampled FK values can point at rows that were never written. The fix must (a) sample FK values from the FINAL set of parent rows that actually survive the writer, or (b) re-run the FK sampling after the final parent row set is known, or (c) ensure the writer never drops the parent rows that FKs referenced. The current code does not guarantee this. Also note: the FK columns are sampled from the parent's in-memory values, but the parent's PKs are also subject to _assign_autoincrement_pks which may drop the boundary values (e.g. 0, 1, 2) if they collide with existing; the child FK must be sampled from the final set."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The writer's rows_skipped counts (words 365, langs_words 547, pages_words 687, biwords 977) show that many rows are dropped after generation. The FK violation counts (e.g. langs_words.wid 1883) are consistent with the child FKs referencing the dropped parent rows. The program's own docstring says 'Child foreign keys are sampled from the FINAL parent key set (compact + generated), so no dangling references are produced' \u2014 but this is not true in the final written database because the writer drops rows after the parent set is finalized.",
+     "requested_revision": "The writer must be the final authority on which rows exist. Either (a) the writer must not drop the parent rows that were referenced in the in-memory FK set, or (b) the instance builder must re-run the FK sampling after the writer's final row set is known. The cleanest fix is to make the writer's row-drop deterministic and visible to the instance builder: e.g., after the writer drops rows, the instance builder should re-run the FK sampling for the final rows. Alternatively, the writer should never drop rows that are referenced by FK columns (or the parent should be dropped first)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas lists 'trigger-maintained hard rules' (langs.pages = COUNT(pages.pid), langs.words = COUNT(langs_words.wid), pages.words = COUNT(pages_words.wid)) as the only hard rules. The writer drops the triggers (DROPPER) and recomputes the aggregates in Python. But the writer's row-skipping means the recomputed aggregates (which are computed from the in-memory instance set before the writer drops rows) are not the actual counts of the final written rows. The execution feedback does not show any violation of these aggregates, but the FK violations are the more serious issue.",
+     "requested_revision": "The designer should clarify that the aggregate rules must be satisfied by the FINAL written rows, not the in-memory rows. The engineer should recompute the aggregates after the writer's final row set is known, or the writer should not drop rows that would violate the aggregate rules."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The writer's 'fall back to row-by-row' logic means the writer can silently drop rows and the instance builder does not know the final row set. The program's own report says 'rows_skipped' but the instance builder does not use this to fix the FK columns. This is a design flaw: the instance builder and the writer are not coordinated.",
+     "requested_revision": "The instance builder should be the single source of truth for the final row set. The writer should either (a) never drop rows (fail loudly), or (b) the instance builder should re-run the FK sampling after the writer's final row set is known. The current design is not sound."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions for words.wid includes 'comparison_boundary' targets [7, 8, 9, 8967, 8968, 8969]. The instance's _assign_autoincrement_pks plants these boundary values but if they collide with existing rows (the compact original values are large, e.g. 2148990..1652191), the boundary values are skipped. The execution feedback does not show any boundary values being written, so the boundary planting may not be working. This is a secondary issue.",
+     "requested_revision": "The engineer should verify that the boundary values are actually planted (e.g. by checking the generated SQL for the boundary values). The spec's boundary targets are not being satisfied, which is a spec violation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's NULL rule says 'for every nullable column (including nullable foreign keys), each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The execution feedback's nullable_columns is empty, so the nullable columns are not being checked. The program's _plant_nulls uses a fixed NULL_SHARE = 0.05, not the compact database's share. The spec says 'follow the compact database's share for that column', which is not implemented.",
+     "requested_revision": "The engineer should compute the NULL share per column from the compact database (schema.original_values) and use that instead of the fixed 0.05. The spec says 'follow the compact database's share for that column', so the fixed 0.05 is a spec violation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's 'pages' table has a NULL-able column 'pages' (pages.lid) and 'pages' (pages.words). The spec's null_targets includes 'pages.lid', 'pages.page', 'pages.revision', 'pages.title', 'pages.words'. The program's _plant_nulls plants NULLs for nullable columns, but the FK columns (pages.lid) are nullable and fill_foreign_keys_consistently emits NULL with 5% probability. The execution feedback's nullable_columns is empty, so the NULL rule is not being verified.",
+     "requested_revision": "The engineer should ensure the NULL rule is actually verified (e.g. by checking the generated SQL for NULL rows). The current execution feedback does not show the NULL rule being satisfied."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's 'pages' table has a UNIQUE(lid, page, title) constraint. The program's drop_unique_tuples handles this. The execution feedback's 'pages' table has 0 rows, so the pages table is not being generated at all. The spec's table_sizes_per_instance says pages: 120, but the program's choose_table_sizes uses a jittered size, so the pages table may be 0 rows. The spec says 'pages: 120', so the program should generate a non-zero number of pages.",
+     "requested_revision": "The engineer should ensure the pages table is generated with a non-zero size (the spec says 120). The current choose_table_sizes uses max(0, int(base * (0.5 + rng.random()))), which can be 0 if base is 120 and rng.random() is 0.5. The spec says pages: 120, so the program should generate a non-zero number of pages."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's 'langs' table has 1 row per instance. The program's choose_table_sizes uses jittered sizes, so the langs table may be 0 or 1 row. The spec says langs: 1, so the program should generate exactly 1 row. The execution feedback shows rows_added for langs: 7, which is more than 1. The spec's table_sizes_per_instance says langs: 1, so the program should generate exactly 1 row.",
+     "requested_revision": "The engineer should generate exactly the spec's table sizes (langs: 1, words: 200, pages: 120, langs_words: 200, pages_words: 230, biwords: 230), not jittered sizes. The spec says 'table_sizes_per_instance': {'langs': 1, 'words': 200, 'pages': 120, 'langs_words': 200, 'pages_words': 230, 'biwords': 230}, so the program should generate exactly these sizes."
+    }
+   ],
+   "unresolved_checks": [
+    "The FK values are sampled from the parent's in-memory set, but the writer drops rows. The FK violations are the main issue. The fix is to ensure the writer's final row set is the one used for FK sampling.",
+    "The NULL rule is not verified (nullable_columns is empty). The program should use the compact database's NULL share, not a fixed 0.05.",
+    "The boundary values are not planted (the execution feedback does not show them). The program should verify the boundary values are actually written.",
+    "The table sizes are not the spec's sizes (the program uses jittered sizes). The spec says 1, 200, 120, 200, 230, 230, but the program uses jittered sizes."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with KeyError('lid') at tscore_gen/instance.py:72 in sample_fresh_primary_keys: `k = tuple(columns[c][i] for c in table_meta.primary_key)`. The traceback shows build_random_instance calls `sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns if cm.name in cols})`. For the `langs` table, `lid` is the AUTOINCREMENT PK and is assigned via `_assign_autoincrement_pks` into `cols[pk]` only when `t in schema.autoincrement`. However, the dict comprehension passed to `sample_fresh_primary_keys` filters `if cm.name in cols`, and `cols` at that point is built only from `samplers` (non-FK columns). The PK column `lid` is added to `cols` after the comprehension is evaluated in the same statement \u2014 but the comprehension is evaluated first, so `lid` is absent from the filtered dict, and `sample_fresh_primary_keys` then indexes `columns['lid']` \u2192 KeyError. This is a real ordering bug: the PK assignment must happen before the dedup call, or the dedup must operate on the full `cols` including the freshly assigned PK.",
+     "requested_revision": "In build_random_instance, assign AUTOINCREMENT PKs into `cols` BEFORE calling sample_fresh_primary_keys, and pass the full `cols` (not a filtered comprehension) to sample_fresh_primary_keys / drop_unique_duplicates / drop_unique_tuples. E.g. build `cols` from samplers, then `if t in schema.autoincrement: cols[pk] = _assign_autoincrement_pks(...)`, then `cols = sample_fresh_primary_keys(tm, cols)`. Also guard sample_fresh_primary_keys to skip PK columns missing from `columns` (defensive) so a missing PK never raises KeyError. Re-run and confirm n_ok == n_instances and the expected directory layout is produced."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Even after fixing the KeyError, the spec's `pk_autoincrement` rule says 'Generate fresh sequential integers starting at 1, never NULL, never reusing original values.' `_assign_autoincrement_pks` computes `start = max(existing)+1` and plants boundary targets [0,1,2] for `langs.lid` etc. But the spec's per_column_exceptions list `langs.lid` comparison_boundary targets [0,1,2] and the generic rule says boundary values are 'planted as actual written PKs'. Value 0 is not a valid AUTOINCREMENT PK in SQLite (rowid 0 is allowed but AUTOINCREMENT starts at 1; inserting 0 is accepted but the spec says 'starting at 1'). More importantly, the compact DB already has `langs.lid=1` (supporting_evidence: 'langs row: lid=1'), so planting 1 or 2 as a fresh PK collides with existing rows and the `_assign_autoincrement_pks` filter `b not in existing` will drop them, leaving only 0 \u2014 which then violates 'starting at 1'. The spec and program disagree on whether boundary PKs may reuse compact values.",
+     "requested_revision": "Designer: clarify whether AUTOINCREMENT PK boundary targets [0,1,2] are meant to be planted as fresh PKs (impossible when compact rows already occupy 1) or as FK-side boundary values only. Engineer: align `_assign_autoincrement_pks` with the clarified rule \u2014 either skip 0 and any value in `existing`, or plant boundaries only on child FK columns (pages.lid, langs_words.lid, biwords.lid) where they can reference existing compact parents. Document the resolution in the spec's uncertainty section."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `null_targets` lists `langs.lang`, `langs.locale`, `words.word`, `pages.title`, etc. as nullable, and the NULL rule requires at least one NULL row per nullable column per instance. But `_plant_nulls` is called on `cols` AFTER `drop_unique_duplicates` and `drop_unique_tuples`, and it sets `cols[cm.name][idx] = None` for a random index. For UNIQUE columns (`langs.lang`, `langs.locale`, `words.word`), setting a value to NULL after dedup is fine (NULLs don't violate UNIQUE in SQLite), but the spec's `text_unique` rule says 'ensure UNIQUE columns get distinct values' \u2014 NULLs are distinct in SQLite so this is acceptable. However, `_plant_nulls` also runs on `langs.pages` and `langs.words` (trigger-maintained aggregates) and `pages.words`, which are then overwritten by `_recompute_aggregates` \u2014 so the NULL planted on those aggregate columns is silently discarded, violating the NULL rule for `langs.pages`, `langs.words`, `pages.words` (all listed in null_targets).",
+     "requested_revision": "Engineer: either (a) exclude trigger-maintained aggregate columns from `null_targets` in the spec (they are recomputed and cannot hold NULL), or (b) make `_recompute_aggregates` preserve a planted NULL for at least one row per aggregate column. Designer: update `null_targets` to remove `langs.pages`, `langs.words`, `pages.words` if (a) is chosen, since these are hard-rule aggregates that must equal COUNT(...) and cannot be NULL."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `table_sizes_per_instance` requires exactly `langs:1, words:200, pages:120, langs_words:200, pages_words:230, biwords:230`. `choose_table_sizes` returns these exact sizes, but `build_random_instance` then runs `sample_fresh_primary_keys`, `drop_unique_duplicates`, and `drop_unique_tuples` on each table, which can reduce row counts below the specified size (e.g. `words.word` UNIQUE with 200 synthetic tokens may collide; `pages(lid,page,title)` UNIQUE with 120 rows and only 1 lang may collide on (lid,page,title)). The spec says 'Generate exactly the table_sizes_per_instance counts (no jitter)'. The program does not re-fill after dedup, so final counts may be < specified.",
+     "requested_revision": "Engineer: after dedup, if a table's row count falls below the specified size, resample additional rows (with fresh PKs / unique values) until the exact count is reached, or make the samplers guarantee uniqueness for UNIQUE columns (e.g. append a counter suffix to synthetic tokens for `words.word`, `langs.lang`, `langs.locale`). Verify final written counts equal SPEC_SIZES for every table."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `dependencies` lists `pages_words.pid -> pages.pid` and `pages_words.wid -> words.wid`, and `biwords.w1st/w2nd -> words.wid`. `fill_foreign_keys_consistently` samples from `_final_parent_keys(instance, schema, pt, pc)`, which reads `inst.get(table, {}).get(col, [])` plus `schema.original_values`. But `inst` is built in `order` (topological levels), and `pages_words` depends on `pages` and `words` \u2014 both should be in `inst` by then. However, `biwords` depends on `words` and `langs`; `langs` has only 1 row, so `biwords.lid` will always be 1 (or NULL). The spec's `unmatched_join_rows` for `biwords.lid` targets 'parent rows without children' \u2014 with only 1 lang, there can be no parent row without children if biwords has 230 rows all referencing lid=1. This is a spec/program tension: the spec wants unmatched parent rows but the table sizes make it impossible for `langs` (1 row) to have both children and no-children.",
+     "requested_revision": "Designer: reconcile `table_sizes_per_instance` (langs:1) with the `unmatched_join_rows` target for `langs.lid` ('parent rows without children'). Either increase `langs` size to >=2 so one lang can be childless, or drop the unmatched-parent target for `langs.lid`. Engineer: after the fix, verify at least one parent row per FK has no children and at least one child row has NULL FK (for nullable FKs) in each instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec `semantic_rules_and_formulas` includes hard rules `langs.pages = COUNT(pages.pid) GROUP BY pages.lid`, `langs.words = COUNT(langs_words.wid) GROUP BY langs_words.lid`, `pages.words = COUNT(pages_words.wid) GROUP BY pages_words.pid`. `_recompute_aggregates` computes these from `inst` (generated rows only), but the compact DB already has rows (e.g. `langs.pages=1129144` per supporting_evidence). The writer copies the compact DB and appends generated rows, then drops triggers. So the final `langs.pages` value written is the Python-computed count of GENERATED pages only, not compact+generated. This violates the hard rule on the FINAL written rows (compact + generated).",
+     "requested_revision": "Engineer: `_recompute_aggregates` must count compact rows too \u2014 either add `schema.original_sizes` / per-lid compact counts to the Python computation, or (simpler) do NOT drop triggers and let SQLite maintain aggregates on insert (but then compact aggregate columns are mutated, which the spec's uncertainty note says to avoid). Recommended: compute aggregates as `compact_count[lid] + generated_count[lid]` using `schema.original_values` for `pages.lid`, `langs_words.lid`, `pages_words.pid`. Verify with a post-write SQL check that `langs.pages = (SELECT COUNT(*) FROM pages WHERE lid=langs.lid)` etc. holds on the final DB."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's `langs.pages`/`langs.words`/`pages.words` values are consistent with compact row counts (needed to decide whether to add compact counts in `_recompute_aggregates`).",
+    "Whether `words.word` UNIQUE with 200 synthetic tokens can be satisfied without collisions (affects exact table size).",
+    "Whether `pages(lid,page,title)` UNIQUE with 1 lang and 120 rows can be satisfied (affects exact table size).",
+    "Whether the spec intends AUTOINCREMENT PK boundary targets [0,1,2] to be planted as fresh PKs or only as FK-side values."
+   ]
+  }
+ ]
 }

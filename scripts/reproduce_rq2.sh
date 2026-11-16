@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# RQ2 table: BIRD dev EX, Spider dev EX and Spider test EX (test-suite-sql-eval) of the three released models,
-# k = 30, T = 1.0, seed 42 + vote-after-verify, and greedy decoding.
-#
-# Usage: scripts/reproduce_rq2.sh [limit]        (limit = first N questions per benchmark; default all)
-# Env:   BIRD_DEV_ROOT (default data/bird/dev), SPIDER_ROOT (default data/spider), MODELS ("0.5b 1.5b 3b"),
-#        DECODINGS ("k30 greedy"), BENCHMARKS ("bird_dev spider_dev spider_test")
+# RQ2: BIRD dev, Spider dev and Spider test EX of the three released models, k = 30 + majority voting and greedy.
+# Usage: scripts/reproduce_rq2.sh [limit]   (env: BIRD_DEV_ROOT, SPIDER_ROOT, MODELS, DECODINGS, BENCHMARKS)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 limit=${1:-0}

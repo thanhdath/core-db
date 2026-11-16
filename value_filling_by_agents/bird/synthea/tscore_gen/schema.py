@@ -58,7 +58,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +73,16 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _resolve_parent_column(tables: dict, pt: str, r) -> str:
+    """Parent column of a foreign key: explicit column, else the parent's primary key."""
+    if r[4] is not None:
+        return str(r[4])
+    pk = tables[pt].primary_key
+    if len(pk) == 1:
+        return pk[0]
+    return str(r[3])
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -112,12 +122,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             for r in con.execute('pragma foreign_key_list(%s)' % q(t)).fetchall():
                 pt = tlow.get(str(r[2]).lower())
                 child = next((c.name for c in tables[t].columns if c.name.lower() == str(r[3]).lower()), None)
-                pcol_name = r[4] if r[4] is not None else r[3]
                 pc = None
                 if pt is not None:
+                    pcol_name = _resolve_parent_column(tables, pt, r)
                     pc = next((c.name for c in tables[pt].columns if c.name.lower() == str(pcol_name).lower()), None)
                 if pt is None or pc is None or child is None:
-                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], pcol_name))
+                    warnings.warn('dropping dangling FK %s.%s -> %s.%s' % (t, r[3], r[2], r[4]))
                     continue
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]

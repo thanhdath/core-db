@@ -69,7 +69,7 @@ def execute_and_compare(sql_a: str, sql_b: str, instance_id: str, ds: str, api_b
     """True same denotation, False differ or sql_b fails, None if sql_a unusable (exec_eval.py:171-232)."""
     if order_matters is None:
         order_matters = 'order by' in sql_a.lower()
-    ra, rb = execute_batch(api_base, ds, instance_id, [sql_a, sql_b])
+    ra, rb = execute_batch(api_base, instance_id, [sql_a, sql_b])
     if not ra.get('ok') or ra.get('timed_out'):
         return None
     if not rb.get('ok') or rb.get('timed_out'):

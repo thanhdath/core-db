@@ -3,7 +3,7 @@ import re
 
 import sqlparse
 from sqlparse import tokens as T
-from sqlparse.sql import Comparison, Identifier
+from sqlparse.sql import Comparison, Function, Identifier, Parenthesis
 
 _PH = 'placeholderrare'
 _ITEM = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^,\s]+")
@@ -13,7 +13,6 @@ _IN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?in\s*\(([^()]*)\)', re.I)
 _BETWEEN = re.compile(_COL + r'\s*\)?\s+(?:not\s+)?between\s+' + _VAL + r'\s+and\s+' + _VAL, re.I)
 _CMP = re.compile(_COL + r'\s*\)?\s*(?:<>|!=|>=|<=|==|=|>|<|\s(?:not\s+)?like\s)\s*' + _VAL, re.I)
 _QUAL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?$')
-_PLAIN_COL = re.compile(r'^[`"]?[A-Za-z_][\w$]*[`"]?(\.[`"]?[A-Za-z_][\w$]*[`"]?)?$')
 
 
 def _unquote(v: str) -> str:
@@ -21,14 +20,6 @@ def _unquote(v: str) -> str:
     v = v.strip().rstrip(';')
     if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
         v = v[1:-1].replace(v[0] * 2, v[0])
-    return v.replace(_PH, '')
-
-
-def _raw_unquote(v: str) -> str:
-    """Strip surrounding quotes but KEEP doubled quotes (upstream parse.py:246-253 keeps them)."""
-    v = v.strip().rstrip(';')
-    if len(v) >= 2 and v[0] in '\'"' and v[-1] == v[0]:
-        v = v[1:-1]
     return v.replace(_PH, '')
 
 
@@ -50,16 +41,15 @@ def _split_cols(name: str) -> list:
     return out
 
 
-def _plain_column_name(tok):
-    """Return the column reference text if tok is a plain (optionally qualified) column, else None.
-    Upstream parse.py extract_typed_value_in_comparison_from_query only accepts a bare Identifier
-    (optionally aliased/qualified); function calls and expressions are skipped."""
-    if tok is None or not isinstance(tok, Identifier):
-        return None
-    v = tok.value.strip()
-    if not _PLAIN_COL.match(v):
-        return None
-    return v
+def _left_name(tok):
+    """Identifier, or the identifier inside a Function/Parenthesis wrapper (e.g. LOWER(x))."""
+    if isinstance(tok, Identifier) and re.fullmatch(r'[\w."` -]+', tok.value):
+        return tok.value
+    if isinstance(tok, (Function, Parenthesis, Identifier)):
+        ids = [t for t in tok.flatten() if t.ttype is not None and t.ttype in sqlparse.tokens.Name]
+        if ids:
+            return ids[-1].value
+    return None
 
 
 def _is_literal(tok) -> bool:
@@ -86,14 +76,14 @@ def _is_literal(tok) -> bool:
 
 def _add(out: list, name: str, v: str) -> None:
     for k in _split_cols(name):
-        out.append((k, _raw_unquote(v)))
+        out.append((k, _unquote(v)))
 
 
 def _walk(tok, out: list) -> None:
     if isinstance(tok, Comparison):
         parts = [x for x in tok.tokens if not x.is_whitespace]
         if len(parts) >= 3:
-            name = _plain_column_name(parts[0])
+            name = _left_name(parts[0])
             if name and _is_literal(parts[-1]):
                 _add(out, name, parts[-1].value)
     if tok.is_group:
@@ -125,34 +115,19 @@ def _clean_qualifier(q: str) -> str:
     return tok
 
 
-def _owners(schema, col: str) -> list:
-    """Tables that own a column named col (case-insensitive), sorted for determinism."""
-    if schema is None:
-        return []
-    cl = col.lower()
-    return sorted({tn for tn, tm in schema.tables.items() for cm in tm.columns if cm.name.lower() == cl})
-
-
-def _resolve(out: list, schema, qual: str, col: str, v: str) -> None:
-    """Emit (table, COL) for the qualifier or, if unqualified, for every owning table; plus (None, COL)."""
+def _add_regex(out: list, qual: str, col: str, v: str) -> None:
+    """Add a regex match, normalising the qualifier to a bare table name."""
     q = _clean_qualifier(qual)
     col = col.strip().replace('"', '').replace('`', '').replace(_PH, '')
     if not col:
         return
-    val = _raw_unquote(v)
     if q:
-        out.append(((q, col.upper()), val))
-    else:
-        for tn in _owners(schema, col):
-            out.append(((tn, col.upper()), val))
-    out.append(((None, col.upper()), val))
+        out.append(((q, col.upper()), _unquote(v)))
+    out.append(((None, col.upper()), _unquote(v)))
 
 
-def extract_typed_values(sql: str, schema=None) -> list:
-    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253).
-    Only constant right operands are kept (column-vs-column join predicates are skipped). A comparison whose
-    left side is a function call or expression is skipped (upstream parse.py only accepts a bare Identifier).
-    When schema is given, unqualified columns also yield a (owner_table, COL) key for every owning table."""
+def extract_typed_values(sql: str) -> list:
+    """((table|None, COLUMN), value) pairs from comparisons, IN lists and [NOT] BETWEEN (parse.py:146-253)."""
     out: list = []
     try:
         s = re.sub(r'\b(year|number|length)\b', lambda m: m.group(1) + _PH, sql, flags=re.I)
@@ -167,7 +142,7 @@ def extract_typed_values(sql: str, schema=None) -> list:
                 continue
             if _is_ident_operand(v):
                 continue
-            _resolve(out, schema, m.group(1), m.group(1).split('.')[-1], v)
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], v)
         for m in _IN.finditer(s):
             inner = m.group(2).strip()
             if not inner or inner.lower().startswith('select'):
@@ -175,10 +150,10 @@ def extract_typed_values(sql: str, schema=None) -> list:
             for it in _ITEM.findall(inner):
                 if _is_ident_operand(it):
                     continue
-                _resolve(out, schema, m.group(1), m.group(1).split('.')[-1], it)
+                _add_regex(out, m.group(1), m.group(1).split('.')[-1], it)
         for m in _BETWEEN.finditer(s):
-            _resolve(out, schema, m.group(1), m.group(1).split('.')[-1], m.group(2))
-            _resolve(out, schema, m.group(1), m.group(1).split('.')[-1], m.group(3))
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], m.group(2))
+            _add_regex(out, m.group(1), m.group(1).split('.')[-1], m.group(3))
     except Exception:
         pass
     seen, res = set(), []
@@ -232,7 +207,7 @@ def seed_literal_pool_from_queries(sqls: list, schema, loose: bool = True) -> di
         return cache[k]
 
     for sql in sqls:
-        for (t, c), v in _routing_items(extract_typed_values(sql, schema)):
+        for (t, c), v in _routing_items(extract_typed_values(sql)):
             anchors = [(tn, cm.name) for tn, tm in schema.tables.items() for cm in tm.columns
                        if cm.name.lower() == c.lower() and (t is None or tn.lower() == t)]
             if not anchors and t is not None:

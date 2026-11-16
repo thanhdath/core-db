@@ -1,59 +1,312 @@
 {
  "db": "scientist_1",
- "operator_io_quirks": [
-  "Mixed-case table names (Scientists, Projects, AssignedTo) and mixed-case columns (SSN, Name, Code, Hours, Scientist, Project) \u2014 must double-quote with original spelling.",
-  "Declared types mix case: 'INT', 'Char(30)', 'Char(4)', 'char(4)' \u2014 type dispatch must lower-case before matching.",
-  "Char(4) PK 'Code' holds 4-char alnum strings ('AeH1','Ast3','Bte1') \u2014 String fuzzer with length arg 4, not Number.",
-  "SSN is INT PK with 9-digit values (123234877) \u2014 Number fuzzer scale from 'int' (no args) => scale 0, range [-1,1] then perturbed; will not reproduce 9-digit magnitudes.",
-  "AssignedTo has composite PK (Scientist, Project) and two FKs to Scientists.SSN and Projects.Code \u2014 both parents exist and are unique PKs.",
-  "AssignedTo.Project distinct=8 < 12 rows: FK column has duplicate values (ties) \u2014 parent Code has 14 distinct, so FK draw with replacement is fine.",
-  "AssignedTo.Scientist distinct=12 = row count, but Scientists has 12 rows \u2014 FK coverage is full here; not guaranteed after PK dedup.",
-  "No NULLs anywhere (null_rate 0.0) despite SSN/Code/Hours being nullable \u2014 TS will still emit NULLs for nullable columns.",
-  "All storage classes match declared types (integer for INT, text for Char) \u2014 no affinity contradictions.",
-  "Tiny tables (12/14/12 rows) \u2014 choose_table_sizes will produce sizes 1..~2500, far larger than original; no huge-table sampling needed.",
-  "No views, triggers, indexes beyond PKs; DDL is plain CREATE TABLE \u2014 clone is trivial.",
-  "Projects.Hours distinct=13 of 14 (one duplicate) \u2014 Number fuzzer list-range quirk (upper end overwritten to full range) will widen values."
- ],
- "operator_ts_expectations": [
-  "Scientists.SSN: Number fuzzer, scale 0, no args => range [-1,1], int perturb +-1/+-2; produces tiny/negative ints, never 9-digit \u2014 implausible SSNs (FN risk on SSN filters/joins).",
-  "Scientists.Name / Projects.Name: String fuzzer, length from Char arg (30/50), CHARSET a-zA-Z 0-9() with 50% contaminate \u2014 random gibberish names, not 'First Last' (FN on name LIKE/pattern queries).",
-  "Projects.Code: String length 4, random 4-char strings \u2014 will not match 'AeH1' style; queries filtering Code='AeH1' or LIKE 'Ae%' likely miss (FN).",
-  "Projects.Hours: Number scale 0, list range quirk => values near [-1,1] plus perturb, not 98..789 \u2014 range predicates (Hours>200) become trivially true/false (FN/FP).",
-  "AssignedTo.Scientist/Project: FK draw from parent final values with replacement \u2014 ties/duplicates expected, so join cardinalities differ from original (FP on COUNT/DISTINCT queries).",
-  "Composite PK (Scientist,Project) dedup keeps first occurrence \u2014 AssignedTo may shrink below requested size, reducing join fan-out (FP on aggregate queries).",
-  "Nullable SSN/Code/Hours will receive NULLs from String/Number samplers (p=0.2 fresh) \u2014 IS NULL / NOT NULL predicates flip (FP).",
-  "p=0.2 DB-level fuzz prob, 0.3 chance p=0 whole instance \u2014 some instances reuse only original 5 sampled values, others mostly fresh; variance drives both FN and FP.",
-  "max_l0 cap (rng*30) on non-PK columns limits fresh draws \u2014 small tables may repeat values, creating accidental ties (FP on DISTINCT/COUNT).",
-  "No CHECK constraints, no NOT NULL enforcement in Python \u2014 only PK/unique/NOT NULL at insert; NOT NULL Name columns will drop rows silently (rows_failed>0).",
-  "Date/Time/Bool fuzzers unused here (no such declared types) \u2014 all columns go to Number or String.",
-  "Self-FK absent; table order is Scientists, Projects -> AssignedTo (level 0 then level 1) \u2014 FK fill order is safe."
- ],
- "challenger_refs": [
-  "G1",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "g9a85d177",
-  "G2",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9",
-  "g7694e6b9"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential or random distinct positive integers in a compact range; never NULL; unique per table.",
+   "integer_fk": "Copy from parent key pool; allow parent rows without children; no NULL unless column nullable.",
+   "char_code": "Short alphanumeric codes of the declared length; unique when PK; near-variants allowed for non-key text.",
+   "char_name": "Human-readable names; allow near-duplicate variants and duplicates on DISTINCT columns.",
+   "integer_quantity": "Positive integers within observed min/max; include boundary values and one step on each side.",
+   "nullable_column": "Generate NULL rows and non-NULL rows; NULL share follows compact database share; at least one NULL per nullable column.",
+   "distinct_column": "Include duplicate values so COUNT(DISTINCT) differs from COUNT(*); duplicate share 20-50%.",
+   "order_tie_column": "Ensure ties at rank 1 for ORDER BY ... DESC on the listed aggregate.",
+   "join_column": "Include parent rows without children and child rows referencing existing parents; no NULL FK unless nullable."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "AssignedTo.Scientist",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, ties_for_order_limit, comparison_boundary, null_rows",
+    "targets": {
+     "joins_with": [
+      "Scientists.SSN"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "duplicate_share": "20-50% (applies to DISTINCT over joined/derived results, not to the PK Scientists.SSN itself)",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "equal_and_one_step_from": [
+      "Scientists.SSN"
+     ],
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "AssignedTo.Project",
+    "pattern": "null_rows, group_sizes, ties_for_order_limit, unmatched_join_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)",
+     "group_sizes": "1, 2 and >= 3",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT assignedto.scientist)"
+     ],
+     "joins_with": [
+      "Projects.Code",
+      "Scientists.SSN"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false
+    }
+   },
+   {
+    "column": "Scientists.SSN",
+    "pattern": "unmatched_join_rows, duplicates_for_distinct, comparison_boundary",
+    "targets": {
+     "joins_with": [
+      "AssignedTo.Scientist",
+      "AssignedTo.Project",
+      "Projects.Code"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "duplicate_share": "20-50% (applies to DISTINCT over joined/derived results, not to the PK column itself, which is unique)",
+     "equal_and_one_step_from": [
+      "AssignedTo.Scientist"
+     ]
+    }
+   },
+   {
+    "column": "Projects.Code",
+    "pattern": "group_sizes, unmatched_join_rows, ties_for_order_limit, duplicates_for_distinct",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "joins_with": [
+      "AssignedTo.Project",
+      "Scientists.SSN"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": false,
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(DISTINCT assignedto.scientist)"
+     ],
+     "duplicate_share": "20-50% (applies to DISTINCT over joined/derived results, not to the PK column itself, which is unique)"
+    }
+   },
+   {
+    "column": "Projects.Hours",
+    "pattern": "rows_with_different_values, ties_for_order_limit, comparison_boundary",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values",
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "values": [
+      99,
+      100,
+      101,
+      299,
+      300,
+      301,
+      302
+     ]
+    }
+   },
+   {
+    "column": "Projects.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   },
+   {
+    "column": "Scientists.Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50%"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "AssignedTo",
+    "child_column": "Scientist",
+    "parent_table": "Scientists",
+    "parent_column": "SSN",
+    "copied_columns": []
+   },
+   {
+    "child_table": "AssignedTo",
+    "child_column": "Project",
+    "parent_table": "Projects",
+    "parent_column": "Code",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Scientists",
+    "column": "SSN",
+    "formula": "SSN > 0"
+   },
+   {
+    "table": "Projects",
+    "column": "Hours",
+    "formula": "Hours IS NULL OR Hours > 0"
+   },
+   {
+    "table": "Projects",
+    "column": "Hours",
+    "formula": "Hours IS NULL OR Hours BETWEEN 1 AND 1000"
+   },
+   {
+    "table": "AssignedTo",
+    "column": "Scientist",
+    "formula": "Scientist > 0"
+   },
+   {
+    "table": "AssignedTo",
+    "column": "Project",
+    "formula": "length(Project) = 4"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Scientists": 12,
+   "Projects": 14,
+   "AssignedTo": 12
+  },
+  "null_targets": [
+   "Projects.Hours"
+  ],
+  "supporting_evidence": {
+   "Projects.Hours": "Observed values 156, 189, 256, 789, 98, 89, 112, 299 all positive; boundary values 99,100,101,299,300,301,302 included per atomic summary.",
+   "AssignedTo.Scientist": "Join to Scientists.SSN; parent rows without children and duplicate share 20-50% required.",
+   "AssignedTo.Project": "Join to Projects.Code; group sizes 1,2,>=3 and ties at rank 1 required.",
+   "Scientists.SSN": "Primary key; join to AssignedTo.Scientist; duplicate share 20-50% for DISTINCT over joined results.",
+   "Projects.Code": "Primary key; join to AssignedTo.Project; group sizes and ties required."
+  },
+  "uncertainty": "No formulas beyond range and length constraints are supported by the shown rows; no date pairs or calculated columns exist. NULL share for Projects.Hours is 0.0 in statistics but column is nullable, so at least one NULL row is generated per instruction 10. Duplicate-share targets for Scientists.SSN and Projects.Code apply to DISTINCT over joined/derived results, not to the PK columns themselves, which are unique."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "cli.py line 95: `_merge_added({t: {'rows_ok': s['added'], 'rows_failed': s['skipped']} ...})` but `write_instance_sqlite` returns `{'rows_ok': ok, 'rows_failed': bad}` (writer.py). The construction run crashed with `KeyError: 'added'` (returncode 1, n_instances 20, run_seconds 0.8).",
+     "requested_revision": "Fix the key mismatch in cli.py: use `s['rows_ok']` / `s['rows_failed']` (or change writer to return 'added'/'skipped'). The program must run to completion and produce instances without errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli.py `_one` calls `build_random_instance(_G['schema'], _G['pool'], None, rng)` and then `write_instance_sqlite(_G['schema'], inst, p)` \u2014 but `write_instance_sqlite` is called without `orig_path`, so it falls into the `orig_path is None` branch and creates an *empty* clone from DDL, not a byte-copy of the compact database. The docstring/comment claims 'start from a byte-copy of the compact database' and 'compact rows preserved', but the CLI never passes the original path. This violates the stated instance semantics ('every instance is a byte-copy of the compact database with generated rows appended').",
+     "requested_revision": "Pass the original database path (e.g. `a['orig']`) through to `write_instance_sqlite` so compact rows are preserved. Also ensure `_G['args']` carries `orig`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_project_group_sizes` is guarded by `if (_is_code(cm.name) is False) and cm.name.lower() == 'project'`. For AssignedTo.Project the column name is 'Project' (not 'Code'), so `_is_code('Project')` is False and the condition holds \u2014 OK. However the same block also runs for any column literally named 'project' in any table; more importantly, the spec requires group sizes 1, 2 and >=3 *and* parent rows without children. The function only tilts the child column; it does not guarantee a project with zero children (parent rows without children). `fill_foreign_keys_consistently` draws uniformly from the parent pool, so a project may or may not be childless \u2014 not guaranteed by construction as the spec's `unmatched_join_rows` target requires.",
+     "requested_revision": "Explicitly reserve at least one Projects.Code value that is never referenced by AssignedTo.Project (parent row without children), and verify group sizes 1, 2, >=3 are actually realized after PK/unique dedup (dedup can drop rows and change counts)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_hours_ties` plants a second max only if exactly one row has the max. But `_enforce_hours_ties` runs *before* `sample_fresh_primary_keys`/`drop_unique_duplicates`, and Hours is not a key, so that is fine. However the spec's `comparison_boundary` for Projects.Hours requires values 99,100,101,299,300,301,302 to be present so that BETWEEN 100 AND 300 vs BETWEEN 100 AND 301 differ. The code adds `_HOUR_BOUNDARIES` to the literal pool, but `NumberSampler` only *sometimes* draws from the pool (with probability p) and clamps to [1,1000]; there is no guarantee all seven boundary values appear. The spec's `values` target is not enforced by construction.",
+     "requested_revision": "Plant the boundary values 99,100,101,299,300,301,302 explicitly in the appended Projects.Hours column (subject to the planted NULL rule) so the BETWEEN boundary separation is guaranteed, not probabilistic."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_hours_ties` mutates `hours_col` in place and may overwrite a value with `mx`; if the planted NULL index happens to be adjacent, the guard `if hours_col[j] is not None` protects it, but the function can still overwrite a boundary value (e.g. 300) with the max, potentially removing a needed boundary. Also `_enforce_hours_ties` is called after clamping, so a boundary value could be replaced.",
+     "requested_revision": "Ensure boundary values are not overwritten by the tie-planting step; plant ties and boundaries in a coordinated way."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `uncertainty` states 'NULL share for Projects.Hours is 0.0 in statistics but column is nullable, so at least one NULL row is generated per instruction 10.' The atomic summary lists `null_targets: [Projects.Hours]` and the program plants one NULL. This is consistent with the interface NULL rule (at least one NULL per nullable column). No issue, but note: the spec's `null_targets` only lists Projects.Hours; AssignedTo.Scientist and AssignedTo.Project are NOT NULL per schema, consistent with `null_share: none`. Supported.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `duplicates_for_distinct` targets 20-50% duplicate share for Scientists.SSN, Projects.Code, Projects.Name, Scientists.Name, AssignedTo.Scientist. But Scientists.SSN and Projects.Code are PRIMARY KEYs (unique), so COUNT(DISTINCT) == COUNT(*) necessarily; a 20-50% duplicate share is impossible for a PK column. The atomic summary's `duplicates_for_distinct` for Scientists.SSN/Projects.Code appears to reflect DISTINCT over join results, not the base column. The spec's per-column target `duplicate_share: 20-50%` for these PK columns is contradictory with the schema.",
+     "requested_revision": "Clarify that duplicate_share for Scientists.SSN and Projects.Code applies to DISTINCT over joined/derived results (e.g. AssignedTo.Scientist), not to the PK column itself, which cannot contain duplicates. Otherwise the target is unsatisfiable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_domain_for` returns `(_SSN_MIN, None)` for SSN, and `NumberSampler` with `dom_hi=None` sets `dom_hi = self.max` (2*10^scale). For SSN (INT, scale 10) this yields a huge range; `sample_fresh_primary_keys` dedups, but with table size 12 and a huge domain, collisions are unlikely \u2014 fine. However `_domain_for` is keyed on column name 'ssn'/'hours'/'code' only; AssignedTo.Scientist (FK) is filled from parent pool, so SSN>0 holds. OK. But `Projects.Hours` semantic rule 'Hours IS NULL OR Hours BETWEEN 1 AND 1000' \u2014 the clamp uses `_HOURS_RANGE=(1,1000)`, consistent. Supported.",
+     "requested_revision": "None (informational)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `choose_appended_sizes` ignores the spec's `table_sizes_per_instance` (Scientists 12, Projects 14, AssignedTo 12) and instead uses random sizes (base//2..base+base//2 or level-scaled up to 2500). The spec explicitly gives per-instance table sizes; the program does not honor them.",
+     "requested_revision": "Use the spec's `table_sizes_per_instance` (or a documented derivation from it) for appended row counts, or update the spec to state that sizes are randomized. As written, spec and program disagree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_enforce_project_group_sizes` is applied to any column named 'project' (lowercased) in any table, including potentially Projects table if it had such a column; more concretely, the guard `(_is_code(cm.name) is False) and cm.name.lower() == 'project'` is convoluted and would also fire on a column literally named 'Project' in Projects (none here). Minor, but the intent (AssignedTo.Project only) is not clearly scoped.",
+     "requested_revision": "Scope the group-size tilt explicitly to (table='AssignedTo', column='Project')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` sets `pragma foreign_keys = OFF` and inserts rows; FK integrity is not enforced at write time. The spec requires child rows referencing existing parents and no NULL FK. `fill_foreign_keys_consistently` draws from parent pools, but if a parent pool is empty it emits `[None]*n`, which would violate NOT NULL FK. Also, appended parent rows are added to `parent_pools` only after the child table is built in FK order \u2014 `schema.table_order` should place parents first, but if a cycle or ordering issue occurs, children may reference only compact parents. Needs verification.",
+     "requested_revision": "Assert non-empty parent pools before FK fill; verify table_order places Scientists/Projects before AssignedTo; add a post-write integrity check (or enable foreign_keys=ON) to confirm no dangling/NULL FKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: `_one` seeds `random.Random(a['seed_base']*100003 + i)`, deterministic per unit. But `build_random_instance` uses `rng.random()` in `choose_appended_sizes` and elsewhere; deterministic given seed. However `_init` reads schema once per process and `_G['pool']` is shared; `seed_literal_pool_from_queries` is deterministic. Reproducibility appears OK, but the crash prevented verification of actual instance contents.",
+     "requested_revision": "After fixing the crash, re-run and confirm identical instances for the same seed across runs."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify actual generated instance contents (integrity, FK consistency, compact-row preservation, NULL placement, group sizes, boundary values) because the construction run crashed with KeyError 'added' before writing/validating instances.",
+    "Whether `schema.table_order` reliably places parent tables before child tables for this schema (needed for FK pool availability) was not confirmed by execution.",
+    "Whether the 20-50% duplicate-share target for PK columns (Scientists.SSN, Projects.Code) is intended to apply to base columns or to DISTINCT over joins \u2014 spec is ambiguous/contradictory."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Specification's `uncertainty` field states: 'NULL share for Projects.Hours is 0.0 in statistics but column is nullable, so at least one NULL row is generated per instruction 10.' The atomic summary for Projects.Hours lists no `null_rows` pattern, and the column statistics show no NULLs in the compact data. The spec nonetheless lists Projects.Hours in `null_targets` and the generic rule 'nullable_column' mandates at least one NULL per nullable column.",
+     "requested_revision": "Clarify whether Projects.Hours should be treated as nullable-with-NULLs (per the interface NULL rule) or whether the compact 0.0 NULL share should be honored. The current spec is internally consistent with the interface rule (at least one NULL), and execution shows 13/244 NULLs, so this is a documentation note rather than a blocking error. No change strictly required, but the spec should state the intended NULL share explicitly (e.g. 'at least one NULL, share not constrained by compact 0.0')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_hours_values` in instance.py plants boundary values {99,100,101,299,300,301,302} and then overwrites the first two non-null slots with 300,300 to create a tie at max. This means the planted 99/100/101/299/301/302 values may be partially overwritten (e.g. slots 0 and 1 become 300,300, so 99 and 100 are lost). The spec requires boundary values 99,100,101,299,300,301,302 to be present so that BETWEEN 100 AND 300 vs BETWEEN 100 AND 301 differ. With 14 Projects rows and ~13 non-null, all 7 boundaries fit before the tie overwrite, but the overwrite of slots 0,1 destroys 99 and 100. Execution feedback does not report per-value presence, so this is a latent risk.",
+     "requested_revision": "Plant the tie at max (300,300) in slots that do not collide with the boundary values, or plant boundaries after the tie, ensuring all of {99,100,101,299,300,301,302} survive. Verify with a check that each boundary value appears in at least one generated Projects.Hours row per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_assign_scientist_duplicates` sets the first n//3 rows to random existing scientist values, but does not guarantee the 20-50% duplicate share over the joined result. With AssignedTo size ~12-18 and Scientists ~12-18, the actual duplicate share depends on how many distinct scientists are drawn by `_fill_foreign_keys` (random choice from parent pool). The construction feedback reports 24/56 pairs separated, with no per-pattern breakdown (`construction_pairs_by_group` is empty), so the duplicate-share target is not verified.",
+     "requested_revision": "Add a post-construction assertion (or a reported statistic) that the duplicate share of AssignedTo.Scientist over the joined result falls in 20-50%, and that at least one parent Scientist row has no child. If the random draw cannot guarantee this, adjust the planting to force the target share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_assign_project_groups` requires at least 3 distinct project codes in the AssignedTo.Project column to realize group sizes {3,2,1}. If `_fill_foreign_keys` draws fewer than 3 distinct codes (possible with small AssignedTo size and large Projects pool), the function returns the column unchanged, silently failing the group-size target. The spec requires group sizes 1, 2 and >=3 and at least one childless Projects.Code.",
+     "requested_revision": "When fewer than 3 distinct codes are present, force additional distinct codes from the parent pool (or raise/report) so the group-size target is always realized. Also verify at least one Projects.Code has zero AssignedTo children per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`choose_appended_sizes` perturbs the spec's `table_sizes_per_instance` (Scientists 12, Projects 14, AssignedTo 12) to `rng.randint(base, base + base//2)`, so appended sizes range 12-18, 14-21, 12-18. The spec says 'table_sizes_per_instance' as fixed sizes; the program treats them as lower bounds. Execution shows rows_added Scientists 160/20=8, Projects 244/20=12.2, AssignedTo 283/20=14.15 \u2014 these are *appended* counts averaged, but the per-instance sizes vary. This is a deviation from the literal spec but arguably within 'small perturbation' intent.",
+     "requested_revision": "Either fix the spec to state that table_sizes_per_instance are base sizes with perturbation, or make the program use the exact sizes. The current behavior is defensible but should be documented in the spec to avoid ambiguity."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_drop_primary_key_duplicates` and `_drop_unique_duplicates` drop rows that collide with existing compact keys. For Scientists.SSN and Projects.Code (PKs), this is correct. However, `_existing_uniq` for composite groups uses `schema.unique_groups`, which for this schema is empty (no composite UNIQUE). The single-column unique handling reads `cm.unique`, which for PK columns is set via `pragma index_list` \u2014 but PK columns are already handled by `_drop_primary_key_duplicates`. No double-drop observed; execution shows 0 pk_duplicates and 0 not_ok.",
+     "requested_revision": "No change required; noted for completeness. The dedup logic is consistent with the schema."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` include 'Hours IS NULL OR Hours BETWEEN 1 AND 1000' and 'Hours IS NULL OR Hours > 0'. The program clamps Hours to [1,1000] in `build_random_instance` before planting boundaries, and `_plant_hours_values` plants 99..302 which are within range. Execution shows no integrity violations. However, the spec's `comparison_boundary` target lists values [99,100,101,299,300,301,302] and the program plants them, but the tie-at-max overwrite (issue 2) may drop 99/100.",
+     "requested_revision": "See issue 2. The formula itself is correctly implemented."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-pattern construction separation (construction_pairs_by_group is empty) \u2014 cannot confirm which of the 56 eligible pairs were separated and whether the 24 separated pairs cover the intended patterns (unmatched_join_rows, duplicates_for_distinct, ties_for_order_limit, comparison_boundary, group_sizes).",
+    "Presence of all boundary values {99,100,101,299,300,301,302} in generated Projects.Hours rows per instance is not directly reported; the tie-overwrite in _plant_hours_values may drop 99 and 100.",
+    "Duplicate share of AssignedTo.Scientist over the joined result (20-50% target) is not verified by execution feedback.",
+    "Group sizes {1,2,>=3} for AssignedTo.Project and at least one childless Projects.Code are not verified by execution feedback.",
+    "Reproducibility is reported true, and integrity checks (fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0) pass; compact-row preservation is implied by the writer copying orig_path and appending, but not independently verified by row-count comparison."
+   ]
+  }
+ ]
 }

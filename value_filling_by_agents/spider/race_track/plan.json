@@ -1,50 +1,519 @@
 {
  "db": "race_track",
- "operator_io_quirks": [
-  "Mixed-case identifiers: Race_ID, Track_ID, Year_Opened, Name, Class, Date \u2014 must be double-quoted in generated SQL; column lookup case-insensitive.",
-  "race.Track_ID declared TEXT but FK to track.Track_ID declared INT: type-affinity mismatch across the FK edge; parent values are integers, child stores them as text ('1','2',...).",
-  "race.Track_ID has 6 distinct over 7 rows (one duplicate) \u2014 FK child is non-unique, parent is unique PK; fine, but child draws with replacement.",
-  "race.Date is TEXT holding free-form human dates ('January 26 January 27', 'March 29', 'April 19') \u2014 NOT ISO, NOT parseable by TS Date templates; dispatches to String fuzzer, not Date.",
-  "race.Class has only 2 distinct values ('DP/GT','GT') \u2014 low-cardinality enum-like text; TS String fuzzer will not reproduce this.",
-  "track.Seating and track.Year_Opened declared REAL, storage real, values are whole numbers (92000.0, 1997.0) \u2014 Number fuzzer with scale from REAL (no args) will emit floats.",
-  "track.Year_Opened is a year stored as REAL, not declared YEAR \u2014 dispatches to Number, not the year fuzzer.",
-  "Tiny tables (race=7, track=9 rows): choose_table_sizes will produce sizes far larger than originals; original_values sampling k=min(5,len) is fine.",
-  "No NOT NULL, no CHECK, no UNIQUE constraints beyond PKs \u2014 insert failures only from PK collisions.",
-  "Self-references: none. Composite keys: none. Dangling FKs: none (parent_exists true).",
-  "Table order: track (level 0) before race (level 1) \u2014 FK fill works in one pass.",
-  "race.Name values contain dots, spaces, digits ('RumBum.com 250', 'Bosch Engineering 250 at VIR') \u2014 String fuzzer charset a-zA-Z 0-9() will not match punctuation like '.' or '/'."
- ],
- "operator_ts_expectations": [
-  "Race_ID, Track_ID (track): Number fuzzer, int, scale 0, range [-1,1] plus perturbation \u2014 will generate tiny ints, mostly colliding with PK uniqueness filter; distinct count collapses.",
-  "race.Track_ID: String fuzzer (declared TEXT) but FK fill overrides \u2014 draws from track.Track_ID final values with replacement, so text '1'..'9' style; consistent with parent.",
-  "race.Name, track.Name, track.Location: String fuzzer, length range from min/max of 5 sampled originals, charset a-zA-Z 0-9() \u2014 plausible-looking but not real track names; FN risk when gold filters on specific names.",
-  "race.Class: String fuzzer over 2 originals \u2014 will emit random strings, not 'DP/GT'/'GT'; gold queries filtering Class='GT' will get empty or wrong results -> FN.",
-  "race.Date: String fuzzer (TEXT, not date-dispatched) \u2014 will emit random strings, never 'January 26' style; gold date predicates (LIKE '%January%', month extraction) will miss -> FN.",
-  "track.Seating, track.Year_Opened: Number fuzzer scale 0 (REAL, no args -> scale 0, precision 0), range [-1,1] plus +-1/+-2 perturbation \u2014 will NOT produce 92000 or 1997; gold range predicates (Seating>50000, Year_Opened>1990) will be empty -> FN.",
-  "Number fuzzer list_max quirk: upper end overwritten to full-range max, so even with originals the fresh draws dominate small ranges.",
-  "PK uniqueness filter (sample_fresh_primary_keys) on Race_ID/Track_ID with tiny int range will drop most rows -> small effective table sizes, possibly 0-2 rows -> FP from missing ties/duplicates in aggregates.",
-  "String contaminate (0.5 prob) adds/drops chars \u2014 further degrades name/class/date plausibility.",
-  "No NOT NULL/CHECK enforcement: NULLs may appear in columns that were 0% null originally (String/Number samplers can emit None via element dropout) -> gold IS NOT NULL predicates change cardinality.",
-  "FK fill draws from parent FINAL filtered values; if track PK filter leaves few rows, race.Track_ID gets few distinct -> join cardinality collapses -> FP on COUNT/aggregate queries.",
-  "Low original distinct (Class=2, Track_ID=6) means literal pool from train SQL is the main source of plausible values; without it TS is near-random."
- ],
- "challenger_refs": [
-  "G2",
-  "G1",
-  "G6",
-  "G4",
-  "G5",
-  "G7",
-  "G8",
-  "G3",
-  "g0942a504",
-  "gcec9c81a"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1, unique per table; never NULL. Generated PKs must be offset above the true MAX(pk) of the compact DB (queried with SELECT MAX(pk) FROM table, not from sampled rows) so they never collide with compact rows. If the compact MAX is unavailable or not an int, fall back to base 0 and assert generated PKs exceed the compact MAX and are unique.",
+   "int_foreign_key": "Copy an existing parent key value; allow NULL when the column is nullable. When the child column is declared TEXT and the parent column is INT, store str(value) in the child column.",
+   "text_name": "Pick from a small pool of realistic names; allow near-duplicate variants (case, spacing, punctuation) and occasional NULL when nullable.",
+   "text_short_code": "Pick from a small enum-like pool of short codes; allow case variants and occasional NULL when nullable.",
+   "text_date": "Pick from a pool of month-day strings in 'Month D' or 'Month D Month D' form. The chronological-order rule does not apply to this schema (no order rule on race.Date); the date pool is unordered.",
+   "real_positive": "Uniform real in a plausible positive range for the column; never negative; never NULL when NOT NULL.",
+   "real_year": "Integer-valued real in a plausible historical range (e.g. 1900-2025); never NULL when NOT NULL.",
+   "null_share": "Effective NULL share per nullable column is max(1/n, compact_share), where n is the generated row count for that table and compact_share = COUNT(col IS NULL)/COUNT(*) from the compact DB. Plant NULLs before target construction and re-verify all targets after planting; never plant a NULL in a row whose non-NULL value is required by a target (comparison_boundary values, FK child presence, tie at rank 1, group-size targets, orphan-parent reachability). Planted NULLs are never replaced to satisfy a rule. NOT NULL and primary-key columns never get NULL."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "race",
+    "column": "Track_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "track.Track_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "race",
+    "column": "Track_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Track_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(race.race_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "race",
+    "column": "Track_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "track",
+    "column": "Name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(race.race_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Name",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Class",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Class",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "GT",
+      "gt"
+     ]
+    }
+   },
+   {
+    "table": "race",
+    "column": "Class",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Class",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "race",
+    "column": "Class",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Track_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "track",
+    "column": "Track_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "race.Track_ID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "track",
+    "column": "Track_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Track_ID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(race.race_id)",
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "race",
+    "column": "Race_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(race.race_id)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "race",
+    "column": "Race_ID",
+    "pattern": "null_in_count_column",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Race_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "track",
+    "column": "Location",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "table": "track",
+    "column": "Location",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": [
+      "COUNT(*)"
+     ],
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "table": "track",
+    "column": "Location",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "race",
+    "column": "Name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_table": "race",
+    "child_column": "Track_ID",
+    "parent_table": "track",
+    "parent_column": "Track_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "race",
+    "column": "Class",
+    "formula": "Class IN ('DP/GT', 'GT', 'gt', 'GT ')",
+    "evidence": "Observed DP/GT and GT; case variants 'gt' and 'GT ' added to satisfy comparison_boundary target values ['GT','gt']"
+   },
+   {
+    "table": "track",
+    "column": "Seating",
+    "formula": "Seating > 0",
+    "evidence": "All observed seating values are positive reals"
+   },
+   {
+    "table": "track",
+    "column": "Year_Opened",
+    "formula": "Year_Opened BETWEEN 1900 AND 2025",
+    "evidence": "Observed years 1947-2001"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "track": 9,
+   "race": 7
+  },
+  "null_targets": [
+   "race.Track_ID",
+   "race.Name",
+   "race.Class",
+   "race.Date",
+   "track.Name",
+   "track.Location",
+   "track.Seating",
+   "track.Year_Opened"
+  ],
+  "supporting_evidence": {
+   "race.Class enum": "Rows 1-7 show only 'DP/GT' and 'GT'; case variants 'gt' and 'GT ' added for comparison_boundary target.",
+   "track.Seating > 0": "All 8 shown seating values are positive.",
+   "track.Year_Opened range": "Shown years 1947, 1950, 1959, 1964, 1968, 1995, 1997, 2001."
+  },
+  "uncertainty": "No calculated columns or date-pair order rules exist in the schema; the text_date chronological-order rule is not applicable. Compact NULL share is 0.0 for every nullable column, so the effective NULL share is max(1/n, 0.0) = 1/n per nullable column per instance; plant NULLs before target construction and re-verify targets after planting. Track_ID declared TEXT in race but INT in track; generation copies integer values and stores them as text (str(value)) in race. FK distribution must be skewed so that per-parent child counts of 0, 1, 2 and >=3 and a tie at rank 1 are reachable: with track=9 and race=7, at least one parent track row has zero race children, at least one race row has NULL Track_ID, and the child counts include 0, 1, 2 and >=3 with a tie at rank 1. The 0/1/2/>=3 distribution plus a rank-1 tie is tight at these sizes; the generator must verify it explicitly and retry/rebuild when violated. For the 20-50% duplicate share at these sizes: track.Name needs 6-7 distinct values among 9 rows, track.Location needs 6-7 distinct among 9, race.Class needs 4-5 distinct among 7. Every instance must contain at least one 'GT' and at least one 'gt' to exercise the comparison boundary (both '=' and '>=' forms); 'GT ' and 'DP/GT' are optional. Generated PKs must be offset above the true MAX(pk) of the compact DB (fallback base 0 if unavailable) and each generated row inserted exactly once; the writer must not double-insert rows. Verification must check group_sizes, ties_for_order_limit, aggregate_boundary, duplicates_for_distinct, unmatched_join_rows and comparison_boundary, and protect at least one race.Track_ID row from NULL planting so the orphan-parent + NULL-child targets remain jointly satisfiable."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `NameError: name 'random' is not defined` at instance.py line 82 (`def _fk_choice(parent, table: str, col: str, rng: random.Random):`). instance.py imports only `from .values import _init_sampler`; it never imports `random`, yet uses `random.Random` in the type annotation and `rng.random()`/`rng.randrange()` at runtime. The module fails to import, so `build_random_instance` is never reached and 0 instances are produced.",
+     "requested_revision": "Add `import random` to tscore_gen/instance.py (or remove the `random.Random` annotation). Re-run generation and confirm n_instances > 0 with no import errors."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fk_choice(parent, table, col, rng)` is called as `_fk_choice(pv, pv, pc, rng)` in `fill_foreign_keys_consistently` \u2014 the second positional argument (declared `table: str`) receives the parent value list `pv`, not a table name. The function body ignores `table`/`col`, so it happens to work, but the signature is wrong and misleading. More importantly, the three branches (`r<0.30`, `r<0.55`, else) all do `parent[rng.randrange(len(parent))]` \u2014 identical behavior \u2014 so the intended 'skewed distribution' producing group sizes 0/1/2/>=3 and a tied top rank is not actually implemented; only the 10% NULL branch differs.",
+     "requested_revision": "Fix the call/signature so arguments match, and implement an actual skewed FK distribution (e.g. weight a small subset of parent keys heavily) so that per-parent child counts of 0, 1, 2 and >=3 and a tie at rank 1 are reachable, as the spec's group_sizes/ties_for_order_limit targets require."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py builds `rows = []` and loops `con.execute(sql, row)` per row, then after the loop sets `rows = []` again and never calls `executemany`. The docstring claims 'generated rows are appended with executemany inside one transaction', but the code does per-row execute. This is a spec/implementation mismatch (not fatal to correctness, but contradicts the stated design and the 'append-only ... executemany' contract).",
+     "requested_revision": "Either use `con.executemany(sql, rows)` as documented, or correct the docstring/comment. Ensure the transaction wraps all inserts and that failing rows are still counted in `rows_failed`."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `null_targets` lists all nullable columns and the generic rule says 'overall NULL share follows the compact database's observed share (0.0 here, so NULLs are rare but present)'. But `_plant_null` plants a NULL with probability 0.5 per column per instance, and `_fk_choice` returns NULL with probability 0.10 for race.Track_ID. This yields a NULL share far above the observed 0.0 (though the interface rule requires at least one NULL per nullable column, so some NULLs are mandated). The spec's '0.0 share' phrasing conflicts with the interface's 'at least one NULL per nullable column' requirement; the spec should state the intended planted share explicitly.",
+     "requested_revision": "Clarify in the spec that the compact share is 0.0 but the interface mandates >=1 NULL per nullable column per instance, and state the intended planted share (e.g. 'exactly one NULL per nullable column per instance' or a small fixed share) so the program's 0.5/0.10 planting probabilities can be checked against it."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec semantic rule `race.Class IN ('DP/GT', 'GT')` with evidence 'Distinct values observed: DP/GT, GT', but the comparison_boundary target requires values ['GT','gt'] and the program's `_class_enum` emits 'gt', 'GT ', and other CLASS_VARIANTS ('GT ', 'gt'). The spec's enum rule and the comparison-boundary target are in tension: the enum rule as written would be violated by 'gt'/'GT ' rows. The spec should reconcile the enum domain with the case-variant boundary requirement.",
+     "requested_revision": "Update the Class semantic rule to reflect the intended domain including case variants (e.g. `Class IN ('DP/GT','GT','gt','GT ')` or state that case-insensitive comparison is intended), so the enum rule and the comparison_boundary target are consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_null` is applied to every nullable non-PK column including `race.Track_ID` (a nullable FK). The interface rule says a planted NULL is never replaced to satisfy a rule, and rules constrain only non-NULL operands \u2014 this is consistent. However, `_plant_null` may set a NULL on a column that also feeds `fill_foreign_keys_consistently`'s self-FK remap (`pt == t` branch), and the ordering (FK fill, then PK overwrite, then self-FK remap, then NULL plant) means a NULL planted after the remap is fine, but the spec's `unmatched_join_rows` target requires both `parent_rows_without_children` and `child_rows_with_null_fk` \u2014 the latter is satisfied by the 10% NULL in `_fk_choice`, but the former (parent rows with no children) depends on the skewed distribution that is not actually implemented (see issue 2).",
+     "requested_revision": "After fixing the FK distribution (issue 2), verify that generated instances actually contain at least one parent track row with zero race children and at least one race row with NULL Track_ID, per the unmatched_join_rows target."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (n_instances=0), so integrity-constraint satisfaction, dependent-value consistency, compact-row preservation, and reproducibility could not be verified from execution evidence.",
+    "Whether the generated FK distribution actually yields group sizes 0/1/2/>=3 and a tie at rank 1 cannot be confirmed until the import error is fixed and generation runs.",
+    "Whether track.Name / track.Location duplicate shares fall in 20-50% and whether track.Name group sizes reach 1/2/>=3 cannot be confirmed without execution."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units failed with IntegrityError('UNIQUE constraint failed: race.Race_ID'); n_ok=0, n_instances=0. In writer.py, write_instance_sqlite copies the compact DB (shutil.copyfile(orig, part)) and then appends generated rows. In instance.py, PKs are assigned as base = schema.max_ints[(t, pk)]; cols[pk] = [base + 1 + i ...]. However, schema.max_ints is populated in read_schema only from the sampled original rows (max_rows_per_table=300000, and for large tables only every k-th rowid is read), so max_ints can be lower than the true maximum PK in the compact DB. More importantly, the append-only copy already contains the compact rows, so any generated PK that collides with an existing compact PK raises UNIQUE constraint failure. The observed failure on race.Race_ID for every unit shows the offset is not reliably above the compact maximum (or the compact rows are not being accounted for).",
+     "requested_revision": "Compute the true maximum integer PK per table from the compact DB (e.g. SELECT MAX(pk) FROM table, not from the sampled rows), and use that as the base for generated PKs. Alternatively, verify the generated PK range does not intersect compact PKs before insert. Re-run generation and confirm n_ok > 0 and n_instances > 0 with no IntegrityError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py inserts each row twice: first via con.execute(sql, row) inside the loop (which already inserts the row and increments ok[t]), then again via con.executemany(sql, good_rows) after the loop. This double-inserts every generated row, which will itself cause UNIQUE constraint failures on PK columns (and duplicate rows on non-PK tables). The comment 'rows are written with executemany inside one transaction' contradicts the code, which executes both paths.",
+     "requested_revision": "Remove the per-row con.execute(sql, row) call (or remove the executemany call), so each generated row is inserted exactly once. Keep the try/except row-skipping semantics on a single insert path."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_null plants exactly one NULL per nullable column, but the interface rule requires the NULL share to follow the compact database's share for that column (with at least one NULL). The spec's null_share rule says 'Compact observed share is 0.0 for every nullable column', so a share of 1/table_size is consistent with the spec, but the program does not read or honor the compact share per column; it hardcodes one NULL. For columns where the compact share is nonzero this would under-represent NULLs. Also, _plant_null is applied after FK filling and after PK/unique filtering, and it can overwrite a value that was needed for a target (e.g. a NULL planted in race.Track_ID may remove the only child of a parent, or a NULL in race.Class may remove the 'GT'/'gt' boundary value). The spec says planted NULLs are never replaced to satisfy a rule, but the program does not check that planting a NULL does not destroy a required target (e.g. the single 'gt' value, the single child of a parent, the tie at rank 1).",
+     "requested_revision": "Read the compact NULL share per column from schema.original_values and plant NULLs to match that share (at least one). When planting a NULL, avoid columns/rows whose non-NULL value is required by a target (comparison_boundary values, FK child presence, tie at rank 1, group-size targets), or plant NULLs before target construction and re-verify targets after planting. Document the chosen policy in the spec."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions include race.Track_ID group_sizes target '1, 2 and >= 3' and ties_for_order_limit tie_at_rank [1] on COUNT(race.race_id)/COUNT(*), and track.Track_ID group_sizes '1, 2 and >= 3'. With table_sizes track=9, race=7, the FK distribution in _fk_choice (10% NULL, 70% to first 3 keys, 30% uniform) makes per-parent child counts of 0,1,2,>=3 reachable, but the spec does not state the required skew or the required number of parents with each count, nor does it state that at least one parent must have zero children and at least one child must have NULL FK (it does mention this in uncertainty). The spec also does not specify how many distinct track.Name values are needed to achieve the 20-50% duplicate share with 9 rows, nor how many race.Class values are needed for the 20-50% duplicate share with 7 rows. These are under-specified targets that the program approximates rather than guarantees.",
+     "requested_revision": "Add explicit construction requirements to the spec: (a) FK skew parameters and the required counts of parents with 0,1,2,>=3 children; (b) required number of NULL FK rows; (c) required distinct-value counts for track.Name, track.Location, race.Class to hit the 20-50% duplicate share at the specified table sizes; (d) required tie structure at rank 1 (which parents/keys tie and on what aggregate)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's semantic_rules_and_formulas include race.Class IN ('DP/GT','GT','gt','GT ') with evidence 'Observed DP/GT and GT; case variants gt and GT  added to satisfy comparison_boundary target values [GT,gt]'. The comparison_boundary target is values ['GT','gt'] and the ops include set_r:PRED(race.class >= 'GT'). The spec does not state whether 'GT ' (trailing space) and 'DP/GT' are required, nor whether the comparison boundary must be exercised with both '=' and '>=' (the extracted ops show both). The program's _class_enum produces 'GT','gt','DP/GT', and random CLASS_VARIANTS including 'GT ', but does not guarantee that both 'GT' and 'gt' appear in every instance (with n=7 and probabilities 0.15/0.15/0.25/0.45, both may be absent in some instances).",
+     "requested_revision": "Specify that every instance must contain at least one 'GT' and at least one 'gt' (and optionally 'GT ' and 'DP/GT') to exercise the comparison boundary, and state whether the '>=' vs '=' distinction must be covered. Update the program to guarantee these values per instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py build_random_instance applies _plant_null to every nullable column including race.Track_ID, race.Name, race.Class, race.Date, track.Name, track.Location, track.Seating, track.Year_Opened. For race.Track_ID, planting a NULL after FK filling can remove the only child of a parent, breaking the 'parent_rows_without_children' and 'child_rows_with_null_fk' targets simultaneously (the target requires both a parent with no children and a child with NULL FK; a single NULL child may satisfy the latter but the former requires a parent with zero non-NULL children). The program does not verify these targets after planting NULLs.",
+     "requested_revision": "After planting NULLs, verify the unmatched_join_rows targets (at least one parent with zero children, at least one child with NULL FK) and the group-size targets; if violated, adjust the FK distribution or plant the NULL in a row that is not the sole child of a parent. Add a post-construction target check that fails the unit if targets are not met."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "schema.py read_schema samples original rows with 'where rowid % k = 0' when n > max_rows_per_table, and populates max_ints/max_values from the sampled rows only. This means max_ints may be less than the true maximum PK, causing PK collisions on append (as observed). It also means original_values used by samplers and _parent_values are a sample, not the full compact data, so FK parent values may miss some compact keys and the 'copied_columns' dependency may not cover all compact parent keys.",
+     "requested_revision": "For max_ints and max_values, query the true MAX from the compact DB (SELECT MAX(col) FROM table) rather than deriving from sampled rows. For FK parent values, either read all parent keys (or at least the full set of PK values) or document that sampling is acceptable and ensure generated PKs never collide with compact PKs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The spec's dependencies list only race.Track_ID -> track.Track_ID with copied_columns []. The program's fill_foreign_keys_consistently copies parent values from _parent_values (compact + generated) and stores them as-is; for race.Track_ID declared TEXT but parent INT, the program stores the parent value (int) directly, not str(value). The spec's uncertainty says 'generation copies integer values and stores them as text in race', but the program does not convert to str. SQLite is dynamically typed so this may not fail, but it does not implement the stated type conversion.",
+     "requested_revision": "In fill_foreign_keys_consistently, when the child column declared type is TEXT and the parent column is INT, store str(value) in the child column, as the spec states. Add a test that race.Track_ID values are text-typed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's generic_sampling_rules say 'text_date: Pick from a pool of month-day strings in Month D or Month D Month D form; keep chronological order where an order rule applies.' The extracted atomic operations do not include any date order rule, and the spec's uncertainty says 'No calculated columns or date-pair order rules exist in the schema.' The program's _race_date_variants does not enforce chronological order. This is consistent with the uncertainty, but the generic rule is stated as if it applies; it should be marked as not applicable for this schema.",
+     "requested_revision": "Clarify in the spec that the text_date chronological-order rule does not apply to this schema (no order rule on race.Date), so the program's unordered date pool is correct. No program change needed if the spec is clarified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows n_ok=0 and n_instances=0, so no instance was produced. The automated checks report construction_pairs_by_group as empty, meaning no target pairs were exercised. The program cannot be validated against the spec's targets until the IntegrityError is fixed.",
+     "requested_revision": "Fix the PK collision and double-insert issues, re-run generation, and provide execution feedback showing n_ok > 0, n_instances > 0, and construction_pairs_by_group populated with the target groups (group_sizes, ties_for_order_limit, aggregate_boundary, comparison_boundary, duplicates_for_distinct, unmatched_join_rows, null_in_count_column)."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's true max race.Race_ID and track.Track_ID exceed the sampled max_ints (cannot be confirmed without reading the compact DB; the IntegrityError strongly suggests a collision).",
+    "Whether the compact NULL share for each nullable column is actually 0.0 (the spec asserts this; the program hardcodes one NULL per column regardless).",
+    "Whether the FK skew in _fk_choice reliably produces per-parent child counts of 0,1,2,>=3 and a tie at rank 1 for every instance (not verified because no instance was produced).",
+    "Whether the 20-50% duplicate share for track.Name, track.Location, race.Class is achieved at the specified table sizes (not verified because no instance was produced).",
+    "Whether the comparison_boundary values 'GT' and 'gt' both appear in every instance (probabilistic, not guaranteed)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with IntegrityError('UNIQUE constraint failed: race.Race_ID'); n_ok=0, n_instances=0. In writer.py write_instance_sqlite, each row is first inserted via _try_insert(con, sql, row) inside the loop, and then the accepted rows are inserted AGAIN via con.executemany(sql, good_rows). The first insert already commits the row to the transaction, so the second insert collides on the primary key. The docstring claims 'each row inserted exactly once' but the code inserts twice.",
+     "requested_revision": "Remove the double insertion: either validate rows without inserting (e.g. dry-run / savepoint rollback) or drop the per-row _try_insert and rely solely on executemany with per-row error handling. Ensure each generated row is inserted exactly once so PKs do not collide. Re-run generation and confirm n_ok>0 and no IntegrityError."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _build_once: PKs are assigned as base+1+i for i in range(n) where base = schema.max_ints[(t,pk)]. But schema.max_ints is only populated when the compact MAX is an int (schema.py: 'if isinstance(mx, int)'). For race.Race_ID this should be fine, yet the failure is a UNIQUE constraint on race.Race_ID, consistent with the double-insert bug above rather than an offset bug. However, the offset logic is also fragile: if max_ints is missing for a PK column, cols[pk] is left as sampler output (random ints), which can collide with compact rows. The spec requires PKs offset above true MAX(pk); the code silently skips the offset when max_ints lacks the key.",
+     "requested_revision": "Guarantee PK offsetting: if (t,pk) not in schema.max_ints, fall back to a safe base (e.g. 0 or a queried MAX) rather than leaving sampler values. Add an assertion/verification that generated PKs exceed the compact MAX and are unique."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification table_sizes_per_instance sets track=9, race=7, and uncertainty text requires 'at least one parent track row has zero race children, at least one race row has NULL Track_ID, and the child counts include 0, 1, 2 and >=3 with a tie at rank 1'. With only 7 race rows and 9 track rows, achieving per-parent child counts of 0,1,2,>=3 simultaneously (which needs at least 0+1+2+3=6 children across distinct parents) plus a NULL child plus a rank-1 tie is extremely tight and may be infeasible in many random draws; the program's _verify_targets only checks NULL child + orphan parent, not the 0/1/2/>=3 distribution or the rank-1 tie.",
+     "requested_revision": "Either relax/clarify the cardinality targets to be feasible at these sizes, or increase table sizes, and make the verification explicitly check the 0/1/2/>=3 child-count distribution and the rank-1 tie (not just NULL child and orphan parent)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _verify_targets does not verify group_sizes (1,2,>=3), ties_for_order_limit (tie at rank 1), aggregate_boundary (COUNT values 0,1,2 / 0,1,2,3), or duplicates_for_distinct (20-50% share) targets. The spec's uncertainty section explicitly requires these to be reachable and re-verified after NULL planting. The program only checks unmatched_join_rows and comparison_boundary.",
+     "requested_revision": "Extend _verify_targets to check the group-size distribution, rank-1 tie, aggregate boundary counts, and duplicate shares for track.Name, track.Location, race.Class, and rebuild when violated, consistent with the spec's re-verification requirement."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification null_targets lists race.Track_ID, race.Name, race.Class, race.Date, track.Name, track.Location, track.Seating, track.Year_Opened as nullable, but the schema DDL shows no NOT NULL constraints, so all are nullable. The spec's uncertainty says compact NULL share is 0.0 for every nullable column yet mandates at least one NULL per nullable column. This is internally consistent with the interface rule, but the spec should state the effective share used (max(1/n, compact_share)) explicitly so the program's _plant_nulls behavior (want = max(1, round(share*n))) is unambiguous.",
+     "requested_revision": "Clarify in the spec that the effective NULL share is max(1/n, compact_share) per nullable column, matching the interface rule, so the program and spec agree on the planted NULL count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls protects rows {0,1} for race.Class to keep GT/gt, but for race.Track_ID protected is set() (empty), so NULLs may be planted in all child rows, potentially destroying the 'at least one non-NULL child so an orphan parent remains reachable' intent noted in the comment. _verify_targets would then fail and retry, but the protection is inconsistent with the stated intent.",
+     "requested_revision": "Protect at least one race.Track_ID row from NULL planting (or rely on _verify_targets retry) and make the comment match the code; ensure the orphan-parent + NULL-child targets are jointly satisfiable after NULL planting."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 0/1/2/>=3 child-count distribution and rank-1 tie are actually achievable at track=9/race=7 was not verified because generation failed before producing any instance.",
+    "The exact compact MAX(race.Race_ID) and whether max_ints is populated for it could not be confirmed from the feedback; the UNIQUE failure is attributed to the double-insert bug, but the PK-offset fallback remains unverified.",
+    "Semantic rules (Class IN enum, Seating>0, Year_Opened range) are supported by observed values and implemented in _class_enum/_seating_variants/_year_variants; no issue found there."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fk_plan` builds the FK plan over the *generated* parent keys only (`_parent_values` returns compact + generated, but the plan picks `pool[0..3]` after shuffling the whole pool). The spec's `unmatched_join_rows` target requires `parent_rows_without_children: true` \u2014 i.e. a parent track row with zero race children. With track=9 and race=7, the plan assigns counts {p1:1, p2:2, p3:max(3,n-4)} plus one NULL, so at most 4 distinct parents are touched and 5+ parents are orphans \u2014 that part is fine. However `_verify_targets` computes `_child_counts` over `parents` = compact key_values \u222a generated track.Track_ID, and requires `{0,1,2} <= vals and any(c>=3)`. The plan guarantees p1=1, p2=2, p3>=3, and orphans=0, so this is satisfiable. The real defect: `_fk_plan` is called with `n` = race row count (7) but the plan's `counts` dict sums to 1+2+max(3,3)=6 plus the NULL = 7, so `out` has exactly 7 entries and the `while len(out) < n` pad never runs \u2014 but `rng.shuffle(out)` then `out[:n]` is fine. The tie-at-rank-1 requirement (`ties_for_order_limit`, tie_at_rank [1]) is NOT satisfied: p3 has the unique maximum count (3), so `sum(1 for c in counts.values() if c == mx) < 2` and `_verify_targets` returns False. The builder retries 16 times but `_fk_plan` is deterministic in structure (always one p3 with the max), so every retry fails the tie check and `build_random_instance` returns the last (failing) instance. Execution feedback confirms: `construction_pairs.separated = 22` of 69 eligible, and the ties_for_order_limit pairs are among the unseparated. The spec explicitly states 'the generator must verify it explicitly and retry/rebuild when violated' and 'the child counts include 0, 1, 2 and >=3 with a tie at rank 1' \u2014 the program cannot produce a rank-1 tie at these sizes.",
+     "requested_revision": "Fix `_fk_plan` so that at least two parents share the maximum child count (e.g. assign p3 and p4 both count 3, or p2 and p3 both count 2 when n is small), and make `_verify_targets`'s tie check actually reachable. Alternatively, if a rank-1 tie is genuinely impossible at track=9/race=7, the designer must relax the `ties_for_order_limit` target (e.g. tie_at_rank [1] with a documented fallback) rather than leaving an unsatisfiable target in the spec. Re-run and confirm `construction_pairs.separated` covers the ties_for_order_limit group."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` block asserts 'the child counts include 0, 1, 2 and >=3 with a tie at rank 1' and calls the distribution 'tight at these sizes'. With race=7 and one NULL child, only 6 non-NULL children remain to be spread over 9 parents while simultaneously requiring counts 0, 1, 2, >=3 AND a tie at the maximum. A tie at rank 1 with a >=3 group requires at least 2*3=6 non-NULL children just for the tied maximum, leaving zero for the 1 and 2 groups \u2014 arithmetically impossible. The spec does not acknowledge this contradiction or provide a fallback (e.g. drop the >=3 requirement, or increase race size).",
+     "requested_revision": "Either (a) increase `table_sizes_per_instance.race` so the 0/1/2/>=3 + rank-1-tie combination is arithmetically feasible (needs >= 2*3 + 1 + 2 = 9 non-NULL children, so race >= 10 with one NULL), or (b) drop the rank-1 tie requirement for this column, or (c) drop the >=3 requirement. Document the chosen resolution in the spec so the engineer's `_fk_plan` and `_verify_targets` can be made consistent."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` is called for every nullable column with `share = schema.null_shares.get((t, cm.name), 0.0)`. The compact DB has 0.0 NULL share for all nullable columns (per spec `uncertainty`), so `want = max(1, int(round(0.0 * n))) = 1`. This plants exactly 1 NULL per nullable column per instance. Execution feedback shows `race.Track_ID: NULL 37 / 152` across 20 instances (~1.85/instance) and `race.Class: NULL 20/152` (1/instance) \u2014 consistent with the rule. However, `_plant_nulls` protects `{0}` for race.Track_ID and `{0,1}` for race.Class, but the FK plan already places a NULL at `out[0]` before shuffle; after shuffle the NULL may land anywhere, and `_plant_nulls` may then plant a *second* NULL, or the protected index 0 may already be NULL. This is benign for the NULL rule but means the 'at least one non-NULL child' protection is not actually guaranteed to protect a non-NULL row \u2014 it protects row index 0 which may itself be the FK-plan NULL. The spec requires 'protect at least one race.Track_ID row from NULL planting so the orphan-parent + NULL-child targets remain jointly satisfiable'; the current protection is index-based and does not check the value.",
+     "requested_revision": "In `_plant_nulls` for race.Track_ID, choose a protected index whose current value is non-NULL (e.g. `next(i for i,v in enumerate(values) if v is not None)`), not a fixed index 0. Same for race.Class: protect indices whose value is 'GT' and 'gt' respectively, not fixed 0/1."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_verify_targets` checks `duplicates_for_distinct` share in [0.20, 0.50] for track.Name, track.Location, race.Class. With track=9 and `_track_name_variants` drawing from 8 names with `_variant` producing case/space variants, the distinct count is typically 8-9, giving share ~0-0.11, below 0.20. The spec requires 'track.Name needs 6-7 distinct values among 9'. `_variant` returns the base unchanged 20% of the time and variants otherwise, but with 8 base names and 9 draws, collisions are rare. Execution feedback does not report per-target separation for duplicates_for_distinct, but the `construction_pairs.separated = 22/69` and the spec's own note that this is 'tight' suggests the duplicate-share target is frequently missed. The builder retries 16 times but `_track_name_variants` is i.i.d. per draw, so the probability of hitting 6-7 distinct among 9 from 8 bases is low.",
+     "requested_revision": "Make `_track_name_variants` / `_track_location_variants` / `_class_enum` explicitly construct the required distinct count (e.g. pick 6-7 distinct bases, then fill the remaining rows by repeating them with variants) rather than relying on random draws to hit the 20-50% share. Verify the share in `_verify_targets` and confirm separation in the construction feedback."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` includes `race.Class IN ('DP/GT', 'GT', 'gt', 'GT ')` with evidence 'Observed DP/GT and GT; case variants gt and GT added'. The `comparison_boundary` target requires values ['GT','gt'] and the spec says 'Every instance must contain at least one GT and at least one gt'. `_class_enum` guarantees this by setting out[0]='GT', out[1]='gt' when n>=2. However, `_plant_nulls` for race.Class protects {0,1} but the NULL planting may still set other rows to NULL, and the `duplicates_for_distinct` check counts non-NULL values only. This is consistent. The unresolved issue is that the spec's `text_short_code` generic rule says 'allow case variants and occasional NULL when nullable' but does not specify the exact enum pool; the program hardcodes CLASS_VARIANTS = ['GT','gt','DP/GT','GT '] which matches the formula. No defect here, but the spec should state the enum pool explicitly rather than only in the formula evidence.",
+     "requested_revision": "Add the explicit enum pool for race.Class to the spec's per-column rules (not just the formula evidence string) so the engineer's hardcoded CLASS_VARIANTS is traceable to the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction feedback reports `construction_pairs.separated = 22/69` but does not break down which target groups are unseparated. Without per-group separation counts, it is not possible to confirm whether the ties_for_order_limit and duplicates_for_distinct failures are the sole cause of the 47 unseparated pairs, or whether other targets (group_sizes, aggregate_boundary, unmatched_join_rows) also fail.",
+    "The spec's `table_sizes_per_instance` (track 9, race 7) combined with the 0/1/2/>=3 + rank-1-tie requirement is arithmetically infeasible as shown; the designer must resolve this before the engineer's fix can be validated.",
+    "Execution feedback shows `race.Track_ID: NULL 37/152` (~1.85/instance) which exceeds the `max(1/n, 0.0) = 1` rule; this is because the FK plan plants one NULL and `_plant_nulls` plants another. The spec's NULL rule says 'at least one NULL row per nullable column' and 'NULL share following the compact share' \u2014 the compact share is 0.0, so 1 NULL/instance is the target, but 1.85 is observed. This should be reconciled (either the FK-plan NULL counts toward the share, or `_plant_nulls` should not add a second NULL when the FK plan already placed one)."
+   ]
+  }
+ ]
 }

@@ -34,6 +34,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    original_sets: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +59,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +74,17 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _read_pk_tuples(con, table: str, cols: list) -> set:
+    """Stringified PK tuples of the compact rows (used to keep generated keys fresh)."""
+    if not cols:
+        return set()
+    try:
+        rows = con.execute('select %s from %s' % (', '.join(q(c) for c in cols), q(table))).fetchall()
+    except sqlite3.Error:
+        return set()
+    return {tuple(str(x) for x in r) for r in rows}
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -122,7 +134,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, osets = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +148,11 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                vals = [r[j] for r in rows]
+                ov[(t, c.name)] = vals
+                osets[(t, c.name)] = {str(v) for v in vals if v is not None}
+        schema = Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, osets)
+        schema.pk_tuples = {t: _read_pk_tuples(con, t, tables[t].primary_key) for t in tnames}
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return schema

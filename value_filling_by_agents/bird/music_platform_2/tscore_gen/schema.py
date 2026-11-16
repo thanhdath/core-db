@@ -1,5 +1,6 @@
 """Schema reading (upstream sql_util/dbinfo.py)."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ class TableMeta:
     name: str
     columns: list
     primary_key: list
+    unique_sets: list = field(default_factory=list)
 
 
 @dataclass
@@ -34,6 +36,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    null_share: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +61,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +76,17 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _table_unique_sets(create_sql: str, colnames: list) -> list:
+    """Composite UNIQUE(...) constraints declared at table level."""
+    low = {c.lower(): c for c in colnames}
+    out = []
+    for m in re.finditer(r'unique\s*\(([^)]*)\)', create_sql, re.I):
+        cols = [c.strip().strip('"`[]').lower() for c in m.group(1).split(',')]
+        if cols and all(c in low for c in cols):
+            out.append(tuple(low[c] for c in cols))
+    return out
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -96,16 +110,22 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     uniq.add(tok)
                 if ('check (' in ll or 'check(' in ll) and tok in low:
                     chk.add(tok)
+            usets = _table_unique_sets(create[t], [r[1] for r in info])
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
+                    names = [c[2] for c in cols if c[2]]
+                    if len(names) == 1 and names[0].lower() not in uniq:
+                        uniq.add(names[0].lower())
+                        from_index.append((t, names[0]))
+                    elif len(names) > 1:
+                        usets.append(tuple(low[n.lower()] for n in names if n.lower() in low))
             cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
-            tables[t] = TableMeta(t, cols, pk)
+            if pk:
+                usets.append(tuple(pk))
+            tables[t] = TableMeta(t, cols, pk, usets)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -122,7 +142,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, nshare = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +156,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                vals = [r[j] for r in rows]
+                ov[(t, c.name)] = vals
+                if vals:
+                    nshare[(t, c.name)] = sum(1 for v in vals if v is None) / float(len(vals))
+                else:
+                    nshare[(t, c.name)] = 0.0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, nshare)

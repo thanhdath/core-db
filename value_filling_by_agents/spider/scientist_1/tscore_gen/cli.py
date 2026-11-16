@@ -1,4 +1,4 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
 import json
 import multiprocessing as mp
@@ -22,20 +22,28 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int):
+    """Build and write unit i; returns (err, per_table_stats)."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return '', {}
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        stats = write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])
+        return '', stats
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return type(e).__name__, {}
+
+
+def _merge_added(dst: dict, src: dict) -> None:
+    """Merge writer stats {'rows_ok': {t: n}, 'rows_failed': {t: n}} into dst."""
+    for t, n in src.get('rows_ok', {}).items():
+        dst.setdefault(t, {'added': 0, 'skipped': 0})['added'] += n
+    for t, n in src.get('rows_failed', {}).items():
+        dst.setdefault(t, {'added': 0, 'skipped': 0})['skipped'] += n
 
 
 def main(argv=None) -> None:
@@ -63,7 +71,8 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag,
+            'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -72,12 +81,21 @@ def main(argv=None) -> None:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
-    for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
-                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+    merged: dict = {}
+    n_ok = 0
+    for err, stats in res:
+        if err:
+            errs[err] = errs.get(err, 0) + 1
+        else:
+            n_ok += 1
+        _merge_added(merged, stats)
+    rows_added = {t: v['added'] for t, v in merged.items()}
+    rows_skipped = {t: v['skipped'] for t, v in merged.items()}
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
+                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good),
+                      'pool_skipped': skipped,
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': rows_added, 'rows_skipped': rows_skipped}))
 
 
 if __name__ == '__main__':

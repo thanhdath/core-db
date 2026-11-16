@@ -1,50 +1,707 @@
 {
  "db": "books",
- "operator_io_quirks": [
-  "Mixed-case/spaced table names: \"cust_order\", \"order_history\", \"order_line\" must be double-quoted; column lookup case-insensitive.",
-  "All columns notnull=0 in pragma even for PKs; NOT NULL never enforced by TS, so PK/unique filtering is the only dedup.",
-  "cust_order/order_history/order_line use 'INTEGER primary key autoincrement' \u2014 sqlite assigns rowid if NULL inserted; TS inserts explicit values so fine, but autoincrement counter may collide on re-insert.",
-  "FKs declared inline as 'references customer' with NULL parent_col -> parent column = child name (customer_id, shipping_method_id, dest_address_id, order_id, status_id, book_id).",
-  "cust_order.dest_address_id -> address.address_id: parent exists but only 1000 rows vs 7550 orders; FK draw with replacement gives heavy duplication.",
-  "Composite PKs: customer_address(customer_id,address_id), book_author(book_id,author_id) \u2014 both members are also FKs; PK dedup after FK fill.",
-  "publication_date/order_date/status_date declared DATE/DATETIME but stored as TEXT ('YYYY-MM-DD' and 'YYYY-MM-DD HH:MM:SS'); storage class contradicts declared type.",
-  "book.publication_date samples are all 'YYYY-MM-DD' (no time); order_date/status_date include time component \u2014 Date fuzzer template will differ per column.",
-  "isbn13 stored as TEXT but all-digit strings (10-11 chars) \u2014 String fuzzer will treat as int-like and add +-1 variants.",
-  "street_number TEXT but numeric strings ('57','86') \u2014 String fuzzer int-like branch applies.",
-  "Large tables: order_history 22348, book_author 17642, book 11127 \u2014 under 300k cap, full read OK.",
-  "order_line.line_id samples start at 1024 (not 1) \u2014 autoincrement gap; PK values not contiguous."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all INTEGER PKs/FKs: uniform in [-10^4,10^4] (scale=4 default for int family), then +-1/+-2 perturbation; produces negative and huge ids implausible for book_id/order_id.",
-  "Date fuzzer on publication_date: template %Y-%m-%d from samples; range 1800-01-01..2100-01-01 (or min/max of 5 sampled originals); fresh dates outside 1980-2022 plausible range -> FN on year filters.",
-  "Date fuzzer on order_date/status_date: template %Y-%m-%d %H:%M:%S; random datetimes across 300 years -> FN on 'recent orders' predicates.",
-  "String fuzzer on first_name/last_name/city/title: random a-zA-Z0-9() strings, not name-like -> FN on LIKE 'A%' or name predicates; contaminate adds junk chars.",
-  "String fuzzer on email: random strings, never '@' -> FN on email LIKE '%@%'.",
-  "String fuzzer on language_code ('eng','en-US'): random 0-20 char strings -> FN on language_code='eng'.",
-  "String fuzzer on status_value/address_status/method_name: random strings instead of the 2-6 real enum values -> FN on status_value='Delivered' etc.",
-  "Number fuzzer on num_pages: uniform [-10^4,10^4] -> negative page counts, FN on num_pages>300.",
-  "Number fuzzer on cost/price (REAL): uniform [-10^4,10^4] with +-0.01/0.02 -> negative prices, FN on price>10.",
-  "FK fill with replacement from parent's final values: customer_address.address_id drawn from 1000 addresses for 3350 rows -> duplicates, but PK(customer_id,address_id) dedup drops many rows; ties in address_id preserved (good for joins).",
-  "Small parent tables (address_status 2, shipping_method 4, order_status 6): FK draws collapse to few values -> many duplicate rows, PK dedup on order_history.history_id (fresh) keeps them; ties abundant.",
-  "book_author: book_id drawn from 11127 books, author_id from 9235 authors, PK dedup -> ~17642 rows expected but random collisions reduce; join cardinality roughly preserved."
- ],
- "challenger_refs": [
-  "G23",
-  "G21",
-  "G9",
-  "G27",
-  "G1",
-  "G19",
-  "G24",
-  "G17",
-  "G25",
-  "G2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1; never NULL; unique per table.",
+   "integer_fk": "Copy from parent pool; 5% NULL when nullable; 10% parent rows left childless.",
+   "text_short": "Draw from a small pool of realistic values; 20-50% duplicate share; 5% near-variant (case/typo) of a pool value.",
+   "text_long": "Draw from a pool of realistic titles/names; 20-50% duplicate share; 5% near-variant.",
+   "date": "Uniform over 1800-01-01..2025-12-31; format %Y-%m-%d; 5% boundary values at year edges.",
+   "datetime": "Uniform over 2019-01-01..2023-12-31; format %Y-%m-%d %H:%M:%S; 5% boundary values at year edges.",
+   "real_price": "Uniform 0.50..50.00, 2 decimals; 5% boundary at 9.99/10.00/10.01/12.99/13.00/13.01.",
+   "real_cost": "Uniform 1.00..30.00, 2 decimals.",
+   "integer_quantity": "Uniform 1..1000; 5% boundary at 499/500/501.",
+   "enum_small": "Draw uniformly from the listed enum values.",
+   "null_share": "For each nullable column, 5% NULL rows per instance, at least one; NOT NULL/PK columns never NULL; rules constrain non-NULL operands only."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "book.title",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "book.title",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "column": "book.title",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "book.title",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Anleitung zum Zickigsein",
+      "anleitung zum zickigsein",
+      "Fantasmas",
+      "fantasmas"
+     ]
+    }
+   },
+   {
+    "column": "book.publication_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "1899-12-31",
+      "1900-01-01",
+      "1900-12-31",
+      "1901-01-01"
+     ]
+    }
+   },
+   {
+    "column": "book.publication_date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2001%",
+      "1900%",
+      "1992%",
+      "1997-07-10",
+      "1995%",
+      "2017-%"
+     ],
+     "variants": [
+      "2000-12-31",
+      "2001-01-01",
+      "2001-12-31",
+      "2002-01-01",
+      "1899-12-31",
+      "1900-01-01",
+      "1900-12-31",
+      "1901-01-01"
+     ]
+    }
+   },
+   {
+    "column": "book.publication_date",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      2
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "column": "book.book_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "book_author.book_id",
+      "order_line.book_id",
+      "book_language.language_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "book.book_id",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "publisher.publisher_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "publisher.publisher_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Ace Book",
+      "ace book",
+      "HarperCollins Publishers",
+      "harpercollins publishers",
+      "Free Press",
+      "free press"
+     ]
+    }
+   },
+   {
+    "column": "publisher.publisher_name",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(publisher.publisher_id)"
+     ]
+    }
+   },
+   {
+    "column": "publisher.publisher_name",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "author.author_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "author.author_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Hirohiko Araki",
+      "hirohiko araki",
+      "Jennifer Crusie",
+      "jennifer crusie",
+      "A.J. Ayer",
+      "a.j. ayer"
+     ]
+    }
+   },
+   {
+    "column": "author.author_name",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "Ada%",
+      "Adam%",
+      "Orson Scott Card%",
+      "Orson Scott Card"
+     ],
+     "variants": [
+      "Ada",
+      "Adb",
+      "Ada x",
+      "ada",
+      "Adam",
+      "Adan",
+      "Adam x",
+      "adam"
+     ]
+    }
+   },
+   {
+    "column": "cust_order.order_date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2021%",
+      "2020-12-01",
+      "2020-12%",
+      "2020%",
+      "2022-11-10",
+      "2022-11-10%"
+     ],
+     "variants": [
+      "2020-12-31 00:00:00",
+      "2021-01-01 00:00:00",
+      "2021-12-31 00:00:00",
+      "2022-01-01 00:00:00",
+      "2020-11-30 00:00:00",
+      "2020-12-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "cust_order.order_date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "cust_order.order_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2019-12-31 00:00:00",
+      "2020-01-01 00:00:00",
+      "2020-12-31 00:00:00",
+      "2021-01-01 00:00:00",
+      "2021-12-31 00:00:00",
+      "2022-01-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "cust_order.order_date",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC",
+     "tie_on": [
+      "COUNT(STRFTIME('%Y', cust_order.order_date))"
+     ]
+    }
+   },
+   {
+    "column": "cust_order.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "order_line.order_id",
+      "order_history.order_id",
+      "order_line.line_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "customer.first_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "customer.first_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Lucas",
+      "lucas",
+      "Ursola",
+      "ursola",
+      "Ruthanne",
+      "ruthanne"
+     ]
+    }
+   },
+   {
+    "column": "book.num_pages",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      499,
+      500,
+      501
+     ]
+    }
+   },
+   {
+    "column": "order_history.status_date",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "2021-12-31 00:00:00",
+      "2022-01-01 00:00:00",
+      "2022-12-31 00:00:00",
+      "2023-01-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "order_history.status_date",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literals": [
+      "2019-12%",
+      "2021%",
+      "%2020%",
+      "2022%",
+      "2020%"
+     ],
+     "variants": [
+      "2019-11-30 00:00:00",
+      "2019-12-01 00:00:00",
+      "2019-12-31 00:00:00",
+      "2020-01-01 00:00:00",
+      "2020-12-31 00:00:00",
+      "2021-01-01 00:00:00",
+      "2021-12-31 00:00:00",
+      "2022-01-01 00:00:00"
+     ]
+    }
+   },
+   {
+    "column": "customer.last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "customer.last_name",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Vatini",
+      "vatini",
+      "Wyldbore",
+      "wyldbore",
+      "Purdy",
+      "purdy"
+     ]
+    }
+   },
+   {
+    "column": "order_line.order_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "cust_order.order_id"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "address.country_id",
+    "parent_table": "country",
+    "parent_column": "country_id",
+    "copied": []
+   },
+   {
+    "child": "customer_address.customer_id",
+    "parent_table": "customer",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "customer_address.address_id",
+    "parent_table": "address",
+    "parent_column": "address_id",
+    "copied": []
+   },
+   {
+    "child": "customer_address.status_id",
+    "parent_table": "address_status",
+    "parent_column": "status_id",
+    "copied": []
+   },
+   {
+    "child": "book.language_id",
+    "parent_table": "book_language",
+    "parent_column": "language_id",
+    "copied": []
+   },
+   {
+    "child": "book.publisher_id",
+    "parent_table": "publisher",
+    "parent_column": "publisher_id",
+    "copied": []
+   },
+   {
+    "child": "book_author.book_id",
+    "parent_table": "book",
+    "parent_column": "book_id",
+    "copied": []
+   },
+   {
+    "child": "book_author.author_id",
+    "parent_table": "author",
+    "parent_column": "author_id",
+    "copied": []
+   },
+   {
+    "child": "cust_order.customer_id",
+    "parent_table": "customer",
+    "parent_column": "customer_id",
+    "copied": []
+   },
+   {
+    "child": "cust_order.shipping_method_id",
+    "parent_table": "shipping_method",
+    "parent_column": "method_id",
+    "copied": []
+   },
+   {
+    "child": "cust_order.dest_address_id",
+    "parent_table": "address",
+    "parent_column": "address_id",
+    "copied": []
+   },
+   {
+    "child": "order_history.order_id",
+    "parent_table": "cust_order",
+    "parent_column": "order_id",
+    "copied": []
+   },
+   {
+    "child": "order_history.status_id",
+    "parent_table": "order_status",
+    "parent_column": "status_id",
+    "copied": []
+   },
+   {
+    "child": "order_line.order_id",
+    "parent_table": "cust_order",
+    "parent_column": "order_id",
+    "copied": []
+   },
+   {
+    "child": "order_line.book_id",
+    "parent_table": "book",
+    "parent_column": "book_id",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "address_status",
+    "column": "address_status",
+    "formula": "address_status IN ('Active','Inactive')"
+   },
+   {
+    "table": "order_status",
+    "column": "status_value",
+    "formula": "status_value IN ('Order Received','Pending Delivery','Delivery In Progress','Delivered','Cancelled','Returned')"
+   },
+   {
+    "table": "shipping_method",
+    "column": "cost",
+    "formula": "cost >= 0"
+   },
+   {
+    "table": "book",
+    "column": "num_pages",
+    "formula": "num_pages > 0"
+   },
+   {
+    "table": "book",
+    "column": "publication_date",
+    "formula": "publication_date BETWEEN '1800-01-01' AND '2025-12-31'"
+   },
+   {
+    "table": "order_line",
+    "column": "price",
+    "formula": "price >= 0"
+   },
+   {
+    "table": "order_history",
+    "column": "status_date",
+    "formula": "status_date >= (SELECT order_date FROM cust_order WHERE cust_order.order_id = order_history.order_id)"
+   },
+   {
+    "table": "cust_order",
+    "column": "order_date",
+    "formula": "order_date BETWEEN '2019-01-01 00:00:00' AND '2023-12-31 23:59:59'"
+   },
+   {
+    "table": "book_language",
+    "column": "language_code",
+    "formula": "length(language_code) BETWEEN 2 AND 5"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "address_status": 2,
+   "order_status": 6,
+   "shipping_method": 4,
+   "book_language": 27,
+   "country": 232,
+   "publisher": 230,
+   "author": 230,
+   "customer": 230,
+   "address": 230,
+   "book": 230,
+   "customer_address": 230,
+   "book_author": 230,
+   "cust_order": 230,
+   "order_history": 230,
+   "order_line": 230
+  },
+  "null_targets": [
+   "book.title",
+   "book.publication_date",
+   "book.num_pages",
+   "book.publisher_id",
+   "book.language_id",
+   "publisher.publisher_name",
+   "author.author_name",
+   "customer.first_name",
+   "customer.last_name",
+   "address.city",
+   "address.street_name",
+   "address.street_number",
+   "address.country_id",
+   "cust_order.order_date",
+   "cust_order.customer_id",
+   "cust_order.shipping_method_id",
+   "cust_order.dest_address_id",
+   "order_history.order_id",
+   "order_history.status_id",
+   "order_history.status_date",
+   "order_line.order_id",
+   "order_line.book_id",
+   "order_line.price",
+   "customer_address.status_id"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "order_history.status_date >= cust_order.order_date",
+    "rows": [
+     "order_history 1: 2021-07-14 17:04:28 >= cust_order 1: 2021-07-14 10:47:19",
+     "order_history 2: 2020-08-16 20:23:19 >= cust_order 2: 2020-08-16 17:26:41",
+     "order_history 3: 2021-08-20 05:34:51 >= cust_order 3: 2021-08-19 21:43:07"
+    ]
+   },
+   {
+    "formula": "book.num_pages > 0",
+    "rows": [
+     "book 1: 276",
+     "book 2: 352",
+     "book 3: 128"
+    ]
+   },
+   {
+    "formula": "order_line.price >= 0",
+    "rows": [
+     "order_line 1024: 3.19",
+     "order_line 1025: 1.24",
+     "order_line 1026: 14.74"
+    ]
+   }
+  ],
+  "uncertainty": "No formula links order_line.price to book or order totals; price is sampled independently. order_history.status_date order rule holds on shown rows but may be violated by planted NULLs (rule constrains non-NULL only). Negative num_pages boundary values (-101,-100,-99) removed to keep num_pages > 0 consistent; boundary pool is 499/500/501 only. Generic date range widened to 1800-01-01..2025-12-31 to match the book.publication_date semantic rule; other date columns still use the 2019..2023 datetime range. null_targets is the explicit list of nullable columns; columns not listed (e.g. address_status.address_status, order_status.status_value, shipping_method.method_name/cost, book_language.language_code/name, country.country_name, customer.email, book.isbn13) are treated as NOT NULL and must never receive NULL."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "cli.py:76 calls build_spec(load_specification(...), schema); spec.py:105 does `for t, c in (raw.get('null_targets') or []):`. The specification's null_targets is a flat list of column-name strings (e.g. \"book.title\"), not (table, column) pairs, so unpacking raises `ValueError: too many values to unpack (expected 2)`. Execution feedback confirms: returncode 1, n_instances 0, traceback at spec.py:105.",
+     "requested_revision": "Parse null_targets entries as 'table.column' strings (split on the first '.'), or change the specification to emit [table, column] pairs. The program must run to completion and produce instances."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "schema.py:120 warns 'dropping dangling FK cust_order.dest_address_id -> address.dest_address_id' and 'cust_order.shipping_method_id -> shipping_method.shipping_method_id'. The schema declares these FKs as `references address` / `references shipping_method` (implicit PK target), but the code resolves the parent column from r[4] (or r[3] when NULL) and fails to map to the parent's primary key. As a result these two FK dependencies are dropped from schema.fks, so fill_foreign_keys_consistently never populates them and the specification's dependencies for cust_order.dest_address_id and cust_order.shipping_method_id are not implemented.",
+     "requested_revision": "When the FK target column is NULL, resolve to the parent table's primary key column (from TableMeta.primary_key) instead of the child column name. Ensure all 15 dependencies listed in the specification are present in schema.fks."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py:write_instance_sqlite is called from cli.py:_one as `write_instance_sqlite(_G['schema'], inst, p, _G['spec'])` with no orig_path. The function then creates an empty clone from DDL only (the `else` branch), so the compact rows are NOT preserved in each instance. This contradicts the docstring ('each instance is a copy of the compact database with generated rows appended') and the specification's intent that generated FKs reference compact rows and that compact rows are preserved. It also means the 'parent_rows_without_children' / 'child_rows_with_null_fk' patterns and the compact-share NULL rule (which reads schema.original_values) are computed against rows that are not actually in the written database.",
+     "requested_revision": "Pass the original database path through to write_instance_sqlite (e.g. store it in _G['args'] and forward it), so each unit is a copy of the compact database with generated rows appended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py:choose_table_sizes uses `int(rng.random() * 2 * base)` giving sizes in [0, 2*base), so a table can be generated with 0 rows. Combined with the 10% NULL FK rule and the requirement that every nullable column has at least one NULL and non-NULL row, a zero-row table cannot satisfy the NULL rule. Also, the specification's table_sizes_per_instance are fixed sizes (e.g. 230), but the code randomizes them, which may not match the intended per-instance sizes.",
+     "requested_revision": "Guarantee at least one row per table that has nullable columns requiring NULL/non-NULL, and clarify whether table_sizes_per_instance are exact or base sizes; if exact, use them directly."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic rule `book.num_pages > 0` conflicts with the per_column_exceptions boundary values for book.num_pages: [-101, -100, -99, 499, 500, 501]. The program's _BOUNDARIES includes the negative values and RangeNumberSampler draws them with 5% probability, so generated rows can violate `num_pages > 0`. The specification does not state that the boundary values override the semantic rule, nor that the rule constrains only non-NULL operands in a way that permits negatives.",
+     "requested_revision": "Either remove the negative boundary values (-101, -100, -99) from the num_pages boundary pool, or explicitly state that the semantic rule is relaxed for boundary testing and document the intended behavior. The program and specification must agree on whether negative num_pages are allowed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists null_targets as a flat list of column names (e.g. \"book.title\"), but the program's build_spec expects (table, column) pairs. This is a specification/program interface mismatch that directly caused the crash. Additionally, the specification's null_targets includes columns like book.publisher_id and book.language_id which are nullable FKs; the program's _apply_null_rule only applies to columns in spec['null_targets'] and skips pk_pos > 0, which is consistent, but the format must be fixed.",
+     "requested_revision": "Change null_targets to a list of [table, column] pairs (or 'table.column' strings) and ensure the program parses them consistently. Document the format in the specification."
+    }
+   ],
+   "unresolved_checks": [
+    "Could not verify integrity constraint satisfaction (FK consistency, PK uniqueness, order_history.status_date >= cust_order.order_date) because generation crashed before producing any instances.",
+    "Could not verify preservation of compact rows or reproducible generation (seed handling) because no instances were written.",
+    "Could not verify that the intended value variation (duplicate shares, boundary values, near-variants) remains possible in the written databases, since no output exists.",
+    "The NULL rule for nullable FKs (cust_order.dest_address_id, cust_order.shipping_method_id) cannot be checked because those FKs are dropped by the schema reader."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows NULLs generated in NOT NULL / primary-key columns: 'address_status.address_status: NULL 16 / 24', 'order_status.status_value: NULL 10 / 40', 'shipping_method.method_name: NULL 14 / 21', 'shipping_method.cost: NULL 12 / 21', 'book_language.language_code: NULL 13 / 133', 'book_language.language_name: NULL 13 / 133', 'country.country_name: NULL 8 / 889', 'customer.email: NULL 6 / 813', 'book.isbn13: NULL 5 / 835'. These columns are declared NOT NULL in the schema (no 'NOT NULL' keyword is present, but they are non-nullable per the spec's null_targets list, which does not include them). The spec's null_targets list explicitly enumerates the nullable columns and none of these appear; the generic rule states 'NOT NULL/PK columns never NULL'. Yet the program's _apply_null_rule and fill_foreign_keys_consistently only guard on cm.notnull and pk_pos, and build_spec adds every non-PK column to null_targets regardless of the spec's explicit list: 'for t, tm in schema.tables.items(): for cm in tm.columns: if not cm.notnull and cm.pk_pos == 0: null_targets.add((t, cm.name))'. Since SQLite's pragma table_info reports notnull=0 for columns declared without NOT NULL, all these columns are treated as nullable and receive NULLs, contradicting the specification's null_targets enumeration.",
+     "requested_revision": "In build_spec, do not auto-add every non-PK column to null_targets; restrict null_targets to the explicit list from the specification (plus any column the spec's generic rule genuinely marks nullable). Alternatively, if the intent is that these columns are nullable, the designer must update the specification's null_targets to include them and remove the 'NOT NULL/PK columns never NULL' claim for them. As written, the program violates the specification's null_targets list."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'integer_fk: Copy from parent pool; 5% NULL when nullable; 10% parent rows left childless.' The program's fill_foreign_keys_consistently uses a 10% NULL rate ('elif nullable and rng.random() < 0.10'), not 5%. Execution feedback confirms ~10% NULLs on nullable FKs: 'cust_order.customer_id: NULL 74 / 767' (~9.6%), 'order_line.order_id: NULL 82 / 872' (~9.4%), 'book.publisher_id: NULL 86 / 835' (~10.3%). The spec says 5%.",
+     "requested_revision": "Change the FK NULL probability in fill_foreign_keys_consistently from 0.10 to 0.05 to match the specification, or update the specification to 10% if that is the intended rate. The two must agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's generic_sampling_rules state 'date: Uniform over 1980-01-01..2023-12-31' and 'datetime: Uniform over 2019-01-01..2023-12-31'. The program's _DATE_RANGES uses ('book','publication_date'): ('1800-01-01','2025-12-31') and cust_order/order_history datetimes over 2019-01-01..2023-12-31. The book publication_date range (1800..2025) contradicts the generic '1980-01-01..2023-12-31' rule, though it matches the semantic rule 'publication_date BETWEEN 1800-01-01 AND 2025-12-31'. The boundary pool for publication_date includes 1899-12-31/1900-01-01/1900-12-31/1901-01-01, which are outside 1980..2023 but inside 1800..2025. This is a specification inconsistency: the generic date rule and the semantic rule disagree.",
+     "requested_revision": "Designer should reconcile the generic date range with the semantic rule for book.publication_date (either widen the generic rule to 1800..2025 or narrow the semantic rule). Engineer should then align _DATE_RANGES accordingly. As-is the program follows the semantic rule but not the generic rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions for book.publication_date like_near_variant lists literals including '1997-07-10' and '2017-%' and variants including '2000-12-31','2001-01-01','2001-12-31','2002-01-01'. The program's _BOUNDARIES for ('book','publication_date') includes 2000-12-31..2002-01-01 and 1899..1901 but omits '1997-07-10' and '2017-%' literals. Similarly, the spec's author.author_name like_near_variant lists 'Orson Scott Card%' and 'Orson Scott Card' as literals; the program's boundary pool has 'Orson Scott Card' and 'Orson Scott Card x' but not the '%' variant. These are minor omissions of specified boundary literals.",
+     "requested_revision": "Add the missing boundary literals ('1997-07-10', '2017-%' for publication_date; 'Orson Scott Card%' for author_name) to the boundary pools in spec.py so the specified comparison-boundary and like-near-variant patterns are realizable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's per_column_exceptions for book.num_pages comparison_boundary targets values [499,500,501] (negative values removed per uncertainty note). The program's _BOUNDARIES for ('book','num_pages') is [499,500,501] \u2014 consistent. However, the spec's generic integer_quantity rule says 'Uniform 1..1000; 5% boundary at 499/500/501', and the program's RangeNumberSampler for num_pages uses lo=1, hi=1000 with 5% boundary \u2014 consistent. No issue here; noted as verified.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic rule 'order_history.status_date >= (SELECT order_date FROM cust_order WHERE cust_order.order_id = order_history.order_id)' is enforced in _enforce_rules, which shifts status_date forward when it precedes order_date. However, _enforce_rules runs AFTER _apply_null_rule, and the spec's uncertainty note says 'a planted NULL is never replaced to satisfy a rule'. The code correctly skips NULL operands ('if oid is None or sd is None: continue'), so this is consistent. But the rule is only enforced for order_ids present in the generated cust_order or compact cust_order; if order_history.order_id references a compact order whose order_date is NULL, the rule is skipped (od is None). This is acceptable under three-valued logic. No blocking issue.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's table_sizes_per_instance gives exact sizes (e.g., book: 230, customer: 230). The program's choose_table_sizes varies each table size between base-2 and base+2 ('lo = max(1, base - 2); hi = min(2500, base + 2); sizes[t] = rng.randint(lo, hi)'). Execution feedback shows generated row counts like 'book.title: 835 / 835' across 20 instances, i.e., ~41.75 rows per instance, not 230. Wait \u2014 the feedback aggregates across 20 instances: 835/20 \u2248 41.75, which is far below 230. This suggests the table sizes are not being applied as specified, or the feedback counts only generated (non-compact) rows. The spec says table_sizes_per_instance book: 230; the program should produce ~230 rows per instance. The feedback 'book.title: generated rows: NULL 5 / 835' over 20 instances implies ~42 rows/instance, not 230.",
+     "requested_revision": "Investigate why generated row counts per instance (~42) are far below the specified table size (230). Either the size variation logic is wrong, or the writer is dropping rows (e.g., PK collisions with compact rows via sample_fresh_primary_keys, or unique-duplicate dropping). Ensure each instance has approximately the specified table size (230 \u00b1 small variation) for book, customer, etc."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's null_targets list includes 'book.title', 'book.publication_date', 'book.num_pages', 'book.publisher_id', 'book.language_id', etc., but the schema declares these columns without NOT NULL, so they are nullable in SQLite. However, the specification's generic rule says 'NOT NULL/PK columns never NULL' and the null_targets list is meant to enumerate nullable columns. The execution feedback shows NULLs in columns NOT in null_targets (address_status.address_status, order_status.status_value, shipping_method.method_name, shipping_method.cost, book_language.language_code, book_language.language_name, country.country_name, customer.email, book.isbn13). This indicates the specification's null_targets list is incomplete relative to the actual schema nullability, OR the program is over-generating NULLs. The designer should clarify which columns are intended nullable.",
+     "requested_revision": "Designer should either (a) add the missing nullable columns to null_targets if they are intended nullable, or (b) confirm they are NOT NULL and the engineer must prevent NULLs there. The current specification is ambiguous about these columns."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the ~42 rows/instance for book (vs specified 230) is due to PK-collision dropping in sample_fresh_primary_keys or a size-selection bug \u2014 needs inspection of per-instance row counts.",
+    "Whether the specification intends address_status.address_status, order_status.status_value, shipping_method.method_name/cost, book_language.language_code/name, country.country_name, customer.email, book.isbn13 to be nullable (they are not in null_targets but receive NULLs).",
+    "Whether the generic date range 1980..2023 or the semantic rule 1800..2025 governs book.publication_date."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Semantic rule `book_language.language_code: length BETWEEN 2 AND 5` is stated in semantic_rules_and_formulas but has no supporting execution rows and is not enforced in code. In spec.py, ('book_language','language_code') is absent from _ENUMS/_RANGES/_DATE_RANGES/_LONG_TEXT, so make_spec_sampler falls through to make_column_sampler -> StringSampler. StringSampler (values.py) can produce fresh random strings of length ['+lo+'..'+hi+') derived from original value lengths and can truncate by one char, which could in principle yield a value of length < 2. Execution feedback shows generated book_language rows have NULL 0/534 and no length-check reported.",
+     "requested_revision": "Either add an explicit length-2..5 constraint sampler for book_language.language_code (e.g. clamp/regenerate StringSampler output to length>=2), or record in the specification that this rule is supported only by inheriting original values and no fresh sub-2-length strings are generated. Not blocking: generated values largely inherit original values that satisfy the rule, and no integrity/validity failure was observed."
+    },
+    {
+     "agent": "designer",
+     "severity": "info",
+     "evidence": "Several nullable non-target columns (customer.email, book.isbn13, book_language.language_name, order_status.status_value, shipping_method.method_name/cost, address_status.address_status) show 'generated rows: NULL 0 / n'. These are not in null_targets and the spec explicitly declares them NOT NULL, so the program correctly never plants NULLs. This is consistent with interface rule 7.",
+     "requested_revision": "No change required; noted for the engineer's awareness only. If nullable NULL coverage were desired for these columns, add them to null_targets."
+    },
+    {
+     "agent": "engineer",
+     "severity": "info",
+     "evidence": "construction_pairs: eligible 634, separated 174. Value variation remains present (many pairs separated, integrity clean). This is not a generation error and does not indicate query equivalence.",
+     "requested_revision": "No change required; separation is partial but non-zero, so intended variation remains possible."
+    }
+   ],
+   "unresolved_checks": [
+    "book_language.language_code length 2..5 rule has no direct execution evidence and no dedicated sampler; assumed satisfied via inherited original values."
+   ]
+  }
+ ]
 }

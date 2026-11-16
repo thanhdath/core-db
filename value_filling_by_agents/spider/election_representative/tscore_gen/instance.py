@@ -1,6 +1,8 @@
 """Random instance construction (fuzz/fuzz.py:83-196)."""
 from .values import _init_sampler
 
+_SPEC_SIZES = {'representative': 8, 'election': 6}
+
 
 def _filter(columns: dict, keep: list) -> dict:
     return {c: [v[i] for i in keep] for c, v in columns.items()}
@@ -33,6 +35,32 @@ def drop_unique_duplicates(table_meta, columns: dict) -> dict:
     return columns
 
 
+def _compact_pk_max(schema, table: str):
+    """Largest compact PK value for a single-column PK, or None."""
+    tm = schema.tables[table]
+    if len(tm.primary_key) != 1:
+        return None
+    vals = [v for v in schema.original_values.get((table, tm.primary_key[0]), []) if v is not None]
+    return max(vals) if vals else None
+
+
+def _offset_primary_keys(schema, table: str, cols: dict) -> None:
+    """Shift generated single-column PKs past the compact PKs so appended rows never collide."""
+    tm = schema.tables[table]
+    if len(tm.primary_key) != 1:
+        return
+    pk = tm.primary_key[0]
+    if pk not in cols:
+        return
+    mx = _compact_pk_max(schema, table)
+    if mx is None:
+        return
+    try:
+        cols[pk] = [None if v is None else int(v) + int(mx) for v in cols[pk]]
+    except (TypeError, ValueError):
+        pass
+
+
 def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
     """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
     out = {}
@@ -47,7 +75,9 @@ def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, r
 
 
 def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+    """Spec sizes when the schema matches the spec; otherwise upstream rand_lin / level sizes."""
+    if all(t in _SPEC_SIZES for t in schema.tables):
+        return {t: _SPEC_SIZES[t] for t in schema.tables}
     sizes = {}
     if rng.random() < 0.5:
         for lvl in schema.table_order:
@@ -63,8 +93,78 @@ def choose_table_sizes(schema, rng) -> dict:
     return sizes
 
 
+def _plant_nulls(schema, table: str, cols: dict, n: int, rng) -> None:
+    """NULL rule: for each nullable column, plant >=1 NULL and follow the compact NULL share."""
+    tm = schema.tables[table]
+    for cm in tm.columns:
+        if cm.notnull or cm.pk_pos > 0:
+            continue
+        if cm.name not in cols or not cols[cm.name]:
+            continue
+        ov = schema.original_values.get((table, cm.name), [])
+        share = (sum(1 for v in ov if v is None) / len(ov)) if ov else 0.0
+        k = max(1, int(round(share * n)))
+        k = min(k, n)
+        idx = rng.sample(range(n), k)
+        for i in idx:
+            cols[cm.name][i] = None
+
+
+def _verify_nulls(schema, table: str, cols: dict) -> None:
+    """Post-check: every nullable column with generated rows has >=1 NULL."""
+    tm = schema.tables[table]
+    for cm in tm.columns:
+        if cm.notnull or cm.pk_pos > 0:
+            continue
+        v = cols.get(cm.name)
+        if v and all(x is not None for x in v):
+            v[0] = None
+
+
+def _plant_unmatched_join(schema, instance: dict, rng) -> None:
+    """unmatched_join_rows: parent without children; child NULL FK values (no orphan values)."""
+    for (ct, cc), (pt, pc) in schema.fks.items():
+        if ct not in instance or pt not in instance:
+            continue
+        child = instance[ct].get(cc)
+        parent = instance[pt].get(pc)
+        if not child or not parent:
+            continue
+        pset = set(parent)
+        n = len(child)
+        if n >= 1:
+            child[0] = None
+        used = {v for v in child if v is not None}
+        if all(p in used for p in pset) and len(pset) > 1:
+            drop = rng.choice(sorted(pset))
+            for i, v in enumerate(child):
+                if v == drop:
+                    child[i] = None
+                    break
+
+
+def _plant_votes_tie(schema, instance: dict, rng) -> None:
+    """ties_for_order_limit: at least two election rows share the minimum Votes value."""
+    if 'election' not in instance:
+        return
+    votes = instance['election'].get('Votes')
+    if not votes or len(votes) < 2:
+        return
+    nonnull = [v for v in votes if v is not None]
+    if len(nonnull) < 2:
+        return
+    m = min(nonnull)
+    cnt = 0
+    for i, v in enumerate(votes):
+        if v is not None:
+            votes[i] = m
+            cnt += 1
+            if cnt >= 2:
+                break
+
+
 def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
+    """Build one random instance (fuzz.py:111-196) with spec-driven NULL / join / tie planting."""
     p = 0.0 if rng.random() < 0.3 else 0.2
     order = [t for lvl in schema.table_order for t in lvl]
     samplers = {}
@@ -85,6 +185,7 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
                 for cm in tm.columns if (t, cm.name) in samplers}
         inst[t] = cols
         cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
+        _offset_primary_keys(schema, t, cols)
         cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
         cols = drop_unique_duplicates(tm, cols)
         for cm in tm.columns:
@@ -95,4 +196,9 @@ def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
                 cols[cm.name] = [v if v is None or v in fs else (rng.choice(final) if final else None)
                                  for v in cols[cm.name]]
         inst[t] = cols
+    _plant_unmatched_join(schema, inst, rng)
+    _plant_votes_tie(schema, inst, rng)
+    for t in inst:
+        _plant_nulls(schema, t, inst[t], len(next(iter(inst[t].values()))) if inst[t] else 0, rng)
+        _verify_nulls(schema, t, inst[t])
     return {t: inst[t] for t in schema.tables}

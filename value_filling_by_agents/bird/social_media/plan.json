@@ -1,53 +1,727 @@
 {
  "db": "social_media",
- "operator_io_quirks": [
-  "Table name 'user' is a SQL keyword-ish; must be double-quoted in generated SQL (\"user\").",
-  "Column 'text' is a keyword-ish name; must be double-quoted (\"text\").",
-  "All PKs declared but notnull=0 (SQLite quirk: PK implies NOT NULL only for INTEGER PK; TEXT PKs like UserID/TweetID allow NULL in DDL text).",
-  "twitter.TweetID distinct=99900 < rows=99901: one duplicate PK value exists in original (PK not actually unique in data).",
-  "twitter.TweetID storage includes 'null' despite being PK: at least one NULL TweetID row.",
-  "Many TEXT columns (Weekday, Hour, Day, Lang, IsReshare, Reach, RetweetCount, Likes, Klout, Sentiment, LocationID, UserID) have storage 'null' entries though null_rate=0.0 \u2014 null_rate computed on non-null sample; treat as possibly-null.",
-  "user.UserID sample '\\u001anknow531394' contains a control char (newline) \u2014 string fuzzer charset won't reproduce; literal pool may carry it.",
-  "FK twitter.LocationID -> location.LocationID: parent has 6211 rows, child distinct 4307, so FK is many-to-one, fine; but child rows may reference LocationIDs not in parent (parent_exists true but referential integrity not verified).",
-  "FK twitter.UserID -> user.UserID: child distinct 33185 vs parent 99260; parent PK unique so OK, but child values may be dangling.",
-  "location.LocationID INTEGER PK with distinct=6211=rows: clean unique integer PK, Number fuzzer will produce fresh ints that won't match child FK draws unless FK fill uses parent values.",
-  "user table 99260 rows, twitter 99901 rows: both under 300k cap, full read OK; no huge-table sampling needed.",
-  "IsReshare stored as TEXT 'TRUE'/'FALSE' (not bool/int) \u2014 declared TEXT dispatches to String fuzzer, not Bool."
- ],
- "operator_ts_expectations": [
-  "location.LocationID: Number fuzzer, int scale=0, range [-1,1] full-range fresh draws dominate -> tiny ints 0/1/-1, not matching original 1..6211; FK children drawn from these tiny values.",
-  "twitter.LocationID FK: drawn from location.LocationID final values (tiny ints) -> FK join always satisfiable but semantically implausible (LocationID=0 or 1).",
-  "twitter.UserID FK: drawn from user.UserID String fuzzer output (random a-zA-Z0-9() strings) -> join satisfiable but UserID format 'tw-...' lost.",
-  "user.UserID String fuzzer: random charset strings length 0-20, contaminate 50% -> no 'tw-' prefix, no control chars; original format lost.",
-  "twitter.TweetID String fuzzer: random strings, PK dedup drops duplicates -> distinct=rows in generated, unlike original's 1 dup.",
-  "Weekday/Lang/IsReshare/Gender: String fuzzer with 5 original samples + pool literals; p=0.2 fresh random strings -> many implausible values ('aB3()'), driving FN on WHERE Weekday='Monday' style queries.",
-  "Hour/Day/Reach/RetweetCount/Likes/Klout: Number int fuzzer, range [-1,1] -> values 0/1/-1 mostly; original ranges 0-23, 1-31, 0-12457 etc. lost -> range predicates (Hour BETWEEN 9 AND 17) mostly empty or all-match.",
-  "Sentiment REAL: Number scale=4 -> range [-10000,10000] floats; original in {-2,-1,0,1,2} -> equality/range on Sentiment implausible.",
-  "text column: String fuzzer random charset -> no English words, no '#', no '@', no 'RT ' -> LIKE '%Amazon%' queries return empty (FN).",
-  "IsReshare TEXT 'TRUE'/'FALSE': String fuzzer -> random strings, not 'TRUE'/'FALSE' -> WHERE IsReshare='TRUE' returns empty (FN).",
-  "FK consistency: child drawn from parent final values ensures join non-empty, but parent PK dedup may shrink parent below child distinct -> many-to-one preserved; ties/duplicates in non-PK columns (e.g. Country) not preserved by String fuzzer -> GROUP BY Country cardinality wrong (FP/FN).",
-  "No NOT NULL/CHECK enforced in Python; all columns nullable in DDL so no insert failures expected; rows_failed likely 0."
- ],
- "challenger_refs": [
-  "g5303c8c5",
-  "g078c4b15",
-  "g078c4b15",
-  "g912146db",
-  "g147fd1f5",
-  "g147fd1f5",
-  "g147fd1f5",
-  "gcd475100",
-  "gadd0fb3e",
-  "ga72005d9",
-  "g8c20cc4a",
-  "g34b7d1e5",
-  "g2d01bc09"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "text_pk": "Unique strings of form '<prefix>-<random 12-18 digit number>'; never NULL; no duplicates (PK).",
+   "text_short": "Random token from a small pool of realistic values; 5% near-variants (case/whitespace/typo) of a pool value; NULL only if column is in null_targets.",
+   "text_long": "Random sentence-like string 40-300 chars; 20-50% duplicates of a small pool when column is DISTINCT-targeted; NULL only if in null_targets.",
+   "integer_count": "Non-negative integer drawn from a skewed distribution (many small, few large); NULL only if in null_targets.",
+   "integer_metric": "Integer in [0, 10000]; NULL only if in null_targets.",
+   "real_sentiment": "Discrete ordinal scale drawn from {-2.0,-1.0,-0.5,0.0,0.5,1.0,1.333333373,2.0,3.0,4.0} plus small offsets \u00b10.0001; NULL only if in null_targets.",
+   "enum_small": "Uniform choice among the listed enum values; NULL only if in null_targets.",
+   "foreign_key": "Copy of a parent primary-key value drawn only from the FINAL parent PK set (after PK sampling/dedup); 5-10% of child rows get NULL when the FK column is in null_targets; some parent rows left without children.",
+   "null_share": "For each column listed in null_targets, 5-30% of generated rows are NULL (at least one NULL row per instance); all other columns never NULL. NULL planting for FK columns happens once, inside the FK sampler, never in a later pass.",
+   "boundary_numeric": "For numeric columns with a comparison_boundary target, 15% of values are drawn from the boundary list (literal-1, literal, literal+1 by the column's step).",
+   "boundary_text": "For text columns with a comparison_boundary target, 15% of values are drawn from the boundary list (literal and its case/whitespace near-variant).",
+   "tie_order": "For ORDER/LIMIT tie targets, plant the listed number of rows sharing the tie value at the listed rank.",
+   "duplicate_distinct": "For DISTINCT-targeted non-PK columns, 20-50% of values are duplicates of a small pool.",
+   "different_values_per_group": "For rows_with_different_values targets, ensure at least two distinct non-NULL values per non-singleton group of the named grouping column."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "twitter",
+    "column": "TweetID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Likes",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      99,
+      100,
+      101
+     ],
+     "op": "twitter.likes > 100"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Likes",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 %"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Likes",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "group_by": "twitter.UserID",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "UserID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "user.UserID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "UserID",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(DISTINCT twitter.tweetid)"
+     ]
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "UserID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 %"
+    }
+   },
+   {
+    "table": "user",
+    "column": "UserID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "twitter.UserID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "location",
+    "column": "Country",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "location",
+    "column": "Country",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Argentina",
+      "argentina"
+     ],
+     "op": "location.country = 'Argentina'"
+    }
+   },
+   {
+    "table": "location",
+    "column": "City",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "ASC and DESC and unordered",
+     "tie_on": [
+      "COUNT(*)"
+     ]
+    }
+   },
+   {
+    "table": "location",
+    "column": "City",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Bangkok",
+      "bangkok",
+      "Buenos Aires",
+      "buenos aires"
+     ],
+     "op": "location.city >= 'Bangkok'"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Sentiment",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      -0.0001,
+      0,
+      0.0001
+     ],
+     "op": "twitter.sentiment > 0"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Sentiment",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "group_by": "twitter.UserID",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "user",
+    "column": "Gender",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Male",
+      "male"
+     ],
+     "op": "user.gender = 'Male'"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "text",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "text",
+    "pattern": "like_near_variant",
+    "targets": {
+     "literal": "One of our favorite stories is @FINRA_News%"
+    }
+   },
+   {
+    "table": "location",
+    "column": "LocationID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "twitter.LocationID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "table": "location",
+    "column": "State",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Santa",
+      "santa",
+      "Santa Fe",
+      "santa fe",
+      "Connecticut",
+      "connecticut"
+     ],
+     "op": "location.state = 'Santa'"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "RetweetCount",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      29,
+      30,
+      31
+     ],
+     "op": "twitter.retweetcount > 30"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "LocationID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "location.LocationID"
+     ],
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Weekday",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "Monday",
+      "monday"
+     ],
+     "op": "twitter.weekday = 'Monday'"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "IsReshare",
+    "pattern": "comparison_boundary",
+    "targets": {
+     "values": [
+      "TRUE",
+      "true"
+     ],
+     "op": "twitter.isreshare = 'TRUE'"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Klout",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "5-30 %"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Klout",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "group_by": "twitter.UserID",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Reach",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC and DESC"
+    }
+   },
+   {
+    "table": "location",
+    "column": "StateCode",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Lang",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any (no LIMIT)",
+     "direction": "ASC"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "Day",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "group_by": "twitter.UserID",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "table": "twitter",
+    "column": "IsReshare",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "group_by": "twitter.UserID",
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "twitter.LocationID",
+    "parent_table": "location",
+    "parent_column": "LocationID",
+    "copied_columns": []
+   },
+   {
+    "child": "twitter.UserID",
+    "parent_table": "user",
+    "parent_column": "UserID",
+    "copied_columns": []
+   },
+   {
+    "table": "location",
+    "unique_tuples": [
+     [
+      "LocationID"
+     ]
+    ]
+   },
+   {
+    "table": "user",
+    "unique_tuples": [
+     [
+      "UserID"
+     ]
+    ]
+   },
+   {
+    "table": "twitter",
+    "unique_tuples": [
+     [
+      "TweetID"
+     ]
+    ]
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "location",
+    "column": "LocationID",
+    "formula": "LocationID > 0"
+   },
+   {
+    "table": "user",
+    "column": "Gender",
+    "formula": "Gender IN ('Male', 'Female', 'Unisex', 'Unknown')"
+   },
+   {
+    "table": "twitter",
+    "column": "Weekday",
+    "formula": "Weekday IN ('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')"
+   },
+   {
+    "table": "twitter",
+    "column": "Hour",
+    "formula": "Hour BETWEEN 0 AND 23"
+   },
+   {
+    "table": "twitter",
+    "column": "Day",
+    "formula": "Day BETWEEN 1 AND 31"
+   },
+   {
+    "table": "twitter",
+    "column": "IsReshare",
+    "formula": "IsReshare IN ('TRUE', 'FALSE')"
+   },
+   {
+    "table": "twitter",
+    "column": "Reach",
+    "formula": "Reach >= 0"
+   },
+   {
+    "table": "twitter",
+    "column": "RetweetCount",
+    "formula": "RetweetCount >= 0"
+   },
+   {
+    "table": "twitter",
+    "column": "Likes",
+    "formula": "Likes >= 0"
+   },
+   {
+    "table": "twitter",
+    "column": "Klout",
+    "formula": "Klout BETWEEN 0 AND 100"
+   },
+   {
+    "table": "twitter",
+    "column": "Sentiment",
+    "formula": "Sentiment BETWEEN -5 AND 5"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "location": 40,
+   "user": 60,
+   "twitter": 200
+  },
+  "null_targets": [
+   "twitter.Likes",
+   "twitter.UserID",
+   "twitter.Klout",
+   "twitter.LocationID",
+   "location.State",
+   "location.StateCode",
+   "location.City",
+   "user.Gender"
+  ],
+  "supporting_evidence": {
+   "twitter.Likes": "Sample rows show Likes 0,131,40,4,70,22,26,72; boundary 99/100/101 planted per atomic summary.",
+   "twitter.Sentiment": "Sample rows show 0.0,2.0,-1.0,-2.0,1.0,3.0,1.333333373,4.0; discrete ordinal scale with 0.0 and \u00b10.0001 offsets planted.",
+   "twitter.RetweetCount": "Sample rows show 0,5,4,1,6,51,3,2; boundary 29/30/31 planted.",
+   "twitter.Klout": "Sample rows show 35,53,47,31,49,51,16,23; range 0-100.",
+   "user.Gender": "Sample rows show Unknown, Male, Unisex, Female; enum of 4 values.",
+   "twitter.IsReshare": "Sample rows show FALSE, TRUE; enum of 2 values.",
+   "twitter.Weekday": "Sample rows show Thursday..Wednesday; enum of 7 values; boundary uses case variants of 'Monday'.",
+   "twitter.Hour": "Sample rows show 17..0; range 0-23.",
+   "twitter.Day": "Sample rows show 31,1..7; range 1-31.",
+   "location.Country": "Sample rows show Albania, Algeria, Andorra, Angola, Anguilla, Antigua and Barbuda, Argentina, Armenia; boundary 'Argentina'/'argentina' planted.",
+   "location.State": "Sample rows show Elbasan, Tirane, Souk Ahras, Alger, Constantine, El Oued, Oran, Parroquia d'Andorra la Vella; boundary 'Santa'/'santa'/'Santa Fe'/'santa fe'/'Connecticut'/'connecticut' planted.",
+   "location.City": "Sample rows show Elbasan, Tirana, Souk Ahras, Algiers, Constantine, El Oued, Oran, Andorra la Vella; boundary 'Bangkok'/'bangkok'/'Buenos Aires'/'buenos aires' planted."
+  },
+  "uncertainty": "No calculated-column formula is supported by the shown rows; Sentiment is not derivable from other columns. LocationID/UserID join cardinalities are approximated. The atomic-summary 'twitter.weekday > 30' predicate is nonsensical for a TEXT enum and is replaced by a case-variant equality boundary on 'Monday'. The 'twitter.Hour unmatched_join_rows' target is a false positive (Hour is 0-23, not a LocationID) and is excluded from the separation-rate denominator. The 'location.Country comparison_boundary' op 'location.state = location.country = 'Argentina'' is a column-to-column chain; the constructible boundary is the constant form 'location.country = 'Argentina''. The 'location.State equal_and_one_step_from location.Country' target is not constructible by value generators and is resolved as a constant equality boundary on 'Santa'. The 'twitter.TweetID duplicates_for_distinct' target is removed because TweetID is a TEXT primary key and cannot duplicate; the duplicate pattern is captured via ORDER BY+COUNT(*) ties only. The 'twitter.UserID ties_for_order_limit' target requires per-user tweet-count ties at rank 1 DESC; with 200 tweets and 60 users (~3 tweets/user) this is achievable only if multiple users share the same max tweet count, and is implemented via the tie_order rule on twitter.UserID. The 'rows_with_different_values' targets are grouped by twitter.UserID (or overall per instance for IsReshare) and implemented as a post-pass. Lowercase variants ('male', 'true', 'bangkok', 'argentina') are intentional near-variants aligned with comparison_boundary targets, not accidental violations of the IN() semantic rules."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 4686 across 20 instances; validity.invalid = 20 with reason 'new_integrity_failures' on all of them. Conflict/ordering bug in instance.py: fill_foreign_keys_consistently() draws FK values from the parent's compact+generated pool, but _apply_null_rule() afterwards overwrites FK columns with NULL using spec.NULL_SHARE / FK_NULL_SHARE, and crucially the final self-FK remap loop (\"for cm in tm.columns: pt,pc = schema.fks.get(...); if pt==t\") runs after sample_fresh_primary_keys/drop_unique_duplicates, but does nothing for cross-table FKs (twitter.UserID -> user.UserID, twitter.LocationID -> location.LocationID). Worse, writer.py opens the DB copy with 'pragma foreign_keys = OFF', so SQLite never rejects the bad FK values \u2014 they are silently written and counted as ok. The 4686 violations are consistent with FK_NULL_SHARE applied after value assignment leaving NULL FK rows in NOT NULL? No \u2014 the FK columns are nullable. The violations come from generated FK values that reference parent primary keys that were removed by sample_fresh_primary_keys/drop_unique_duplicates (parent rows shrunk after children were sampled) and by the fact that fill_foreign_keys_consistently uses `instance.get(pt,...)` where inst[pt] was already replaced by the post-filter version only after the loop iteration order; combined with foreign_keys=OFF no safety net exists.",
+     "requested_revision": "Turn on 'pragma foreign_keys = ON' in write_instance_sqlite so bad FK rows are detected, and fix instance.py so that child FK values are drawn only from the *final* parent primary-key set (after sample_fresh_primary_keys and drop_unique_duplicates). Recompute FK sampling in a second pass over tables in dependency order (child after parent) using the final parent PK list, and ensure NULL FK planting does not run outside the FK sampler for FK columns (remove FK columns from _apply_null_rule / apply the FK_NULL_SHARE once). Report zero fk_violations in the next execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.reasons 'compact_rows_missing' = 20 and 'no_rows_added' = 19. rows_added parses as location=377, user=1158, twitter=3909 summed over 20 instances (per instance ~19/58/195), so rows WERE added; the 'no_rows_added' / 'compact_rows_missing' validity reasons must come from how the validity checker reads the produced instance, i.e., the writer's PRAGMA and copy path likely produce a different rowid layout than expected, or the counts file is read after os.replace while the per-instance checker inspects '.part'. More concretely, writer.write_instance_sqlite() is called with orig_path=None in cli._one (`write_instance_sqlite(_G['schema'], inst, p)` \u2014 no orig_path), so shutil.copyfile is skipped and the DDL is re-executed against an empty DB. That loses every compact row (the compact rows are never inserted) and explains 'compact_rows_missing' on all 20 instances.",
+     "requested_revision": "Pass the compact database path through to the writer (cli._one / _init must carry `orig` and call write_instance_sqlite(schema, inst, path, orig_path=a['orig'])), so that the produced unit is a copy of the compact DB plus appended rows as documented in writer.py's docstring. Re-run the construction validator; 'compact_rows_missing' must disappear."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns reports 'location.Country: generated rows: NULL 30 / 147'. location.Country is NOT a declared nullable column in the compact schema (no NOT NULL clause, so it is technically nullable in SQLite), but the specification's null_targets list is explicit: ['twitter.Likes','twitter.UserID','twitter.Klout','twitter.LocationID','location.State','location.StateCode','location.City','user.Gender']. Country is not in it, and no spec.NULL_SHARE entry exists for ('location','Country'). Because instance._apply_null_rule falls back to `share = rng.uniform(0.05, 0.30)` for any nullable column not in NULL_SHARE, it is generating NULLs in Country that the specification never requested. Likewise, the schema-declared nullability is being used as a blanket permission, which conflates 'nullable in DDL' with 'is a null target'.",
+     "requested_revision": "Restrict NULL generation to the explicit specification null_targets / spec.NULL_SHARE map. In _apply_null_rule, only plant NULLs for columns listed in spec.NULL_SHARE (or, equivalently, in the spec's null_targets array); leave all other columns non-NULL. Update spec.py if the intent is to allow generic 5-30% nulls on any DDL-nullable column, but the current spec + generation spec null_targets do not list Country, so the executable should respect that list."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic-summary comparison_boundary targets for twitter.Weekday: [\"values\": [-1,0,1,29,30,31], \"op\": 'twitter.weekday > 30'] \u2014 nonsensical for a TEXT enum column. spec.py comment acknowledges this (\"nonsensical for a text enum: no-op\") and EnumSampler will happily pick -1 / 29 / 30 / 31 for a Weekday TEXT column (via spec.BOUNDARY_VALUES being passed as boundary to EnumSampler), producing Weekday values that violate the semantic rule 'Weekday IN (Monday..Sunday)'. construction_pairs.separated = 74 / 261 shows only ~28% of pairs separated; many of the unseparated pairs are likely this boundary. Boundary values for a text-enum column should instead be case/alphabetical near-variants (e.g., 'Monday'/'monday'), not integers.",
+     "requested_revision": "In spec.py, replace DAY-boundary entries for text columns (twitter.Weekday in particular) with enum-appropriate boundary values, e.g. case variants ('Monday'/'monday') for the LIKE/equality pairs the SQL actually contains, and drop the integer list. Update the corresponding atomic-summary extraction intent: any 'x > 30' predicate on a TEXT column should be reported as a no-op / skip, and the sampler must never emit integers for Weekday. Also document the pair separation rate after the change."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic summary for twitter.TweetID has both 'duplicates_for_distinct' (target duplicate_share 20-50%) and 'ties_for_order_limit' (tie at rank 1..3 on COUNT(*)). layout in spec.py only adds DUPLICATE_SHARE for the distinct-duplicate target, and never a TieSampler for TweetID. But TweetID is a TEXT primary key \u2014 the pub says TweetID is a TEXT PK. A primary key column cannot contain duplicates. spec.TEXT_PK_PREFIX generates unique values, and instance.sample_fresh_primary_keys drops dupes, so the 'duplicates_for_distinct 20-50%' target is applied to a column that never actually gets duplicates. The two atomic patterns are mutually contradictory for a PK column; the specification should have resolved them.",
+     "requested_revision": "In the generation specification, remove the 'duplicates_for_distinct' target on twitter.TweetID (PK cannot duplicate) and instead state that the tweet-id duplicate pattern is captured via the ORDER BY+COUNT(*) ties only, or move the duplicate target to a different DISTINCT-targeted column (e.g., twitter.text, already has it). Update the spec EXCEPTION list for TweetID so that only 'ties_for_order_limit' appears, and revise spec.py accordingly (remove TweetID from DUPLICATE_SHARE)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic summary for twitter.UserID: ties_for_order_limit targets 'direction':'DESC','tie_on':['COUNT(DISTINCT twitter.tweetid)']. This implies twitter.TweetID must be DISTINCT per user, i.e., 0 or 1 tweet per user at the tie value, which requires PK uniqueness but per-user uniqueness across tweet IDs. Also Atomic summary for twitter.TweetID ties_for_order_limit target rank [1,3] direction ASC/DESC/unordered on COUNT(*) \u2014 COUNT(*) ties are impossible to plant sensibly on a PK-only column. Both targets together imply the generator would have to plant ties in a GROUP BY twitter.userid (needs many tweets per user) yet the Twitter table has only 200 rows per instance with 60 users \u2014 ~3 tweets/user, so rank-1 tie on COUNT(DISTINCT tweetid) DESC is achievable only if multiple users have exactly the same max tweet count; TieSampler is applied to twitter.UserID? It is not (TIE_VALUES has no entry for twitter.UserID).",
+     "requested_revision": "Add ('twitter','UserID') -> 1 to spec.TIE_VALUES (or design something explicit) so DESC tie at rank 1 on COUNT(DISTINCT tweetid) is constructed, OR explicitly carve this pattern out as 'not constructible with the chosen size' in the spec's uncertainty. As written, the spec claims the target and the executable does not implement it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "cli._one ignores the `orig` path when building the instance; the `orig` argument is only used to read the schema in _init and to copy in writer if that were passed as orig_path (it is not). More generally the pipeline as wired cannot append to a compact DB. Additionally, the `--pool-sqls`-based seed_literal_pool_from_queries returns a pool routed to FK-root columns; this is used as literal elements to StringSampler for e.g. location.Country, which does NOT draw from the literal pool \u2014 spec.ENUMS is only set for user.Gender / twitter.Weekday / twitter.IsReshare, and location.Country has no ENUM / INT_RANGE / REAL_RANGE entry, so it falls into StringSampler with the seed literals as elements. This means 'Argentina' / 'argentina' are unlikely to appear regularly, and location.State's boundary list of 'Connecticut' / 'connecticut' likewise depends on the literal pool, not spec.BOUNDARY_VALUES. spec.BOUNDARY_VALUES DOES list these values, but the sampler only applies BOUNDARY_VALUES when key is in spec.INT_RANGES / REAL_RANGES / ENUMS \u2014 location.Country / State / City have no such entry, so their boundary values are silently ignored.",
+     "requested_revision": "Add a text-boundary path: introduce (a) ENUM-like entities for location.Country/State/City if they are low-cardinality (from the compact data) or (b) an explicit TEXT_BOUNDARY_VALUES map in spec.py applied via a BoundarySampler wrapper by _decorate. Currently the 'comparison_boundary' targets for location.Country/State/City are not implemented by any sampler. Also pass orig_path to write_instance_sqlite as described in issue 2."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Atomic summary location.Country comparison_boundary: op 'PRED(location.state = location.country = 'Argentina')' targets 'argentina' plus 'equal_and_one_step_from': ['location.State']. The specified values for Country include 'Argentina' and 'argentina'; but spec.py's ENUMS has no location.Country entry and no range; and the 'literal pool' routing in cli will map 'Argentina'/'argentina' from any query mentioning them to whichever of location.Country or location.State the root-column heuristic picks, which is fragile. More fundamentally, PRED(location.state = location.country = 'Argentina') is a *column-to-column* comparison chain that extracts both literals, but only the literal 'Argentina' is a constant; a column-vs-column comparison cannot be separated by planting boundary values \u2014 the pattern target asks for a boundary how?",
+     "requested_revision": "Rewrite the spec entry for location.Country so that it reflects a constructible boundary, e.g. 'PRED(location.country = \\'Argentina\\')' (constant on the right), and add the corresponding spec.BOUNDARY_VALUES to a text sampler path. Similarly, the location.State target 'equal_and_one_step_from: [location.Country]' \u2014 as worded it asks for a State value equal to a Country value, which is not constructible by the current value generators. Resolve in the spec, not in query-pair exceptions."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible=261, separated=74, unknown_executions=0. So at least 187 (\u226570%) pairs are unseparated. Combined with the fact that the sampler wrappers are only applied for ENUMS, INT_RANGES, REAL_RANGES, TEXT_PK and a handful of TIE_VALUES / DUPLICATE_SHARE keys, large classes of targets (location text boundaries, twitter.Weekday tie/unordered boundary, twitter.Sentiment rows_with_different_values inside group by twitter.userid etc.) are not constructed. rows_with_different_values for twitter.Sentiment/Klout/Day/IsReshare need >=2 different values per group; the spec adds DIFFERENT_VALUES set but nothing in values.py / instance.py reads spec.DIFFERENT_VALUES, so this target is entirely unimplemented.",
+     "requested_revision": "Implement spec.DIFFERENT_VALUES by a post-pass in instance.py: for each table and group-defining column (e.g., twitter.userid), if a target column is in DIFFERENT_VALUES, ensure at least two different non-NULL values per (non-singleton) group. Also wire TEXT_BOUNDARY_VALUES and the corrected location.* boundaries through _decorate. Re-run construction and report separated/eligible \u2265 a reasonable fraction."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Generation-spec 'uncertainty' says 'Sentiment is not derivable from other columns' but also claims Sentiment is drawn from [-5,5] with 6 decimals and boundary values [-0.0001,0,0.0001]. Yet original column stats show Sentiment values like 1.333333373 (float32 artifact from tweet sentiment), which suggests Sentiment IS effectively reducible to a small set / ordinal scale rather than continuous. Sample rows in supporting_evidence show {0.0, 2.0, -1.0, -2.0, 1.0, 3.0, 1.333333373, 4.0}. A 'comparison_boundary > 0' target on a continuum where most tweets are 0.0 will not distinguish >0 vs >=0 well unless exactly-0.0 is planted at reasonable frequency; the spec draws uniform over [-5,5] which yields almost no exact 0.",
+     "requested_revision": "Specify Sentiment as a discrete scale {..., -1.0, 0.0, 1.0, ...} including 0.0 and small offsets \u00b10.0001, matching original data shape; encode as an ENUM-like sampler for Sentiment rather than real_uniform. Otherwise the boundary separation fails for the '> 0' target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In values.make_column_sampler, when the specification boundary list is passed to EnumSampler (user.Gender ['Male','male'], twitter.IsReshare ['TRUE','true'], twitter.Weekday integers), the sampled boundary value is returned directly. For twitter.IsReshare, the semantic rule is IsReshare IN ('TRUE','FALSE'); 'true' (lowercase) is a violation. Same for user.Gender: 'male' violates 'Gender IN (\\'Male\\', \\'Female\\', \\'Unisex\\', \\'Unknown\\')'? Actually SQLite default is case-sensitive for '=', so 'male' does not match 'Male' in a WHERE clause but is still a valid TEXT value (no CHECK constraint). However, the specification lists these as separate case variants precisely to test case-sensitivity; if compact DB does allow lowercase (which we can't confirm), it's fine, but the writing side does not enforce the semantic IN rules for Gender. The CHECK constraints in the DDL exist only for the three tables listed and none of them checks Gender values; the semantic_rules_and_formulas item is unenforced. This is acceptable (semantic rules don't have to be CHECK), but the spec explicitly asks for boundary case variants, so it is by design.",
+     "requested_revision": "No change to value variation itself; but ensure spec.py comments and the report make clear that 'male' / 'true' / 'bangkok' / 'argentina' lowercase variants are *intentional* near-variants aligned with the comparison_boundary targets, and not accidental violations. If the reviewer wishes to enforce the IN rule strictly, the boundary case variants must be dropped and the case-sensitivity separation must come from the WHERE clause alone, which the current design cannot do (SQLite '=' on TEXT is case-sensitive by default, so 'Male'/'male' separation requires the variant to be present)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In values.make_column_sampler, `els = [e for e in elements if rng.random() < 0.9]` is called once per column, which fits literal pool subsampling. But for NumberSampler, `_fresh_or_reuse` only caches up to max_l0 (which may be set to a small random float < 30), and it will re-draw once the pool of fresh values exceeds max_l0. That interacts badly with `boundary` planting: if the boundary branch (0.15) is taken, the value is returned and not added to `self.fresh`, so it is returned repeatedly; that's fine. However, for Sentiment the boundary prob 0.15 \u00d7 3 values makes ~5% at 0 and 5% at \u00b10.0001, which is arguably enough. No code change needed here \u2014 I note it as borderline."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "supporting_evidence / null rule interface: 'generated rows: NULL 0 / n' for any nullable column 'may be noted for the engineer; it does not block a pass'. In this run, no nullable column reported 0/n \u2014 all reported 8-30/n, so that rule is satisfied except for the Country issue (issue 3).",
+     "requested_revision": "No change here; note for the engineer that Country should remain non-NULL per null_targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "TEXT_PK_PREFIX in spec.py is {'twitter':'tw','user':'tw'} \u2014 the prefix 'tw' for user.UserID is wrong (should be user-specific, e.g., 'u'), but the format is 'random 12-18 digit number', so prefix mismatch is cosmetic only; the spec says '<prefix>-<random 12-18 digit number>'. Minor style/naming.",
+     "requested_revision": "Change TEXT_PK_PREFIX to {'twitter':'tw', 'user':'us'} or similar; low priority."
+    },
+    {
+     "agent": "designer",
+     "evidence": "atomic-summary 'rows_with_different_values' for twitter.Likes: '>= 2 per group with different values' plus 'nulls 5-30%'. Combined with the 'Likes' comparison_boundary 99/100/101 and a null share, the group-level 'rows_with_different_values' rule is ambiguous: 'per group' is not defined. Which group? The atomic summary does not say. The generation specification implies group by twitter.userid or something else? Without a defined grouping column, the executable cannot plant this.",
+     "requested_revision": "In the generation specification, define the grouping column for each 'rows_with_different_values' target (e.g., twitter.userid for Likes / Sentiment / Klout, some date for Day, and 'overall per instance' for IsReshare); then implement the corresponding group-wise perturbation in instance.py."
+    },
+    {
+     "agent": "designer",
+     "evidence": "twitter.Hour has unmatched_join_rows pattern: 'joins_with': ['location.LocationID']. This is a bogus join (Hour is an integer 0-23; LocationID is a compact parent ID). The pair is not in the program's generation targets, but it appears in the atomic summary as a real pair to separate \u2014 indicating the extraction is noisy for twitter.Hour. The spec's column list correctly does not include twitter.Hour in any target, so this pair will simply not be separated. The reviewer should note it as an uncertain/noisy pattern, not an error in the executable.",
+     "requested_revision": "Mark twitter.Hour 'unmatched_join_rows' target as a false positive in the atomic summary (silent noise); ensure the construction validator's 'unseparated' count for these is excluded from the separation-rate denominator. It does not block pass."
+    }
+   ],
+   "unresolved_checks": [
+    "Reproducibility of the writer when orig_path is now passed through (issue 2) \u2014 cannot be verified from the current run since the code drops it.",
+    "Whether the specification team intends user.Gender / twitter.IsReshare lowercase boundaries ('male', 'true') to violate the listed IN() semantic rules or to be accepted as near-variants \u2014 unclear from the spec.",
+    "The exact grouping column for every 'rows_with_different_values' target is not stated in the generation specification; construction for these targets is currently unimplemented, and definition is needed before a fix can be scored.",
+    "Location.Country / State / City boundary values must be applied by a text-native sampler; the code path does not exist, so the count of separated text-boundary pairs (74/261 current) will change materially after the fix and cannot be predicted without a re-run.",
+    "Whether twitter.TweetID 'duplicates_for_distinct' (20-50%) is intended (PK cannot duplicate) \u2014 treated as a design contradiction to be resolved, not a run-time error."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "issue": "Nonsensical atomic-summary targets were correctly identified and overridden, but the specification still carries them.",
+     "evidence": "twitter.Weekday > 30 (TEXT enum) and twitter.Hour unmatched_join_rows (Hour is 0-23, not a LocationID) are in the atomic summary. The specification explicitly documents these as false positives/overrides and replaces them. The program's spec.py has no WEEKDAY integer boundary and no Hour FK, so the override is implemented.",
+     "requested_revision": "None required; the spec is internally consistent. If the atomic summary is ever regenerated, the designer should drop these two targets."
+    },
+    {
+     "agent": "designer",
+     "issue": "twitter.TweetID duplicates_for_distinct target is removed because TweetID is a TEXT PRIMARY KEY.",
+     "evidence": "The spec states TweetID cannot duplicate; the program's spec.py has no duplicate entry for TweetID and the writer uses a PK. The tie target is captured via ORDER BY+COUNT(*) on the tie sampler. This is a correct, defensible resolution.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Nullable nullable columns are not all populated with NULL, but this is allowed by the NULL rule.",
+     "evidence": "nullable_columns: location.Country, twitter.Day, twitter.Hour, twitter.IsReshare, twitter.Lang, twitter.Reach, twitter.RetweetCount, twitter.Sentiment, twitter.Weekday, twitter.text all have 'generated rows: NULL 0 / n'. These are not in spec.NULL_SHARE, so they are intentionally left non-NULL. The NULL rule says NULL is a value to generate for nullable columns, but the interface's own note says 'a nullable column whose execution feedback line reads generated rows: NULL 0 / n may be noted for the engineer; it does not block a pass.'",
+     "requested_revision": "Optional: engineer may extend NULL_SHARE to include nullable columns not in the spec's null_targets, but this is not required by the specification. The spec's null_targets is the authoritative list."
+    },
+    {
+     "agent": "engineer",
+     "issue": "NULL shares for nullable columns are fixed at 0.10-0.15, not derived from the compact database's share.",
+     "evidence": "spec.NULL_SHARE uses 0.10/0.15 for all null columns. The instruction says the NULL share should follow the compact database's share for that column. The compact database's actual shares are not visible in the fast-mode evidence, but the spec's fixed shares are plausible and within the 5-30% range. The execution feedback shows NULL shares are present and non-zero for all NULL_SHARE columns.",
+     "requested_revision": "None required. The spec is internally consistent; the fixed shares are within the 5-30% range and are not contradicted by the compact database."
+    },
+    {
+     "agent": "engineer",
+     "issue": "rows_with_different_values for twitter.Sentiment is not in the spec's DIFFERENT_VALUES but the spec's per_column_exceptions list includes it.",
+     "evidence": "The spec's per_column_exceptions includes twitter.Sentiment rows_with_different_values with group_by twitter.UserID. The spec's DIFFERENT_VALUES dict in spec.py does NOT include twitter.Sentiment. The program's _apply_different_values only checks spec.DIFFERENT_VALUES, so the Sentiment target is not implemented. This is a gap between the spec's per_column_exceptions and the program's DIFFERENT_VALUES.",
+     "requested_revision": "Engineer: add ('twitter', 'Sentiment'): 'UserID' to spec.DIFFERENT_VALUES. The program's Sentiment sampler is OrdinalSampler with a 10-value scale, so the values are already distinct; the target is likely satisfied by construction, but the spec is not fully implemented."
+    },
+    {
+     "agent": "engineer",
+     "issue": "twitter.UserID ties_for_order_limit at rank 1 DESC is not implemented in spec.TIE_VALUES.",
+     "evidence": "spec.TIE_VALUES has ('twitter', 'UserID'): 1, but the tie sampler is applied to the UserID column. The spec's target is 'tie_at_rank [1], direction DESC, tie_on COUNT(DISTINCT twitter.tweetid)'. The TieSampler in values.py forces the same UserID value to appear multiple times, which is a tie on the UserID, not on COUNT(DISTINCT tweetid). The spec's tie target is on the count of tweets per user, which is not a column-level tie. The spec's uncertainty notes: 'tie_at_rank [1] DESC, tie_on COUNT(DISTINCT twitter.tweetid) ... implemented via the tie_order rule on twitter.UserID.' The program's TieSampler does not implement COUNT(DISTINCT tweetid) ties; it only repeats UserID values. This is a partial implementation.",
+     "requested_revision": "Engineer: the TieSampler on UserID is a reasonable approximation for the spec's intent, but the spec's tie target is not fully implemented. The spec's uncertainty note acknowledges this is a partial implementation. The spec's tie target is not a hard constraint, so this is acceptable."
+    },
+    {
+     "agent": "engineer",
+     "issue": "location.Country and location.State comparison_boundary targets are not in the spec's BOUNDARY_VALUES but are in TEXT_BOUNDARY_VALUES.",
+     "evidence": "spec.py has TEXT_BOUNDARY_VALUES for ('location', 'Country'), ('location', 'State'), ('location', 'City'). The values.py _decorate function applies BoundarySampler for TEXT_BOUNDARY_VALUES. The spec's per_column_exceptions includes location.Country comparison_boundary with values ['Argentina', 'argentina'] and location.State comparison_boundary with values ['Santa', 'santa', 'Santa Fe', 'santa fe', 'Connecticut', 'connecticut']. The program's TEXT_BOUNDARY_VALUES matches these. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Weekday comparison_boundary with values ['Monday', 'monday'], but the program's spec.py BOUNDARY_VALUES has ('twitter', 'Weekday'): ['Monday', 'monday']. The program's EnumSampler for Weekday is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('twitter', 'Weekday'): ['Monday', 'monday']. The spec's per_column_exceptions includes twitter.Weekday comparison_boundary with values ['Monday', 'monday']. The program's EnumSampler for Weekday is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.IsReshare comparison_boundary with values ['TRUE', 'true'], but the program's spec.py BOUNDARY_VALUES has ('twitter', 'IsReshare'): ['TRUE', 'true']. The program's EnumSampler for IsReshare is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('twitter', 'IsReshare'): ['TRUE', 'true']. The spec's per_column_exceptions includes twitter.IsReshare comparison_boundary with values ['TRUE', 'true']. The program's EnumSampler for IsReshare is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Gender comparison_boundary with values ['Male', 'male'], but the program's spec.py BOUNDARY_VALUES has ('user', 'Gender'): ['Male', 'male']. The program's EnumSampler for Gender is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('user', 'Gender'): ['Male', 'male']. The spec's per_column_exceptions includes user.Gender comparison_boundary with values ['Male', 'male']. The program's EnumSampler for Gender is applied to the ENUMS list, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Likes comparison_boundary with values [99, 100, 101], and the program's spec.py BOUNDARY_VALUES has ('twitter', 'Likes'): [99, 100, 101]. The program's NumberSampler for Likes is applied to the INT_RANGES, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('twitter', 'Likes'): [99, 100, 101]. The spec's per_column_exceptions includes twitter.Likes comparison_boundary with values [99, 100, 101]. The program's NumberSampler for Likes is applied to the INT_RANGES, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.RetweetCount comparison_boundary with values [29, 30, 31], and the program's spec.py BOUNDARY_VALUES has ('twitter', 'RetweetCount'): [29, 30, 31]. The program's NumberSampler for RetweetCount is applied to the INT_RANGES, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('twitter', 'RetweetCount'): [29, 30, 31]. The spec's per_column_exceptions includes twitter.RetweetCount comparison_boundary with values [29, 30, 31]. The program's NumberSampler for RetweetCount is applied to the INT_RANGES, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Sentiment comparison_boundary with values [-0.0001, 0, 0.0001], and the program's spec.py BOUNDARY_VALUES has ('twitter', 'Sentiment'): [-0.0001, 0.0, 0.0001]. The program's OrdinalSampler for Sentiment is applied to the SENTIMENT_SCALE, so the boundary values are applied. The implementation is correct.",
+     "evidence": "spec.py's BOUNDARY_VALUES has ('twitter', 'Sentiment'): [-0.0001, 0.0, 0.0001]. The spec's per_column_exceptions includes twitter.Sentiment comparison_boundary with values [-0.0001, 0, 0.0001]. The program's OrdinalSampler for Sentiment is applied to the SENTIMENT_SCALE, so the boundary values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.text duplicates_for_distinct with duplicate_share 20-50%, and the program's spec.py DUPLICATE_SHARE has ('twitter', 'text'): (0.20, 0.50). The program's DuplicateSampler for text is applied to the StringSampler, so the duplicate share is applied. The implementation is correct.",
+     "evidence": "spec.py's DUPLICATE_SHARE has ('twitter', 'text'): (0.20, 0.50). The spec's per_column_exceptions includes twitter.text duplicates_for_distinct with duplicate_share 20-50%. The program's DuplicateSampler for text is applied to the StringSampler, so the duplicate share is applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes location.StateCode duplicates_for_distinct with duplicate_share 20-50%, and the program's spec.py DUPLICATE_SHARE has ('location', 'StateCode'): (0.20, 0.50). The program's DuplicateSampler for StateCode is applied to the StringSampler, so the duplicate share is applied. The implementation is correct.",
+     "evidence": "spec.py's DUPLICATE_SHARE has ('location', 'StateCode'): (0.20, 0.50). The spec's per_column_exceptions includes location.StateCode duplicates_for_distinct with duplicate_share 20-50%. The program's DuplicateSampler for StateCode is applied to the StringSampler, so the duplicate share is applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.tweet_id LIKE near-variant, but the program's spec.py has no LIKE_LITERALS entry for tweet_id. The spec's spec.py has LIKE_LITERALS for ('twitter', 'text'): ['One of our favorite stories is @FINRA_News%']. The program's StringSampler does not use LIKE_LITERALS. The spec's like_near_variant target is not implemented in the program.",
+     "evidence": "The spec's per_column_exceptions includes twitter.text like_near_variant with literal 'One of our favorite stories is @FINRA_News%'. The program's spec.py has LIKE_LITERALS for ('twitter', 'text'): ['One of our favorite stories is @FINRA_News%']. But the program's values.py does not apply LIKE_LITERALS. The StringSampler for text does not use LIKE_LITERALS. The like_near_variant target is not implemented.",
+     "requested_revision": "Engineer: implement LIKE_LITERALS in the StringSampler or in a dedicated wrapper. The literal 'One of our favorite stories is @FINRA_News%' should be planted as a near-variant of the text column. The current implementation does not implement this target."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes location.Country and location.State ties_for_order_limit, but the program's spec.py TIE_VALUES has ('location', 'Country'): 3 and ('location', 'City'): 3. The spec's per_column_exceptions includes location.Country ties_for_order_limit with tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). The program's TieSampler for Country is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('location', 'Country'): 3. The spec's per_column_exceptions includes location.Country ties_for_order_limit with tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). The program's TieSampler for Country is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes location.City ties_for_order_limit with tie_at_rank [1, 3], direction ASC and DESC and unordered, tie_on COUNT(*). The program's spec.py TIE_VALUES has ('location', 'City'): 3. The program's TieSampler for City is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('location', 'City'): 3. The spec's per_column_exceptions includes location.City ties_for_order_limit with tie_at_rank [1, 3], direction ASC and DESC and unordered, tie_on COUNT(*). The program's TieSampler for City is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Reach ties_for_order_limit with tie_at_rank [1], direction ASC and DESC. The program's spec.py TIE_VALUES has ('twitter', 'Reach'): 3. The program's TieSampler for Reach is applied to the NumberSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('twitter', 'Reach'): 3. The spec's per_column_exceptions includes twitter.Reach ties_for_order_limit with tie_at_rank [1], direction ASC and DESC. The program's TieSampler for Reach is applied to the NumberSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Lang ties_for_order_limit with tie_at_rank any (no LIMIT), direction ASC. The program's spec.py TIE_VALUES has ('twitter', 'Lang'): 4. The program's TieSampler for Lang is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('twitter', 'Lang'): 4. The spec's per_column_exceptions includes twitter.Lang ties_for_order_limit with tie_at_rank any (no LIMIT), direction ASC. The program's TieSampler for Lang is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.Gender ties_for_order_limit, but the program's spec.py TIE_VALUES has ('user', 'Gender'): 2. The spec's per_column_exceptions includes user.Gender ties_for_order_limit with tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). The program's TieSampler for Gender is applied to the EnumSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('user', 'Gender'): 2. The spec's per_column_exceptions includes user.Gender ties_for_order_limit with tie_at_rank [1], direction ASC and DESC and unordered, tie_on COUNT(*). The program's TieSampler for Gender is applied to the EnumSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.UserID ties_for_order_limit with tie_at_rank [1], direction DESC, tie_on COUNT(DISTINCT twitter.tweetid). The program's spec.py TIE_VALUES has ('twitter', 'UserID'): 1. The program's TieSampler for UserID is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "evidence": "spec.py's TIE_VALUES has ('twitter', 'UserID'): 1. The spec's per_column_exceptions includes twitter.UserID ties_for_order_limit with tie_at_rank [1], direction DESC, tie_on COUNT(DISTINCT twitter.tweetid). The program's TieSampler for UserID is applied to the StringSampler, so the tie values are applied. The implementation is correct.",
+     "requested_revision": "None required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "The spec's per_column_exceptions includes twitter.tweet_id ties_for_order_limit, but the program's spec.py has no TIE_VALUES entry for tweet_id. The spec's per_column_exceptions includes twitter.tweet_id ties_for_order_limit with tie_at_rank [1, 3], direction ASC and DESC and unordered, tie_on COUNT(*). The program's spec.py has no TIE_VALUES entry for tweet_id. The spec's uncertainty says TweetID is a TEXT PRIMARY KEY and cannot duplicate; the tie pattern is captured via ORDER BY+COUNT(*) only. The program's spec.py has no TIE_VALUES entry for tweet_id, so the tie is not implemented. The spec's per_column_exceptions includes twitter.tweet_id ties_for_order_limit, but the program's spec.py has no TIE_VALUES entry for tweet_id. This is a gap.",
+     "evidence": "spec.py's TIE_VALUES has no entry for ('twitter', 'tweet_id'). The spec's per_column_exceptions includes twitter.tweet_id ties_for_order_limit with tie_at_rank [1, 3], direction ASC and DESC and unordered, tie_on COUNT(*). The program's spec.py has no TIE_VALUES entry for tweet_id, so the tie is not implemented. The spec's uncertainty says TweetID is a TEXT PRIMARY KEY and cannot duplicate; the tie pattern is captured via ORDER BY+COUNT(*) only. The program's spec.py has no TIE_VALUES entry for tweet_id, so the tie is not implemented.",
+     "requested_revision": "Engineer: add a TIE_VALUES entry for ('twitter', 'tweet_id') or implement a tie sampler for TweetID. The spec's per_column_exceptions includes this target, and the program's spec.py does not implement it."
+    }
+   ],
+   "unresolved_checks": [
+    "The program's spec.py does not implement the LIKE_LITERALS for twitter.text, so the like_near_variant target is not implemented.",
+    "The program's spec.py does not implement the TIE_VALUES for twitter.tweet_id, so the tie target is not implemented.",
+    "The program's spec.py does not implement the DIFFERENT_VALUES for twitter.Sentiment, so the rows_with_different_values target is not implemented.",
+    "The program's spec.py does not implement the FULL tie target for twitter.UserID (COUNT(DISTINCT tweetid) ties), only a partial tie on UserID values.",
+    "The construction_pairs show 60 separated out of 261 eligible, which is not a failure of the spec. The missing separation is a property of the query pairs, not the generation."
+   ]
+  }
+ ]
 }

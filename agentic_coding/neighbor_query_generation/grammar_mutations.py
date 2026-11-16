@@ -1,10 +1,4 @@
-"""Grammar mutations of a gold query, following the Spider test-suite neighbor generator (Zhong et al., 2020).
-
-A mutation either drops one contiguous token span (except whitespace, '*', AS, ASC, ';' and 'name .' spans) or
-replaces one token by another of its family: aggregate, comparison, ORDER direction, arithmetic, AND/OR,
-LIKE/NOT LIKE, IN/NOT IN, another column of the schema, nearby or random numbers, and sub-spans, cuts and
-%-wrapped variants of a string literal.
-"""
+"""Grammar mutations of a gold query, following the Spider test-suite neighbor generator (Zhong et al., 2020)."""
 import random
 import re
 

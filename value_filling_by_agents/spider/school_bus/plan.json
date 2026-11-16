@@ -1,48 +1,405 @@
 {
  "db": "school_bus",
- "operator_io_quirks": [
-  "All identifiers are simple lowercase ASCII (driver, school, school_bus, Driver_ID, If_full_time); no spaces or mixed case, but the spec's quoting rule still applies.",
-  "Tiny tables (12/7/5 rows) \u2014 no rowid sampling or max_rows_per_table pressure; original_values are complete.",
-  "school_bus has a composite PK (School_ID, Driver_ID) and two FKs to driver and school; both parents exist and are unique on their PKs.",
-  "If_full_time declared 'bool' but storage class is text with values 'T'/'F' \u2014 declared type dispatches to Bool fuzzer, which emits True/False/1/0, contradicting the stored 'T'/'F'.",
-  "No NOT NULL, no CHECK, no UNIQUE indexes, no views/triggers; all columns nullable in DDL.",
-  "FK parent columns (driver.Driver_ID, school.School_ID) are INTEGER PKs, so FK child draws are integer values from the parent's final filtered column.",
-  "No self-references, no dangling FKs, no non-unique parents.",
-  "Grade/Location samples contain en-dash (\u2013) and commas \u2014 String fuzzer's CHARSET lacks these, so fresh strings won't reproduce them.",
-  "Party has only 2 distinct values (Dem/Rep); Home_city 5; Type 3 \u2014 small literal pools per column.",
-  "School_ID in school_bus samples (1,3,4,5,7) are a subset of school's 1..7; Driver_ID samples (10,4,3,7,9) subset of driver's 1..12."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on Driver_ID/School_ID/Age/Years_Working: uniform in [-10^scale,10^scale] with scale from INT (no args -> scale 0, so [-1,1] plus +-1/+-2 perturbation) \u2014 implausible IDs/ages, likely FN on range predicates.",
-  "String fuzzer on Name/Party/Home_city/Grade/School/Location/Type: random a-zA-Z0-9() strings of length 0..20 with 0.5 contaminate \u2014 destroys 'Dem'/'Rep'/'Public' ties, likely FP on equality/IN and FN on LIKE patterns.",
-  "Bool fuzzer on If_full_time emits True/False (Python bools) not 'T'/'F' \u2014 stored as 1/0 in sqlite; queries filtering ='T' will miss, =1 may hit.",
-  "Composite PK (School_ID,Driver_ID) in school_bus: sample_fresh_primary_keys drops duplicate pairs; with tiny sizes (1+30u) collisions rare, so few drops.",
-  "FK draws from parent's FINAL filtered column: driver/school PKs are single-column PKs -> max_l0=inf, so many fresh draws; child FK values may reference parent IDs that were dropped by PK dedup only if parent had dupes (it won't, PK unique).",
-  "choose_table_sizes: level 0 = driver,school (1+30u each), level 1 = school_bus (x4) \u2014 school_bus often larger than parents, so FK draws with replacement create many duplicate (School_ID,Driver_ID) pairs -> heavy PK dedup, shrinking school_bus.",
-  "Literal pool from train SQL: Party/Type/Home_city literals ('Dem','Rep','Public',...) enter the pool and are sampled with p=0.2, giving some plausible values but diluted by fresh strings.",
-  "checked=False everywhere, so p stays 0.2 (or 0 w.p. 0.3 at instance level) \u2014 no CHECK-driven p=0.",
-  "No Date/Time columns, so Date/Time fuzzers unused; no crash-fallback types.",
-  "Known misses: FN from Number fuzzer's tiny [-1,1] range for Age/Years_Working (real 2..46) and from String fuzzer losing 'Dem'/'Rep' ties; FP from missing duplicate (School_ID,Driver_ID) pairs after PK dedup and from Bool True/False vs 'T'/'F'."
- ],
- "challenger_refs": [
-  "G2",
-  "g91507b3f",
-  "g91507b3f",
-  "g5938451e",
-  "g5938451e",
-  "g4cbcca20",
-  "G3",
-  "g72cc7c4d",
-  "g3a1bdb76",
-  "g1707356b",
-  "gb8356378",
-  "gd1e7003d"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers 1..N, no NULL, no duplicates; parent tables filled before children; primary-key columns are never subject to group-size, duplicate-share or tie enforcement.",
+   "int_foreign_key": "Sample with replacement from the parent table's generated primary-key values; NULL only when the column is nullable; leave at least one parent row without children.",
+   "composite_primary_key": "After all FK columns of a child table are assigned, enforce uniqueness of the full PK tuple by construction: for each colliding tuple, redraw one FK value from that parent's pool (never a value that would create a new collision) until the tuple is unique; never rely on the writer to drop rows; rows_skipped must be 0 for every table.",
+   "int_numeric": "Uniform integer within the column's range rule; include boundary values and one step on each side; enforcement of group sizes / duplicate shares / ties draws fresh integers within the same range, never string placeholders.",
+   "text": "Short ASCII strings; a small pool of near-duplicates; NULL only when the column is nullable; enforcement of group sizes / duplicate shares / ties draws from the observed value pool or near-duplicates, never 'g%d'/'d%d' placeholders.",
+   "bool": "0 or 1 only.",
+   "text_enum": "Uniform sample from the listed enum values.",
+   "fresh_values_share": "0.2 of new values per instance",
+   "null_share": "Follow the compact database's share for the column, computed over the generated rows of that column; at least one NULL row per nullable column per instance (k = max(1, round(share*n))); never NULL in NOT NULL / primary-key columns; a nullable column whose compact share is 0 still gets exactly one NULL row.",
+   "planted_values": "Boundary, enum, tie, duplicate and aggregate-boundary values are reserved slots and are never overwritten by NULL application, by group-size / duplicate-share / tie enforcement, or by replanting; tied and aggregate-boundary positions are excluded from the NULL shuffle and from _replant.",
+   "post_conditions": "After generation, verify per instance: (a) each (parent, child) in unmatched-parent targets has at least one parent value absent from the child FK column; (b) each tie at rank 1 exists in the final column; (c) each group-size target (1, 2, >=3) exists in the final column; (d) COUNT(DISTINCT school_bus.School_ID) in {1,2,3}; (e) each Years_Working group (by School_ID and/or Driver_ID) with >=2 rows has >=2 distinct values; (f) each nullable column has >=1 NULL row; (g) rows_skipped == 0 for every table; report counts in execution feedback."
+  },
+  "per_column_exceptions": [
+   {
+    "table": "driver",
+    "column": "Driver_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "at least one driver row without a school_bus child; PK remains sequential unique integers 1..N; the duplicates_for_distinct and group_sizes targets extracted for this column refer to join/aggregation behaviour over school_bus, not to PK values, and are not enforced on the PK column"
+   },
+   {
+    "table": "driver",
+    "column": "Home_city",
+    "pattern": "group_sizes; aggregate_boundary; duplicates_for_distinct; ties_for_order_limit; comparison_boundary",
+    "targets": "group_sizes 1,2,>=3; COUNT(*) values 1,2,3,4 enforced and verified; duplicate_share 20-50%; tie at rank 1 DESC protected from NULL application and replanting; observed values plus 'Hartford' and case-variant 'hartford'"
+   },
+   {
+    "table": "driver",
+    "column": "Age",
+    "pattern": "comparison_boundary; group_sizes",
+    "targets": "39,40,41; group_sizes 1,2,>=3"
+   },
+   {
+    "table": "driver",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct; ties_for_order_limit",
+    "targets": "duplicate_share 20-50%; tie at rank 1 ASC"
+   },
+   {
+    "table": "driver",
+    "column": "Party",
+    "pattern": "aggregate_boundary",
+    "targets": "COUNT(*) 0,1; values only in {Dem, Rep}; no NULLs"
+   },
+   {
+    "table": "school",
+    "column": "School_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "at least one school row without a school_bus child"
+   },
+   {
+    "table": "school",
+    "column": "Type",
+    "pattern": "duplicates_for_distinct; aggregate_boundary",
+    "targets": "duplicate_share 20-50%; COUNT(*) 1,2,3"
+   },
+   {
+    "table": "school",
+    "column": "School",
+    "pattern": "duplicates_for_distinct",
+    "targets": "duplicate_share 20-50%"
+   },
+   {
+    "table": "school_bus",
+    "column": "Driver_ID",
+    "pattern": "unmatched_join_rows; null_rows",
+    "targets": "parent rows without children; no NULL (NOT NULL column); participates in composite-PK uniqueness repair"
+   },
+   {
+    "table": "school_bus",
+    "column": "School_ID",
+    "pattern": "unmatched_join_rows; null_rows; aggregate_boundary; null_in_count_column",
+    "targets": "parent rows without children; no NULL (NOT NULL column); restrict to at most 3 distinct parent values per instance and at least 1, verified per instance; no NULL share; participates in composite-PK uniqueness repair"
+   },
+   {
+    "table": "school_bus",
+    "column": "Years_Working",
+    "pattern": "rows_with_different_values",
+    "targets": "for each group by School_ID (and/or Driver_ID) with >=2 rows, assign >=2 distinct values and protect those positions from NULL application; range 0..20"
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "school_bus.School_ID",
+    "parent": "school.School_ID",
+    "copied_from_parent": []
+   },
+   {
+    "child": "school_bus.Driver_ID",
+    "parent": "driver.Driver_ID",
+    "copied_from_parent": []
+   },
+   {
+    "child": "school_bus",
+    "parent": "school_bus",
+    "copied_from_parent": [],
+    "note": "composite PRIMARY KEY (School_ID, Driver_ID) enforced by construction after FK assignment"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "driver",
+    "column": "Driver_ID",
+    "formula": "Driver_ID > 0"
+   },
+   {
+    "table": "driver",
+    "column": "Age",
+    "formula": "Age BETWEEN 18 AND 120",
+    "evidence": "assumption; observed 30..52"
+   },
+   {
+    "table": "driver",
+    "column": "Party",
+    "formula": "Party IN ('Dem','Rep')"
+   },
+   {
+    "table": "school",
+    "column": "School_ID",
+    "formula": "School_ID > 0"
+   },
+   {
+    "table": "school",
+    "column": "Type",
+    "formula": "Type IN ('Public','Private','Private Catholic')"
+   },
+   {
+    "table": "school_bus",
+    "column": "School_ID",
+    "formula": "School_ID > 0"
+   },
+   {
+    "table": "school_bus",
+    "column": "Driver_ID",
+    "formula": "Driver_ID > 0"
+   },
+   {
+    "table": "school_bus",
+    "column": "Years_Working",
+    "formula": "Years_Working >= 0"
+   },
+   {
+    "table": "school_bus",
+    "column": "If_full_time",
+    "formula": "If_full_time IN (0,1)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "driver": 12,
+   "school": 7,
+   "school_bus": 5
+  },
+  "null_targets": [
+   "driver.Home_city",
+   "driver.Age",
+   "driver.Name",
+   "school.Grade",
+   "school.School",
+   "school.Location",
+   "school.Type",
+   "school_bus.Years_Working",
+   "school_bus.If_full_time"
+  ],
+  "supporting_evidence": [
+   "driver.Party values: Dem, Rep (no NULLs).",
+   "driver.Age values: 30, 35, 36, 40, 42, 45, 46, 52.",
+   "school.Type values: Public, Private, Private Catholic.",
+   "school_bus.If_full_time values: T, F.",
+   "school_bus.Years_Working values: 2, 3, 6, 8, 10.",
+   "school_bus.Driver_ID and school_bus.School_ID are NOT NULL (composite PRIMARY KEY)."
+  ],
+  "uncertainty": [
+   "No formulas were found; the original data does not show any calculated columns.",
+   "The NULL share follows the compact database's share per column (as implemented); the earlier 0.2 claim is removed. A nullable column with compact share 0 still gets exactly one NULL row per instance.",
+   "The per-instance sizes are 12/7/5 (chosen, not the original compact sizes); the compact database is the source of the observed values and statistics, not of the generated row counts.",
+   "The upper bound 20 for school_bus.Years_Working is an explicit assumption; the observed values are 2..10 and the semantic rule only requires Years_Working >= 0.",
+   "The driver.Age range 18..120 is an explicit assumption; the supplied DDL has no CHECK constraints and observed values are 30..52.",
+   "Planting 'hartford' (lowercase) in driver.Home_city is an assumption to exercise case sensitivity of the <= / = comparison boundary; the compact DB does not show this value.",
+   "The NULL share is computed over generated rows of each column, not over the whole instance; a nullable column with compact share 0 still gets exactly one NULL row.",
+   "The composite-PK uniqueness repair and the school_bus.School_ID distinct-count restriction (1..3) are construction steps; after the fix, rows_skipped must be empty for all tables."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py DEFAULT_SPEC.null_targets lists driver.Party, driver.Home_city, driver.Age, school.Grade, school.School, school.Location, school.Type, school_bus.Years_Working, school_bus.If_full_time as nullable, and the execution feedback confirms all of these receive NULLs (e.g. 'driver.Name: generated rows: NULL 20 / 239'). However, the specification's supporting_evidence states 'driver.Party values: Dem, Rep (no NULLs).' and the semantic rule 'Party IN (Dem,Rep)' plus the aggregate_boundary target 'COUNT(*) 0,1' are consistent with a non-null Party. The program's _apply_null_rule (instance.py) injects NULLs into every nullable column including driver.Party, contradicting the 'no NULLs' evidence for Party. The spec's null_targets should not include driver.Party (or the supporting evidence should be reconciled), and the program should not plant NULLs in Party.",
+     "requested_revision": "Designer: remove driver.Party from null_targets (or document why the 'no NULLs' evidence is overridden). Engineer: ensure _apply_null_rule does not inject NULLs into driver.Party, and that Party values remain within {Dem, Rep}."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py BOUNDARY_VALUES includes ('driver','Home_city'): ['Hartford','hartford'] and the per_column_exceptions target 'Hartford' and 'hartford' for the comparison_boundary pattern (PRED(driver.age < 40 OR driver.home_city <= 'Hartford') vs = 'Hartford'). In instance.py, _planted_values appends boundaries_for(table,column) to the planted list, but _apply_null_rule then overwrites a random subset of positions with NULL, and _enforce_group_sizes / _enforce_duplicate_share / _enforce_tie run before NULL application and can overwrite the planted boundary positions (e.g. _enforce_group_sizes sets vals[0..5] unconditionally). There is no guarantee that both 'Hartford' and 'hartford' survive in the generated Home_city column, so the comparison_boundary separation may be lost. The construction_pairs feedback shows only 15/54 separated, consistent with planted values being clobbered.",
+     "requested_revision": "Engineer: apply _apply_column_patterns and _apply_null_rule in a way that preserves planted boundary values (e.g. reserve slots for planted values, or re-plant boundaries after pattern enforcement), and verify that both 'Hartford' and 'hartford' appear in every instance's driver.Home_city."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py TIE_COLUMNS = {('driver','Name'): 'ASC', ('driver','Home_city'): 'DESC'} and per_column_exceptions require 'tie at rank 1 ASC' for Name and 'tie at rank 1 DESC' for Home_city. instance.py _enforce_tie sets vals[0]=vals[1], which creates a tie but does not guarantee it is at rank 1 for the ORDER BY direction (e.g. for DESC, the tied value must be the maximum; for ASC, the minimum). Additionally, _apply_null_rule runs after _enforce_tie and may NULL out one of the tied positions, destroying the tie. The construction_pairs feedback (15/54 separated) is consistent with ties not being reliably at rank 1.",
+     "requested_revision": "Engineer: make _enforce_tie direction-aware (set the two extreme values to the max for DESC / min for ASC) and ensure NULL application does not remove the tied pair; verify tie-at-rank-1 for both Name (ASC) and Home_city (DESC) in every instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py UNMATCHED_PARENT_COLUMNS = {('driver','Driver_ID'), ('school','School_ID')} and per_column_exceptions require 'parent rows without children' for driver.Driver_ID and school.School_ID. instance.py _fk_values(leave_unmatched=True) drops the last parent value from the pool, but the FK sampler draws with replacement from the remaining pool, so the dropped parent is guaranteed unmatched only if the pool is non-empty and the child table has rows. However, _plant_unmatched_parents is a no-op (returns columns unchanged) and there is no post-check that at least one parent row is actually unmatched. With school_bus size 5 and driver size 12, the probability that all 12 drivers get a child is low but not zero; more importantly, the 'last parent value' is the last generated PK, which may itself be dropped by sample_fresh_primary_keys or drop_unique_duplicates, so the intended unmatched parent may not exist. The feedback does not report unmatched-parent counts.",
+     "requested_revision": "Engineer: after FK assignment, explicitly verify (and if needed force) that at least one driver.Driver_ID and one school.School_ID have no matching school_bus row; add a post-construction assertion or repair step."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_FK_COLUMNS = {('school_bus','Driver_ID'), ('school_bus','School_ID')} and per_column_exceptions require 'no NULL (NOT NULL column)' for both. The schema declares school_bus.Driver_ID and school_bus.School_ID as part of PRIMARY KEY (School_ID, Driver_ID), so they are NOT NULL. instance.py _plant_null_fk_rows checks cm.notnull or cm.pk_pos > 0 and skips, which is correct. However, _fk_values returns [None]*n when parent_vals is empty, and build_random_instance does not filter these out before insertion; writer.py would then fail those rows (feedback shows school_bus rows_skipped: 2). This is a minor integrity concern but the feedback reports 0 not_null_violations, so it is handled by row skipping. No blocking issue here, but the silent row skipping (2 rows) should be surfaced.",
+     "requested_revision": "Engineer: when parent_vals is empty, either skip generating child rows or raise a clear error rather than relying on writer row-skipping; report skipped rows in the run summary (already partially done)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py RANGES includes ('school_bus','Years_Working'): (0, 20) and DIFFERENT_VALUES_COLUMNS requires '>=2 rows per group with different values'. The supporting_evidence lists Years_Working values 2,3,6,8,10. The range (0,20) is not evidenced by the compact data (max observed 10) and the semantic rule only says 'Years_Working >= 0'. The upper bound 20 is an unsupported assumption.",
+     "requested_revision": "Designer: either justify the upper bound 20 from evidence or widen/remove it; align with the observed value range (2..10) or state it as an explicit uncertainty."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py table_sizes_per_instance = {driver:12, school:7, school_bus:5} and uncertainty states 'The original table sizes are not used, as the table sizes are 12, 7, 5, which are not the original sizes.' This is self-contradictory: the sizes 12/7/5 are presented as both the per-instance sizes and as 'not the original sizes'. The feedback shows rows_added driver:239/20\u224812, school:142/20\u22487, school_bus:95/20\u22485, confirming the sizes are used. The uncertainty text is misleading.",
+     "requested_revision": "Designer: correct the uncertainty text to state that the per-instance sizes are 12/7/5 (chosen, not the original compact sizes), and clarify the relationship to the compact database."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _spec_sizes jitters base sizes by rng.choice([-1,0,0,1]), so per-instance sizes vary (e.g. driver 11-13). The specification's table_sizes_per_instance is a fixed dict; jittering is not specified. This is a minor deviation but affects reproducibility of the intended sizes and the group-size / duplicate-share targets (which depend on n).",
+     "requested_revision": "Engineer: either remove the jitter to match the specification exactly, or document the jitter as an intentional variation in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_duplicate_share collapses the tail onto already-seen values to keep distinct/rows in [0.5,0.8], but it does not guarantee the lower bound (duplicate share <= 50%) when the initial distinct count is already below 0.5*n; and it can overwrite planted boundary/enum values. Combined with _apply_null_rule running afterwards, the duplicate share target (20-50%) is not reliably enforced. The feedback does not report per-column duplicate shares.",
+     "requested_revision": "Engineer: add a post-construction check that duplicate share for DUPLICATE_SHARE_COLUMNS is within 20-50% (excluding NULLs per the NULL rule), and adjust the enforcement to preserve planted values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The construction_pairs feedback reports eligible 54, separated 15, unknown_executions 0. While a missing separation alone does not prove an error, the low separation rate (15/54) combined with the code-level issues above (planted values clobbered by _enforce_group_sizes/_enforce_duplicate_share/_enforce_tie and NULL application) suggests the intended value variation is not reliably achieved. This is a signal to verify, not a standalone blocker.",
+     "requested_revision": "Engineer: after fixing the planting/enforcement ordering, re-run and report per-pattern separation counts (group_sizes, duplicate_share, ties, boundaries, unmatched parents, different values) to confirm the specification is realized."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-column duplicate-share and group-size distributions were not reported in the feedback; cannot confirm 20-50% duplicate share and group sizes 1/2/>=3 are met in every instance.",
+    "Unmatched-parent counts (driver.Driver_ID, school.School_ID without children) were not reported; cannot confirm the unmatched_join_rows target is met.",
+    "Tie-at-rank-1 for driver.Name (ASC) and driver.Home_city (DESC) was not verified against actual ORDER BY results.",
+    "Presence of both 'Hartford' and 'hartford' in driver.Home_city per instance was not verified.",
+    "The 2 skipped school_bus rows (likely NULL FK from empty parent pool) should be explained; they do not violate integrity but indicate a generation path that should be made explicit."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "spec.py NULL_FK_COLUMNS = {('school_bus','Driver_ID'), ('school_bus','School_ID')} and instance.py _plant_null_fk_rows() sets vals[0]=None for these columns. But both school_bus.Driver_ID and school_bus.School_ID are NOT NULL (schema: PRIMARY KEY ('School_ID','Driver_ID'), and the spec's own per_column_exceptions say 'no NULL (NOT NULL column)'). The NULL rule in the instructions explicitly forbids NULL in NOT NULL columns. The writer's rows_skipped={'school_bus': 2} in the execution feedback is consistent with these planted NULLs being rejected by the NOT NULL constraint (2 rows skipped across 20 instances).",
+     "requested_revision": "Remove ('school_bus','Driver_ID') and ('school_bus','School_ID') from NULL_FK_COLUMNS (or gate _plant_null_fk_rows on cm.notnull, which it already checks \u2014 but the set membership is what triggers it; since both columns are NOT NULL the set should be empty for this schema). The spec's per_column_exceptions already state 'no NULL (NOT NULL column)' for both, so the program contradicts the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_group_sizes() and _enforce_duplicate_share() are applied to driver.Driver_ID (GROUP_SIZE_COLUMNS and DUPLICATE_SHARE_COLUMNS both contain ('driver','Driver_ID')). But Driver_ID is the primary key: _fresh_pk_values() produces sequential unique integers, then _apply_column_patterns() overwrites tail[0..5] with 'g0','g1','g2' style values and collapses duplicates. This both violates the int_primary_key rule ('Sequential integers 1..N, no NULL, no duplicates') and the semantic rule Driver_ID > 0 (string 'g0' is not > 0). The subsequent sample_fresh_primary_keys() only drops duplicate PK tuples, it does not restore integer values. The execution feedback shows 0 pk_duplicates and 0 not_ok, which suggests the PK enforcement in the writer is masking this, but the generated values are not the specified sequential integers.",
+     "requested_revision": "Exclude primary-key columns from GROUP_SIZE_COLUMNS and DUPLICATE_SHARE_COLUMNS enforcement (or skip _apply_column_patterns for cm.pk_pos > 0). The specification's 'duplicates_for_distinct' and 'group_sizes' patterns for driver.Driver_ID refer to the *join/aggregation* behaviour of queries over the column, not to making the PK itself non-unique; the PK must remain sequential unique integers per the int_primary_key rule."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_duplicate_share() and _enforce_group_sizes() inject synthetic string values ('g0','g1','g2','d<random>') into columns regardless of declared type. For driver.Age (INT) and driver.Driver_ID (INT) this produces non-integer values. For driver.Home_city the 'g0'/'d...' values are plausible strings but not near-duplicates of observed cities. The spec's generic_sampling_rules say int_numeric must be 'Uniform integer within the range rule' and text must be 'Short ASCII strings; a small pool of near-duplicates'.",
+     "requested_revision": "Make the enforcement type-aware: for integer columns draw fresh integers within the column's range (or reuse observed integers); for text columns draw from the observed value pool / near-duplicates. Do not inject 'g%d'/'d%d' placeholders into typed columns."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py BOUNDARY_VALUES for ('driver','Home_city') = ['Hartford','hartford'] and the per_column_exceptions require 'both Hartford and hartford present in every instance'. The comparison_boundary pattern in the extracted operations is PRED(driver.age < 40 OR driver.home_city <= 'Hartford') vs PRED(... = 'Hartford'), i.e. the boundary is about the *comparison operator* (<= vs =) and case sensitivity, not about planting both spellings. Planting 'hartford' is a reasonable way to exercise case sensitivity, but the spec does not state that the compact DB contains 'hartford'; the supporting_evidence does not list Home_city values. This is an assumption, not a supported rule.",
+     "requested_revision": "Either (a) mark the 'hartford' planting as an explicit assumption in the uncertainty list, or (b) drop it and rely on the observed Home_city values plus the <= / = operator boundary. The current spec presents it as a hard target without evidence."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec.py RANGES ('school_bus','Years_Working') = (0,20) and the uncertainty note says the upper bound 20 is an explicit assumption. The semantic rule only requires Years_Working >= 0. The per_column_exceptions target 'range 0..20' is therefore an assumption, not a supported rule. Similarly, driver.Age range (18,120) is an assumption (observed values 30..52; the semantic rule Age BETWEEN 18 AND 120 is stated in the spec but not in the database schema/integrity constraints provided).",
+     "requested_revision": "Move the Age 18..120 and Years_Working 0..20 bounds into the uncertainty list (or confirm them against the schema CHECK constraints, which are not present in the supplied DDL). The supplied DDL has no CHECK constraints, so these bounds are designer assumptions."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _repair_unmatched_parents() only rewrites a child row when *every* parent value is used. But _fk_values() with leave_unmatched=True already drops the last parent value from the pool, so the repair is usually a no-op. More importantly, the repair picks 'a parent value with >= 2 children and moves one child to another parent' \u2014 this can re-use the dropped parent value, undoing the unmatched guarantee. The execution feedback does not report per-instance unmatched-parent counts, so this is unverified.",
+     "requested_revision": "Add an explicit post-condition check (and a test) that for each (pt,pc) in UNMATCHED_PARENT_COLUMNS at least one parent value is absent from the child FK column, and make the repair move the child to a value that is *not* the one being freed. Report the count in the execution feedback."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_tie() for ('driver','Name') ASC and ('driver','Home_city') DESC places the tied pair in tail[0], tail[1] of the *non-reserved* tail, but _replant() then overwrites positions [0, reserved) with planted values. If reserved >= 2 the tie is placed at positions reserved, reserved+1 \u2014 fine \u2014 but if the planted list already contains the extreme value the tie may be broken by _replant. Also _apply_null_rule() runs *after* _enforce_tie() and can NULL out one of the tied slots (it shuffles indices from `reserved` onward), breaking the tie. The comment claims ties 'survive NULL application' but the code does not protect the tied positions.",
+     "requested_revision": "Protect the tied positions from NULL application (e.g. exclude them from the shuffle, or re-apply the tie after NULL application). Add a post-condition check that the tie at rank 1 exists in the final column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _enforce_different_values() for school_bus.Years_Working makes consecutive values differ, but the pattern is '>= 2 rows per group with different values' where the group is presumably by School_ID or Driver_ID. Consecutive-difference does not guarantee that within each (School_ID) group there are two rows with different Years_Working. With only 5 school_bus rows per instance and 2 skipped, this is likely not satisfied.",
+     "requested_revision": "Group by the relevant key (School_ID and/or Driver_ID) and ensure at least one group has >= 2 rows with different Years_Working values. Add a post-condition check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_null_rule() uses schema.null_shares.get((table,column), 0.0) and k = max(1, round(share*n)). For columns with observed share 0.0 (e.g. driver.Party, but Party is in NO_NULL_COLUMNS so skipped) this still forces 1 NULL. For columns with observed share > 0 the share is followed. The execution feedback shows NULL 20/240 for driver.Age/Home_city/Name and 20/140 for school columns and 20/99 for school_bus \u2014 i.e. ~8% not the compact share. This is because the compact DB's null_shares are computed over the *compact* rows only, and the generated rows are appended; the share over generated rows is 1/12 \u2248 8.3% for driver, 1/7 \u2248 14% for school, 1/5 = 20% for school_bus. The instruction says 'NULL share following the compact database's share for that column' \u2014 the program uses the compact share to compute k but then the *generated* share differs because n is the generated row count, not the total. This is arguably correct (share over generated rows) but the feedback line 'NULL 20/240' suggests the share is not being reported per column correctly.",
+     "requested_revision": "Clarify in the spec whether the NULL share is over generated rows or over the whole instance, and make the feedback report the per-column share. If the compact share is 0 for a nullable column, the instruction still requires at least one NULL row, which the program does \u2014 note this in the spec."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance unmatched-parent counts for driver.Driver_ID and school.School_ID are not reported in the execution feedback; the _repair_unmatched_parents() logic may undo the guarantee.",
+    "Tie-at-rank-1 for driver.Name ASC and driver.Home_city DESC is not verified after NULL application and replanting.",
+    "Group sizes 1,2,>=3 for driver.Driver_ID, driver.Home_city, driver.Age are not verified in the final instance (the enforcement is overwritten by _replant and _apply_null_rule).",
+    "COUNT(DISTINCT school_bus.school_id) in {1,2,3} is not verified; with 5 rows and 2 skipped the distinct count may be 1 or 2 only.",
+    "The construction_pairs feedback shows 11/54 separated with 0 unknown executions; the remaining 43 pairs are not separated, which may be acceptable (missing separation does not prove equivalence) but the specific patterns (comparison_boundary, aggregate_boundary, ties) should be spot-checked.",
+    "Preservation of compact rows: the writer copies the compact DB and appends, so compact rows are preserved by construction; not independently verified in the feedback."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped = {\"school_bus\": 14} out of 20 instances (i.e. 14 of 100 generated school_bus rows were rejected by the writer). The composite PRIMARY KEY (School_ID, Driver_ID) is not enforced by construction: _fk_values draws School_ID and Driver_ID independently with replacement from parent pools, and sample_fresh_primary_keys() only deduplicates single-column PKs (it returns [None]*n when len(pk)!=1, and the dedup loop is keyed on table_meta.primary_key but the FK columns are filled after the non-FK loop, so the composite key is never checked). The writer then silently drops the colliding rows (writer.py retries each row alone and counts failures). This means the generated instance does not contain the specified number of school_bus rows and the composite-key uniqueness is only achieved by discarding rows.",
+     "requested_revision": "Enforce composite PRIMARY KEY uniqueness by construction in build_random_instance (e.g. after FK assignment, regenerate/repair colliding (School_ID, Driver_ID) pairs by redrawing one FK value from the parent pool), so that rows_skipped['school_bus'] == 0 across all instances. Do not rely on the writer's per-row retry to drop rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification per_column_exceptions for school_bus.School_ID requires 'COUNT(DISTINCT school_id) 1,2,3' and spec.py declares DISTINCT_COUNT_COLUMNS = {('school_bus','School_ID'): (1,2,3)}. verify_instance reports distinct_count['school_bus.School_ID'] = 86 over 20 instances (\u22484.3 per instance), and the execution feedback shows the same value. The construction never enforces this bound: _fk_values draws uniformly from the full parent pool (7 school rows), so the distinct count is not constrained to {1,2,3}. The post-condition (d) in the specification ('COUNT(DISTINCT school_bus.School_ID) in {1,2,3}') is therefore not met.",
+     "requested_revision": "Add a construction step that restricts the school_bus.School_ID values to at most 3 distinct parent values per instance (and at least 1), while still leaving at least one school parent without children (UNMATCHED_PARENT_COLUMNS). Update verify_instance to report the per-instance distinct count and assert it is in {1,2,3}."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification per_column_exceptions for school_bus.Years_Working requires '>=2 rows per group (by School_ID and/or Driver_ID) with different values'. verify_instance reports different_values['school_bus.Years_Working'] = 8 over 20 instances, i.e. only 8 groups (out of many) have >=2 distinct values. _enforce_different_values only makes consecutive values differ within the column vector; it does not group by School_ID/Driver_ID, and the NULL application afterwards can remove the differing value. The post-condition (e) is not reliably satisfied.",
+     "requested_revision": "Enforce the different-values rule per School_ID (and/or Driver_ID) group after FK assignment, e.g. for each group with >=2 rows assign at least two distinct Years_Working values, and protect those positions from NULL application. Report per-instance counts of qualifying groups in verify_instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Specification per_column_exceptions for driver.Home_city requires 'COUNT(*) 1,2,3,4' (aggregate_boundary) and 'tie at rank 1 DESC'. spec.py does not declare an aggregate-boundary enforcement for Home_city (no HAVING/COUNT(*) target is implemented), and _enforce_tie for Home_city DESC picks the max string among the tail and duplicates it in the first two non-reserved slots, but the subsequent _apply_null_rule can NULL those positions (tied positions are protected only via the `protected` tuple returned by _enforce_tie, which is passed to _apply_null_rule \u2014 however _replant then overwrites the head with planted values, potentially destroying the tie). Execution feedback shows ties['driver.Home_city'] = 28 over 20 instances, which is plausible but the aggregate-boundary target (COUNT(*) in {1,2,3,4}) is not verified or enforced.",
+     "requested_revision": "Add explicit enforcement and verification for the Home_city aggregate boundary (COUNT(*) values 1,2,3,4) and ensure the DESC tie at rank 1 survives NULL application and replanting (protect tied positions from _replant as well)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions for driver.Driver_ID lists 'duplicates_for_distinct' (duplicate_share 20-50%) and 'group_sizes 1,2,>=3', but the generic_sampling_rules state 'primary-key columns are never subject to group-size, duplicate-share or tie enforcement'. spec.py resolves this by excluding Driver_ID from DUPLICATE_SHARE_COLUMNS and GROUP_SIZE_COLUMNS, which is consistent with the generic rule but contradicts the per-column exception text. The extracted atomic operations also list driver.Driver_ID duplicates_for_distinct and group_sizes targets.",
+     "requested_revision": "Reconcile the specification: either remove the duplicate_share/group_sizes targets from the driver.Driver_ID per-column exception (since PK columns are excluded by the generic rule), or explicitly state that these targets refer to join/aggregation behaviour rather than the PK column values. The current text is internally inconsistent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's uncertainty list states 'The exact NULL share for nullable columns is not observed in the original data; the generic rule uses 0.2 for nullable columns and at least one NULL row per nullable column', but the generic_sampling_rules say 'null_share: Follow the compact database's share for the column, computed over the generated rows of that column'. spec.py's null_share_for returns max(observed_share, 0.0) and _apply_null_rule uses schema.null_shares (the compact share), not 0.2. Execution feedback shows NULL 20/240 for driver columns (\u22488.3%, not 20%) and NULL 20/140 for school columns (\u224814%), i.e. the compact share, not 0.2. The two statements are inconsistent.",
+     "requested_revision": "Clarify the NULL-share rule: state that the compact database's share is used (as implemented), and remove or correct the '0.2' claim in the uncertainty list, or change the implementation to use 0.2. The current specification and program disagree on the intended NULL share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows 'school_bus.Years_Working: generated rows: NULL 18 / 97' and 'school_bus.If_full_time: generated rows: NULL 20 / 97', but the specification's null_targets include both and the generic rule requires at least one NULL row per nullable column per instance. 18/97 and 20/97 over 20 instances means some instances have zero NULLs in Years_Working (18 < 20). This is a minor violation of the 'at least one NULL row per nullable column' rule.",
+     "requested_revision": "Ensure _apply_null_rule always plants at least one NULL per nullable column per instance (k = max(1, ...) is present, but the protected/reserved positions can reduce the eligible set; verify per-instance that each nullable column has >=1 NULL)."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs report shows eligible=54, separated=12, unknown_executions=0, but construction_pairs_by_group is empty; the per-pair separation status could not be inspected in detail.",
+    "The 'hartford' lowercase assumption and the driver.Age 18..120 / Years_Working 0..20 ranges are explicit assumptions in the specification; they are implemented but their correctness against the original data cannot be verified from the supplied evidence.",
+    "The writer's per-row retry path (rows_skipped) masks composite-PK collisions; after the fix, re-run and confirm rows_skipped is empty for all tables."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `distinct_count_ok: {\"school_bus.School_ID\": 19}` out of 20 instances, and `distinct_count: {\"school_bus.School_ID\": 54}` (sum over 20 instances). The specification requires COUNT(DISTINCT school_bus.School_ID) in {1,2,3} per instance (post-condition (d), per_column_exceptions for school_bus.School_ID: 'restrict to at most 3 distinct parent values per instance and at least 1, verified per instance'). One instance therefore has 4+ distinct School_ID values, violating the stated post-condition. The cause is visible in instance.py: `_restrict_distinct_fk` caps distinct values, but `_repair_composite_pk` and `_repair_unmatched_parents` run afterwards and can redraw FK values from the full parent pool, reintroducing extra distinct values; `verify_instance` reports the failure but nothing repairs it.",
+     "requested_revision": "Make the school_bus.School_ID distinct-count restriction a hard post-condition: after composite-PK repair and unmatched-parent repair, re-apply the distinct-FK restriction (or constrain the repair pools to the chosen subset) so that every instance has 1..3 distinct school_bus.School_ID values, and have verify_instance fail/repair when the count is outside {1,2,3}. Re-run and confirm distinct_count_ok is 20/20."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `group_sizes: {\"driver.Home_city\": {\"has_1\": 20, \"has_2\": 14, \"has_ge3\": 20}}` and `aggregate_boundary: {\"driver.Home_city\": {\"has_1\": 20, \"has_2\": 14, \"has_3\": 9, \"has_4\": 4}}`. The specification requires group sizes 1, 2 and >=3 and COUNT(*) values 1,2,3,4 to be 'enforced and verified' per instance (per_column_exceptions for driver.Home_city). Only 14/20 instances have a group of size 2, and only 4/20 have a group of size 4. The enforcement in `_enforce_group_sizes`/`_enforce_aggregate_boundary` operates on the tail after `reserved` planted slots, but `_apply_null_rule` then NULLs some of those positions (Home_city is a NULL target), and `_replant`/`_enforce_duplicate_share` can collapse the planted groups, so the required group sizes are not guaranteed per instance.",
+     "requested_revision": "Protect the positions that realize the group-size and aggregate-boundary targets from NULL application and from duplicate-share collapse (as is already done for ties), or re-apply the enforcement after the NULL rule, so that every instance contains groups of size 1, 2, >=3 and COUNT(*) values 1,2,3,4 for driver.Home_city. Verify per instance and report 20/20."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `group_sizes: {\"driver.Age\": {\"has_1\": 20, \"has_2\": 18, \"has_ge3\": 16}}`. The specification requires group sizes 1, 2 and >=3 for driver.Age (per_column_exceptions: '39,40,41; group_sizes 1,2,>=3'). Only 18/20 instances have a size-2 group and 16/20 have a >=3 group. Same root cause as above: `_enforce_group_sizes` runs before `_apply_null_rule`, and Age is a NULL target, so NULLing removes members of the planted groups.",
+     "requested_revision": "Protect the group-size-realizing positions for driver.Age from NULL application (or re-apply group-size enforcement after the NULL rule) so every instance has groups of size 1, 2 and >=3. Verify per instance and report 20/20."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `ties: {\"driver.Name\": 39, \"driver.Home_city\": 28}` over 20 instances. The specification requires a tie at rank 1 for ORDER BY driver.Name ASC and ORDER BY driver.Home_city DESC in every instance (post-condition (b): 'each tie at rank 1 exists in the final column'). driver.Name has 39 tied rows over 20 instances (so at least one instance has no tie, since a tie needs >=2), and driver.Home_city has 28 (also below 2*20=40). `_enforce_tie` places the tied pair in the first two non-reserved slots, but `_apply_null_rule` and `_replant` can overwrite them (the `protected` tuple is passed, but `_enforce_duplicate_share` and `_enforce_group_sizes` run before the tie and can move values, and the tie is computed on the tail before NULLing).",
+     "requested_revision": "Guarantee the rank-1 tie per instance for both columns: compute the tie after all other enforcement, protect the tied positions from NULL application and replanting, and verify per instance that the tie exists (report 20/20 for each)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets` lists driver.Party as a NULL target, but `per_column_exceptions` for driver.Party says 'values only in {Dem, Rep}; no NULLs', and `NO_NULL_COLUMNS` in spec.py includes ('driver','Party'). The execution feedback shows `driver.Party: generated rows: NULL 0 / 240`, consistent with the exception but contradicting the `null_targets` list. The two parts of the specification are inconsistent.",
+     "requested_revision": "Remove driver.Party from `null_targets` (or remove the 'no NULLs' exception and NO_NULL_COLUMNS entry) so the specification is internally consistent. The supporting evidence ('Dem, Rep (no NULLs)') favors keeping the no-NULL rule and dropping it from null_targets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` states 'The NULL share follows the compact database's share per column (as implemented); the earlier 0.2 claim is removed. A nullable column with compact share 0 still gets exactly one NULL row per instance.' However, the execution feedback shows `school_bus.Years_Working: generated rows: NULL 36 / 100` (36% NULL) while the compact DB observed values are 2,3,6,8,10 with no NULLs, and `driver.Age: NULL 20 / 240` (8.3%) while observed Age values are 30..52 with no NULLs. The program's `_apply_null_rule` uses `schema.null_shares` from the compact DB, but the compact DB has no NULLs in these columns, so the 'at least one NULL' rule should give 1 per instance (20 total), not 36 for Years_Working. The 36 arises because `_enforce_different_values_per_group` and the NULL rule interact, and the share is computed over generated rows including the planted values. This is a specification/implementation mismatch on the NULL share.",
+     "requested_revision": "Clarify the NULL-share rule: if the compact share is 0, the program should plant exactly one NULL per instance (k = max(1, round(0*n)) = 1), not a share derived from generated rows. Fix `_apply_null_rule` to use the compact share (0) and the max(1, ...) rule, and document that the 'at least one NULL' rule applies. Re-run and confirm Years_Working NULL count is 20/100 (1 per instance) and Age is 20/240."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `unmatched_parents: {\"driver.Driver_ID\": 198, \"school.School_ID\": 112}` over 20 instances. The specification requires 'at least one parent row without children' per instance (post-condition (a)). 198/20 \u2248 9.9 and 112/20 \u2248 5.6, so on average there are unmatched parents, but the per-instance guarantee is not shown. `_repair_unmatched_parents` only acts when every parent is used; with 12 drivers and 5 school_bus rows, and 7 schools and 5 school_bus rows, it is possible for an instance to have all parents used (especially after `_restrict_distinct_fk` and `_repair_composite_pk`). The feedback aggregates over instances and does not prove the per-instance post-condition.",
+     "requested_revision": "Add a per-instance check in verify_instance that reports the minimum unmatched-parent count across instances (or a boolean per instance), and ensure `_repair_unmatched_parents` runs after all FK repairs (including `_restrict_distinct_fk` and `_repair_composite_pk`) so every instance has >=1 unmatched driver and >=1 unmatched school. Report 20/20."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: `different_values: {\"school_bus.Years_Working\": 24}` over 20 instances. The specification requires 'for each group by School_ID (and/or Driver_ID) with >=2 rows, assign >=2 distinct values' (post-condition (e)). 24 groups with >=2 distinct values over 20 instances is plausible but the feedback does not report the number of groups with >=2 rows, so it cannot be verified that every such group has >=2 distinct values. `_enforce_different_values_per_group` protects the first two positions of each group, but `_apply_null_rule` is re-applied afterwards with `protected` set, which should preserve them; however, `_repair_composite_pk` and `_repair_unmatched_parents` run after and can change School_ID values, regrouping rows and potentially breaking the per-group distinctness.",
+     "requested_revision": "Run `_enforce_different_values_per_group` after all FK repairs (composite-PK and unmatched-parent), and have verify_instance report the number of groups with >=2 rows and the number of those with >=2 distinct values, so the post-condition can be confirmed per instance."
+    }
+   ],
+   "unresolved_checks": [
+    "Per-instance (not aggregate) verification of unmatched parents, ties, group sizes, aggregate boundaries, and different-values-per-group is not reported; the feedback only gives sums over 20 instances, so per-instance post-conditions (a)-(e) cannot be fully confirmed.",
+    "The `construction_pairs` feedback shows 54 eligible, 12 separated, 0 unknown executions; the 42 unseparated pairs are not explained, and it is not shown whether they are due to missing value variation or genuine query equivalence. This does not by itself establish a generation error, but the engineer should confirm the intended value variation remains possible.",
+    "The `null_share` feedback for school_bus.Years_Working (36/100) and driver.Age (20/240) is inconsistent with the stated 'compact share 0 -> exactly one NULL' rule; needs clarification and re-run.",
+    "The specification's `null_targets` includes driver.Party while the exception and NO_NULL_COLUMNS exclude it; the designer must reconcile."
+   ]
+  }
+ ]
 }

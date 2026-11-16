@@ -1,5 +1,6 @@
 """Schema reading (upstream sql_util/dbinfo.py)."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ class ColumnMeta:
     pk_pos: int
     unique: bool
     checked: bool
+    check_texts: list = field(default_factory=list)
 
 
 @dataclass
@@ -22,6 +24,7 @@ class TableMeta:
     name: str
     columns: list
     primary_key: list
+    unique_groups: list = field(default_factory=list)
 
 
 @dataclass
@@ -34,6 +37,7 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    max_ids: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +62,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -75,8 +79,19 @@ def _first_token(line: str) -> str:
     return toks[0].strip('"`[](),') if toks else ''
 
 
+def _parse_unique_groups(create_sql: str, low_names: dict) -> list:
+    """Extract column lists of UNIQUE(...) constraints and column-level UNIQUE."""
+    groups = []
+    for m in re.finditer(r'unique\s*\(([^)]*)\)', create_sql, re.I):
+        cols = [c.strip().strip('"`[]').lower() for c in m.group(1).split(',')]
+        cols = [low_names[c] for c in cols if c in low_names]
+        if cols:
+            groups.append(cols)
+    return groups
+
+
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
-    """Read tables, columns, keys, FKs and original values read-only (sql_util/dbinfo.py:28-109, 185-233)."""
+    """Read tables, columns, keys, FKs and original values read-only."""
     con = sqlite3.connect('file:%s?mode=ro&immutable=1' % orig_path, uri=True)
     try:
         master = con.execute("select type, name, sql from sqlite_master where sql is not null order by rowid").fetchall()
@@ -88,24 +103,32 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
         for t in tnames:
             info = con.execute('pragma table_info(%s)' % q(t)).fetchall()
             low = {r[1].lower(): r[1] for r in info}
-            uniq, chk = set(), set()
+            uniq, chk = set(), {}
             for line in create[t].split('\n'):
                 ll = line.lower()
                 tok = _first_token(line).lower()
                 if 'unique' in ll and tok in low:
                     uniq.add(tok)
-                if ('check (' in ll or 'check(' in ll) and tok in low:
-                    chk.add(tok)
+                mm = re.search(r'check\s*\((.*)\)\s*,?\s*$', ll)
+                if mm and tok in low:
+                    chk.setdefault(tok, []).append(mm.group(1))
+            unique_groups = _parse_unique_groups(create[t], low)
             for idx in con.execute('pragma index_list(%s)' % q(t)).fetchall():
                 if idx[2]:
                     cols = con.execute('pragma index_info(%s)' % q(idx[1])).fetchall()
-                    if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
-                        uniq.add(cols[0][2].lower())
-                        from_index.append((t, cols[0][2]))
-            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
+                    names = [c[2] for c in cols if c[2]]
+                    if len(names) == 1 and names[0].lower() not in uniq:
+                        uniq.add(names[0].lower())
+                        from_index.append((t, names[0]))
+                    elif len(names) > 1:
+                        unique_groups.append(names)
+            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq,
+                               r[1].lower() in chk, chk.get(r[1].lower(), []))
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
-            tables[t] = TableMeta(t, cols, pk)
+            if len(pk) > 1:
+                unique_groups.append(list(pk))
+            tables[t] = TableMeta(t, cols, pk, unique_groups)
         tlow = {t.lower(): t for t in tables}
         fks: dict = {}
         for t in tnames:
@@ -122,7 +145,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, max_ids = {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -137,6 +160,9 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
                 ov[(t, c.name)] = [r[j] for r in rows]
+            for c in tables[t].columns:
+                vals = [v for v in ov[(t, c.name)] if isinstance(v, int)]
+                max_ids[(t, c.name)] = max(vals) if vals else 0
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, max_ids)

@@ -1,14 +1,4 @@
-"""Canonical atomic operations of a SQL query (sqlglot, SQLite dialect).
-
-``OpExtractor.keys(sql)`` returns a set of operation keys: TABLE(t) JOIN(a.c=b.d) JOIN_KIND(t, LEFT) PRED(text)
-SELECT(expr) DISTINCT GROUP(expr) HAVING(pred) ORDER(expr, ASC|DESC) LIMIT(n) OFFSET(n) SETOP(kind).  Sub-query
-ops carry a role prefix (in:, exists:, scalar:), set-operation sides set:/set_l:/set_r:, derived tables derived:.
-Only semantics-preserving rewrites are applied: aliases resolve to table names (a repeated table is t#2),
-unqualified columns are qualified from the schema, projection aliases and ordinals are resolved, numeric strings
-equal numbers, equality joins are unordered edges (ON, USING or WHERE) with their transitive closure, AND-conjuncts
-are separate ops, OR operands and IN lists are sorted, an OR-chain of equalities on one column is an IN list,
-comparisons are written column-first and COUNT(1) is COUNT(*).
-"""
+"""Canonical atomic operations of a SQL query (sqlglot, SQLite dialect)."""
 from __future__ import annotations
 
 import json
@@ -38,8 +28,8 @@ class Op:
 class _Scope:
     def __init__(self, parent: Optional["_Scope"] = None):
         self.parent = parent
-        self.alias: Dict[str, str] = {}             # written alias / table name (lower) -> canonical source name
-        self.tables: List[Tuple[str, str]] = []     # (canonical, real table name) base tables of this scope
+        self.alias: Dict[str, str] = {}
+        self.tables: List[Tuple[str, str]] = []
         self.select_alias: Dict[str, exp.Expression] = {}
         self.ctes: Dict[str, str] = dict(parent.ctes) if parent else {}
 
@@ -83,8 +73,7 @@ def _num_text(text: str) -> Optional[str]:
 
 
 class OpExtractor:
-    """Canonical op extraction. ``schema`` = {table: [columns]} of the database (names in any case); it is used to
-    qualify unqualified columns. Without a schema an unqualified column renders as ``?.col``."""
+    """Canonical op extraction."""
 
     def __init__(self, schema: Optional[Dict[str, List[str]]] = None):
         self.schema: Dict[str, Set[str]] = {str(t).lower(): {str(c).lower() for c in cols}
@@ -162,7 +151,7 @@ class OpExtractor:
                 ops.append(Op(f"{prefix}TABLE({canon})", "TABLE"))
             elif isinstance(src, exp.Table):
                 canon = scope.ctes[src.name.lower()]
-            else:  # derived table: merge its ops into this scope, projections tagged derived:
+            else:
                 inner = src.this if isinstance(src, exp.Subquery) else src
                 n0 = len(ops)
                 self._query(inner, _Scope(scope), prefix, ops)
@@ -384,7 +373,6 @@ class OpExtractor:
                         scopes[id(s_)] = self._sub_scope(s_, sc)
                     sc = scopes[id(s_)]
 
-        # sqlglot.transform does not descend into a replaced node: transform its children explicitly
         def sub(x):
             return None if x is None else x.transform(tx, copy=False)
 
@@ -396,7 +384,7 @@ class OpExtractor:
                     return self._normalise(sc.select_alias[name].copy(), sc, False)
                 if not n.table and n.this.args.get("quoted") and not any(
                         name in self.schema.get(real, ()) for _, real in sc.chain_tables()):
-                    return exp.Literal.string(n.name)      # sqlite reads an unknown "quoted" name as a string
+                    return exp.Literal.string(n.name)
                 ref = self._col(n, sc)
                 t, c = ref.rsplit(".", 1)
                 return exp.Column(this=exp.to_identifier(c, quoted=False), table=exp.to_identifier(t, quoted=False))
@@ -408,7 +396,7 @@ class OpExtractor:
                 return exp.Literal.number(num) if num is not None else n
             if isinstance(n, exp.Count) and isinstance(n.this, exp.Literal):
                 return exp.Count(this=exp.Star(), big_int=True)
-            if isinstance(n, exp.If) and not isinstance(n.parent, exp.Case):  # IIF(c, a, b)
+            if isinstance(n, exp.If) and not isinstance(n.parent, exp.Case):
                 return exp.Case(ifs=[exp.If(this=sub(n.this), true=sub(n.args.get("true")))],
                                 default=sub(n.args.get("false")))
             if isinstance(n, exp.Table):
@@ -494,10 +482,7 @@ def jaccard(a: Set[str], b: Set[str]) -> float:
 
 def load_ops_file(path: str) -> Tuple[Dict[Tuple[str, Any], List[Set[str]]],
                                       Dict[str, Dict[str, List[str]]], Dict[str, Any]]:
-    """Read a prebuilt op-set file {"meta", "schemas", "prompts": [{"dataset_name", "sample_id", "opsets"}]}.
-
-    Returns ({(dataset_name, sample_id): [gold op set, reference op sets...]}, schemas, meta).
-    """
+    """Read a prebuilt op-set file {"meta", "schemas", "prompts": [{"dataset_name", "sample_id", "opsets"}]}."""
     with open(path) as f:
         d = json.load(f)
     recs = {(p["dataset_name"], p["sample_id"]): [set(x) for x in p["opsets"]] for p in d["prompts"]}

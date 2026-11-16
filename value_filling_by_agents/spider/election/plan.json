@@ -1,50 +1,171 @@
 {
  "db": "election",
- "operator_io_quirks": [
-  "Mixed-case identifiers everywhere (County_Id, Party_ID, Lieutenant_Governor, US_Senate); must double-quote in generated SQL.",
-  "Table 'party' has a column also named 'Party' (same name as table) and 'election' has column 'Party' that is an FK to party.Party_ID \u2014 name collision between table and column.",
-  "Column 'Year' declared REAL but semantically a year; ts_fuzzer dispatches to Number (not Date) because type_str is 'real'.",
-  "Column 'First_Elected' declared REAL, holds years (1994..2006); Number fuzzer will produce floats in [-10^4,10^4] \u2014 implausible years.",
-  "Column 'Zip_code' declared TEXT but values are district codes 'D21','D08' \u2014 String fuzzer will not reproduce the D-prefix pattern.",
-  "Column 'Counties_Represented' TEXT with values like '09.1 9A','12.1 12A' \u2014 space-separated multi-token strings; String fuzzer treats as opaque.",
-  "Column 'Delegate' TEXT with comma+period names 'Bates, Gail H. Gail H. Bates' \u2014 long strings, String length range will be [min,max+1] of these.",
-  "Column 'US_Senate' contains literal '(no election)' \u2014 a sentinel string; String fuzzer may contaminate it.",
-  "All tables tiny (county=5, party=7, election=8 rows); original_values sampling k=min(5,len) will use nearly all rows.",
-  "FK election.District -> county.County_Id and election.Party -> party.Party_ID both parent_exists=true, non-null parents, unique PKs \u2014 clean FKs.",
-  "No NOT NULL, no CHECK, no UNIQUE constraints beyond PKs; no views/triggers/indexes in DDL.",
-  "All columns null_rate=0.0 in original; TS may still emit NULLs via FK-empty-parent path or String/Number dropout."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on County_Id/Party_ID/Election_ID (INT PKs): range [-10^4,10^4], int perturbation +-1/+-2; PK dedup keeps first occurrence, so sizes shrink toward distinct count.",
-  "Number fuzzer on Population (REAL): floats in [-10^4,10^4] \u2014 plausible magnitude but sign/decimals implausible vs 13300..90000.",
-  "Number fuzzer on Year/First_Elected (REAL): floats in [-10^4,10^4] \u2014 will produce negative years and non-integer years; drives FN on year-range predicates.",
-  "String fuzzer on County_name/Party/Governor/etc: random a-zA-Z0-9() strings length [min,max+1] of originals, plus 50% contaminate \u2014 implausible names, drives FN on equality/IN predicates.",
-  "String fuzzer on Zip_code: random strings, loses 'D' prefix pattern \u2014 FN on LIKE 'D%' style predicates.",
-  "String fuzzer on Counties_Represented: random strings, loses 'NN.N NX' multi-token structure \u2014 FN on string-split predicates.",
-  "FK election.Party draws from party.Party_ID final values; FK election.District draws from county.County_Id final values \u2014 ties preserved, so joins work.",
-  "Table sizes: choose_table_sizes gives ~30-230 rows per table (rand_lin) or level-based 1+30u then x4 capped 2500 \u2014 much larger than originals (5-8), so many duplicate non-PK values.",
-  "PK dedup on tiny tables: county/party/election PKs are INT with range 2*10^4, so ~all rows survive dedup; sizes stay near chosen n.",
-  "No unique non-PK columns, so drop_unique_duplicates is a no-op here.",
-  "Missing ties/duplicates: original has distinct=4-8 per column; TS generates many rows with repeated String values (from element pool) \u2014 may create ties the original lacks (FP on GROUP BY / DISTINCT predicates).",
-  "Implausible values (negative years, random names) drive FN on range/equality predicates; missing sentinel '(no election)' and 'D'-prefix codes drive FN on pattern predicates."
- ],
- "challenger_refs": [
-  "g8281d908",
-  "G6",
-  "G3",
-  "G5",
-  "G2",
-  "g1dd51bb9",
-  "G4",
-  "G1",
-  "g932030e0",
-  "gde7a9af5"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 1,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "Sequential integers starting at 1; never NULL; unique per table.",
+   "int_foreign_key": "Sample from parent primary-key pool; include NULL rows (nullable FK) and rows referencing missing parent ids (unmatched join rows).",
+   "int_numeric": "Uniform integer within observed min/max; include boundary values at listed literals and one step on each side.",
+   "real_numeric": "Uniform real within observed min/max; include boundary values at listed literals and one step on each side.",
+   "text_short": "Sample from observed distinct pool; include near-variants (case/whitespace changes) and duplicates to reach 20-50% duplicate share on DISTINCT columns.",
+   "text_nullable": "Sample from observed pool; plant NULL rows at 5-30% share; never replace planted NULL.",
+   "year_real": "Sample from observed year pool; integer-valued reals.",
+   "null_share": "For every nullable column, at least one NULL row per instance; share follows compact database share (0% observed but still plant >=1 NULL for nullable columns per instruction 10)."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "county.County_Id",
+    "pattern": "unmatched_join_rows, group_sizes, aggregate_boundary",
+    "targets": "Parent rows without children (county ids not referenced by election.District); group sizes 1, 2, >=3; HAVING COUNT(*) >= 2 boundary at 1,2,3."
+   },
+   {
+    "column": "election.Party",
+    "pattern": "unmatched_join_rows, group_sizes, ties_for_order_limit",
+    "targets": "Child rows with NULL FK and FK values not in party.Party_ID; group sizes 1,2,>=3; tie at rank 1 on ORDER(COUNT(*), DESC)."
+   },
+   {
+    "column": "election.Delegate",
+    "pattern": "duplicates_for_distinct, aggregate_boundary, null_rows",
+    "targets": "20-50% duplicate share on DISTINCT; HAVING COUNT(delegate) >= 2 boundary at 1,2,3; NULL share 5-30%."
+   },
+   {
+    "column": "election.District",
+    "pattern": "unmatched_join_rows, comparison_boundary",
+    "targets": "FK values not in county.County_Id and NULL FK; boundary values 0,1,2,3,4,99999,100000,100001."
+   },
+   {
+    "column": "party.Party_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": "Parent rows without children (party ids not referenced by election.Party)."
+   },
+   {
+    "column": "county.County_name",
+    "pattern": "group_sizes, duplicates_for_distinct, aggregate_boundary, ties_for_order_limit",
+    "targets": "Group sizes 1,2,>=3; 20-50% duplicate share; HAVING COUNT(*) >= 2 boundary; tie at ranks 1,1000,10000 on DESC order."
+   },
+   {
+    "column": "party.Party",
+    "pattern": "group_sizes, duplicates_for_distinct, ties_for_order_limit",
+    "targets": "Group sizes 1,2,>=3; 20-50% duplicate share; tie at rank 1 on ORDER(COUNT(*), DESC)."
+   },
+   {
+    "column": "county.Population",
+    "pattern": "rows_with_different_values, comparison_boundary",
+    "targets": ">=2 rows per group with different values; boundary values 93059,93060,93061,99999,100000,100001."
+   },
+   {
+    "column": "election.Committee",
+    "pattern": "duplicates_for_distinct",
+    "targets": "20-50% duplicate share on DISTINCT."
+   },
+   {
+    "column": "election.Election_ID",
+    "pattern": "null_in_count_column",
+    "targets": "NOT NULL column; COUNT(election_id) never counts NULL."
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "election.Party",
+    "parent_table": "party",
+    "parent_column": "Party_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "election.District",
+    "parent_table": "county",
+    "parent_column": "County_Id",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "county",
+    "column": "County_Id",
+    "formula": "County_Id > 0"
+   },
+   {
+    "table": "county",
+    "column": "Population",
+    "formula": "Population > 0"
+   },
+   {
+    "table": "party",
+    "column": "Party_ID",
+    "formula": "Party_ID > 0"
+   },
+   {
+    "table": "party",
+    "column": "Year",
+    "formula": "Year BETWEEN 1990 AND 2010"
+   },
+   {
+    "table": "election",
+    "column": "Election_ID",
+    "formula": "Election_ID > 0"
+   },
+   {
+    "table": "election",
+    "column": "First_Elected",
+    "formula": "First_Elected BETWEEN 1990 AND 2010"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "county": 5,
+   "party": 7,
+   "election": 8
+  },
+  "null_targets": [
+   "election.Delegate",
+   "election.District",
+   "election.Party"
+  ],
+  "supporting_evidence": {
+   "county.County_Id": "Rows 1-5 distinct, PK.",
+   "election.Party": "FK to party.Party_ID; values 1,2,3,4,7.",
+   "election.District": "FK to county.County_Id; values 1-4.",
+   "election.Delegate": "8 distinct values, no NULL observed but nullable.",
+   "party.Party_ID": "Rows 1-7 distinct, PK.",
+   "county.Population": "Values 13300-90000, all positive.",
+   "party.Year": "Values 1998,2002,2006.",
+   "election.First_Elected": "Values 1994,2002,2003,2006."
+  },
+  "uncertainty": "Observed NULL rates are 0% for all nullable columns; instruction 10 requires at least one NULL row per nullable column, so NULLs are planted despite 0% observed. Formula bounds for Year and First_Elected are inferred from observed range, not a declared constraint."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's semantic_rules_and_formulas include Year BETWEEN 1990 AND 2010 and First_Elected BETWEEN 1990 AND 2010, but the supporting_evidence only lists observed values (party.Year: 1998,2002,2006; election.First_Elected: 1994,2002,2003,2006) and the uncertainty field explicitly states these bounds are 'inferred from observed range, not a declared constraint'. The schema has no CHECK constraint on these columns.",
+     "requested_revision": "Mark the Year and First_Elected range rules as uncertain/inferred rather than hard semantic rules, or drop them from semantic_rules_and_formulas. They are not supported by the DDL and could over-constrain generated values (e.g. legitimate years outside 1990-2010 would be clamped away)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _apply_formula_bounds clamps Year and First_Elected into [1990,2010] and _apply_positive forces County_Id/Population/Party_ID/Election_ID > 0. These implement the designer's inferred rules, so the program is consistent with the specification as written; the concern is inherited from the designer's over-specified rules, not a program bug.",
+     "requested_revision": "No change required if the designer downgrades the inferred range rules; otherwise keep as-is. This is a note, not a blocking defect."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires the NULL share to follow the compact database's share per column. The compact database has 0% NULLs in all nullable columns (per specification uncertainty), yet the program plants NULLs at 5-30% for the three NULL_TARGETS (election.Delegate 31/160, election.District 25/160, election.Party 29/160) and 1 row per instance for all other nullable columns (20/100, 20/140, 20/160). This is consistent with instruction 10 (at least one NULL per nullable column) and the interface NULL rule, which permits planting NULLs despite 0% observed share.",
+     "requested_revision": "No change required; behavior matches the interface NULL rule and instruction 10. Noted for transparency."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 20/20 instances valid, 0 FK violations, 0 PK duplicates, 0 NOT NULL violations, 0 compact-row changes, reproducible (returncode 0, n_fail 0). rows_added county 100, party 140, election 160 = 5/7/8 per instance matching SPEC_SIZES. Boundary literals for election.District (0,1,2,3,4,99999,100000,100001) and county.Population (93059..100001) are injected via BOUNDARIES and NumberSampler.boundaries. FK dependencies (election.Party->party.Party_ID, election.District->county.County_Id) are drawn from parent key pools in fill_foreign_keys_consistently/_parent_key_pool. Unmatched-join rows are produced by planting NULL FKs and by drawing from compact+generated pools that may not cover all parent ids.",
+     "requested_revision": "No change required; value domains, dependencies, and integrity are implemented and verified by execution."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 90, separated 35, unknown_executions 0. Separation is partial (35/90), but per instruction 4 a missing separation alone does not establish a generation error. The remaining unseparated pairs may reflect genuine query equivalence or insufficient value variation; no evidence of a blocking defect.",
+     "requested_revision": "No change required for pass. If higher separation is desired, the designer could add more boundary literals or widen value domains, but this is not a blocking issue."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the inferred Year/First_Elected range rules are intended as hard constraints (designer should clarify).",
+    "Whether the 35/90 separation rate is acceptable for the intended test-suite coverage (not blocking per instruction 4)."
+   ]
+  }
+ ]
 }

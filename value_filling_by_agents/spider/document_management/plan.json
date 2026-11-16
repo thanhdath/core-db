@@ -1,61 +1,575 @@
 {
  "db": "document_management",
- "operator_io_quirks": [
-  "All identifiers are backtick-quoted in DDL; generated SQL must double-quote them (Roles, Users, Document_Structures, ...).",
-  "Mixed-case table names (Roles, Users, Document_Structures, Functional_Areas, Document_Sections_Images) \u2014 case-insensitive column lookup required.",
-  "Document_Structures and Functional_Areas have self-referential-looking parent_*_code columns but NO declared FK; they are plain VARCHAR(15) with values that happen to be codes (e.g. '1','6','8').",
-  "Document_Functional_Areas has NO primary key (pk=[]); upstream sample_fresh_primary_keys must handle empty PK (no dedup) and drop_unique_duplicates has nothing to drop.",
-  "Document_Sections_Images has composite PK (section_id, image_id) \u2014 composite-PK member gets max_l0=30 per spec 3.3.",
-  "All VARCHAR columns store text; INTEGER columns store integer \u2014 no storage/declared-type contradictions observed.",
-  "No NULLs anywhere (null_rate 0.0 on every column) despite several nullable columns; NOT NULL only on role_code, functional_area_description, document_structure_code, document_type_code, document_code, section_id, image_id.",
-  "Small tables (2\u201320 rows); original_values sampling of 5 with replacement will heavily repeat (Roles has 2 rows, Functional_Areas 3).",
-  "VARCHAR(15) PKs hold short numeric-looking strings ('1','5','6','8','9','217','349') \u2014 String fuzzer will add str(i\u00b11) neighbours and contaminate.",
-  "user_login holds '0'/'1' (2 distinct) while user_name holds dotted names \u2014 String fuzzer treats both identically.",
-  "password holds 40-char hex hashes; image_url holds http URLs; section_title only 'after'/'before' \u2014 String fuzzer will not preserve these shapes.",
-  "No views/triggers/indexes beyond PKs in DDL; empty-clone creation is straightforward."
- ],
- "operator_ts_expectations": [
-  "All VARCHAR columns dispatch to String fuzzer (charset a-zA-Z 0-9() plus contamination) \u2014 role_code, document_code, section_code, image_url, password all get random strings, destroying the numeric-code / URL / hex-hash shapes.",
-  "INTEGER columns (user_id, image_id, section_id, access_count, section_sequence) dispatch to Number fuzzer with scale=0, precision=0 \u2192 range [-1,1] plus \u00b11/\u00b12 perturbation; access_count (1864..8208) and section_sequence (4510..9847) will be wildly implausible.",
-  "Number fuzzer's list_max quirk (overwrite with full-range max) means even with original values in the pool, fresh draws dominate the small [-1,1] range.",
-  "String fuzzer's int-like neighbour addition (str(i+1), str(i-1)) will produce plausible-looking codes for document_code/section_code but not for password/url.",
-  "FK role_code (Users\u2192Roles), document_structure_code (Documents\u2192Document_Structures), document_code (Document_Functional_Areas, Document_Sections\u2192Documents), functional_area_code (DFA\u2192Functional_Areas), section_id/image_id (DSI\u2192Document_Sections/Images) are filled from parent's final values \u2014 good referential integrity, but parent PKs are random strings so children inherit random strings.",
-  "Document_Functional_Areas has no PK \u2192 no dedup \u2192 many duplicate (document_code, functional_area_code) pairs; original has 15 rows / 11 distinct document_code, so duplicates are plausible but TS will over-produce them.",
-  "Document_Sections_Images composite PK dedup keeps first occurrence; with random section_id/image_id from parents, collisions are rare so ~n rows survive.",
-  "Self-referential-looking parent_document_structure_code / parent_functional_area_code are NOT FKs \u2192 filled by String fuzzer independently, breaking the tree structure (parent codes won't match any document_structure_code).",
-  "Expected FN drivers: queries filtering access_count > 1000, section_sequence ranges, or LIKE 'http%' / hex-pattern passwords will find no matching rows in TS instances.",
-  "Expected FP drivers: queries relying on the tree (parent_document_structure_code = document_structure_code) or on document_type_code \u2208 {Book,Paper,Advertisement,CV} will see random strings and may spuriously match/differ.",
-  "Small parent tables (Roles=2, Functional_Areas=3) mean FK children collapse onto few values; joins produce tiny results, amplifying result_eq sensitivity."
- ],
- "challenger_refs": [
-  "G1",
-  "g171effdc",
-  "g171effdc",
-  "g171effdc",
-  "g171effdc",
-  "g171effdc",
-  "g171effdc",
-  "g171effdc",
-  "G2",
-  "G3",
-  "G4",
-  "gb25b653d",
-  "gb25b653d",
-  "gb25b653d",
-  "gb25b653d",
-  "gb25b653d",
-  "g0cbe5a5e",
-  "g0cbe5a5e",
-  "g0cbe5a5e",
-  "g0cbe5a5e",
-  "G5",
-  "g2223c6bf"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 4,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential from 1, unique per table; never NULL. When appending to a compact DB, start above max(compact PK) so generated PKs never collide.",
+   "varchar_pk": "Short unique token: prefix of table abbreviation + zero-padded counter (e.g. 'D001'); never NULL. When appending, skip any token already present in the compact DB. If a per_column_exceptions enum must occupy the PK column, emit only enum values not already present in the compact DB; if the enum domain is exhausted, keep fresh tokens and record the shortfall.",
+   "varchar_fk": "Copy from the FINAL parent key pool (generated + compact) after all parent post-processing; nullable FKs get NULL share ~10% and at least one NULL row; every non-NULL value must exist in the written parent table.",
+   "short_code": "Random token of 1-3 alphanumeric chars from a small pool; duplicates allowed unless PK.",
+   "description_text": "Random phrase from a small pool of 3-8 words; duplicates allowed.",
+   "name_text": "Random person-like or title-like string; duplicates allowed.",
+   "url_text": "http://<random-host>/<n>.jpg; choose host/path pools so the distinct-value count yields a 20-50% duplicate share.",
+   "hash_text": "40-char lowercase hex string.",
+   "integer_count": "Uniform integer in [0, 10000]; NULL share 0 unless nullable.",
+   "integer_sequence": "Uniform integer in [1000, 9999].",
+   "nullable_text": "Non-NULL value from pool; NULL share per compact-database share (fallback ~10%) with at least one NULL row.",
+   "near_variant": "For LIKE/equality literals: include exact literal, one prefix/suffix variant, one case variant, one near-miss (e.g. 'CV','CV x','cv','CW').",
+   "boundary_numeric": "For each listed literal L: include L-1, L, L+1 (or step-appropriate neighbors).",
+   "tie_order": "Ensure at least two rows share the ORDER key value at the listed rank; plant the tie AFTER any aggregate adjustment that could change the key, and re-verify the aggregate target afterwards.",
+   "duplicate_distinct": "Choose the number of distinct values so the duplicate share falls in [20%, 50%]; use d = int(n*0.7) (mid-range) rather than the upper bound so the share stays valid under table-size jitter; compute the share on non-NULL values only and assert it after the NULL rule.",
+   "null_share": "Nullable columns: NULL share from the compact database's per-column share; at least one NULL row per column per instance; never replace a planted NULL to satisfy a rule; never NULL a row that carries a planted construction target (tie, group-size representative, SUM-boundary row, boundary literal). Protection is keyed by (table, column) and scoped to the owning table.",
+   "append_model": "table_sizes_per_instance counts GENERATED rows appended to the compact DB. All construction targets (group sizes, ties, SUM boundary, duplicate shares, unmatched parents) are realized on the generated rows only; the program must verify each target on the generated rows and must not rely on compact rows to satisfy them. Generated PKs must not collide with compact PKs.",
+   "sum_target_construction": "Set the target SUM first: counts[i] = target // n, remainder to the first rows, all within [0,10000]. Then plant the rank-1 tie by lowering two rows to the minimum and compensating the difference on other rows within [0,10000]. Apply the delta in one step (or spread it) \u2014 no bounded-step loop. Recompute the SUM over non-NULL rows after the NULL rule and assert it equals the target.",
+   "group_size_construction": "Assign distinct domain values to the size-1, size-2 and size->=3 groups deterministically; distribute the remainder without merging into the size-1 or size-2 groups; verify the resulting group-size multiset contains 1, 2 and >=3 (and 4, 5 where the domain allows).",
+   "unmatched_parent_construction": "Construct unmatched-parent targets explicitly on the generated rows and assert after FK assignment that at least one parent row has no child."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Documents.document_type_code",
+    "pattern": "enum",
+    "targets": [
+     "Book",
+     "Paper",
+     "Advertisement",
+     "CV"
+    ]
+   },
+   {
+    "column": "Documents.document_type_code",
+    "pattern": "group_sizes",
+    "targets": [
+     "groups of size 1, 2, 3, 4, 5, >=3"
+    ]
+   },
+   {
+    "column": "Documents.document_type_code",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "HAVING(COUNT(*) > 0)",
+     "HAVING(COUNT(*) > 1)",
+     "HAVING(COUNT(*) > 2)",
+     "HAVING(COUNT(*) > 3)",
+     "HAVING(COUNT(*) > 4)",
+     "HAVING(COUNT(*) > 5)"
+    ]
+   },
+   {
+    "column": "Documents.document_type_code",
+    "pattern": "aggregate_boundary_trivial",
+    "targets": [
+     "HAVING(COUNT(*) > -2)"
+    ]
+   },
+   {
+    "column": "Documents.document_type_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share"
+    ]
+   },
+   {
+    "column": "Documents.access_count",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "SUM > 9999",
+     "SUM >= 10000",
+     "SUM > 10000",
+     "SUM > 10001"
+    ]
+   },
+   {
+    "column": "Documents.access_count",
+    "pattern": "aggregate_boundary_trivial",
+    "targets": [
+     "SUM > -5429"
+    ]
+   },
+   {
+    "column": "Documents.access_count",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1 ASC"
+    ]
+   },
+   {
+    "column": "Documents.document_structure_code",
+    "pattern": "group_sizes",
+    "targets": [
+     "groups of size 1, 2, >=3"
+    ]
+   },
+   {
+    "column": "Documents.document_structure_code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1 ASC and DESC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "Documents.document_structure_code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent Document_Structures rows without children"
+    ]
+   },
+   {
+    "column": "Documents.document_name",
+    "pattern": "like_near_variant",
+    "targets": [
+     "%CV%",
+     "%CV",
+     "CV",
+     "CW",
+     "CV x",
+     "cv",
+     "x CV"
+    ]
+   },
+   {
+    "column": "Documents.document_code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent Documents rows without children"
+    ]
+   },
+   {
+    "column": "Users.user_login",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "0",
+     "1",
+     "2"
+    ]
+   },
+   {
+    "column": "Document_Structures.document_structure_code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1 ASC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "Document_Structures.document_structure_code",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent rows without children"
+    ]
+   },
+   {
+    "column": "Users.role_code",
+    "pattern": "group_sizes",
+    "targets": [
+     "groups of size 1, 2, >=3 (relaxed to domain size)"
+    ]
+   },
+   {
+    "column": "Users.role_code",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 1 DESC on COUNT(*)"
+    ]
+   },
+   {
+    "column": "Document_Sections.section_title",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share on non-NULL values"
+    ]
+   },
+   {
+    "column": "Images.image_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share on non-NULL values"
+    ]
+   },
+   {
+    "column": "Images.image_url",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50% duplicate share on non-NULL values"
+    ]
+   },
+   {
+    "column": "Roles.role_code",
+    "pattern": "group_sizes",
+    "targets": [
+     "groups of size 1, 2, >=3 (relaxed to domain size)"
+    ]
+   },
+   {
+    "column": "Roles.role_code",
+    "pattern": "enum",
+    "targets": [
+     "DBA",
+     "PROJ-MGR"
+    ]
+   },
+   {
+    "column": "Functional_Areas.functional_area_description",
+    "pattern": "enum",
+    "targets": [
+     "Signature",
+     "Acknowledgement",
+     "Keep blank"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Users.role_code",
+    "parent_table": "Roles",
+    "parent_column": "role_code",
+    "copied": []
+   },
+   {
+    "child": "Documents.document_structure_code",
+    "parent_table": "Document_Structures",
+    "parent_column": "document_structure_code",
+    "copied": []
+   },
+   {
+    "child": "Document_Functional_Areas.document_code",
+    "parent_table": "Documents",
+    "parent_column": "document_code",
+    "copied": []
+   },
+   {
+    "child": "Document_Functional_Areas.functional_area_code",
+    "parent_table": "Functional_Areas",
+    "parent_column": "functional_area_code",
+    "copied": []
+   },
+   {
+    "child": "Document_Sections.document_code",
+    "parent_table": "Documents",
+    "parent_column": "document_code",
+    "copied": []
+   },
+   {
+    "child": "Document_Sections_Images.section_id",
+    "parent_table": "Document_Sections",
+    "parent_column": "section_id",
+    "copied": []
+   },
+   {
+    "child": "Document_Sections_Images.image_id",
+    "parent_table": "Images",
+    "parent_column": "image_id",
+    "copied": []
+   },
+   {
+    "child": "Document_Structures.parent_document_structure_code",
+    "parent_table": "Document_Structures",
+    "parent_column": "document_structure_code",
+    "copied": []
+   },
+   {
+    "child": "Functional_Areas.parent_functional_area_code",
+    "parent_table": "Functional_Areas",
+    "parent_column": "functional_area_code",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Documents",
+    "column": "document_type_code",
+    "formula": "document_type_code IN ('Book','Paper','Advertisement','CV')"
+   },
+   {
+    "table": "Documents",
+    "column": "access_count",
+    "formula": "access_count >= 0"
+   },
+   {
+    "table": "Users",
+    "column": "role_code",
+    "formula": "role_code IN (SELECT role_code FROM Roles)"
+   },
+   {
+    "table": "Document_Structures",
+    "column": "parent_document_structure_code",
+    "formula": "parent_document_structure_code IS NULL OR parent_document_structure_code IN (SELECT document_structure_code FROM Document_Structures)"
+   },
+   {
+    "table": "Functional_Areas",
+    "column": "parent_functional_area_code",
+    "formula": "parent_functional_area_code IS NULL OR parent_functional_area_code IN (SELECT functional_area_code FROM Functional_Areas)"
+   },
+   {
+    "table": "Document_Sections",
+    "column": "section_sequence",
+    "formula": "section_sequence > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Roles": 2,
+   "Users": 15,
+   "Document_Structures": 5,
+   "Functional_Areas": 3,
+   "Images": 15,
+   "Documents": 15,
+   "Document_Functional_Areas": 15,
+   "Document_Sections": 15,
+   "Document_Sections_Images": 20
+  },
+  "null_targets": [
+   "Document_Structures.parent_document_structure_code",
+   "Functional_Areas.parent_functional_area_code",
+   "Documents.access_count",
+   "Documents.document_name",
+   "Document_Sections.section_sequence",
+   "Document_Sections.section_code",
+   "Document_Sections.section_title",
+   "Images.image_alt_text",
+   "Images.image_name",
+   "Images.image_url",
+   "Users.user_name",
+   "Users.user_login",
+   "Users.password",
+   "Roles.role_description"
+  ],
+  "supporting_evidence": [
+   "Documents.document_type_code enum from sample: Book, Paper, Advertisement, CV.",
+   "Documents.access_count sample values 1864..8208 all >= 0.",
+   "Users.role_code sample values PROJ-MGR, DBA match Roles.role_code.",
+   "Document_Structures.parent_document_structure_code sample values 1,6,8 are existing codes.",
+   "Functional_Areas.parent_functional_area_code sample value 8 is an existing code.",
+   "Document_Sections.section_sequence sample values 4510..9847 all > 0."
+  ],
+  "uncertainty": [
+   "No formula found for any calculated column; all columns are independent or FK-copied.",
+   "Document_Sections.section_title has only 2 distinct observed values ('after','before'); treated as free text with a controlled 20-50% duplicate share on non-NULL values; additional distinct titles may be synthesized to reach the target.",
+   "Users.user_login values are stored as the strings '0','1','2'; boundary targets 0,1,2 are realized as both equality and >= comparisons (SQLite type affinity makes numeric comparison work). The column is VARCHAR(40) with numeric-string content; comparisons rely on SQLite affinity.",
+   "SQLite LIKE is ASCII case-insensitive by default, so the 'cv' variant matches '%CV%'.",
+   "No date columns present, so no order rules needed.",
+   "FK assignment must run after all parent post-processing and be validated against the final written parent key sets (generated + compact); fk_violations must be 0.",
+   "Group-size and tie targets must be realized on the actual FK value domain of the GENERATED rows; Users.role_code and Roles.role_code use the 2 available roles, so the >=3 group size is relaxed to what the domain allows.",
+   "SUM boundary and rank-1 tie on Documents.access_count must be verified by construction after the SUM adjustment and after the NULL rule (NULLs excluded from SUM); assert the final SUM equals the target and at least two non-NULL rows share the minimum. No silent approximate fallback.",
+   "The NULL rule must not overwrite rows carrying planted construction targets; protect only the load-bearing rows (tie rows, SUM-boundary rows, boundary literals, group-size representatives), not all rows, so at least one NULL row per nullable column is achievable.",
+   "Unmatched-parent targets (Document_Structures without Documents children, Documents without Document_Sections children) must be constructed explicitly on the generated rows and asserted after FK assignment.",
+   "Images.image_name distinct pool must be extended (or synthesized) to at least 12 entries so the 20-50% duplicate share target is met by construction for n=15.",
+   "table_sizes_per_instance counts generated rows appended to the compact DB; generated PKs must not collide with compact PKs (integer PKs offset above max(compact), varchar PKs skip existing tokens).",
+   "Roles.role_code enum overwrite must skip tokens already present in the compact DB; if the compact DB already contains 'DBA' and 'PROJ-MGR', the generated Roles rows keep fresh tokens and the enum shortfall is recorded."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback reports fk_violations=252 and validity.invalid=19/20 with reason 'new_integrity_failures'. The writer (writer.py) sets 'pragma foreign_keys = OFF' and inserts generated rows without validating FK targets. instance.py's _post_* functions overwrite FK columns with values drawn from in-memory pools (e.g. _post_documents sets document_structure_code from inst['Document_Structures'] codes, _post_users sets role_code from Roles codes) but these post-processing steps run AFTER fill_foreign_keys_consistently and can produce values that do not exist in the parent table as actually written (e.g. when parent rows were dropped by sample_fresh_primary_keys/drop_unique_duplicates, or when _post_roles rewrites Roles.role_code to only ['DBA','PROJ-MGR'] while Users.role_code was already assigned from the pre-post Roles pool).",
+     "requested_revision": "Ensure every generated FK value references an actually-written parent row: run FK assignment (or re-assignment) after all parent post-processing, or validate/repair FK columns against the final parent key sets before writing. Do not disable FK enforcement as a workaround; the generated instances must satisfy the schema's FK constraints (fk_violations must be 0)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _post_roles forces Roles.role_code to exactly ['DBA','PROJ-MGR'] (n=2), but _post_users assigns Users.role_code from _assign_group_sizes over the Roles pool. With only 2 roles and 15 users, the spec target 'groups of size 1, 2, >=3' for Users.role_code cannot be realized (max 2 groups). Similarly _post_document_structures uses STRUCTURE_CODES of length 5 while Documents.document_structure_code group-size targets require >=3 groups; the mapping 'structs[g % len(structs)]' collapses distinct group labels onto the same structure code, so the intended group-size distribution (1,2,>=3) is not guaranteed. The execution feedback shows construction_pairs separated=19/57, consistent with several group-size/tie patterns not being realized.",
+     "requested_revision": "Make group-size and tie construction operate on the actual FK value domain: choose the number of distinct parent keys large enough to host the required group sizes (e.g. ensure Document_Structures has >=3 distinct codes used by Documents, and Users.role_code uses >=3 distinct roles or relax the target to what the domain allows), and assign group labels directly to the FK values rather than via modulo mapping. Verify by construction that each targeted group size (1, 2, >=3) and each tie-at-rank-1 (ASC and DESC) actually occurs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _post_documents adjusts access_count to hit a SUM target with 'counts[-1] = max(MIN, min(MAX, counts[-1] + delta))'. Because the clamp can prevent reaching the target, the SUM boundary (9999/10000/10001) is not guaranteed. Also the tie-at-rank-1 ASC is set before this adjustment, and the adjustment can change counts[-1] to a value below the current minimum, breaking the tie. The spec requires both 'SUM > 9999 / >= 10000 / > 10001' and 'tie at rank 1 ASC' simultaneously.",
+     "requested_revision": "Compute the SUM target first, then plant the tie on the final minimum (or plant the tie after the SUM adjustment), and verify the achieved SUM equals the chosen target (or document that the target is only approximate). Add an assertion/check in the generator that the SUM boundary and the rank-1 tie both hold."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _post_images builds image_url as 'http://<host>/<i%4+1>.jpg' with only 8 hosts and 4 path numbers, giving at most 32 distinct URLs for 15 rows; the spec requires 20-50% duplicate share on Images.image_url. With 15 rows and <=32 possible values, duplicates are likely but the share is not controlled. Similarly _post_document_sections sets section_title from only ['after','before'] (2 values) for 15 rows, which yields ~93% duplicate share, far above the 20-50% target. The spec's duplicates_for_distinct target is '20-50%'.",
+     "requested_revision": "Control the duplicate share explicitly: for each DISTINCT-target column, choose the number of distinct values so that the duplicate share falls in [20%, 50%] (e.g. for n=15, use 8-12 distinct values), and verify the share by construction. Do not rely on small pools that force a share outside the target range."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's per_column_exceptions include 'Documents.document_type_code enum [Book, Paper, Advertisement, CV]' and 'Roles.role_code enum [DBA, PROJ-MGR]', but the extracted atomic operations also list 'Documents.document_type_code aggregate_boundary HAVING(COUNT(*) > 1/2/4)' and 'duplicates_for_distinct 20-50%'. With only 4 document types and 15 documents, the aggregate boundaries >1, >2, >4 are all satisfiable, but the spec does not state the required group-size distribution for document_type_code (unlike document_structure_code). The construction feedback shows construction_pairs separated=19/57, and the group-size/tie patterns for document_type_code are not explicitly realized in _post_documents (types are assigned round-robin then shuffled, which gives roughly equal groups but not guaranteed 1/2/>=3).",
+     "requested_revision": "Add an explicit group-size target for Documents.document_type_code (e.g. groups of size 1, 2, >=3) to the specification, and implement it in _post_documents analogously to document_structure_code. Also clarify whether the aggregate boundaries >1/>2/>4 are meant to be simultaneously satisfiable (they are, given 4 types and 15 rows) and record the intended group sizes."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification lists 'Users.user_login comparison_boundary targets [0,1,2]' and the program sets user_login to ['0','1','2'] round-robin. However, the extracted atomic operations show 'scalar:PRED(users.user_login = 1)' and 'PRED(users.user_login >= 1)' \u2014 these are numeric comparisons on a VARCHAR column. The spec's uncertainty note says 'Users.user_login observed values 0,1 suggest small integer-like strings; boundary targets 0,1,2 applied.' This is a reasonable interpretation, but the spec does not state whether user_login should be stored as strings '0','1','2' or integers, and the program stores strings. The comparison boundary is satisfied either way under SQLite's type affinity, but the spec should be explicit.",
+     "requested_revision": "State explicitly in the specification that Users.user_login values are the strings '0','1','2' (or integers), and confirm the boundary targets 0,1,2 are realized as both equality and >= comparisons. No program change needed if strings are intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires 'for every nullable column ... each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share for that column and at least one NULL row per nullable column'. The execution feedback shows nullable_columns with NULL counts, e.g. 'Documents.access_count: generated rows: NULL 24 / 252' (~9.5%), 'Users.password: NULL 3 / 48' (~6%), 'Images.image_url: NULL 4 / 50' (8%). These are near 10% but the spec says the share should follow the compact database's share, not a fixed 10%. The program uses a fixed NULL_SHARE=0.10 in _apply_null_rule, ignoring the compact database's per-column NULL share.",
+     "requested_revision": "Compute the NULL share per nullable column from the compact database (schema.original_values) and use that share in _apply_null_rule, with at least one NULL row per nullable column. If the compact share is 0 for a column, still plant at least one NULL row per the interface rule, but otherwise follow the observed share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _post_document_structures assigns parent_document_structure_code as 'NULL or rng.choice(codes)' where codes are the generated structure codes. But the self-FK repair loop in build_random_instance only runs for 'pt == t' before post-processing; after _post_document_structures rewrites document_structure_code, the parent values may reference codes that were dropped by sample_fresh_primary_keys/drop_unique_duplicates. This contributes to the fk_violations=252. Similarly _post_functional_areas assigns parent_functional_area_code from generated codes without re-validating against the final Functional_Areas.functional_area_code set.",
+     "requested_revision": "After all post-processing, re-validate self-FK columns (Document_Structures.parent_document_structure_code, Functional_Areas.parent_functional_area_code) against the final parent key sets, replacing invalid references with NULL or a valid parent code. Add a post-write FK check that asserts zero violations."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs separated=19/57 indicates many targeted patterns are not separated by the generated instances; without held-out query pairs it is not possible to confirm which specific patterns are unrealized, but the group-size/tie/SUM-boundary issues above are the likely causes.",
+    "The compact database's per-column NULL shares were not provided in the input; the program's fixed 10% share cannot be verified against the compact share without that data.",
+    "The specification's 'Documents.document_name like_near_variant' targets include '%CV%', '%CV', 'CV', 'CW', 'CV x', 'cv', 'x CV'; the program's DOC_NAME_VARIANTS includes 'David CV', 'CV', 'CV x', 'x CV', 'cv', 'CW', 'CV report' but not the literal '%CV%' or '%CV' patterns (these are LIKE patterns, not stored values, so this is likely fine, but the spec should clarify that the stored values are the unquoted variants)."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows massive rows_skipped: Roles 20/20, Document_Structures 93, Functional_Areas 59, Document_Functional_Areas 302, Document_Sections 229, Document_Sections_Images 20, Images 114, Documents 111, Users 94. Only Roles/Users/Images/Documents got any rows added (0 for Roles). The writer copies the compact DB and appends generated rows; PK collisions with compact rows cause the batch to fail and fall back to row-by-row, where most rows are rejected. The spec's table_sizes_per_instance (Roles=2, Document_Structures=5, Functional_Areas=3, etc.) is meant to describe the *instance* size, but the program treats it as *rows to append* on top of the compact DB, so PKs collide and the intended per-instance sizes/patterns are never realized.",
+     "requested_revision": "Reconcile the append model with the spec: either (a) generate fresh PKs that do not collide with compact rows (e.g. offset integer PKs above max(compact), and use distinct varchar PK tokens not present in the compact DB), or (b) make the spec explicit that table_sizes_per_instance counts *generated* rows and adjust the per-column pattern targets (group sizes, ties, duplicate shares, SUM boundary) to be realized on the generated rows only. As written, the construction targets (group sizes 1/2/>=3, rank-1 ties, SUM>=10000, duplicate shares) are computed over the generated rows but the compact rows dominate the actual table, so the patterns are not realized in the written instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_documents` sets `counts[0]=m; counts[1]=m` to plant the rank-1 ASC tie *after* the SUM adjustment, which changes the SUM away from the chosen ACCESS_SUM_TARGETS (9999/10000/10001). The spec explicitly requires 'plant the tie AFTER any aggregate adjustment that could change the key' and 'SUM boundary and rank-1 tie ... must be verified by construction after the SUM adjustment'. The code does the opposite order and never re-verifies the SUM. Also the delta-distribution loop caps at `n*4` iterations and silently accepts an approximate target ('if still off ... accept approximate target'), so the SUM boundary is not guaranteed.",
+     "requested_revision": "Compute the SUM target first, then plant the tie by choosing the minimum value such that two rows share it while preserving the SUM (e.g. pick the two smallest rows and set both to a value that keeps the total at the target, or adjust other rows to compensate). Assert the final SUM equals the target and that at least two rows share the minimum. Remove the silent 'accept approximate target' fallback or make it a hard error."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_assign_group_sizes_to_domain` maps only the first three group ids to the three chosen domain values and maps all remaining groups to `rng.choice(domain)`. This does not guarantee the required 'groups of size 1, 2 and >=3' on the *actual* FK domain: the extra groups can collapse onto the same domain value, producing e.g. two size-1 groups and no size-2 group, or merging into a size-4 group. The spec's uncertainty note says group-size targets must be realized on the actual FK value domain. Same issue applies to `_post_users` (role_code) and `_post_documents` (document_type_code, document_structure_code).",
+     "requested_revision": "Assign domain values to groups deterministically so that exactly one group has size 1, one has size 2, and at least one has size >=3, using distinct domain values for those three groups and distributing the remainder without merging them into the size-1 or size-2 groups. Verify the resulting group-size multiset contains 1, 2, and >=3."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_post_images` builds `url_pool` of length d but the URL string is `'http://%s/%d.jpg' % (host, i % 4 + 1)`; with 8 hosts and i%4+1 in {1,2,3,4}, distinct URLs = min(d, 8*4)=d only if d<=32, which holds for n=15 (d\u22488-12), so URLs are distinct \u2014 but `image_name` uses `spec.IMAGE_NAMES[:d]` where IMAGE_NAMES has only 8 entries; for n=15, `distinct_count_for_share(15)` returns d_hi = int(15*0.8)=12, so `names_pool` is truncated to 8, giving duplicate share (15-8)/15\u224847% (within range) but the intended d is not reached. More importantly, `_post_document_sections` synthesizes `'title%d'` values beyond the observed pool ('after','before'), which is acceptable per the spec's uncertainty note, but `_post_images` silently caps distinct count below the target without noting it.",
+     "requested_revision": "Either extend IMAGE_NAMES to at least 12 entries, or synthesize additional distinct names (as done for section titles) so the duplicate share target is met by construction. Document the cap in the spec if intentional."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `per_column_exceptions` lists `Documents.document_type_code` aggregate_boundary targets as `HAVING(COUNT(*) > 1)`, `> 2`, `> 4`, but the extracted atomic operations also include `HAVING(COUNT(*) > -2)` and `HAVING(COUNT(*) > 0)` (values 0 and -2). The spec omits these boundary values, so the program cannot be verified against them. Similarly `Documents.access_count` aggregate_boundary lists `SUM > 9999`, `>= 10000`, `> 10001` but the extracted ops include `SUM > -5429`, `>= 10000`, `> 10000`, `> 9999`, `> 10001` \u2014 the negative boundary (-5429) is not covered.",
+     "requested_revision": "Add the missing boundary values (COUNT(*) > 0, COUNT(*) > -2, SUM > -5429) to the per-column exceptions, or explicitly state they are trivially satisfied by any non-empty group and need no construction. Clarify which boundaries are construction targets vs. incidental."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `null_targets` includes `Documents.access_count`, `Documents.document_name`, `Document_Sections.section_sequence`, `Document_Sections.section_code`, `Document_Sections.section_title`, `Images.image_alt_text`, `Images.image_name`, `Images.image_url`, `Users.user_name`, `Users.user_login`, `Users.password`, `Roles.role_description`, `Document_Structures.parent_document_structure_code`, `Functional_Areas.parent_functional_area_code`. But the schema declares `Document_Sections.section_sequence`, `section_code`, `section_title` as nullable (no NOT NULL), and `Images.image_alt_text/name/url` nullable \u2014 consistent. However `Documents.access_count` is nullable in schema but the spec's semantic rule `access_count >= 0` combined with NULL rule means NULLs are allowed; the program's `_apply_null_rule` runs after `_post_documents` and may NULL out the planted tie rows (counts[0], counts[1]), destroying the rank-1 tie. The spec says 'never replace a planted NULL to satisfy a rule' but does not say 'never NULL a planted tie'.",
+     "requested_revision": "Add a spec rule that the NULL rule must not overwrite rows carrying planted construction targets (ties, group-size representatives, SUM-boundary rows), or run the NULL rule before planting ties/group sizes and re-verify. Currently `_apply_null_rule` can NULL `access_count[0]`/`[1]`, breaking the tie target."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_apply_null_rule` computes `k = max(1, min(k, n))` and samples `k` indices uniformly, but for `Documents.access_count` the compact share may be 0 (all non-NULL in compact), giving k=1 \u2014 yet the execution feedback shows 'Documents.access_count: generated rows: NULL 18 / 252', i.e. ~7% NULL, which is plausible. However the feedback also shows `Images.image_url: NULL 3/50` and `Users.user_login: NULL 4/52` \u2014 these are fine. The real issue: `_apply_null_rule` is applied to *all* nullable columns including FK columns (`Document_Structures.parent_document_structure_code`, `Functional_Areas.parent_functional_area_code`), and `_validate_fks` allows NULL, so that's OK. But `_apply_null_rule` runs *after* `_assign_fks`, so a FK value that was assigned a valid parent key can be NULLed \u2014 acceptable per NULL rule. No blocking error here, but note the tie-destruction risk above.",
+     "requested_revision": "No change required for NULL share itself; see the tie-preservation issue."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_post_users` sets `user_login` to `['0','1','2']` cycled and shuffled, but `_apply_null_rule` then NULLs ~10% of them. The spec's comparison_boundary target for `Users.user_login` is values 0,1,2 \u2014 with NULLs present, the boundary rows still exist among non-NULL rows, so this is satisfied. However `_post_users` does not ensure at least one row with each of 0,1,2 survives the NULL rule; with n=15 and ~10% NULL, probability of losing all of one value is low but not zero. Minor.",
+     "requested_revision": "Optionally guarantee at least one non-NULL row per boundary value after the NULL rule (e.g. exclude boundary rows from NULL sampling)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_post_document_structures` assigns `parent_document_structure_code` from `codes` (the generated codes) with NULL share, but the compact DB's `Document_Structures` rows are also present in the written instance. `_final_parent_keys` merges generated + compact keys, so FK validity holds. But the spec's `unmatched_join_rows` target for `Document_Structures.document_structure_code` requires 'parent rows without children' \u2014 i.e. some Document_Structures rows not referenced by any Documents row. With `_assign_group_sizes_to_domain` mapping all Documents rows to a subset of structs, some structs may be unreferenced, but this is not guaranteed by construction. The execution feedback shows Document_Structures rows_skipped=93 (all rejected), so no generated structs exist; only compact structs are present, and whether they are unreferenced depends on compact data.",
+     "requested_revision": "Explicitly construct at least one Document_Structures row (and one Documents row) that is not referenced by any child, and verify by construction. Same for `Documents.document_code` unmatched_join_rows (parent Documents without Document_Sections children)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `uncertainty` note says 'Users.user_login values are stored as the strings 0,1,2; boundary targets 0,1,2 are realized as both equality and >= comparisons (SQLite type affinity makes numeric comparison work)'. But the extracted atomic ops show `PRED(users.user_login = 1)`, `PRED(users.user_login >= 1)`, `PRED(users.user_login = 1)` \u2014 the spec should state whether the column is TEXT or INTEGER affinity in the compact DB, since `user_login VARCHAR(40)` with values '0','1','2' compared to integer 1 relies on SQLite affinity. This is a semantic ambiguity that affects whether the boundary is meaningful.",
+     "requested_revision": "Clarify in the spec whether user_login is intended to hold numeric strings and whether comparisons are numeric or string; if numeric, consider declaring the column INTEGER or documenting the affinity reliance."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's Documents.access_count SUM already exceeds 10000 (making the SUM boundary trivially satisfied regardless of generated rows) \u2014 not verifiable from the provided feedback.",
+    "Whether the compact DB's Document_Structures rows include at least one unreferenced parent (needed for unmatched_join_rows) \u2014 not verifiable from the provided feedback.",
+    "Whether the compact DB's Documents rows include at least one without Document_Sections children \u2014 not verifiable from the provided feedback.",
+    "The construction_pairs feedback shows 18/57 separated with 0 unknown executions; the remaining 39 pairs are not separated, but per instruction 4 this alone does not prove a generation error. However, given the massive rows_skipped, many patterns are likely unrealized in the written instances; a per-pattern verification (group sizes, ties, SUM, duplicate shares) on the written DBs is needed to confirm."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with AssertionError('access_count SUM target not reached: sum=62859 target=10001') etc. In instance.py `_post_documents`, the SUM adjustment loop is bounded by `max_steps = n * 20` and only moves one unit per step; with n=15 and a random start sum in [0,10000]*15 (mean ~75000), the delta to a target of ~10000 is tens of thousands, so the loop exhausts its step budget and the final direct adjustment `counts[j] - diff` is rejected by the `ACCESS_COUNT_MIN <= newv <= ACCESS_COUNT_MAX` guard. The assertion then fires and no instance is written (n_ok=0, n_instances=0).",
+     "requested_revision": "Fix the SUM construction so it always reaches the target: e.g. set the target sum first and distribute it across rows (counts[i] = target // n, remainder to first rows), then plant the rank-1 tie by lowering two rows to the minimum and compensating the difference on other rows within [0,10000]; or compute the delta directly and apply it in one step to a single row when it fits, otherwise spread it. Remove the bounded-step loop that can silently fail. Re-run and confirm n_ok == n_instances and rows_added populated."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_roles` overwrites `role_code` (a varchar PK) with enum values ['DBA','PROJ-MGR'] for n=2 generated rows, but the compact DB already contains role_code values 'PROJ-MGR' and 'DBA' (per supporting_evidence). The writer appends these rows to a copy of the compact DB, so the INSERT will hit a PRIMARY KEY collision on Roles.role_code. The spec's append_model requires generated PKs not to collide with compact PKs; `fresh_pk_values` is bypassed here. Same risk for `_post_document_structures`/`_post_functional_areas` if compact codes overlap the generated tokens, though those use fresh_pk_values.",
+     "requested_revision": "Do not overwrite the fresh PK with enum values that may already exist in the compact DB. Either (a) keep the fresh PK tokens and store the enum in a non-PK column, or (b) if the enum must be the PK, skip tokens already present in the compact DB and only emit the enum values that are free (and adjust the group-size target accordingly, as the spec already relaxes Users.role_code). Verify no PK collision by construction and assert it before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_users` sets `protected = {'user_login': set(range(n))}` and returns it, but `build_random_instance` merges post-processing protection via `protected.setdefault('columns', {}).update(prot)` only when `prot` is truthy; `_post_users` returns `(protected, {})` so it is merged. However `_post_document_structures` and `_post_functional_areas` return `({}, protected)` \u2014 the second element is treated as `extra` and merged into `protected['columns']`, which is then applied to *every* table whose column name matches. `parent_document_structure_code` and `parent_functional_area_code` are distinct names so this happens to be harmless, but the mechanism is fragile and the `_post_users` protection is keyed by column name only, so a same-named column in another table would be wrongly protected. More importantly, `_apply_null_rule` is called per table with `col_prot` built from `protected['columns']` filtered by `cname in inst[t]`; since `user_login` only exists in Users this works, but the design conflates per-table and per-column protection.",
+     "requested_revision": "Key protection by (table, column) rather than column name alone, and have each post-processing function return protection scoped to its own table. This prevents accidental cross-table protection and makes the NULL rule auditable."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_documents` sets `protected = {'access_count': set(range(n))}` protecting all rows from NULL, but the spec's null_targets includes `Documents.access_count` and the NULL rule requires at least one NULL row per nullable column. Because every access_count row is protected, `_apply_null_rule` finds `candidates` empty for access_count and skips it, so no NULL is ever generated for access_count. The spec's uncertainty note says the NULL rule must not overwrite construction-target rows, but the SUM-boundary and tie rows are a subset; protecting all n rows over-protects.",
+     "requested_revision": "Protect only the rows that actually carry the SUM-boundary/tie construction (e.g. the two tie rows and any row whose value is load-bearing for the SUM), and allow the remaining rows to receive NULL per the compact share. Ensure at least one NULL row for access_count while keeping the SUM target and tie intact (NULLs are excluded from SUM in SQL, so recompute the target over non-NULL rows)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_document_structures` and `_post_functional_areas` assign `parent_*` values from `all_codes = list(compact) + codes`, but `_assign_fks` later runs and for self-FKs `_final_parent_keys` includes both compact and generated codes, so values remain valid. However `_ensure_unmatched_parents` only handles Document_Structures->Documents and Documents->Document_Sections; the spec's unmatched_join_rows for `Document_Structures.document_structure_code` (parent rows without children) is handled, but the spec also lists `Documents.document_code` unmatched (parent Documents without Document_Sections children) \u2014 handled \u2014 yet the `Document_Structures` self-FK parent rows without children is not a listed target. The bigger gap: `_ensure_unmatched_parents` repoints children only if *all* parents have children; if some parent already lacks children it does nothing, which is fine, but it never verifies the target holds after `_assign_fks` re-randomizes FK values. Since `_assign_fks` runs before `_ensure_unmatched_parents`, the repointing is preserved, but there is no assertion that the unmatched-parent target actually holds.",
+     "requested_revision": "Add explicit post-construction assertions that at least one Document_Structures row has no Documents child and at least one Documents row has no Document_Sections child, computed on the final generated rows, and raise if not met (consistent with the spec's 'verify by construction' requirement)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `per_column_exceptions` lists `Documents.document_type_code` aggregate_boundary targets `HAVING(COUNT(*) > 1)`, `> 2`, `> 4` and trivial `> 0`, `> -2`, but the extracted atomic operations show `HAVING(COUNT(*) > 2)`, `> 4`, `> -2`, `> 1` with values [0,1,2,3,4,5]. The spec omits `> 0` and `> 3`/`> 5` boundaries present in the value set. Similarly `Documents.access_count` spec lists `SUM > 9999`, `>= 10000`, `> 10000`, `> 10001` but the extracted ops include `SUM >= 10000` and `SUM > -5429`; the spec's `ACCESS_SUM_TARGETS = [10000, 10001, 10002]` does not guarantee `SUM > 10001` (needs sum >= 10002, which is included) but does not guarantee `SUM > 9999` and `SUM >= 10000` simultaneously unless sum >= 10000 \u2014 satisfied. The `> 0` and `> 3` COUNT boundaries are not covered by the group-size assignment (which only guarantees sizes 1, 2, >=3).",
+     "requested_revision": "Extend the group-size construction for document_type_code to also realize a group of size 4 and 5 (or document that `> 3`/`> 5` are satisfied by the >=3 group only if its size reaches 4/5), and add the missing `> 0` trivial boundary explicitly. Align the spec's boundary lists with the extracted atomic operations."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `uncertainty` states Users.user_login values are stored as strings '0','1','2' and comparisons rely on SQLite affinity. The extracted ops show `PRED(users.user_login = 1)`, `>= 1`, `= 1` with values [0,1,2]. The program sets `USER_LOGIN_VALUES = ['0','1','2']` and protects all rows from NULL, but the spec's null_targets includes `Users.user_login`, so the NULL rule is violated for user_login (all rows protected, no NULL). This is the same over-protection pattern as access_count.",
+     "requested_revision": "Protect only the boundary rows (the rows holding '0','1','2') from NULL, and allow other user_login rows to receive NULL per the compact share, ensuring at least one NULL row. Since n=15 and only 3 boundary values are needed, there is ample room for NULLs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_images` and `_post_document_sections` build duplicate-share pools via `spec.distinct_count_for_share(n)` with n=15, returning d_hi = int(15*0.8)=12, so 12 distinct values over 15 rows gives duplicate share 3/15=20%, at the lower bound. The spec requires 20-50%; 20% is inclusive but the construction uses `names_pool[i % len(names_pool)]` which yields exactly 12 distinct only if the pool has >=12 entries; `IMAGE_NAMES` has 16 and `SECTION_TITLES` has 16, so 12 distinct is achieved. However `_post_images` also sets `image_url` from `url_pool(d)` with d=12, and `url_pool` cycles hosts; with 8 hosts and 12 URLs, `i // len(IMAGE_HOSTS) + 1` gives paths 1 and 2, producing 12 distinct URLs \u2014 OK. But `image_alt_text` is not a duplicate-share target and is shuffled from an 8-element pool over 15 rows, giving 8 distinct (duplicate share 47%) \u2014 not a listed target, so acceptable. No blocking error here, but the 20% lower bound is fragile if table size jitter reduces n.",
+     "requested_revision": "Use a mid-range distinct count (e.g. d = int(n*0.7)) rather than the upper bound d_hi, so the duplicate share sits comfortably inside [20%,50%] and remains valid under the \u00b12 table-size jitter. Add a post-construction assertion of the duplicate share per column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_documents` assigns `document_name` from `spec.DOC_NAMES` and overwrites the first `len(DOC_NAME_VARIANTS)` entries with variants, then shuffles. `DOC_NAME_VARIANTS` includes 'David CV', 'CV', 'CV x', 'x CV', 'cv', 'CW', 'CV report' \u2014 7 variants for n=15, so all variants appear. The spec's like_near_variant targets `%CV%`, `%CV`, and the near-miss set; 'CW' is a near-miss for `%CV%`? 'CW' does not contain 'CV', so `LIKE '%CV%'` excludes it \u2014 correct as a near-miss. 'cv' matches `%CV%` only under case-insensitive collation; SQLite LIKE is case-insensitive for ASCII by default, so 'cv' matches \u2014 acceptable. No blocking error, but the spec's `near_variant` rule says include exact literal, prefix/suffix variant, case variant, near-miss; the program includes all. OK.",
+     "requested_revision": "No change required; note that LIKE case-sensitivity depends on SQLite's default (ASCII case-insensitive), which the spec's uncertainty should state explicitly so the 'cv' variant is understood to match `%CV%`."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_post_document_sections` sets `section_sequence = rng.randint(1, 9999)` satisfying `> 0`, and `section_code` as a 2-digit string. The spec's null_targets includes `Document_Sections.section_sequence`, `section_code`, `section_title`; `_apply_null_rule` will NULL them per compact share, but `section_title` is a duplicate-share target and NULLing rows changes the distinct count. The duplicate share is computed before NULLing, so after NULLing the share may fall outside [20%,50%] (NULLs count as a distinct value in DISTINCT).",
+     "requested_revision": "Apply the NULL rule before computing/planting the duplicate-share target, or exclude NULL rows from the duplicate-share computation and re-verify the share on non-NULL rows. Add an assertion that the duplicate share on non-NULL values is in [20%,50%]."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact DB's Roles table already contains 'DBA' and 'PROJ-MGR' (supporting_evidence says yes) \u2014 if so, the Roles PK collision is certain; if the compact DB uses different codes, the collision may not occur but the enum overwrite still bypasses fresh-PK logic.",
+    "Whether `_ensure_unmatched_parents` targets actually hold after `_assign_fks` for all seeds \u2014 no assertion is present, so this is unverified.",
+    "Whether the duplicate-share targets remain in [20%,50%] after the NULL rule is applied to section_title, image_name, image_url \u2014 not verified by construction.",
+    "Whether the `Document_Structures` self-FK and `Functional_Areas` self-FK NULL shares match the compact DB's per-column share \u2014 the program uses `spec.NULL_SHARE` (0.10) rather than the compact share for these, and `_apply_null_rule` is skipped for them because they are already assigned in post-processing (not re-NULLed), so the compact share is not honored.",
+    "Whether `Documents.access_count` NULL share can be honored at all given the SUM target \u2014 NULLs are excluded from SUM, so the target must be recomputed over non-NULL rows; the program does not do this."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_added shows Document_Functional_Areas: 0, Document_Sections: 0, Document_Sections_Images: 0, while rows_skipped shows Document_Functional_Areas: 302, Document_Sections: 299, Document_Sections_Images: 20. The spec's table_sizes_per_instance requires 15/15/20 generated rows for these tables. In instance.py, build_random_instance builds cols for every table including these, but _assign_fks sets FK columns to None when the parent key pool is empty, and _apply_null_rule then NULLs NOT NULL FK columns (Document_Functional_Areas.document_code/functional_area_code, Document_Sections.document_code, Document_Sections_Images.section_id/image_id are all NOT NULL). The writer then rejects every row (rows_skipped), so these tables receive zero generated rows. Root cause: _assign_fks runs before _apply_null_rule and _apply_null_rule does not skip NOT NULL columns that were set to None by FK assignment; also _apply_null_rule's `if cm.notnull or cm.pk_pos > 0: continue` should prevent this, but the FK columns are being set to None in _assign_fks and then the NOT NULL check in _apply_null_rule is bypassed because the column is already None \u2014 actually the check does skip them, so the None values come from _assign_fks when parent_keys is empty. Either way, the NOT NULL FK columns end up None and every row is rejected.",
+     "requested_revision": "Ensure _assign_fks never leaves a NOT NULL FK column as None: if the parent key pool is empty, the parent table must have generated rows first (it does \u2014 Documents and Document_Sections are generated), so the empty-pool branch should not trigger. Investigate why _final_parent_keys returns empty for Documents.document_code and Document_Sections.section_id at FK-assignment time (likely because _post_documents/_post_document_sections run after _assign_fks in the loop order, or because the FK assignment for Document_Sections.document_code runs before Documents.document_code is populated). Reorder so all parent post-processing completes before _assign_fks, and add an assertion that every NOT NULL FK column has zero None values before writing. Verify rows_added for Document_Functional_Areas, Document_Sections, Document_Sections_Images match table_sizes_per_instance (15/15/20)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: Roles.role_description: generated rows: NULL 23 / 23 \u2014 every generated Roles row has NULL role_description. In _post_roles, cols['role_description'] = [spec.ROLE_DESCRIPTIONS.get(c) for c in codes]. When the compact DB already contains 'DBA' and 'PROJ-MGR' (the spec's uncertainty note anticipates this), free is empty and codes = fresh PK tokens (e.g. 'R001'), so ROLE_DESCRIPTIONS.get('R001') returns None for every row. The NULL rule then cannot add non-NULL values, and the column is 100% NULL. The spec's null_targets includes Roles.role_description and the interface rule requires rows with non-NULL values as well.",
+     "requested_revision": "When the enum domain is exhausted and fresh tokens are used, assign a non-NULL role_description (e.g. cycle through ROLE_DESCRIPTIONS values or a description pool) so the column has both NULL and non-NULL generated rows. Add an assertion that every nullable column has at least one non-NULL generated row."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: construction_pairs separated = 18 of 57 eligible. The spec's per_column_exceptions list many construction targets (group sizes 1/2/>=3 on Documents.document_type_code, Documents.document_structure_code, Users.role_code, Roles.role_code; ties at rank 1 on Documents.access_count, Documents.document_structure_code, Document_Structures.document_structure_code, Users.role_code; SUM boundaries; duplicate shares; unmatched parents; LIKE near-variants; comparison boundaries). Only 18 pairs separated. In particular, _post_roles overwrites role_code with enum values but does not construct group sizes 1/2/>=3 on Roles.role_code (spec requires it, relaxed to domain size \u2014 with 2 roles the >=3 group is impossible, but the spec says 'relaxed to domain size', so at least sizes 1 and 2 should appear; the code assigns free.pop(0) then fresh tokens, which may not produce a size-2 group). _post_users assigns group sizes on Users.role_code but the domain is the generated Roles codes, which may be only 2 values, so >=3 is impossible and the code's _assign_group_sizes_to_domain relaxes to alternating \u2014 acceptable per spec, but the tie at rank 1 DESC on COUNT(*) for Users.role_code is not constructed. _post_document_structures does not construct the tie at rank 1 ASC on COUNT(*) for Document_Structures.document_structure_code (spec requires it). _post_documents constructs the access_count tie but the SUM target is chosen from ACCESS_SUM_TARGETS = [10000, 10001, 10002], which satisfies SUM>9999, SUM>=10000, SUM>10000, but SUM>10001 requires target >= 10002 \u2014 only one of three targets satisfies it, so the boundary is not reliably separated.",
+     "requested_revision": "Implement the missing construction targets: (a) Roles.role_code group sizes 1 and 2 (relaxed); (b) Users.role_code tie at rank 1 DESC on COUNT(*); (c) Document_Structures.document_structure_code tie at rank 1 ASC on COUNT(*); (d) ensure ACCESS_SUM_TARGETS always includes a value > 10001 (e.g. 10002) or construct the SUM so all four boundaries (SUM>9999, SUM>=10000, SUM>10000, SUM>10001) are separated by choosing target=10002 deterministically; (e) verify the LIKE near-variant set on Documents.document_name actually produces rows matching '%CV%' vs '%CV' differently (the current DOC_NAME_VARIANTS includes 'CV' and 'CV x' and 'x CV' and 'cv' and 'CW' and 'David CV' and 'CV report' \u2014 '%CV' matches 'David CV' and 'CV' but not 'CV x' or 'x CV' or 'CV report', so the pair should separate; confirm it is in the 18 separated pairs). Add assertions for each construction target on the generated rows."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec per_column_exceptions lists Documents.document_type_code aggregate_boundary targets HAVING(COUNT(*) > 0..5) and aggregate_boundary_trivial HAVING(COUNT(*) > -2). The extracted atomic operations show pairs with HAVING(COUNT(*) > 2), > 4, > -2, > 1. The spec's group_sizes target for Documents.document_type_code is 'groups of size 1, 2, 3, 4, 5, >=3' \u2014 with 4 enum values (Book, Paper, Advertisement, CV) and n=15, groups of size 1,2,3,4,5 are achievable (1+2+3+4+5=15), but the code's _assign_group_sizes_to_domain only constructs sizes 1, 2, >=3, not the full 1,2,3,4,5 multiset. The spec is internally consistent (4 enum values can host 5 groups only if one value hosts two groups, which is impossible \u2014 5 groups need 5 distinct values). This is a spec inconsistency: 4 enum values cannot produce 5 distinct group sizes.",
+     "requested_revision": "Either relax the Documents.document_type_code group_sizes target to 'groups of size 1, 2, >=3' (matching the 4-value enum domain) or add a fifth enum value. Update the spec and the code's _assign_group_sizes_to_domain accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: nullable_columns shows Document_Structures.document_structure_description: NULL 20/98, but the spec's null_targets does NOT include Document_Structures.document_structure_description. The column is nullable in the schema (no NOT NULL), so the NULL rule applies, but the spec's null_targets list omits it. This is a spec omission, not a program error \u2014 the program correctly applies the NULL rule to all nullable columns. However, the spec's null_targets should list all nullable columns for consistency.",
+     "requested_revision": "Add Document_Structures.document_structure_description to the spec's null_targets list (it is nullable and the program already handles it)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "In _post_documents, the access_count tie protection returns {'access_count': set(tie_idx)} where tie_idx is computed from counts BEFORE the NULL rule. But _apply_null_rule runs after _assign_fks and _ensure_unmatched_parents, and the protected set is keyed by (table, column) \u2014 the code maps function name to table name via tmap, but _post_documents returns {'access_count': ...} and the tmap lookup uses fn.__name__[len('_post_'):] = 'documents', which maps to 'Documents'. This works. However, the SUM target is verified in _build_access_counts BEFORE the NULL rule, and the NULL rule may NULL some access_count rows (20/307 per feedback), changing the SUM over non-NULL rows. The spec's uncertainty note says 'Recompute the SUM over non-NULL rows after the NULL rule and assert it equals the target.' The code does NOT recompute or assert the SUM after the NULL rule \u2014 _build_access_counts asserts before, and _apply_null_rule may NULL non-tie rows, breaking the SUM target.",
+     "requested_revision": "After _apply_null_rule, recompute SUM(access_count) over non-NULL generated rows and assert it equals the chosen target (or re-plant the SUM after the NULL rule). Protect all SUM-boundary rows from NULLing, not just the tie rows, or recompute the SUM after NULLing and adjust non-NULL rows to restore the target."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 18 separated construction pairs include the LIKE near-variant pair on Documents.document_name ('%CV%' vs '%CV') \u2014 the feedback does not break down which pairs separated.",
+    "Whether the access_count SUM boundary pairs (SUM>9999, SUM>=10000, SUM>10000, SUM>10001) are among the separated pairs given the target pool [10000, 10001, 10002] and the NULL rule potentially changing the SUM.",
+    "Whether the Document_Structures.document_structure_code tie at rank 1 ASC on COUNT(*) is constructed \u2014 the code does not appear to plant it.",
+    "Whether the Users.role_code tie at rank 1 DESC on COUNT(*) is constructed \u2014 the code does not appear to plant it.",
+    "Whether the Roles.role_code group sizes 1 and 2 are constructed \u2014 the code assigns enum values then fresh tokens without explicit group-size construction."
+   ]
+  }
+ ]
 }

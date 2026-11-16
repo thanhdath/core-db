@@ -4,8 +4,48 @@ import re
 import string
 
 _MAX = 2 ** 31 - 1
-CHARSET = string.ascii_letters + ' ' + string.digits + '()'
+_LOWER = string.ascii_lowercase
+_UPPER = string.ascii_uppercase
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_DT_LO = dt.datetime(1970, 1, 1, 0, 0, 0)
+_DT_HI = dt.datetime(2015, 12, 31, 23, 59, 59)
+
+
+def _case_flip(s: str) -> str:
+    return s.swapcase()
+
+
+def _one_char_variants(s: str) -> list:
+    """One-character edits: drop a char, or substitute a char."""
+    out = []
+    if not s:
+        return out
+    for i in range(len(s)):
+        out.append(s[:i] + s[i + 1:])
+    for i in range(len(s)):
+        c = s[i]
+        rep = 'a' if c != 'a' else 'b'
+        out.append(s[:i] + rep + s[i + 1:])
+    return out
+
+
+def _boundary_variants(literals: list, rng) -> list:
+    """For each literal: itself, case-flip, one-char near-variants; numeric literal-1/literal/literal+1."""
+    out = []
+    for v in literals:
+        s = str(v)
+        out.append(s)
+        out.append(_case_flip(s))
+        out.extend(_one_char_variants(s))
+        if re.fullmatch(r'-?\d+', s):
+            i = int(s)
+            out.extend([str(i - 1), str(i), str(i + 1)])
+    seen, res = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res
 
 
 class ColumnSampler:
@@ -19,7 +59,7 @@ class ColumnSampler:
         self.fresh: list = []
 
     def _fresh_or_reuse(self, draw):
-        if len(self.fresh) > self.max_l0:
+        if self.max_l0 is not None and len(self.fresh) > self.max_l0 and self.fresh:
             return self.rng.choice(self.fresh)
         v = draw()
         self.fresh.append(v)
@@ -40,7 +80,8 @@ class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
     def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
-        super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
+        nums = [f for f in (_num(e) for e in elements) if f is not None]
+        super().__init__(nums, p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
         hi = min(10 ** scale, _MAX)
         self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
@@ -71,20 +112,33 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped); spec varchar domains by construction."""
 
-    def __init__(self, elements, p, max_l0, rng, length=20):
+    def __init__(self, elements, p, max_l0, rng, length=20, kind='short'):
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
         for e in els:
             if re.fullmatch(r'-?\d+', e):
                 extra += [str(int(e) + 1), str(int(e) - 1)]
         super().__init__(els + extra, p, max_l0, rng)
-        self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
-                            if self.elements else (0, length))
+        self.kind = kind
+        if kind == 'name':
+            self.lo, self.hi = 3, 12
+        elif kind == 'long':
+            self.lo, self.hi = 1, 20
+        else:
+            self.lo, self.hi = 1, 12
+        if self.elements:
+            self.lo = min(self.lo, min(map(len, self.elements)))
+            self.hi = max(self.hi, max(map(len, self.elements)) + 1)
 
     def _rand(self, k):
-        return ''.join(self.rng.choice(CHARSET) for _ in range(k))
+        """Generate a random string of length k; 'name' kind forces first char uppercase."""
+        if k <= 0:
+            return ''
+        if self.kind == 'name':
+            return self.rng.choice(_UPPER) + ''.join(self.rng.choice(_LOWER) for _ in range(k - 1))
+        return ''.join(self.rng.choice(_LOWER) for _ in range(k))
 
     def sample(self):
         r = self.rng
@@ -118,36 +172,40 @@ def _parse_date(s: str):
 
 
 class DateSampler(ColumnSampler):
-    """fuzz/date.py + utils/data_parser.py (an ELEMENT is returned w.p. p)."""
+    """fuzz/date.py + utils/data_parser.py; spec datetime domain 1970-01-01 .."""
 
     def __init__(self, elements, p, max_l0, rng):
-        super().__init__(elements, p, max_l0, rng)
-        self.p = p
-        self.as_int = bool(self.elements) and all(isinstance(e, int) for e in self.elements)
-        strs = [str(e) for e in self.elements]
-        self.template, parsed = None, []
-        for s in strs:
-            t, d = _parse_date(s)
+        parsed = []
+        ints = []
+        for e in elements:
+            if e is None:
+                continue
+            if isinstance(e, dt.datetime):
+                parsed.append(e)
+                continue
+            _, d = _parse_date(str(e))
             if d is not None:
-                self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
-        self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
-        self.n_parsed = len(set(parsed))
-        self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
+            elif re.fullmatch(r'-?\d+', str(e)):
+                ints.append(int(e))
+        self.as_int = bool(elements) and all(re.fullmatch(r'-?\d+', str(e)) for e in elements if e is not None)
+        corp = ints if self.as_int else [d.strftime('%Y-%m-%d %H:%M:%S') for d in parsed]
+        super().__init__(corp, p, max_l0, rng)
+        self.template = '%Y-%m-%d %H:%M:%S'
+        self.full = (_DT_LO, _DT_HI)
+        uniq = sorted(set(parsed))
+        self.rng_dates = (uniq[0], uniq[-1]) if len(uniq) >= 2 else self.full
+        self.n_parsed = len(uniq)
 
     def _draw(self):
         r = self.rng
         lo, hi = self.full if (r.random() < self.p or self.n_parsed <= 1) else self.rng_dates
         d = lo + dt.timedelta(seconds=r.randint(0, int((hi - lo).total_seconds())))
         s = d.strftime(self.template)
-        if self.strip0:
-            s = re.sub(r'(^|[-/ :])0(\d)', r'\1\2', s)
         return int(s) if self.as_int and s.isdigit() else s
 
     def sample(self):
-        if self.elements and self.rng.random() < self.p:
+        if self.elements and self.rng.random() >= self.p:
             return self.rng.choice(self.elements)
         return self._fresh_or_reuse(self._draw)
 
@@ -210,15 +268,19 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
             scale = max(args[0] - prec, 0)
         return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
     if any(k in t for k in ('char', 'text', 'blob')):
-        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
+        kind = 'name' if 'name' in column.name.lower() else ('long' if args and args[0] > 80 else 'short')
+        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20, kind=kind)
     return StringSampler(els, p, max_l0, rng)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224; spec boundary variants added to the pool."""
     ov = list(original_values)
-    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    pool = sorted({str(v) for v in literal_pool})
+    if pool:
+        pool = _boundary_variants(pool, rng)
+    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + pool
     if column.checked:
         p = 0.0
     if max_l0 == float('inf') and rng.random() < 0.5:

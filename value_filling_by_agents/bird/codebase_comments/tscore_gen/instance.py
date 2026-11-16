@@ -1,98 +1,184 @@
-"""Random instance construction (fuzz/fuzz.py:83-196)."""
-from .values import _init_sampler
+"""In-memory instance construction (FK order, null rule, boundaries, ties, group sizes)."""
+from __future__ import annotations
+
+import random
+
+from .sampler import (
+    sample_text, sample_ticks, sample_was_compiled, sample_comment_is_xml,
+    sample_stars, sample_forks, sample_watchers, sample_lang, sample_lang_boundary,
+)
+from .spec import (
+    TABLE_SIZES, NULL_SHARES, LANG_BOUNDARY,
+    STARS_HEAVY, STARS_HEAVY_MIN_ROWS,
+    URL_POOL, PATH_POOL, NAME_POOL, TYPE_POOL, PARAM_NAME_POOL,
+    COMMENT_POOL, SUMMARY_POOL, API_POOL, TOKENIZED_POOL,
+)
 
 
-def _filter(columns: dict, keep: list) -> dict:
-    return {c: [v[i] for i in keep] for c, v in columns.items()}
+def _null_share(table: str, column: str) -> float:
+    return NULL_SHARES.get((table, column), 0.15)
 
 
-def sample_fresh_primary_keys(table_meta, columns: dict) -> dict:
-    """Drop rows whose PK tuple repeats, first occurrence kept (fuzz.py:188-190)."""
-    if not table_meta.primary_key or not columns:
-        return columns
-    n = len(next(iter(columns.values())))
-    seen, keep = set(), []
-    for i in range(n):
-        k = tuple(columns[c][i] for c in table_meta.primary_key)
-        if k not in seen:
-            seen.add(k)
-            keep.append(i)
-    return _filter(columns, keep)
+def _maybe_null(rng: random.Random, value, share: float):
+    if rng.random() < share:
+        return None
+    return value
 
 
-def drop_unique_duplicates(table_meta, columns: dict) -> dict:
-    """Drop rows repeating any single unique column value (fuzz.py:192-195)."""
-    for cm in table_meta.columns:
-        if cm.unique and cm.name in columns:
-            seen, keep = set(), []
-            for i, v in enumerate(columns[cm.name]):
-                if v not in seen:
-                    seen.add(v)
-                    keep.append(i)
-            columns = _filter(columns, keep)
-    return columns
+def _max_existing_id(schema, table: str) -> int:
+    """Max existing integer id in the compact DB for a table (0 if none)."""
+    vals = schema.original_values.get((table, 'Id'), [])
+    ints = [v for v in vals if isinstance(v, int) and not isinstance(v, bool)]
+    return max(ints) if ints else 0
 
 
-def fill_foreign_keys_consistently(instance: dict, schema, table: str, n: int, rng) -> dict:
-    """FK child columns draw from the parent's generated values with replacement; empty parent -> NULL (fuzz.py:31-35)."""
-    out = {}
-    for cm in schema.tables[table].columns:
-        key = (table, cm.name)
-        if key not in schema.fks:
-            continue
-        pt, pc = schema.fks[key]
-        pv = instance.get(pt, {}).get(pc) or []
-        out[cm.name] = [rng.choice(pv) for _ in range(n)] if pv else [None] * n
+def _reserved_ids(schema, table: str, k: int) -> list:
+    """Reserved ids max(existing_id)+1..+k so they never collide with compact PKs."""
+    base = _max_existing_id(schema, table)
+    return [base + j for j in range(1, k + 1)]
+
+
+def _seq_ids_with_reserved(n_regular: int, reserved: list) -> list:
+    """Sequential ids 1..n_regular plus the reserved higher ids (uniqueness preserved)."""
+    ids = list(range(1, n_regular + 1))
+    for r in reserved:
+        if r not in ids:
+            ids.append(r)
+    return ids
+
+
+def _fk_lookup(parent_ids: list, n_child: int, rng: random.Random) -> list:
+    """Build a child->parent assignment with one parent childless, group sizes 1,2,>=3, ties."""
+    if not parent_ids:
+        return [None] * n_child
+    pids = list(parent_ids)
+    childless = pids[-1]
+    pool = pids[:-1] if len(pids) > 1 else pids
+    heavy = pool[0]
+    singles = pool[1:1 + max(1, len(pool) // 3)]
+    doubles = pool[1 + len(pool) // 3: 1 + 2 * len(pool) // 3]
+    others = pool[1 + 2 * len(pool) // 3:] or pool[:1]
+    assigns: list = [heavy] * max(3, n_child // 5)
+    for s in singles:
+        assigns.append(s)
+    for d in doubles:
+        assigns += [d, d]
+    while len(assigns) < n_child:
+        if rng.random() < 0.3:
+            assigns.append(heavy)
+        else:
+            assigns.append(rng.choice(others))
+    rng.shuffle(assigns)
+    out = assigns[:n_child]
     return out
 
 
-def choose_table_sizes(schema, rng) -> dict:
-    """Uniform rand_lin sizes w.p. 0.5, else level sizes x4 capped at 2500 (fuzz.py:83-110)."""
+def _build_repo(schema, rng: random.Random, n: int) -> list:
+    reserved = _reserved_ids(schema, 'Repo', 3)
+    ids = _seq_ids_with_reserved(n, reserved)
+    heavy_rows = set(rng.sample(ids, min(STARS_HEAVY_MIN_ROWS, len(ids)))) if ids else set()
+    rows = []
+    for rid in ids:
+        if rid in heavy_rows:
+            stars = STARS_HEAVY
+        else:
+            stars = sample_stars(rng, heavy_value=STARS_HEAVY)
+        forks = sample_forks(rng)
+        watchers = sample_watchers(rng, stars)
+        url = sample_text(rng, URL_POOL)
+        rows.append({'Id': rid, 'Url': url, 'Stars': stars, 'Forks': forks,
+                     'Watchers': watchers, 'ProcessedTime': sample_ticks(rng)})
+    return rows
+
+
+def _build_solution(schema, rng: random.Random, n: int, repo_rows: list) -> list:
+    reserved = _reserved_ids(schema, 'Solution', 5)
+    ids = _seq_ids_with_reserved(n, reserved)
+    repo_ids = [r['Id'] for r in repo_rows]
+    fk = _fk_lookup(repo_ids, len(ids), rng)
+    share = _null_share('Solution', 'RepoId')
+    pshare = _null_share('Solution', 'Path')
+    path_heavy = PATH_POOL[0]
+    rows = []
+    for idx, sid in enumerate(ids):
+        repoid = None if rng.random() < share else fk[idx]
+        if rng.random() < 0.30:
+            path = path_heavy
+        else:
+            path = sample_text(rng, PATH_POOL)
+        path = _maybe_null(rng, path, pshare)
+        rows.append({
+            'Id': sid, 'RepoId': repoid, 'Path': path,
+            'ProcessedTime': sample_ticks(rng),
+            'WasCompiled': sample_was_compiled(rng),
+        })
+    return rows
+
+
+def _build_method(schema, rng: random.Random, n: int, solution_rows: list) -> list:
+    ids = _seq_ids_with_reserved(n, [])
+    sol_ids = [r['Id'] for r in solution_rows]
+    fk = _fk_lookup(sol_ids, len(ids), rng)
+    sid_share = _null_share('Method', 'SolutionId')
+    name_share = _null_share('Method', 'Name')
+    full_share = _null_share('Method', 'FullComment')
+    sum_share = _null_share('Method', 'Summary')
+    lang_share = _null_share('Method', 'Lang')
+    rows = []
+    for idx, mid in enumerate(ids):
+        sid = None if rng.random() < sid_share else fk[idx]
+        name = _maybe_null(rng, sample_text(rng, NAME_POOL), name_share)
+        full = _maybe_null(rng, sample_text(rng, COMMENT_POOL), full_share)
+        summary = _maybe_null(rng, sample_text(rng, SUMMARY_POOL), sum_share)
+        api = sample_text(rng, API_POOL)
+        if rng.random() < 0.25:
+            lang_val = sample_lang_boundary(rng)
+        else:
+            lang_val = sample_lang(rng)
+        lang = _maybe_null(rng, lang_val, lang_share)
+        tokenized = sample_text(rng, TOKENIZED_POOL)
+        rows.append({
+            'Id': mid, 'Name': name, 'FullComment': full, 'Summary': summary,
+            'ApiCalls': api, 'CommentIsXml': sample_comment_is_xml(rng),
+            'SampledAt': sample_ticks(rng), 'SolutionId': sid, 'Lang': lang,
+            'NameTokenized': tokenized,
+        })
+    return rows
+
+
+def _build_method_parameter(schema, rng: random.Random, n: int, method_rows: list) -> list:
+    ids = _seq_ids_with_reserved(n, [])
+    method_ids = [r['Id'] for r in method_rows]
+    fk = _fk_lookup(method_ids, len(ids), rng)
+    mid_share = _null_share('MethodParameter', 'MethodId')
+    name_share = _null_share('MethodParameter', 'Name')
+    type_share = _null_share('MethodParameter', 'Type')
+    rows = []
+    for idx, pid in enumerate(ids):
+        if rng.random() < mid_share or not method_ids:
+            mid = None
+        else:
+            mid = str(fk[idx]) if fk[idx] is not None else None
+        typ = _maybe_null(rng, sample_text(rng, TYPE_POOL), type_share)
+        pname = _maybe_null(rng, sample_text(rng, PARAM_NAME_POOL), name_share)
+        rows.append({'Id': pid, 'MethodId': mid, 'Type': typ, 'Name': pname})
+    return rows
+
+
+def build_instance(schema, pool: dict, rng: random.Random) -> dict:
+    """Build the instance tables in FK order."""
     sizes = {}
-    if rng.random() < 0.5:
-        for lvl in schema.table_order:
-            for t in lvl:
-                min_c = 30 * rng.random()
-                sizes[t] = int(min_c + int(rng.random() * 200))
-    else:
-        s = 1 + 30 * rng.random()
-        for lvl in schema.table_order:
-            for t in lvl:
-                sizes[t] = int(min(s, 2500))
-            s *= 4
-    return sizes
+    for t in schema.tables:
+        base = TABLE_SIZES.get(t, 50)
+        sizes[t] = rng.randint(0, base) if rng.random() < 0.1 else max(1, base + rng.randint(-5, 5))
 
-
-def build_random_instance(schema, literal_pool: dict, size, rng) -> dict:
-    """Build one random instance (fuzz.py:111-196)."""
-    p = 0.0 if rng.random() < 0.3 else 0.2
-    order = [t for lvl in schema.table_order for t in lvl]
-    samplers = {}
-    for t in order:
-        tm = schema.tables[t]
-        for cm in tm.columns:
-            if (t, cm.name) not in schema.fks:
-                samplers[(t, cm.name)] = _init_sampler(cm, literal_pool.get((t, cm.name), []),
-                                                       schema.original_values.get((t, cm.name), []), p, rng,
-                                                       len(tm.primary_key))
-    if size is None:
-        size = choose_table_sizes(schema, rng)
-    inst: dict = {}
-    for t in order:
-        tm = schema.tables[t]
-        n = int(size.get(t, 0))
-        cols = {cm.name: [samplers[(t, cm.name)].sample() for _ in range(n)]
-                for cm in tm.columns if (t, cm.name) in samplers}
-        inst[t] = cols
-        cols.update(fill_foreign_keys_consistently(inst, schema, t, n, rng))
-        cols = sample_fresh_primary_keys(tm, {cm.name: cols[cm.name] for cm in tm.columns})
-        cols = drop_unique_duplicates(tm, cols)
-        for cm in tm.columns:
-            pt, pc = schema.fks.get((t, cm.name), (None, None))
-            if pt == t:
-                final = cols[pc]
-                fs = set(final)
-                cols[cm.name] = [v if v is None or v in fs else (rng.choice(final) if final else None)
-                                 for v in cols[cm.name]]
-        inst[t] = cols
-    return {t: inst[t] for t in schema.tables}
+    repo_rows = _build_repo(schema, rng, sizes.get('Repo', 0))
+    solution_rows = _build_solution(schema, rng, sizes.get('Solution', 0), repo_rows)
+    method_rows = _build_method(schema, rng, sizes.get('Method', 0), solution_rows)
+    mp_rows = _build_method_parameter(schema, rng, sizes.get('MethodParameter', 0), method_rows)
+    return {
+        'Repo': repo_rows,
+        'Solution': solution_rows,
+        'Method': method_rows,
+        'MethodParameter': mp_rows,
+    }

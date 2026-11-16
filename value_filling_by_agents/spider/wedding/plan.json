@@ -1,71 +1,339 @@
 {
  "db": "wedding",
- "operator_io_quirks": [
-  "Tiny DB: people=12, church=9, wedding=4 rows; original_values fully read, no sampling needed.",
-  "Mixed-case identifiers: People_ID, Is_Male, Church_ID, Open_Date, Continuation_of; must double-quote in generated SQL.",
-  "DDL uses backtick-quoted parent refs (`church`, `people`) inside FOREIGN KEY clauses; sqlite_master text must be replayed verbatim.",
-  "wedding has composite PK (Church_ID, Male_ID, Female_ID) -> composite-PK member max_l0=30 per spec 3.3.",
-  "wedding has two FKs to the SAME parent (people) via Male_ID and Female_ID; both must draw from people.People_ID final values.",
-  "All columns notnull=0 in pragma even though PKs are declared; sqlite PK implies NOT NULL only for INTEGER PRIMARY KEY, so inserts may still fail on NULL PKs.",
-  "Open_Date and Year are INT-stored years (1831..1839, 2014..2016) but declared INT -> Number fuzzer, not Date; no text-stored dates here.",
-  "Is_Male is TEXT with values 'T'/'F' (not 'true'/'false', not 0/1) -> String fuzzer, not Bool.",
-  "Continuation_of has a truncated sample 'Church of Jesus Christ of Latter Day Sai' (looks like a 40-char cut); string length range will be [min,max+1] over these.",
-  "Organized_by contains an en-dash-prefixed value '\u2013 Hoton'; non-ASCII must survive sqlite write/read.",
-  "No views, triggers, indexes beyond PKs; no dangling FKs; no self-references.",
-  "Country has 5 distinct over 12 rows (ties exist); Is_Male 2 distinct; church.Name 7 distinct over 9 rows (duplicates exist)."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on People_ID/Church_ID/Age/Open_Date/Year: uniform in [-10^scale,10^scale] with scale from INT (no args -> scale 0, so [-1,1] plus +-1/+-2 perturbation) -> tiny integer ranges, implausible for IDs and years.",
-  "Number fuzzer on Open_Date/Year will produce values like -1,0,1,2, not 1800s/2010s -> FN on year-range predicates (e.g. Open_Date BETWEEN 1830 AND 1840).",
-  "String fuzzer on Name/Country/Organized_by/Continuation_of: random a-zA-Z 0-9() strings length [0,20] with 0.5 contaminate -> implausible names, FN on LIKE '%Church%' style predicates.",
-  "String fuzzer on Is_Male: fresh random strings, not 'T'/'F' -> FN on Is_Male='T' predicates; also FP risk if a random string happens to equal 'T'.",
-  "String fuzzer on Country: fresh random strings, not the 5 real countries -> FN on Country='Canada' etc.",
-  "FK columns Male_ID/Female_ID/Church_ID in wedding draw from parent final values with replacement -> duplicates across rows likely, but composite PK dedup drops them, shrinking wedding below requested size.",
-  "Composite PK (Church_ID,Male_ID,Female_ID) with tiny parent cardinalities (people=12, church=9) caps distinct wedding rows at ~9*12*12=1296; requested sizes up to 2500 will be truncated by PK dedup.",
-  "Number fuzzer on Age: [-1,1] +-1/+-2 -> ages like -3..3, implausible; FN on Age>18 / Age BETWEEN 20 AND 40.",
-  "p=0.2 default and 0.3 chance of p=0 whole-instance: with p=0, Number/String always fresh (no element reuse) -> even less plausible values.",
-  "max_l0 cap (rng*30, or 30 for composite-PK member) means after ~30 fresh draws values repeat -> ties/duplicates appear, which can cause FP on DISTINCT/COUNT(DISTINCT) queries.",
-  "No CHECK constraints, no NOT NULL in DDL -> upstream inserts almost never fail; rows_ok ~= requested size except PK/unique dedup."
- ],
- "challenger_refs": [
-  "G3",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "ged35dda5",
-  "G1",
-  "gd60b3254",
-  "G2",
-  "g4d09999f",
-  "G4",
-  "g50b99131",
-  "g50b99131",
-  "g50b99131",
-  "g50b99131",
-  "g50b99131",
-  "g50b99131",
-  "g50b99131",
-  "g308c02a9",
-  "g308c02a9",
-  "g308c02a9",
-  "g308c02a9",
-  "g82b91402",
-  "g82b91402"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "int_primary_key": "fresh sequential integers starting at 1, one per row; never NULL; append generated PKs to the parent pool so child FKs may reference generated parents",
+   "int_foreign_key": "copy a value from the parent column's generated pool (compact + generated parents); when duplicate_share is set draw with replacement so COUNT(DISTINCT) < COUNT; ensure at least one parent row without children and at least one child row per referenced parent",
+   "int_quantity": "sample integers in [min, max] from the statistics; force at least one draw of each listed boundary value and one step on each side before filling the rest",
+   "int_year": "sample integers in a plausible range around the observed years; force at least one draw of each listed boundary value and one step on each side",
+   "text": "sample from a short pool of distinct values; for DISTINCT columns allow a few duplicates (20-50 % share) and allow near-duplicate variants",
+   "text_enum": "sample from the explicit enum list",
+   "text_name": "sample from a pool of distinct names; allow near-duplicate variants",
+   "text_country": "sample from a small pool of countries",
+   "flag": "sample from the explicit enum list",
+   "null_rule": "plant NULL only in columns listed in null_targets and only if the column is actually nullable; NULL share follows the compact DB share for that column; at least one NULL row per nullable column; NOT NULL / primary-key columns never get NULL; rules and formulas constrain only non-NULL operands"
+  },
+  "per_column_exceptions": [
+   {
+    "table": "church",
+    "column": "Church_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "join with wedding.Church_ID",
+     "parent rows without children",
+     "group sizes 1, 2 and >= 3",
+     "tie at rank 3 for DESC order"
+    ]
+   },
+   {
+    "table": "church",
+    "column": "Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "duplicate share 20-50 %",
+     "COUNT(DISTINCT Name) < COUNT(Name)"
+    ]
+   },
+   {
+    "table": "church",
+    "column": "Open_Date",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "-1730",
+     "-1729",
+     "-1728",
+     "1839",
+     "1840",
+     "1841",
+     "1849",
+     "1850",
+     "1851",
+     "1852"
+    ]
+   },
+   {
+    "table": "church",
+    "column": "Open_Date",
+    "pattern": "group_sizes",
+    "targets": [
+     "group sizes 1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "church",
+    "column": "Open_Date",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie at rank 3 for DESC order"
+    ]
+   },
+   {
+    "table": "church",
+    "column": "Organized_by",
+    "pattern": "group_sizes",
+    "targets": [
+     "group sizes 1, 2 and >= 3"
+    ]
+   },
+   {
+    "table": "people",
+    "column": "Age",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "29",
+     "30",
+     "31",
+     "32"
+    ]
+   },
+   {
+    "table": "people",
+    "column": "People_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "join with wedding.Male_ID",
+     "join with wedding.Female_ID",
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "people",
+    "column": "People_ID",
+    "pattern": "null_in_count_column",
+    "targets": [
+     "NOT NULL column, no NULLs"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Church_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "duplicate share 20-50 %",
+     "COUNT(DISTINCT Church_ID) < COUNT(Church_ID)"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Church_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "join with church.Church_ID",
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Male_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "join with people.People_ID",
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Male_ID",
+    "pattern": "null_rows",
+    "targets": [
+     "NOT NULL column, no NULLs"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Female_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "join with people.People_ID",
+     "parent rows without children"
+    ]
+   },
+   {
+    "table": "wedding",
+    "column": "Year",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "2015",
+     "2016",
+     "2017"
+    ]
+   },
+   {
+    "table": "people",
+    "column": "Is_Male",
+    "pattern": "enum",
+    "targets": [
+     "T",
+     "F"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "wedding",
+    "child_column": "Church_ID",
+    "parent": "church",
+    "parent_column": "Church_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "wedding",
+    "child_column": "Male_ID",
+    "parent": "people",
+    "parent_column": "People_ID",
+    "copied_columns": []
+   },
+   {
+    "child": "wedding",
+    "child_column": "Female_ID",
+    "parent": "people",
+    "parent_column": "People_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "people",
+    "column": "Age",
+    "formula": "Age BETWEEN 0 AND 120"
+   },
+   {
+    "table": "people",
+    "column": "Is_Male",
+    "formula": "Is_Male IN ('T', 'F')"
+   },
+   {
+    "table": "church",
+    "column": "Open_Date",
+    "formula": "Open_Date BETWEEN -2000 AND 2100"
+   },
+   {
+    "table": "wedding",
+    "column": "Year",
+    "formula": "Year BETWEEN 1900 AND 2100"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "people": 8,
+   "church": 6,
+   "wedding": 3
+  },
+  "null_targets": [],
+  "supporting_evidence": [
+   "people.Age: 34, 32, 30, 27, 26, 31, 36, 25 all within 0..120",
+   "people.Is_Male: values T, F only",
+   "church.Open_Date: 1831, 1832, 1836, 1837, 1839, 1830, 1840, 1842 all within -2000..2100",
+   "wedding.Year: 2014, 2015, 2016 all within 1900..2100"
+  ],
+  "uncertainty": [
+   "No calculated formula found in the source data; all columns are independent.",
+   "The exact range of church.Open_Date is not fully constrained by the sample values; the range is widened to -2000..2100 so the negative boundary literals (-1730, -1729, -1728) can be exercised.",
+   "The compact DB has no nullable columns (nullable_columns: []), so null_targets is empty and the NULL rule is vacuous; no NULLs are planted.",
+   "church.Continuation_of is TEXT with no spec entry; it falls back to the generic text rule and may not look like a church name."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20 with reasons no_rows_added (20), compact_rows_missing (20), new_integrity_failures (20); integrity.fk_violations = 171. In cli.py `_one` calls `write_instance_sqlite(_G['schema'], inst, p)` without passing `orig_path`, so writer.py takes the `orig_path is None` branch: it replays DDL into an empty file instead of copying the compact DB, and the compact rows are never present. The generated rows are then appended on top of an empty schema, and the FK values drawn from `pools` (which include compact parent values) reference parent rows that do not exist in the written file, producing the 171 FK violations.",
+     "requested_revision": "Pass the compact database path through to the writer (e.g. `write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])` in cli.py `_one`, and thread `orig` into the worker args), so each instance is a copy of the compact DB with generated rows appended. Re-run and confirm validity.valid > 0, compact_rows_missing = 0, no_rows_added = 0, and fk_violations = 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` contains `if key in null_targets or True:` \u2014 the `or True` makes the null_targets set irrelevant and plants a NULL in *every* nullable column of every table, including `church.Continuation_of`, `church.Organized_by`, `people.Name`, `people.Country`, `people.Is_Male`, `people.Age`, `wedding.Church_ID`, `wedding.Female_ID`, `wedding.Year`. The spec's `null_targets` is `['people.People_ID', 'wedding.Male_ID']`, and the schema declares `People_ID` and `Male_ID` as PRIMARY KEY / NOT NULL, so the intended NULL targets are actually non-nullable. The program therefore violates the interface rule 'NOT NULL / primary-key columns never get NULL' only by accident (because `_plant_nulls` skips `cm.notnull or cm.pk_pos > 0`), but it also plants NULLs in columns the spec does not designate, and the spec's `null_targets` list is meaningless.",
+     "requested_revision": "Remove the `or True` and make `_plant_nulls` respect `null_targets` (plant NULL only in columns listed there, and only if the column is actually nullable). If the spec's `null_targets` are all NOT NULL, the designer should correct the spec to list the genuinely nullable columns (e.g. `church.Continuation_of`, `church.Organized_by`, `people.Name`, `people.Country`, `wedding.Church_ID`, `wedding.Female_ID`, `wedding.Year`) with a NULL share derived from the compact DB, and the engineer should implement that share rather than a single random NULL per column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `null_targets` = ['people.People_ID', 'wedding.Male_ID'], but the schema declares `People_ID` as PRIMARY KEY and `Male_ID` as a NOT NULL FK (per the atomic operations: `null_rows` target 'NOT NULL column, no NULLs' and `null_in_count_column` target 'NOT NULL column, no NULLs'). The spec's own `per_column_exceptions` also state 'NOT NULL column, no NULLs' for both. The `null_targets` list therefore contradicts the schema and the per-column exceptions.",
+     "requested_revision": "Replace `null_targets` with the actually nullable columns and a NULL share per column consistent with the compact DB statistics (the feedback shows `nullable_columns: []`, so the compact DB has no NULLs; the designer should either drop the NULL rule entirely or explicitly designate a small set of nullable columns with a stated share)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_fill_fk` guarantees 'one child per parent (up to n)' by appending `vals[:n]`, but with `n = 3` (wedding) and 6 church parents / 8 people parents, only 3 of the parents get a child; the remaining parents are unmatched, which is fine, but the function never guarantees 'at least one parent row without children' explicitly \u2014 it happens by accident of small n. More importantly, `_fill_fk` is called for `wedding.Church_ID` with `duplicate_share=(0.2,0.5)`, but the loop `for v in vals[:n]` appends distinct values first, so with n=3 the duplicate share is never exercised (all three values are distinct parents). The spec's `duplicates_for_distinct` target for `wedding.Church_ID` ('duplicate share 20-50 %', 'COUNT(DISTINCT Church_ID) < COUNT(Church_ID)') is therefore not met by construction.",
+     "requested_revision": "In `_fill_fk`, when `duplicate_share` is set, draw the first `n` values with the duplicate share applied (e.g. pick from `vals` with replacement according to the share) rather than forcing distinct parents first, and separately ensure at least one parent without children. Add a post-check that `COUNT(DISTINCT wedding.Church_ID) < COUNT(wedding.Church_ID)` holds for the generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `choose_table_sizes` adds `rng.choice((-1, 0, 0, 1))` to the spec size, so `wedding` can be 2, 3, or 4 and `church` 5\u20137, `people` 7\u20139. The spec's `table_sizes_per_instance` is fixed at `{people: 8, church: 6, wedding: 3}`. The variation is small but not specified; combined with the `_fill_fk` issue above, the duplicate-share and group-size targets (e.g. `church.Open_Date` group sizes '1, 2 and >= 3', `church.Organized_by` group sizes) are not guaranteed by construction \u2014 `IntRangeSampler` draws boundaries with 45% probability and otherwise uniform over [-1000, 2100], so group sizes of exactly 1, 2, and >=3 are not enforced.",
+     "requested_revision": "Either (a) make `choose_table_sizes` return the spec sizes exactly, or (b) document the allowed variation in the spec. For `group_sizes` targets, add a construction step that assigns values so that at least one group of size 1, one of size 2, and one of size >= 3 exists (e.g. by post-processing the sampled column), or relax the spec target to 'varied group sizes'."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` is called after `_fill_fk`, and `_fill_fk` may return `None` for a child FK when `parent_pool` is empty (`return [None] * n`). For `wedding.Male_ID` / `wedding.Female_ID`, `pools[(people, People_ID)]` is populated from compact + generated people, so this is not triggered here, but the code path exists and would plant NULLs in a NOT NULL FK. Also, `_plant_nulls` plants a NULL in `wedding.Church_ID` (a PK component of `wedding`), which would violate the PK constraint \u2014 the writer's row-by-row fallback would then silently drop those rows (`bad[t] += 1`), reducing the effective row count and breaking the 'one child per parent' guarantee.",
+     "requested_revision": "In `_plant_nulls`, skip columns that are part of the primary key (`cm.pk_pos > 0`) \u2014 this is already done \u2014 but also skip FK columns whose parent pool is empty, and never plant NULL in a column that is part of a composite PK. Add an assertion after `_plant_nulls` that no PK component is NULL. Also, the writer's silent row-drop fallback should be surfaced in the CLI output (`rows_skipped`) rather than only counted locally."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py `write_instance_sqlite` sets `pragma foreign_keys = OFF` and never re-enables it, so FK violations are not caught at write time; the 171 FK violations in the feedback were detected by the external integrity check, not by the writer. The writer's `rows_failed` counter is returned but cli.py `_one` discards it (`write_instance_sqlite(...)` return value ignored), so the CLI's `rows_added`/`rows_skipped` are always `{}`.",
+     "requested_revision": "Enable `pragma foreign_keys = ON` after the compact copy (or run a post-write `pragma foreign_key_check` and report violations), and propagate the writer's `rows_ok`/`rows_failed` into the CLI summary so failures are visible."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Spec `semantic_rules_and_formulas` includes `church.Open_Date BETWEEN -1000 AND 2100` and `wedding.Year BETWEEN 1900 AND 2100`, but the `comparison_boundary` targets for `church.Open_Date` include `-1730, -1729, -1728`, which are outside the stated range. The `IntRangeSampler` clamps boundary values to `[lo, hi]`, so `-1730` etc. are silently dropped and the boundary predicate `open_date < 1850` / `BETWEEN -1729 AND 1840` cannot be exercised on the negative side.",
+     "requested_revision": "Either widen the `church.Open_Date` range to include `-1730` (e.g. `(-2000, 2100)`) or remove the negative boundary values from the spec. The spec's `uncertainty` already notes the range is 'not fully constrained'; resolve it explicitly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py `IntRangeSampler.sample` returns `max(self.lo, min(self.hi, v))` when reusing an element, which clamps but does not guarantee boundary coverage; with `p = 0.2` (or 0.0 when `rng.random() < 0.3`), the sampler reuses elements 80% of the time, so boundary values are drawn only ~9% of the time (0.2 * 0.45). For `people.Age` with n=8, the probability that all four boundaries {29,30,31,32} appear is low, so the `comparison_boundary` target for `people.Age` is not reliably met.",
+     "requested_revision": "For `int_quantity` / `int_year` columns with boundary targets, force at least one draw of each boundary value per instance (e.g. seed the first `len(boundaries)` samples with the boundaries, then fill the rest), or raise the boundary probability and document it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` extends `pools[key]` with generated values for every non-FK column, including `people.People_ID` (which is an `int_pk` and is handled by `continue` before the pool extension \u2014 so `pools[(people, People_ID)]` is only the compact values, not the generated ones). This means `wedding.Male_ID` / `wedding.Female_ID` can only reference compact people, never generated ones, so the 'parent rows without children' and 'child rows not all matched' targets are computed against the compact pool only. The spec's `unmatched_join_rows` target for `people.People_ID` ('join with wedding.Male_ID', 'join with wedding.Female_ID', 'parent rows without children') is therefore only partially satisfiable.",
+     "requested_revision": "After generating `people.People_ID`, append the generated PKs to `pools[(people, People_ID)]` before processing `wedding`, so FK children can reference generated parents. Add a post-check that at least one generated person has no wedding row and at least one has a wedding row."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 11/46 separated with 0 unknown executions; the remaining 35 pairs are not separated. This is not by itself a generation error, but the `group_sizes`, `ties_for_order_limit`, and `duplicates_for_distinct` targets are not guaranteed by construction (see issues above), so the separation rate is expected to be low. Re-run after fixes to confirm improvement.",
+    "The compact DB has no nullable columns (`nullable_columns: []`), so the NULL rule as specified (plant NULLs in nullable columns) is vacuous. The designer should confirm whether the NULL rule should be dropped or whether the schema should be extended with nullable columns.",
+    "The `church.Continuation_of` column is TEXT and has no spec entry; it falls back to `_init_sampler` \u2192 `StringSampler`, which may produce values that do not look like church names. This is not a blocking error but should be reviewed by the designer."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "note",
+     "evidence": "The spec's uncertainty section admits church.Open_Date's true range is unconstrained by the sample (1830-1842) and widens it to -2000..2100 solely to exercise the negative boundary literals -1730/-1729/-1728. The atomic-op extraction lists these as comparison_boundary targets, but the compact data contains no negative Open_Date values, so the negative boundaries are speculative rather than evidenced.",
+     "requested_revision": "No blocking change. Optionally document that the negative Open_Date boundaries are synthetic (derived from query literals, not compact data) so downstream consumers do not treat them as data-supported."
+    },
+    {
+     "agent": "designer",
+     "severity": "note",
+     "evidence": "Semantic rules (Age 0..120, Is_Male IN ('T','F'), Open_Date -2000..2100, Year 1900..2100) are supported by the compact sample values listed in supporting_evidence. The spec correctly notes no calculated formula exists and columns are independent. The widened Open_Date range is the only rule not directly evidenced by data.",
+     "requested_revision": "No change required; rules are adequately evidenced except the noted Open_Date widening."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Execution feedback shows all nullable columns with 'generated rows: NULL 0 / n'. This is consistent with the spec (null_targets empty, compact DB has no nullable columns) and with _plant_nulls being a no-op when null_targets is empty. Per the NULL-rule interface note this does not block a pass.",
+     "requested_revision": "No change required for this database. If the interface is later applied to a DB with nullable columns, ensure null_targets is populated from the compact NULL share."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "construction_pairs: eligible 46, separated 16, unknown_executions 0. 16/46 pairs separated means value variation is present but not exhaustive; per instructions a missing separation alone does not establish a generation error. Integrity checks all clean (fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0), 20/20 valid, reproducible=true.",
+     "requested_revision": "No change required. Separation coverage is partial but the generator demonstrably produces varied values (boundary forcing, duplicate shares, group sizes, tie ranks)."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "spec.py _DEFAULT encodes the specification by construction: int_pk sequential from 1, int_fk with duplicate_share (0.2,0.5) for wedding.Church_ID, int_quantity/int_year with boundaries, enum ['T','F'], text duplicate_share for church.Name, group_sizes and tie_rank for church.Church_ID/Open_Date/Organized_by, table_sizes people=8/church=6/wedding=3. instance.py _fill_fk guarantees matched rows and (via duplicate_share) COUNT(DISTINCT)<COUNT; _enforce_group_sizes and _enforce_tie_rank implement the group/tie targets; sample_fresh_primary_keys and drop_unique_duplicates preserve PK/unique integrity; _plant_nulls respects NOT NULL/PK. writer.py copies the compact DB and appends rows, preserving compact rows.",
+     "requested_revision": "No change required; implementation matches the specification."
+    },
+    {
+     "agent": "engineer",
+     "severity": "note",
+     "evidence": "Unresolved check: the spec's per_column_exceptions list 'parent rows without children' for church.Church_ID, people.People_ID, wedding.Church_ID/Male_ID/Female_ID, but _fill_fk's docstring claims to ensure an unmatched parent yet the code only guarantees matched rows (one child per parent up to n) and does not explicitly reserve a parent with zero children. With table_sizes wedding=3 and people=8/church=6, many parents will naturally have no children, so the target is met incidentally rather than by construction.",
+     "requested_revision": "No blocking change given the small child table sizes make unmatched parents near-certain; optionally make the unmatched-parent guarantee explicit in _fill_fk for robustness on larger child tables."
+    }
+   ]
+  }
+ ]
 }

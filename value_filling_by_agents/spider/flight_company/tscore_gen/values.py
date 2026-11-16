@@ -6,6 +6,27 @@ import string
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+           'October', 'November', 'December']
+
+
+def near_variants(v: str) -> list:
+    """Case changes, truncations and one-char edits of a string value."""
+    out = []
+    if not isinstance(v, str) or not v:
+        return out
+    out.append(v.lower())
+    out.append(v.upper())
+    out.append(v.title())
+    if len(v) > 1:
+        out.append(v[:-1])
+        out.append(v[1:])
+        out.append(v[:max(1, len(v) // 2)])
+        out.append(v[max(1, len(v) // 2):])
+    if len(v) > 2:
+        i = len(v) // 2
+        out.append(v[:i] + v[i + 1:])
+    return [x for x in out if x and x != v]
 
 
 class ColumnSampler:
@@ -39,11 +60,16 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        dhi = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-dhi, dhi)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -71,9 +97,9 @@ class NumberSampler(ColumnSampler):
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped); optional fixed length and near-variants."""
 
-    def __init__(self, elements, p, max_l0, rng, length=20):
+    def __init__(self, elements, p, max_l0, rng, length=20, fixed_len=None, near_prob=0.0):
         els = [str(e) for e in elements if e is not None]
         extra = [e.replace('%', '') for e in els if '%' in e]
         for e in els:
@@ -82,6 +108,8 @@ class StringSampler(ColumnSampler):
         super().__init__(els + extra, p, max_l0, rng)
         self.lo, self.hi = ((min(map(len, self.elements)), max(map(len, self.elements)) + 1)
                             if self.elements else (0, length))
+        self.fixed_len = fixed_len
+        self.near_prob = near_prob
 
     def _rand(self, k):
         return ''.join(self.rng.choice(CHARSET) for _ in range(k))
@@ -89,10 +117,17 @@ class StringSampler(ColumnSampler):
     def sample(self):
         r = self.rng
         if not self.elements or r.random() < self.p:
-            v = self._fresh_or_reuse(lambda: self._rand(r.randint(self.lo, self.hi)))
+            k = self.fixed_len if self.fixed_len else r.randint(self.lo, self.hi)
+            v = self._fresh_or_reuse(lambda: self._rand(k))
         else:
             v = r.choice(self.elements)
-        if r.random() < 0.5:
+        if self.near_prob and r.random() < self.near_prob:
+            nv = near_variants(v)
+            if nv:
+                v = r.choice(nv)
+        if self.fixed_len:
+            v = (v + self._rand(self.fixed_len))[:self.fixed_len]
+        elif r.random() < 0.5:
             u = r.random()
             if u < 0.2:
                 v = v + self._rand(5)
@@ -152,6 +187,26 @@ class DateSampler(ColumnSampler):
         return self._fresh_or_reuse(self._draw)
 
 
+class MonthDayYearSampler(ColumnSampler):
+    """'Month D, YYYY' date strings (specification date_text rule)."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        super().__init__(elements, p, max_l0, rng)
+        self.p = p
+
+    def _draw(self):
+        r = self.rng
+        y = r.randint(1950, 2020)
+        m = r.randint(1, 12)
+        d = r.randint(1, 28)
+        return '%s %d, %d' % (_MONTHS[m - 1], d, y)
+
+    def sample(self):
+        if self.elements and self.rng.random() < self.p:
+            return self.rng.choice(self.elements)
+        return self._fresh_or_reuse(self._draw)
+
+
 class TimeSampler(ColumnSampler):
     """fuzz/time.py."""
 
@@ -182,19 +237,31 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
-def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
+class EnumSampler(ColumnSampler):
+    """Draws only from a fixed enumeration (specification IN rule)."""
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+def make_column_sampler(column, elements: list, p: float, max_l0: float, rng, *, fixed_len=None,
+                        near_prob=0.0, lo=None, hi=None, enum=None) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
+    if enum:
+        return EnumSampler(list(enum), 0.0, max_l0, rng)
     t = (column.type_str or '').lower().strip()
     args = [int(a) for a in re.findall(r'\d+', (re.search(r'\(([^)]*)\)', t) or [''])[0])][:2] if '(' in t else []
     if t == 'time':
         return TimeSampler(els, p, max_l0, rng)
     if t == '' or t == 'blob':
-        return StringSampler(els, p, max_l0, rng)
+        return StringSampler(els, p, max_l0, rng, fixed_len=fixed_len, near_prob=near_prob)
     if 'date' in t or 'timestamp' in t:
         first = next((e for e in els if e is not None), None)
         if first is not None and re.fullmatch(r'-?\d+', str(first)):
             return NumberSampler(els, p, max_l0, rng, scale=4)
+        if first is not None and re.fullmatch(r'[A-Za-z]+ \d{1,2}, \d{4}', str(first)):
+            return MonthDayYearSampler(els, p, max_l0, rng)
         return DateSampler(els, p, max_l0, rng)
     if 'bool' in t:
         return BoolSampler(els, p, max_l0, rng)
@@ -208,14 +275,17 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
         if args:
             prec = args[1] if len(args) > 1 else 0
             scale = max(args[0] - prec, 0)
-        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec, unsigned='unsigned' in t)
+        return NumberSampler(els, p, max_l0, rng, scale=scale, is_int=is_int, precision=prec,
+                             unsigned='unsigned' in t, lo=lo, hi=hi)
     if any(k in t for k in ('char', 'text', 'blob')):
-        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20)
-    return StringSampler(els, p, max_l0, rng)
+        return StringSampler(els, p, max_l0, rng, length=args[0] if args else 20,
+                             fixed_len=fixed_len, near_prob=near_prob)
+    return StringSampler(els, p, max_l0, rng, fixed_len=fixed_len, near_prob=near_prob)
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
+                  max_l0: float = float('inf'), *, fixed_len=None, near_prob=0.0, lo=None, hi=None,
+                  enum=None) -> ColumnSampler:
     """Per-column initialisation of fuzz/fuzz.py:198-224."""
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
@@ -225,7 +295,8 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+    return make_column_sampler(column, els, p, max_l0, rng, fixed_len=fixed_len, near_prob=near_prob,
+                               lo=lo, hi=hi, enum=enum)
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

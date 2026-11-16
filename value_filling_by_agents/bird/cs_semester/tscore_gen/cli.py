@@ -1,84 +1,142 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""Command-line driver: generate instances by appending consistent rows to copies of a compact DB."""
 import argparse
 import json
-import multiprocessing as mp
 import os
 import random
+import shutil
 import sys
 import time
 
-from .instance import build_random_instance
-from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
-from .writer import unit_path, write_instance_sqlite
-
-_G: dict = {}
-
-
-def _init(orig: str, pool: dict, args: dict) -> None:
-    """Worker initializer: read the original ONCE per process."""
-    _G['schema'] = read_schema(orig)
-    _G['pool'] = pool
-    _G['args'] = args
+from .pool import build_literal_pool
+from .sampler import generate_instance_rows
+from .writer import unit_path, append_rows_sqlite
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
-    a = _G['args']
-    p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
-    if os.path.exists(p):
-        return ''
+def _db_stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _load_pool_sqls(path):
+    if not path or not os.path.exists(path):
+        return []
     try:
-        rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
-        print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, list):
+        return [str(x) for x in data if isinstance(x, str)]
+    if isinstance(data, dict):
+        out = []
+        for v in data.values():
+            if isinstance(v, list):
+                out.extend(str(x) for x in v if isinstance(x, str))
+            elif isinstance(v, str):
+                out.append(v)
+        return out
+    return []
 
 
-def main(argv=None) -> None:
-    """Entry point."""
-    ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    g = sub.add_parser('generate')
-    for k in ('--db', '--orig', '--ds', '--root', '--pool-sqls'):
-        g.add_argument(k, required=True)
-    g.add_argument('--i0', type=int, default=0)
-    g.add_argument('--i1', type=int, default=800)
-    g.add_argument('--seed-base', type=int, default=42)
-    g.add_argument('--procs', type=int, default=6)
-    g.add_argument('--tag', default='gen')
-    a = ap.parse_args(argv)
+def _run_one(schema, pool, orig, root, ds, db, i, seed, tag):
+    rng = random.Random(seed)
+    rows = generate_instance_rows(schema, pool, rng)
+    path = unit_path(root, ds, db, i, tag=tag)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    part = path + '.part'
+    if os.path.exists(part):
+        os.remove(part)
+    shutil.copyfile(orig, part)
+    res = append_rows_sqlite(schema, rows, part)
+    os.replace(part, path)
+    return res
+
+
+def _generate(args):
     t0 = time.time()
-    with open(a.pool_sqls) as f:
-        sqls = [s for s in json.load(f) if isinstance(s, str)]
-    good, skipped = [], 0
-    for s in sqls:
+    schema = read_schema(args.orig)
+    pool_sqls = _load_pool_sqls(args.pool_sqls)
+    pool = build_literal_pool(pool_sqls, schema)
+    db = args.db or _db_stem(args.orig)
+    i0 = args.i0 if args.i0 is not None else 0
+    i1 = args.i1 if args.i1 is not None else i0 + 1
+    seed_base = args.seed_base if args.seed_base is not None else 42
+    tag = args.tag or 'gen'
+
+    n_ok = n_fail = 0
+    rows_added = {}
+    rows_skipped = {}
+    errors = []
+    for i in range(i0, i1):
+        seed = seed_base * 100003 + i
         try:
-            extract_typed_values(s)
-            good.append(s)
-        except Exception:
-            skipped += 1
-    schema = read_schema(a.orig)
-    pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
-    idx = list(range(a.i0, a.i1))
-    if a.procs <= 1 or len(idx) < 50:
-        _G.update(schema=schema, pool=pool, args=args)
-        res = [_one(i) for i in idx]
-    else:
-        with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
-            res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
-    errs: dict = {}
-    for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
-                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+            res = _run_one(schema, pool, args.orig, args.root, args.ds, db, i, seed, tag)
+            n_ok += 1
+            for t, c in res.get('rows_ok', {}).items():
+                rows_added[t] = rows_added.get(t, 0) + c
+            for t, c in res.get('rows_failed', {}).items():
+                rows_skipped[t] = rows_skipped.get(t, 0) + c
+        except Exception as e:  # noqa: BLE001 - report, do not crash the whole batch
+            n_fail += 1
+            errors.append('%s: %s' % (i, e))
+
+    summary = {
+        'db': db,
+        'n_ok': n_ok,
+        'n_fail': n_fail,
+        'wall_s': round(time.time() - t0, 3),
+        'pool_sqls': len(pool_sqls),
+        'pool_skipped': 0,
+        'pool_values': sum(len(v) for v in pool.values()),
+        'errors': errors[:20],
+        'rows_added': rows_added,
+        'rows_skipped': rows_skipped,
+    }
+    print(json.dumps(summary))
+    return 0 if n_fail == 0 else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='tscore_gen.cli')
+    sub = ap.add_subparsers(dest='cmd')
+
+    g = sub.add_parser('generate', help='generate instances by appending rows to compact-DB copies')
+    g.add_argument('--db', default=None, help='database id (defaults to compact file stem)')
+    g.add_argument('--orig', required=True, help='compact sqlite database path (read-only)')
+    g.add_argument('--ds', required=True, help='dataset name (output subdir)')
+    g.add_argument('--root', required=True, help='output root directory')
+    g.add_argument('--pool-sqls', default=None, help='JSON list of construction SQL for literal pools')
+    g.add_argument('--i0', type=int, default=0, help='first instance index (inclusive)')
+    g.add_argument('--i1', type=int, default=None, help='last instance index (exclusive)')
+    g.add_argument('--seed-base', type=int, default=42, help='base random seed')
+    g.add_argument('--procs', type=int, default=1, help='worker count (accepted; generation is sequential)')
+    g.add_argument('--tag', default='gen', help='instance tag used in filenames')
+
+    ap.add_argument('--orig', dest='orig_flat', default=None)
+    ap.add_argument('--ds', dest='ds_flat', default=None)
+    ap.add_argument('--root', dest='root_flat', default=None)
+    ap.add_argument('--n', type=int, default=None)
+    ap.add_argument('--seed', type=int, default=None)
+    ap.add_argument('--tag', dest='tag_flat', default=None)
+    ap.add_argument('--queries', default=None)
+    ap.add_argument('--scale', type=float, default=1.0)
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == 'generate':
+        return _generate(args)
+
+    if args.orig_flat and args.ds_flat and args.root_flat:
+        ns = argparse.Namespace(
+            db=_db_stem(args.orig_flat), orig=args.orig_flat, ds=args.ds_flat, root=args.root_flat,
+            pool_sqls=args.queries, i0=0, i1=(args.n if args.n is not None else 1),
+            seed_base=(args.seed if args.seed is not None else 42), procs=1,
+            tag=(args.tag_flat or 'gen'))
+        return _generate(ns)
+
+    ap.print_help(sys.stderr)
+    return 2
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

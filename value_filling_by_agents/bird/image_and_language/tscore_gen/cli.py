@@ -1,4 +1,5 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate --db <db_id> --orig <compact.sqlite> --ds <bird|spider> --root <out_root>
+--pool-sqls <pool_sqls.json> --i0 0 --i1 <N> --seed-base 42 --procs <P> --tag <tag>"""
 import argparse
 import json
 import multiprocessing as mp
@@ -7,10 +8,10 @@ import random
 import sys
 import time
 
-from .instance import build_random_instance
+from .instance import build_and_write_instance
 from .literals import extract_typed_values, seed_literal_pool_from_queries
 from .schema import read_schema
-from .writer import unit_path, write_instance_sqlite
+from .writer import unit_path
 
 _G: dict = {}
 
@@ -22,20 +23,19 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _one(i: int):
+    """Build and write unit i from a copy of the compact DB; returns ('', stats) or (errname, stats)."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return '', None
     try:
         rng = random.Random(a['seed_base'] * 100003 + i)
-        inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        stats = build_and_write_instance(_G['schema'], _G['pool'], a['orig'], p, rng, a['spec'])
+        return '', stats
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return type(e).__name__, None
 
 
 def main(argv=None) -> None:
@@ -63,7 +63,9 @@ def main(argv=None) -> None:
             skipped += 1
     schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    spec = _load_spec(a.db)
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag,
+            'seed_base': a.seed_base, 'orig': a.orig, 'spec': spec}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -72,12 +74,42 @@ def main(argv=None) -> None:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
-    for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
-                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+    rows_added: dict = {}
+    rows_skipped: dict = {}
+    n_ok = 0
+    for name, st in res:
+        if name:
+            errs[name] = errs.get(name, 0) + 1
+        else:
+            n_ok += 1
+        if st:
+            for t, v in st.get('rows_added', {}).items():
+                rows_added[t] = rows_added.get(t, 0) + v
+            for t, v in st.get('rows_skipped', {}).items():
+                rows_skipped[t] = rows_skipped.get(t, 0) + v
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
+                      'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good),
+                      'pool_skipped': skipped,
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': rows_added, 'rows_skipped': rows_skipped}))
+
+
+def _load_spec(db: str) -> dict:
+    """Load the specification for this db if present (tscore_gen/specification.json); never required."""
+    for cand in (os.path.join(os.path.dirname(__file__), 'specification.json'),
+                 os.path.join(os.path.dirname(__file__), '..', 'specification.json')):
+        try:
+            with open(cand) as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                if db in obj and isinstance(obj[db], dict):
+                    return obj[db]
+                if 'db' in obj and obj.get('db') == db:
+                    return obj
+                return obj
+        except Exception:
+            continue
+    return {}
 
 
 if __name__ == '__main__':

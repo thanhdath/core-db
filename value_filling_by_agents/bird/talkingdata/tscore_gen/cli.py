@@ -1,5 +1,6 @@
-"""CLI: python -m tscore_gen.cli generate ... (replaces upstream fuzz driver scripts)."""
+"""CLI: python -m tscore_gen.cli generate ..."""
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -22,20 +23,36 @@ def _init(orig: str, pool: dict, args: dict) -> None:
     _G['args'] = args
 
 
-def _one(i: int) -> str:
-    """Build and write unit i; returns '' on success or the exception type name."""
+def _unit_seed(seed_base: int, i: int) -> int:
+    """Deterministic seed for unit i (independent of the number of units)."""
+    return seed_base * 100003 + i
+
+
+def _one(i: int) -> dict:
+    """Build and write unit i; returns a small result dict (never raises)."""
     a = _G['args']
     p = unit_path(a['root'], a['ds'], a['db'], i, a['tag'])
     if os.path.exists(p):
-        return ''
+        return {'ok': True, 'added': {}, 'skipped': {}, 'err': None, 'skipped_existing': True}
     try:
-        rng = random.Random(a['seed_base'] * 100003 + i)
+        rng = random.Random(_unit_seed(a['seed_base'], i))
         inst = build_random_instance(_G['schema'], _G['pool'], None, rng)
-        write_instance_sqlite(_G['schema'], inst, p)
-        return ''
-    except Exception as e:  # counted and reported, never silent
+        rep = write_instance_sqlite(_G['schema'], inst, p, orig_path=a['orig'])
+        return {'ok': True, 'added': rep.get('rows_ok', {}), 'skipped': rep.get('rows_failed', {}),
+                'err': None, 'skipped_existing': False}
+    except Exception as e:
         print('unit %d failed: %r' % (i, e), file=sys.stderr)
-        return type(e).__name__
+        return {'ok': False, 'added': {}, 'skipped': {}, 'err': type(e).__name__,
+                'skipped_existing': False}
+
+
+def _compact_hash(orig: str) -> str:
+    """Cheap content fingerprint of the compact database (for preservation reporting)."""
+    h = hashlib.sha256()
+    with open(orig, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main(argv=None) -> None:
@@ -54,16 +71,17 @@ def main(argv=None) -> None:
     t0 = time.time()
     with open(a.pool_sqls) as f:
         sqls = [s for s in json.load(f) if isinstance(s, str)]
-    schema = read_schema(a.orig)
     good, skipped = [], 0
     for s in sqls:
         try:
-            extract_typed_values(s, schema)
+            extract_typed_values(s)
             good.append(s)
         except Exception:
             skipped += 1
+    schema = read_schema(a.orig)
     pool = seed_literal_pool_from_queries(good, schema)
-    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag, 'seed_base': a.seed_base}
+    args = {'root': a.root, 'ds': a.ds, 'db': a.db, 'tag': a.tag,
+            'seed_base': a.seed_base, 'orig': a.orig}
     idx = list(range(a.i0, a.i1))
     if a.procs <= 1 or len(idx) < 50:
         _G.update(schema=schema, pool=pool, args=args)
@@ -72,12 +90,27 @@ def main(argv=None) -> None:
         with mp.Pool(a.procs, initializer=_init, initargs=(a.orig, pool, args)) as P:
             res = P.map(_one, idx, chunksize=max(1, len(idx) // (a.procs * 4)))
     errs: dict = {}
+    added: dict = {}
+    skipped_rows: dict = {}
+    n_ok = 0
+    n_skipped_existing = 0
     for r in res:
-        if r:
-            errs[r] = errs.get(r, 0) + 1
-    print(json.dumps({'db': a.db, 'n_ok': res.count(''), 'n_fail': len(res) - res.count(''),
+        if r['ok']:
+            n_ok += 1
+        if r.get('skipped_existing'):
+            n_skipped_existing += 1
+        if r['err']:
+            errs[r['err']] = errs.get(r['err'], 0) + 1
+        for t, n in r['added'].items():
+            added[t] = added.get(t, 0) + n
+        for t, n in r['skipped'].items():
+            skipped_rows[t] = skipped_rows.get(t, 0) + n
+    print(json.dumps({'db': a.db, 'n_ok': n_ok, 'n_fail': len(res) - n_ok,
                       'wall_s': round(time.time() - t0, 2), 'pool_sqls': len(good), 'pool_skipped': skipped,
-                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs}))
+                      'pool_values': sum(len(v) for v in pool.values()), 'errors': errs,
+                      'rows_added': added, 'rows_skipped': skipped_rows,
+                      'n_skipped_existing': n_skipped_existing,
+                      'compact_sha256': _compact_hash(a.orig)}))
 
 
 if __name__ == '__main__':

@@ -1,49 +1,376 @@
 {
  "db": "flight_1",
- "operator_io_quirks": [
-  "DDL uses backtick-quoted identifiers (`aircraft`, `aid`) and double-quoted FK columns; sqlite_master stores them verbatim \u2014 writer must replay DDL as-is, not re-quote.",
-  "Declared types are Oracle-style: number(4,0), number(7,2), varchar2(20), date. 'varchar2' is NOT in the char family list (char,text,blob) so it falls to the crash fallback -> String; record.",
-  "departure_date/arrival_date declared 'date' but storage class is TEXT with format 'MM/DD/YYYY HH:MM' (e.g. '04/12/2005 09:30'). First element does not parse as int, so Date fuzzer; none of the 7 upstream templates match this format -> template detection fails, falls to default range.",
-  "price has mixed storage classes (real and integer) in same column; salary/distance stored as integer despite number(10,2)/number(6,0) declared.",
-  "All columns notnull=0 (no NOT NULL constraints) and no CHECK constraints; PKs are the only enforced constraints.",
-  "certificate has composite PK (eid,aid) and two FKs to employee/aircraft; both parents exist and are unique on their PKs.",
-  "flight.aid FK -> aircraft.aid; aircraft has 16 rows, flight 10 rows, so FK values are a subset \u2014 TS will draw with replacement from parent's final values.",
-  "Tiny tables (10-69 rows): original_values sampling (k=min(5,len)) will use nearly all distinct values; literal pool from train SQL will dominate.",
-  "Table names all lowercase, no spaces; column names lowercase; no mixed-case issues here.",
-  "Self-references: none. Cycles: none (flight->aircraft, certificate->employee, certificate->aircraft).",
-  "employee.name has 30 distinct over 31 rows (one duplicate) \u2014 not declared unique, so drop_unique_duplicates won't touch it.",
-  "flight.origin has only 2 distinct values ('Los Angeles','Chicago') \u2014 heavy skew; TS String fuzzer will produce many fresh random strings, losing this skew."
- ],
- "operator_ts_expectations": [
-  "flno/aid/eid: Number fuzzer with scale=0 (number(4,0) etc.), range [-10^0,10^0]=[-1,1] for flno (scale 0) \u2014 wait, scale from (a,b): a=4,b=0 -> scale=4, precision=0; range [-10^4,10^4]. Fresh ints perturbed by +-1/+-2.",
-  "eid number(9,0): range [-10^9,10^9]; original eids are 8-9 digit ints, so fresh draws plausible but perturbed values may collide with PK -> dropped.",
-  "price number(7,2): scale=7, range [-10^7,10^7] floats; original prices ~200-300, so fresh draws are wildly implausible (FN driver: price comparisons in gold SQL will rarely match).",
-  "distance number(6,0): range [-10^6,10^6]; original 1500-8400, fresh draws plausible-ish but wide.",
-  "departure_date/arrival_date: Date fuzzer, no template matches 'MM/DD/YYYY HH:MM' -> default 1800-2100 range, formatted by first parsable template (likely none -> fallback). Text-stored dates will be replaced by random datetimes in a different format -> gold SQL date comparisons (e.g. departure_date > '...') will mostly fail (FN).",
-  "origin/destination/name: String fuzzer, length range from original (origin max ~11, destination ~15, name ~30), fresh random strings over a-zA-Z0-9() \u2014 'Los Angeles' style values lost; gold SQL with origin='Los Angeles' will match only via literal pool (p=0.2 element reuse).",
-  "aircraft.name: String, original 'Boeing 747-400' etc.; fresh strings lose the 'Boeing'/'Airbus' prefix structure -> LIKE 'Boeing%' queries fail (FN).",
-  "certificate composite PK (eid,aid): sample_fresh_primary_keys drops duplicate (eid,aid) pairs; with 20*15 possible pairs and n~30-2000 rows, many duplicates dropped -> small certificate tables.",
-  "FK flight.aid drawn from aircraft.aid final values (16 distinct) with replacement -> flight rows may repeat aid, fine; but if aircraft PK filtering drops rows, flight.aid may reference missing aircraft (FK not enforced, pragma off).",
-  "employee.salary number(10,2): range [-10^10,10^10]; original 100k-256k; fresh draws implausible -> salary comparisons (e.g. salary > 100000) mostly fail (FN).",
-  "Known FP source: TS does not enforce NOT NULL, so NULLs can appear where original had none; but all columns nullable here so no constraint failures \u2014 instead type-affinity mismatches (text in number column) may cause sqlite to store as text, changing comparison semantics."
- ],
- "challenger_refs": [
-  "G5",
-  "G10",
-  "G17",
-  "G18",
-  "G2",
-  "G11",
-  "G8",
-  "G9",
-  "G12",
-  "G16"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL.",
+   "integer_fk": "Copy from parent key pool; NULL only when the column is nullable and not part of a primary key; ensure some parent rows have no children.",
+   "integer_quantity": "Uniform integer in [1, 10000]; include boundary values from per_column_exceptions.",
+   "integer_distance": "Uniform integer in [100, 9000]; include boundary values from per_column_exceptions.",
+   "decimal_price": "Uniform decimal in [50.00, 2000.00] rounded to 2 decimals; include boundary values from per_column_exceptions.",
+   "decimal_salary": "Uniform decimal in [30000.00, 300000.00] rounded to 2 decimals; include boundary values from per_column_exceptions.",
+   "varchar_name": "Random combination of first/last name tokens; 5% near-duplicate variants (case/whitespace) of existing values; 5% NULL when nullable.",
+   "varchar_city": "Random pick from a fixed city pool; 5% NULL when nullable.",
+   "varchar_aircraft_name": "Random pick from a fixed aircraft model pool; 5% near-duplicate variants; 5% NULL when nullable.",
+   "date_datetime": "Random datetime in 2005-01-01..2005-12-31; format 'MM/DD/YYYY HH24:MI'; 5% NULL when nullable.",
+   "distinct_share": "For DISTINCT-target columns, ensure duplicate share 20-50% by repeating values from a small pool.",
+   "group_sizes": "For GROUP-target columns, ensure groups of size 1, 2, and >=3 exist; for numeric columns repeat existing numeric values, for string columns repeat existing string values; never inject non-typed literals.",
+   "order_ties": "For ORDER-target columns, plant ties at the listed rank (e.g., two rows with equal COUNT).",
+   "null_share": "Each nullable column gets at least one NULL row; share follows compact DB null_rate (0% observed, so plant 1 NULL row per nullable column).",
+   "rows_with_different_values": "For MAX/MIN scalar-target columns, ensure at least two rows per group carry different values so the aggregate is non-trivial."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "aircraft.name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Airbus A340-300",
+     "airbus a340-300",
+     "Boeing 737-800",
+     "boeing 737-800"
+    ]
+   },
+   {
+    "column": "aircraft.name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "aircraft.name",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "column": "aircraft.name",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) values 1,2,3"
+    ]
+   },
+   {
+    "column": "aircraft.aid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "flight.aid",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "flight.aid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children",
+     "child_rows_with_null_fk"
+    ]
+   },
+   {
+    "column": "flight.aid",
+    "pattern": "aggregate_boundary",
+    "targets": [
+     "COUNT(*) and COUNT(flight.aid) values 1,2,3"
+    ]
+   },
+   {
+    "column": "employee.eid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "employee.eid",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie_at_rank 1 on COUNT(*)"
+    ]
+   },
+   {
+    "column": "certificate.aid",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "certificate.aid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "certificate.aid",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie_at_rank 1"
+    ]
+   },
+   {
+    "column": "certificate.eid",
+    "pattern": "unmatched_join_rows",
+    "targets": [
+     "parent_rows_without_children"
+    ]
+   },
+   {
+    "column": "certificate.eid",
+    "pattern": "ties_for_order_limit",
+    "targets": [
+     "tie_at_rank 1 on COUNT(*)"
+    ]
+   },
+   {
+    "column": "employee.salary",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "99999",
+     "100000",
+     "100001",
+     "100002",
+     "199999",
+     "200000",
+     "200001"
+    ]
+   },
+   {
+    "column": "employee.salary",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "flight.flno",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "column": "flight.price",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   },
+   {
+    "column": "aircraft.distance",
+    "pattern": "rows_with_different_values",
+    "targets": [
+     ">= 2 per group with different values"
+    ]
+   },
+   {
+    "column": "employee.name",
+    "pattern": "group_sizes",
+    "targets": [
+     "1, 2 and >= 3"
+    ]
+   },
+   {
+    "column": "flight.origin",
+    "pattern": "duplicates_for_distinct",
+    "targets": [
+     "20-50 %"
+    ]
+   },
+   {
+    "column": "flight.destination",
+    "pattern": "literal_pool",
+    "targets": [
+     "Honolulu"
+    ]
+   },
+   {
+    "column": "flight.distance",
+    "pattern": "literal_pool",
+    "targets": [
+     "2000"
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "flight.aid",
+    "parent_table": "aircraft",
+    "parent_column": "aid",
+    "copied_columns": []
+   },
+   {
+    "child_column": "certificate.eid",
+    "parent_table": "employee",
+    "parent_column": "eid",
+    "copied_columns": []
+   },
+   {
+    "child_column": "certificate.aid",
+    "parent_table": "aircraft",
+    "parent_column": "aid",
+    "copied_columns": []
+   },
+   {
+    "primary_key": "flight.flno",
+    "table": "flight"
+   },
+   {
+    "primary_key": "aircraft.aid",
+    "table": "aircraft"
+   },
+   {
+    "primary_key": "employee.eid",
+    "table": "employee"
+   },
+   {
+    "primary_key": "certificate(eid,aid)",
+    "table": "certificate"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "flight",
+    "column": "distance",
+    "formula": "distance > 0"
+   },
+   {
+    "table": "flight",
+    "column": "price",
+    "formula": "price >= 0"
+   },
+   {
+    "table": "flight",
+    "column": "arrival_date",
+    "formula": "arrival_date >= departure_date"
+   },
+   {
+    "table": "aircraft",
+    "column": "distance",
+    "formula": "distance > 0"
+   },
+   {
+    "table": "employee",
+    "column": "salary",
+    "formula": "salary >= 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "aircraft": 16,
+   "employee": 31,
+   "flight": 10,
+   "certificate": 69
+  },
+  "null_targets": [
+   "flight.aid"
+  ],
+  "supporting_evidence": {
+   "flight.arrival_date >= flight.departure_date": "All 8 shown flight rows satisfy arrival_date >= departure_date (e.g., flno 2: 09:40 >= 09:30; flno 7: 08:45 >= 08:45).",
+   "flight.distance > 0": "All shown flight distances are positive (2308, 1749, 1251, 2606, 7487, 5478, 2551, 802).",
+   "flight.price >= 0": "All shown flight prices are positive (235.98, 220.98, 182, 261.56, 278.56, 780.99, 375.23, 425.98).",
+   "aircraft.distance > 0": "All shown aircraft distances are positive (8430, 3383, 7120, 1502, 1530, 2128, 520, 4103).",
+   "employee.salary >= 0": "All shown salaries are positive (120433, 178345, 153972, 256481, 101745, 205187, 212156, 99890)."
+  },
+  "uncertainty": "No formula relating flight.distance to aircraft.distance or price to distance was verified on all shown rows; no offset/rate formula is stated. Nullable columns show 0% null_rate in the compact DB, but at least one NULL row per nullable column is planted per instruction 10. certificate.aid is part of the primary key (eid, aid) and is therefore NOT NULL; the certificate.aid null_rows pattern is dropped. flight.aid is nullable in the DDL and is the only null_target. Primary-key columns aircraft.aid and employee.eid cannot carry duplicates or group sizes > 1; those patterns are dropped for them and reinterpreted on the referencing FK columns (flight.aid, certificate.aid, certificate.eid)."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: 13/20 units fail with TypeError(\"unsupported operand type(s) for -: 'datetime.datetime' and 'str'\"). This originates in DateSampler._draw (values.py): `lo, hi = self.full if ... else self.rng_dates` then `(hi - lo).total_seconds()`. When date_range is provided, `self.full` is set from `_parse_date(str(date_range[0]))`/`_parse_date(str(date_range[1]))` which return (template, datetime) tuples, but the code assigns `lo, _ = _parse_date(...)` and `_, hi = _parse_date(...)` \u2014 so `lo` is the template string and `hi` is the datetime. Subtracting a str from a datetime raises the TypeError. This blocks generation for ~65% of units.",
+     "requested_revision": "Fix DateSampler.__init__ to unpack correctly: `_, lo = _parse_date(str(date_range[0]))` and `_, hi = _parse_date(str(date_range[1]))` (or use the returned datetime consistently). Re-run generation and confirm n_fail == 0."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Integrity feedback: fk_violations = 541 across the 7 produced instances; validity reports new_integrity_failures for all 7. The writer disables `pragma foreign_keys = OFF` and never re-enables it, so FK violations are silently accepted. Additionally, `fill_foreign_keys_consistently` draws from `compact_keys` + `instance[pt][pc]`, but `instance[pt]` is only populated for tables already processed in `order`; for `certificate` (which depends on both `employee` and `aircraft`) this is fine, but for `flight.aid` the parent `aircraft` is processed first \u2014 however the FK pool includes compact keys that may not exist in the copied compact DB if the compact DB was empty or the copy path differs. More importantly, the writer's `orig_path` is never passed by cli.py (`write_instance_sqlite(_G['schema'], inst, p)` \u2014 no orig_path), so the compact DB is NOT copied; only DDL is created. This explains `compact_rows_missing: 7` and the FK violations (generated child rows reference compact parent keys that were never inserted).",
+     "requested_revision": "In cli.py `_one`, pass `orig_path=a['orig']` to `write_instance_sqlite` so the compact database is copied before appending. Also re-enable `pragma foreign_keys = ON` (or validate FKs in Python) so violations are caught rather than silently written. Confirm fk_violations == 0 and compact_rows_missing == 0 after the fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Validity feedback: `compact_rows_missing: 7` for all instances. The docstring of write_instance_sqlite says 'Copy the compact DB, append generated rows', but cli.py calls it without orig_path, so the `_copy_compact` branch is skipped and only `schema.ddl` is executed. The compact rows are therefore absent from every generated instance, contradicting the round-1 design ('Every instance is a copy of the compact database plus appended generated rows').",
+     "requested_revision": "Same fix as above: pass orig_path from cli.py. Verify that each generated instance contains the compact rows plus the appended generated rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: `reproducible: false`. The CLI seeds `random.Random(a['seed_base'] * 100003 + i)` per unit, which is deterministic, but `_init_sampler` uses `rng.choices(ov, k=min(5, len(ov)))` and `sorted({str(v) for v in literal_pool})` \u2014 the latter is deterministic, but `literal_pool` is built from `seed_literal_pool_from_queries` which iterates over `sqls` in file order (deterministic) \u2014 so the non-reproducibility likely stems from the 13 failing units producing different partial state, or from `mp.Pool` ordering. More concretely, `_apply_group_sizes` and `_apply_order_ties` use `rng.sample(range(n), k)` which is deterministic given the seed, so the primary suspect is that failing units leave `.part` files or partial state. Regardless, the feedback explicitly reports reproducible=false.",
+     "requested_revision": "After fixing the TypeError, re-run the same seed twice and confirm identical instance contents (e.g., hash the sqlite files). If non-determinism persists, audit any use of `set` iteration order (e.g., `sorted({str(v) for v in literal_pool})` is fine, but `_compact_unique` returns sets used in `drop_unique_duplicates` \u2014 iteration over `existing_unique.get(...)` is a set, which is deterministic in CPython for the same insertion order but should be sorted for safety)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `null_targets: [\"flight.aid\", \"certificate.aid\"]` and `null_share: 0.05`, but the schema declares `flight.aid` and `certificate.aid` as NOT NULL (they are FK columns in the DDL with no explicit NULL allowance; `certificate.aid` is part of the primary key `(eid, aid)` and therefore cannot be NULL). The specification's `null_targets` and the `certificate.aid` `null_rows` exception contradict the schema's NOT NULL / PK constraints. The program's `fill_foreign_keys_consistently` plants NULLs for nullable FKs, but `certificate.aid` is a PK column (`cm.pk_pos > 0`), so `nullable = not cm.notnull and cm.pk_pos == 0` is False \u2014 the NULL is never planted, which is correct per the schema but contradicts the specification's `null_rows` target for `certificate.aid`.",
+     "requested_revision": "Remove `certificate.aid` from `null_targets` and remove the `certificate.aid` `null_rows` exception, since `certificate.aid` is part of the primary key and cannot be NULL. If `flight.aid` is intended to be nullable, the DDL must be changed to allow NULL; otherwise remove it from `null_targets` as well. Align the specification with the schema's NOT NULL / PK constraints."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` includes `aircraft.aid` with `duplicates_for_distinct` and `group_sizes`, and `employee.eid` with `duplicates_for_distinct` and `group_sizes`. But `aircraft.aid` and `employee.eid` are primary keys (unique, NOT NULL), so they cannot have duplicates or group sizes > 1. The program's `sample_fresh_primary_keys` deduplicates PK tuples, so these patterns are never realized \u2014 the specification is internally inconsistent with the schema.",
+     "requested_revision": "Remove `duplicates_for_distinct` and `group_sizes` exceptions for `aircraft.aid` and `employee.eid` (primary keys), or reinterpret them as applying to the FK columns that reference these keys (e.g., `flight.aid`, `certificate.aid`, `certificate.eid`)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_apply_group_sizes` function overwrites values with literal strings 'g1', 'g2', 'g3'. For numeric columns (e.g., `employee.salary`, `aircraft.aid`), this would insert non-numeric strings, causing type errors or silent coercion. For `employee.salary` (a `number(10,2)` column), `_apply_group_sizes` is invoked because the specification lists `group_sizes` for `employee.salary`, and it would set some salary values to 'g1'/'g2'/'g3', violating the numeric type and the `salary >= 0` formula. The writer would then either fail (skipped rows) or store strings in a numeric column.",
+     "requested_revision": "Make `_apply_group_sizes` type-aware: for numeric columns, pick existing numeric values from the column and repeat them to form groups of size 1, 2, >=3; for string columns, use string values. Never inject literal 'g1'/'g2'/'g3' into typed columns. Similarly audit `_apply_order_ties` and `_apply_distinct_share` for type safety."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_enforce_formulas` function handles `kind == 'ge_column'` for `arrival_date >= departure_date`, but the specification's `formulas` list uses `kind: 'ge_column'` with `other: 'departure_date'`. The function compares `_to_datetime(a)` and `_to_datetime(b)` and sets `vals[i] = b` if `da < db`. However, `b` is the raw value from `columns[other]`, which may be a string in the format `'%m/%d/%Y %H:%M'` (from DateSampler), while `vals[i]` is also a string \u2014 assigning `b` is fine, but the comparison relies on `_to_datetime` parsing both. If `_parse_date` fails (e.g., due to the strip0 logic producing non-zero-padded dates), `da` or `db` is None and the rule is silently skipped. This is a latent correctness issue but not the primary blocker.",
+     "requested_revision": "After fixing the DateSampler TypeError, verify that `arrival_date >= departure_date` holds for all generated flight rows (the feedback's `new_integrity_failures` may include this). Add an assertion or post-check in `_enforce_formulas` that logs when a formula cannot be enforced due to unparseable values."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The `_apply_near_duplicates` function is applied to all string columns, including `aircraft.name`, `employee.name`, `flight.origin`, `flight.destination`. For `aircraft.name`, the specification's `comparison_boundary` targets include both 'Airbus A340-300' and 'airbus a340-300' (case variants), which is consistent with near-duplicate generation. However, `_apply_near_duplicates` is applied AFTER `_apply_distinct_share` and `_apply_group_sizes`, which may overwrite the carefully planted boundary values. The order of pattern application in `build_random_instance` is: distinct_share, group_sizes, order_ties, near_duplicates \u2014 so near_duplicates can clobber the boundary values that were injected via the literal pool. This may prevent the `comparison_boundary` targets from being realized.",
+     "requested_revision": "Apply near-duplicate generation before (or exclude from) the columns/values that carry boundary targets, or ensure boundary values are re-injected after near-duplicate generation. Verify that the `comparison_boundary` targets ('Airbus A340-300', 'airbus a340-300', 'Boeing 737-800', 'boeing 737-800') actually appear in generated `aircraft.name` values."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 21/138 separated construction pairs are sufficient to exercise the intended value variation (the feedback reports 21 separated, 0 unknown executions; this is a partial signal, not a proof of equivalence).",
+    "Whether the `rows_with_different_values` pattern for `flight.price` and `aircraft.distance` is realized (the program does not explicitly implement this pattern; it relies on the NumberSampler's random variation, which may or may not produce >= 2 distinct values per group).",
+    "Whether the `aggregate_boundary` pattern for `aircraft.name` (COUNT(*) values 1,2,3) is realized after the group_sizes overwrite and near-duplicate clobbering.",
+    "Whether the `ties_for_order_limit` pattern for `employee.eid` and `certificate.eid`/`certificate.aid` is realized, given that `_apply_order_ties` is applied to non-FK columns only and `certificate.eid`/`certificate.aid` are FK columns (so the tie is never planted on them)."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` field correctly notes that no formula relating flight.distance to aircraft.distance or price to distance was verified, and that nullable columns show 0% null_rate in the compact DB. The semantic formulas listed (distance > 0, price >= 0, arrival_date >= departure_date, aircraft.distance > 0, salary >= 0) are all backed by supporting_evidence citing concrete row values. These are supported rules. The 'uncertainty' items are correctly flagged as uncertain and are not encoded as hard rules.",
+     "requested_revision": "None required; the distinction between supported and uncertain rules is already documented. Optionally, the designer could add a note that the 0% observed null_rate is overridden by the interface NULL rule (plant at least one NULL per nullable column), which the spec already states."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program implements the specified value domains: `spec.py` encodes ranges (integer_distance [100,9000], decimal_price [50,2000], decimal_salary [30000,300000]), fixed pools (city, aircraft_name, first/last names), date range 2005-01-01..2005-12-31 with format '%m/%d/%Y %H:%M', distinct_share [0.20,0.50], null_share 0.05, and all per_column_exceptions. `instance.py` applies `_apply_distinct_share`, `_apply_group_sizes`, `_apply_order_ties`, `_apply_near_duplicates`, `_apply_null_share`, `_reinject_boundary_values`, and `_enforce_formulas`. FK dependencies are handled by `fill_foreign_keys_consistently` drawing from parent key pools with NULL planting for nullable FKs. Primary-key/unique dedup is done via `sample_fresh_primary_keys` and `drop_unique_duplicates`.",
+     "requested_revision": "None blocking. Minor observation: `_apply_group_sizes` uses `rng.sample(range(n), 3)` which requires n>=3; guarded by n<6 early return, so safe. `_apply_order_ties` plants a tie but does not guarantee the tie is at rank 1 specifically for COUNT-based ordering (it ties raw column values, not aggregate counts); this is a soft approximation of the 'tie_at_rank 1 on COUNT(*)' target and does not block generation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: returncode 0, n_ok 20, n_fail 0, reproducible true, integrity fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0, validity 20/20 valid. Compact rows are preserved because `writer.py` copies the compact DB file (`_copy_compact`) and only appends generated rows; the compact rows are never deleted or modified. Rows added per table (flight 93, aircraft 223, employee 388, certificate 1383) with 0 skipped.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Nullable columns all show generated NULL rows > 0 (e.g., flight.aid NULL 14/93, aircraft.name NULL 12/223, employee.salary NULL 17/388), satisfying the interface NULL rule (at least one NULL per nullable column, NOT NULL/PK columns never NULL). `certificate.aid` is correctly excluded from null_targets since it is part of the primary key. `_enforce_formulas` skips NULL operands (SQL three-valued logic), and `_apply_null_share` is applied after formula enforcement for non-FK columns, so planted NULLs are not replaced to satisfy rules.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 138, separated 30, unknown_executions 0. Value variation remains possible (30 separated pairs demonstrate non-trivial variation). The 108 unseparated pairs are not evidence of generation error per the instructions; they may reflect query equivalence or insufficient variation for specific patterns, but no integrity or domain violation is present.",
+     "requested_revision": "None blocking. If the engineer wishes to improve separation, they could strengthen `_apply_group_sizes`/`_apply_order_ties` to target aggregate counts rather than raw values, but this is an enhancement, not a required fix."
+    }
+   ],
+   "unresolved_checks": [
+    "The 'tie_at_rank 1 on COUNT(*)' target for employee.eid and certificate.eid is approximated by tying raw column values in `_apply_order_ties`, not by planting equal aggregate counts. Whether this yields the intended ORDER/LIMIT tie behavior was not verified against execution of the corresponding queries (no held-out labels used).",
+    "The `rows_with_different_values` target for flight.price and aircraft.distance is not explicitly enforced by a dedicated sampler step; it relies on the general numeric sampler producing varied values. Execution feedback does not report per-pattern separation, so this remains unverified but non-blocking."
+   ]
+  }
+ ]
 }

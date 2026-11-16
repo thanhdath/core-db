@@ -1,50 +1,42 @@
 {
  "db": "food_inspection_2",
- "operator_io_quirks": [
-  "Mixed-case column 'Description' in inspection_point; column lookup must be case-insensitive, output keeps original spelling.",
-  "Self-FK employee.supervisor->employee.employee_id and inspection.followup_to->inspection.inspection_id: table self-edges must be ignored in process_order, column edges kept.",
-  "violation has composite PK (inspection_id, point_id) and 525709 rows > max_rows_per_table 300000: rowid%k sampling; original_sizes must still be full count(*).",
-  "violation.inspection_id distinct 41737 << inspection rows 143870: FK child draws with replacement from parent's final values, so many-to-one is normal.",
-  "inspection_date declared DATE but storage class is text 'YYYY-MM-DD'; TS dispatches to Date (first element not int) with template %Y-%m-%d.",
-  "establishment.city has case variants ('CHICAGO','Chicago','chicago','CHicago') and trailing spaces in address; string equality is exact.",
-  "inspection_point.point_level has trailing spaces ('Serious ','Minor   '); code has spaces/parens '7-38-005 (B) (B-2)'.",
-  "employee.supervisor distinct 8 but employee_id distinct 75: self-FK parent values are a small subset, not the PK.",
-  "aka_name null_rate 0.813, followup_to 0.815: heavy NULL columns; TS drops None elements from samplers so NULLs rarely regenerated.",
-  "All NOT NULL flags are 0 (no constraints) and no CHECK/UNIQUE in DDL: nothing enforced at insert except PK/composite-PK.",
-  "establishment.latitude/longitude REAL ~41.88/-87.6: Number fuzzer full range [-10^scale,10^scale] with scale from 'real' (no args) is wildly off.",
-  "zip/phone stored as INTEGER/TEXT with leading-zero-free values; phone '(773) 424-8729' is String, zip INTEGER Number."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on inspection_date: template %Y-%m-%d, range from min/max parsed originals (~2010-2019), p=0.2 element reuse; fresh dates plausible but ties to specific dates lost.",
-  "Number fuzzer on latitude/longitude (REAL, no args -> scale default) draws uniform in huge range, producing implausible coords -> FN on range/geo predicates.",
-  "Number fuzzer on zip/ward/risk_level/salary: full-range uniform +-1/+-2 perturbation, so zip not 606xx, risk_level not in {1,2,3} -> FN on equality/IN filters.",
-  "String fuzzer on city/state/results/facility_type: random CHARSET strings + contaminate, so 'IL'/'Pass'/'Chicago' rarely reproduced -> FN on categorical equality.",
-  "String fuzzer on first_name/last_name/dba_name: random strings, no name distribution -> FN on LIKE/name predicates.",
-  "Self-FK supervisor/followup_to: child draws from parent's final filtered values with replacement; followup_to 81% NULL in original but TS rarely emits NULL -> FP on IS NULL / missing ties.",
-  "Composite PK violation: sample_fresh_primary_keys drops duplicate (inspection_id,point_id) rows, so per-inspection violation counts collapse -> FP on COUNT/GROUP BY inspection_id.",
-  "FK child draws with replacement from parent final values: many-to-one ties created, but parent PK filtering may shrink parent below child demand -> NULLs or skewed joins.",
-  "Number fuzzer list_max quirk (overwrites max(el)+1 with full-range max) widens ranges for columns with literal pool values -> implausible values, FN.",
-  "String fuzzer adds str(i+1)/str(i-1) for int-like strings and %-stripped variants: helps code/zip-like literals but not exact matches.",
-  "Empty literal pool for most columns (no train SQL given here) means samplers rely on 5 original values + fresh draws; p=0.2 default, whole-instance p=0 w.p. 0.3.",
-  "inspection_point small (46 rows) and employee (75): level-0 sizes 1+30u, so tiny tables stay tiny; joins to violation (525k) heavily skewed."
- ],
- "challenger_refs": [
-  "G3",
-  "G2",
-  "G4",
-  "G7",
-  "G18",
-  "G19",
-  "G12",
-  "G5",
-  "G13",
-  "G1"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
- },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "14316a61fa614ba9"
+ "shipped_round": 1,
+ "generation_specification": {},
+ "reviews": [
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows many nullable columns with 'generated rows: NULL 0 / n' (e.g. employee.address, employee.city, employee.first_name, employee.last_name, employee.phone, employee.salary, employee.state, employee.title, employee.zip, establishment.address, establishment.dba_name, establishment.state, inspection.inspection_date, inspection.results, inspection_point.*, violation.fine). The NULL rule requires at least one NULL row per nullable column per instance. The cause is in instance.py: `_compact_null_share` returns 0.0 when the compact column has no NULLs, and `fill_foreign_keys_consistently`/samplers then never emit NULL. The clamp `share = min(max(share, 1.0/n), 1.0-1.0/n)` is only applied to FK columns, not to non-FK nullable columns, and even there it is applied only when `n >= 2` and only inside the FK path.",
+     "requested_revision": "In instance.py, for every nullable non-PK column (not just FK columns), clamp the effective null_share to at least 1/n (and at most 1-1/n) when n >= 2, and force at least one NULL and one non-NULL value per column per instance, mirroring the FK path. This is a non-blocking note per instruction 7 but should be fixed for spec conformance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py reports rows_skipped for inspection (109), inspection_point (169), violation (1357) in the aggregate run. These are rows that failed a constraint and were dropped. The spec (instance.py docstring) claims PK/UNIQUE dedup and FK repair happen before insert, so skips indicate residual constraint failures (likely composite PK on violation (inspection_id, point_id) and inspection_point PK collisions, or FK to inspection rows that were themselves skipped).",
+     "requested_revision": "Investigate and reduce skipped rows: ensure violation's composite PK (inspection_id, point_id) is deduplicated in instance.py (currently only single-column PK and unique_sets are handled; composite PKs are handled by sample_fresh_primary_keys, but violation's PK is composite and the FK repair for inspection_id may reintroduce duplicates after dedup). Also ensure child rows referencing skipped parent rows are not generated. Not blocking since integrity checks pass (0 violations), but the skip counts are high."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The generation specification is empty (`{}`). The atomic-operation patterns (e.g. comparison_boundary on inspection.inspection_id = 1454071, employee.employee_id = 153225, employee.last_name = 'Rosa', employee.title = 'Sanitarian', establishment.risk_level = 3, inspection.results = 'Pass', LIKE '2010%' on inspection_date, ties_for_order_limit, group_sizes, duplicates_for_distinct) are not explicitly stated as rules. The program implements many of them by construction (fresh keys above compact max, \u00b11/\u00b12 perturbation, string variants, LIKE patterns, NULL share, tie-capping via max_l0), but the specification does not document these as required rules.",
+     "requested_revision": "Populate the generation specification with the supported rules: fresh integer keys above compact max for PK/unique ints; \u00b11/\u00b12 numeric perturbation; string prefix/suffix/drop variants and LIKE patterns without '%'; NULL share following compact share with at least one NULL per nullable column; tie/duplicate capping via max_l0; FK values drawn from compact+generated parent values; composite PK/UNIQUE dedup. Mark uncertain patterns (e.g. exact tie_at_rank=1 for specific columns) as best-effort."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `fill_foreign_keys_consistently` is called with `null_share=_compact_null_share(schema, t, tm.columns[0].name)` \u2014 it uses the first column's null share for all FK columns of the table, not each FK column's own compact null share. E.g. inspection.license_no and inspection.employee_id get the null share of inspection.inspection_id (a PK, share 0), yet feedback shows inspection.license_no NULL 17/920 and inspection.employee_id NULL 20/920 \u2014 these come from the clamp `1/n` applied inside the FK path, not from the column's own share.",
+     "requested_revision": "Pass each FK column's own compact null share to the FK filler (compute per column inside the loop) rather than the first column's share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "construction_pairs: eligible 349, separated 52. Many atomic-operation patterns (e.g. comparison_boundary on inspection.inspection_id = 1454071 with values [1454070,1454071,1454072], employee.employee_id = 153225, employee.last_name = 'Rosa'/'rosa', employee.title = 'Sanitarian'/'sanitarian'/'SANITARIAN', establishment.risk_level = 3 with [0,1,2,3,4]) are not separated by the generated instances. The program generates fresh keys above compact max (offset), so boundary values like 1454070/1454071/1454072 are never produced; case variants ('Rosa'/'rosa') are not generated by StringSampler (it only adds prefix/suffix/drop, not case changes).",
+     "requested_revision": "To support comparison_boundary patterns, add case-variant generation in StringSampler (e.g. lower/upper/title variants of compact values) and consider generating integer values near compact boundary values (compact max \u00b1 1) in addition to fresh keys above max. Not blocking per instruction 4 (missing separation alone does not prove error), but improves coverage of the stated patterns."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the high rows_skipped counts (inspection 109, inspection_point 169, violation 1357) indicate a systematic composite-PK or FK-repair bug versus expected constraint filtering; integrity checks report 0 violations so this is not blocking.",
+    "Whether the empty specification is acceptable given the program implements rules by construction; the designer should document the rules to make the spec non-empty and auditable.",
+    "Whether case-variant and boundary-value generation are required by the atomic-operation patterns or are optional best-effort."
+   ]
+  }
+ ]
 }

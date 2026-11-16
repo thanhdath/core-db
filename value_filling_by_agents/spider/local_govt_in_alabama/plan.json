@@ -1,45 +1,263 @@
 {
  "db": "local_govt_in_alabama",
- "operator_io_quirks": [
-  "All identifiers are plain ASCII, no spaces/mixed case; still double-quote in generated SQL per spec.",
-  "Tiny DB: Services=4, Participants=15, Events=15, Participants_in_Events=18 rows; original read is trivial, no sampling needed.",
-  "All declared types dispatch cleanly: INTEGER->Number, CHAR(15)/VARCHAR(255)->String; no crash-fallback, no Date/Time/Bool/Bit columns.",
-  "No text-stored dates, no NULLs anywhere (null_rate 0.0 on every column), no storage-class/declared-type contradictions (integer->INTEGER, text->CHAR/VARCHAR).",
-  "FKs: Events.Service_ID->Services.Service_ID (parent unique PK, exists); Participants_in_Events.Event_ID->Events.Event_ID and .Participant_ID->Participants.Participant_ID (both parents exist, unique PKs). No dangling FKs, no self-references.",
-  "Composite PK on Participants_in_Events (Event_ID, Participant_ID) -> composite-PK member max_l0=30 path in 3.3.",
-  "Single-column PKs on Services, Participants, Events -> max_l0=inf path.",
-  "No UNIQUE/CHECK constraints in DDL; 'unique'/'check' line scan finds nothing.",
-  "No views, triggers, or extra indexes in DDL.",
-  "Table order: Services, Participants (level 0) -> Events (level 1) -> Participants_in_Events (level 2); no cycles.",
-  "Service_Type_Code and Participant_Type_Code are low-cardinality (4 and 2 distinct) but declared CHAR(15) -> String fuzzer, not ENUM.",
-  "Event_Details has only 2 distinct values ('Success','Fail') but VARCHAR(255) -> String fuzzer."
- ],
- "operator_ts_expectations": [
-  "Number fuzzer on all *_ID columns: uniform in [-10^0,10^0]=[-1,1] for INTEGER (scale=0), then +-1/+-2 perturbation -> mostly small ints, rarely matching original IDs (2,5,6,8,...).",
-  "String fuzzer on Service_Type_Code/Participant_Type_Code/Event_Details/Participant_Details: random a-zA-Z0-9() strings length 0..20 (or 0..15/0..255 from args), plus 5 sampled originals, plus contaminate suffix/prefix/drop.",
-  "FK columns (Events.Service_ID, Participants_in_Events.Event_ID/Participant_ID) draw from parent's FINAL filtered values with replacement -> ties/duplicates in child, plausible joins.",
-  "PK dedup (sample_fresh_primary_keys) keeps first occurrence; composite PK on Participants_in_Events drops many rows since Event_ID and Participant_ID are drawn independently from small parent sets.",
-  "Table sizes: rand_lin gives 30+int(u*200) ~ 30..230 rows per table, or level-based 1+30u, x4 per level capped 2500 -> Services/Participants small, Participants_in_Events potentially large.",
-  "Likely FN driver: Number fuzzer produces IDs in [-1,1] that never match original small-int IDs (2,5,6,8,26,66,...), so equality/join predicates on IDs rarely hit; also String fuzzer produces implausible type codes ('aB3()') that never equal 'Marriage'/'Organizer'.",
-  "Likely FP driver: FK consistency creates many-to-one ties (Events.Service_ID duplicates) and composite-PK dedup leaves sparse Participants_in_Events, so COUNT/DISTINCT/join-cardinality queries can accidentally match or mismatch.",
-  "Low-cardinality columns (Participant_Type_Code 2 distinct, Event_Details 2 distinct) get random strings that never reproduce the 2-value domain -> GROUP BY on these yields many singleton groups, unlike original.",
-  "Participant_Details (names) gets random strings, not name-like -> LIKE '%Batz%' style predicates never match.",
-  "No NULLs in original, but String/Number fuzzers can emit NULL only via FK-empty-parent path (won't happen here since parents non-empty) -> NOT NULL constraints rarely violated, so few insert failures.",
-  "p=0.2 default with 0.3 chance of p=0 per instance: some instances are pure-element (original-value) sampling, others mostly fresh."
- ],
- "challenger_refs": [
-  "g25ed8209",
-  "g5d4402d7",
-  "g5d4402d7",
-  "gceb1f390",
-  "gceb1f390",
-  "gceb1f390"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "fresh sequential integers starting at 1, unique per table, never NULL; prefer compact contiguous ranges but non-contiguous gaps allowed",
+   "integer_fk": "copy an existing parent key drawn uniformly; never NULL; deliberately retain at least one parent row without children per parent table; reuse the same child value on >=3 rows to form a group of size >=3",
+   "char_code_enum": "sample from declared enum list only, padded to CHAR width, never NULL",
+   "varchar_free_text": "sample from a pool of base literals plus near-variants (case, whitespace, suffix) around equality targets; include one exact-match literal per equality target; never NULL for NOT NULL columns",
+   "null_share": "for each nullable column, ~10% NULL rows, at least 1 per instance; rules apply only to non-NULL rows and a planted NULL is never replaced",
+   "near_variant_share": "20-50% of DISTINCT-observed column values are duplicates (reuse values from the sampled pool); remaining rows get fresh values",
+   "boundary_handling": "for each numeric boundary target place rows at literal, literal-1, literal+1 (clamped to valid domain); for each text equality target place one exact match and one case/whitespace near-variant",
+   "tie_handling": "for each ORDER/LIMIT column ensure at least two rows share the same rank value so the LIMIT cut is deterministic",
+   "group_size_handling": "for each GROUP-target column ensure at least one group of size 1, one of size 2, and one of size >=3; the plan is applied by construction to join/group columns (Events.Event_ID, PIE.Event_ID, PIE.Participant_ID, Participants.Participant_ID, Services.Service_ID) as well as enum group columns"
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Services.Service_ID",
+    "pattern": "unmatched_join_rows, group_sizes",
+    "targets": "parent Services rows with no Events children (unmatched parent); group sizes 1,2,>=3 across Services when grouped; Service_ID PK unique"
+   },
+   {
+    "column": "Services.Service_Type_Code",
+    "pattern": "duplicates_for_distinct, group_sizes",
+    "targets": "DISTINCT duplicate share 20-50% across the 4 enum values; group sizes 1,2,>=3 across Service_Type_Code values"
+   },
+   {
+    "column": "Participants.Participant_ID",
+    "pattern": "unmatched_join_rows, group_sizes, duplicates_for_distinct",
+    "targets": "participants with no Participants_in_Events children; group sizes 1,2,>=3 when PIE grouped by Participant_ID; at least one duplicated Participant_ID value across PIE rows"
+   },
+   {
+    "column": "Participants.Participant_Type_Code",
+    "pattern": "group_sizes, duplicates_for_distinct, ties_for_order_limit, unmatched_join_rows",
+    "targets": "group sizes 1,2,>=3 between Organizer and Participant; DISTINCT duplicate share 20-50%; ties at ORDER BY Participant_Type_Code ASC; at least one participant row without PIE children"
+   },
+   {
+    "column": "Participants.Participant_Details",
+    "pattern": "comparison_boundary, duplicates_for_distinct",
+    "targets": "equality literal 'Kenyatta Kuhn' with exact match and near-variant 'kenyatta kuhn'; at least one duplicated DISTINCT value across Participant_Details"
+   },
+   {
+    "column": "Events.Event_ID",
+    "pattern": "unmatched_join_rows, aggregate_boundary, group_sizes, comparison_boundary, duplicates_for_distinct, ties_for_order_limit",
+    "targets": "Events.Event_ID shared with Participants_in_Events on >=12 distinct matched join pairs; group sizes 1,2,>=3 across Events when joined to PIE; COUNT(*) boundaries >1, =1, =2 achieved via PIE grouping counts; comparison boundary Event_ID vs PIE.Event_ID (matched vs non-matched); DISTINCT duplication; ties at ORDER BY COUNT(*) DESC"
+   },
+   {
+    "column": "Events.Service_ID",
+    "pattern": "unmatched_join_rows, group_sizes",
+    "targets": "Events.Service_ID copies from parent Services.Service_ID; at least one Services row without matching Events; group sizes 1,2,>=3 across Events grouped by Service_ID"
+   },
+   {
+    "column": "Events.Event_Details",
+    "pattern": "aggregate_boundary, group_sizes, comparison_boundary",
+    "targets": "HAVING COUNT(*) and COUNT(DISTINCT Event_Details) values 0,1,2 (0 cannot arise under inner join; 1 and 2 must exist); group sizes 1,2,>=3 across Success/Fail; comparison boundary at Success and Fail literals"
+   },
+   {
+    "column": "Participants_in_Events.Event_ID",
+    "pattern": "unmatched_join_rows, group_sizes, comparison_boundary, duplicates_for_distinct, null_in_count_column, ties_for_order_limit",
+    "targets": "Column is NOT NULL so NULL-in-count is unachievable; >=12 matched join pairs with Events.Event_ID; group sizes 1,2,>=3 across PIE grouped by Event_ID; DISTINCT duplication share 20-50%; ties at ORDER BY COUNT(PIE.Participant_ID) DESC"
+   },
+   {
+    "column": "Participants_in_Events.Participant_ID",
+    "pattern": "aggregate_boundary, unmatched_join_rows, group_sizes",
+    "targets": "HAVING COUNT(DISTINCT Participant_ID) and COUNT(Participant_ID) values 0,1,2 (0 impossible under inner join; 1 and 2 must exist); references parent Participants; group sizes 1,2,>=3 across PIE grouped by Participant_ID; composite PK with Event_ID unique"
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "Events.Service_ID",
+    "parent_table": "Services",
+    "parent_column": "Service_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Participants_in_Events.Event_ID",
+    "parent_table": "Events",
+    "parent_column": "Event_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "Participants_in_Events.Participant_ID",
+    "parent_table": "Participants",
+    "parent_column": "Participant_ID",
+    "copied_columns": []
+   },
+   {
+    "unique_tuple": "Participants_in_Events(Event_ID, Participant_ID) primary key"
+   },
+   {
+    "unique_tuple": "Services(Service_ID)"
+   },
+   {
+    "unique_tuple": "Participants(Participant_ID)"
+   },
+   {
+    "unique_tuple": "Events(Event_ID)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Services",
+    "column": "Service_Type_Code",
+    "formula": "Service_Type_Code IN ('Marriage','Death Proof','Birth Proof','Property Change')"
+   },
+   {
+    "table": "Participants",
+    "column": "Participant_Type_Code",
+    "formula": "Participant_Type_Code IN ('Organizer','Participant')"
+   },
+   {
+    "table": "Events",
+    "column": "Event_Details",
+    "formula": "Event_Details IS NULL OR Event_Details IN ('Success','Fail')"
+   },
+   {
+    "table": "Participants",
+    "column": "Participant_Details",
+    "formula": "Participant_Details IS NULL OR length(Participant_Details) BETWEEN 1 AND 255"
+   },
+   {
+    "table": "Events",
+    "column": "Service_ID",
+    "formula": "Service_ID IS NOT NULL"
+   },
+   {
+    "table": "Participants_in_Events",
+    "column": "Event_ID",
+    "formula": "Event_ID IS NOT NULL"
+   },
+   {
+    "table": "Participants_in_Events",
+    "column": "Participant_ID",
+    "formula": "Participant_ID IS NOT NULL"
+   },
+   {
+    "table": "Services",
+    "column": "Service_ID",
+    "formula": "Service_ID > 0"
+   },
+   {
+    "table": "Participants",
+    "column": "Participant_ID",
+    "formula": "Participant_ID > 0"
+   },
+   {
+    "table": "Events",
+    "column": "Event_ID",
+    "formula": "Event_ID > 0"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Services": 15,
+   "Participants": 15,
+   "Events": 15,
+   "Participants_in_Events": 18
+  },
+  "null_targets": [
+   "Events.Event_Details",
+   "Participants.Participant_Details"
+  ],
+  "supporting_evidence": {
+   "enum_services": [
+    "Marriage",
+    "Death Proof",
+    "Birth Proof",
+    "Property Change"
+   ],
+   "enum_participants": [
+    "Organizer",
+    "Participant"
+   ],
+   "enum_events": [
+    "Success",
+    "Fail"
+   ],
+   "null_columns_observed": "Schema declares Events.Event_Details and Participants.Participant_Details nullable; statistics show distinct == rows so NULLs not observed but permitted by schema",
+   "enum_and_range_rows_verified": "Every shown Event_Details value is 'Success' or 'Fail'; every Service_Type_Code value lies in the 4-enum pool; every Participant_Type_Code value is Organizer/Participant; Participant_Details shown values all 1..255 chars",
+   "no_formula_columns": "No numeric/date/calculated columns exist in the schema; only enum/range/order rules apply",
+   "join_op_semantics": "Atomic ops for Events.Event_ID and Participants_in_Events.Event_ID use JOIN(events.event_id=participants_in_events.event_id); the '12 pairs' target refers to matched join pairs (12 distinct Event_ID values appearing in PIE), not unmatched parents. Unmatched-parent pattern (parent_rows_without_children=true) is handled separately by requiring the Events table to contain at least one Event_ID with no PIE children and Services to contain at least one Service_ID with no Events.",
+   "group_size_alignment": "Events.Event_ID, PIE.Event_ID, PIE.Participant_ID, Participants.Participant_ID and Services.Service_ID are explicitly listed as group_size targets in per_column_exceptions; the generation program must apply the explicit group-size plan to these join/group columns, not rely solely on random FK reuse, so groups of size 1,2,>=3 are guaranteed by construction.",
+   "aggregate_boundary_note": "COUNT values 0 and 1,2 for COUNT(*) / COUNT(DISTINCT) over inner joins cannot include 0 without a LEFT JOIN row group; 1 and 2 are planted via group sizes. Value 0 is acknowledged as unachievable under inner-join semantics and is satisfied by producing groups of size 1 (single-row groups produce counts of 1, the closest achievable boundary)."
+  },
+  "uncertainty": "Compact schema has no numeric/date/formula columns; the only semantic constraints are enums and NOT NULL PKs/FKs. The 12 join-pair target for Events.Event_ID / PIE.Event_ID is interpreted as 12 distinct matched Event_ID values shared between the two tables (consistent with the JOIN op), while the unmatched-parent sub-pattern is satisfied separately by retaining Events rows without PIE children and Services rows without Events children. Services row count raised from 4 (original sample) to 15 is required so that Events group-by-Service_ID can exhibit size-1, size-2, and size>=3 groups and at least one Service_ID appears without Events; this is a minimum-size consequence, not a semantic rule. Aggregate boundary value 0 for COUNT(*) is unachievable under inner join and is acknowledged. PIE.Event_ID and PIE.Participant_ID are NOT NULL, so the null_in_count_column target is vacuous."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "aeb0496b4503caeb"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution failed with `ValueError: 'Service_ID' is not in list` in schema.py line 162: `compact_keys[t] = {tuple(r[tm.columns.index(c)] for c in tm.primary_key) for r in rows}`. This occurs because `tm.columns.index(c)` uses list `.index()` on `ColumnMeta` objects (not names); `'Service_ID'` is a string being searched in a list of ColumnMeta, so it can never be found. The result was n_instances=0, returncode=1.",
+     "requested_revision": "Fix `read_schema` to look up column position by name, e.g. build a name->index map per table or use `next(i for i, cm in enumerate(tm.columns) if cm.name == c)`. Also audit the analogous construction of `compact_fk` (line ~168 `tm.columns.index(cc)`), which has the same bug and would raise the same error once the primary-key line is fixed."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `dependencies` list gives parent keys for Services(Service_ID), Participants(Participant_ID), Events(Event_ID), and Participants_in_Events(Event_ID, Participant_ID), but the Events.Service_ID pattern text says 'where relaxed', weakening a clear FK. Meanwhile the atomic-operation evidence for Events.Event_ID/Service_ID and the unmatched_join_rows pairs (12, 2) are stronger than the default table sizes (Events=15, Services=4, Participants_in_Events=18), which makes group sizes >=3 and 12 join-key pairs hard to satisfy simultaneously with 15/18 rows.",
+     "requested_revision": "Clarify whether Events.Service_ID is a mandatory FK (it is declared NOT NULL in the schema, so 'where relaxed' is inconsistent). Also reconcile table_sizes_per_instance (15/18) with the required 12 unmatched-join pairs and 12 shared pairs\u2014either raise sizes or state which are guaranteed minima. These are not blocking per se, but the FKs declared 'where relaxed' contradict the schema NOT NULL constraints."
+    }
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "instance.py defines `_group_size_plan(n: int, rng)` but `_apply_group_sizes` calls it as `_group_size_plan(len(values))`, omitting the rng argument. Execution feedback confirms this: all 20 units fail with `TypeError(\"_group_size_plan() missing 1 required positional argument: 'rng'\")`, n_instances=0, rows_added={}.",
+     "requested_revision": "Fix the call site in `_apply_group_sizes` to pass rng (e.g. `_group_size_plan(len(values), rng)`), or make the rng parameter optional. Re-run generation and confirm n_fail=0 with nonzero rows added."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Because every unit raises before writing, there is no execution evidence for integrity constraints, FK consistency, compact-row preservation, or reproducible output. The build stopped at the first construction error, so none of the specified sampling rules (enum domains, group sizes, duplicate shares, join coverage, NULL planting) can be verified to actually run.",
+     "requested_revision": "After fixing the TypeError, provide execution feedback showing: instances written per unit, rows_ok rows added for Services/Participants/Events/Participants_in_Events, rows_failed=0, and FK / PK constraints satisfied. Confirm compact rows are preserved (copy-then-append) and generation is seed-reproducible."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty note claims 12 unmatched-join pairs and raises Services from 4 to 15 rows, but the atomic-pattern ops for Events.Event_ID / Participants_in_Events.Event_ID are JOIN(events.event_id=participants_in_events.event_id) \u2014 these are *matched* join pairs, not unmatched parent rows. The spec conflates join-pair count with unmatched-parent count. The program's `_min_sizes` derives Events/PIE = 18 from '12 shared + group sizes' which is plausible, but the justification in the spec is inconsistent with the op semantics.",
+     "requested_revision": "Clarify whether the 12 refers to matched join pairs (Event_ID shared between Events and PIE) or unmatched parent rows without children; ensure `_min_sizes` and the spec agree on the intended count. Do not block pass on this alone, but align the wording."
+    }
+   ],
+   "unresolved_checks": [
+    "No runtime verification of FK integrity, PK uniqueness against compact keys, or compact-row preservation, because generation produced zero instances.",
+    "Enum domain fit: EnumSampler pads to width=15 but downstream comparisons on CHAR(15) literal 'Kenyatta Kuhn' etc. only applies to Participant_Details (VARCHAR), so enum padding is consistent with CHAR semantics \u2014 not blocking.",
+    "GROUP_COLUMNS/DISTINCT_COLUMNS exclude Events.Event_ID, Participants_in_Events.Event_ID, PIE.Participant_ID and Services.Service_ID join/group columns that the spec lists as group_sizes targets; group-size layout for those join columns depends on random FK reuse (`_small_set`) rather than the explicit `_apply_group_sizes` plan, so group sizes 1,2,>=3 for PIE.Event_ID / Events.Event_ID / Participants.Participant_ID are not guaranteed by construction. Should be verified after the TypeError fix.",
+    "aggregate_boundary values 0,1,2 for COUNT(*) / COUNT(DISTINCT) are not explicitly planted (no 0-row group possible on inner join). Not blocking, but noted."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification's aggregate_boundary_note and uncertainty acknowledge that COUNT(*) value 0 is unachievable under inner-join semantics; the atomic ops list values [0,1,2] for HAVING(COUNT(*) > 1) and HAVING(COUNT(DISTINCT ...) > 1). The spec explicitly states 0 is satisfied by producing groups of size 1.",
+     "requested_revision": "No blocking change required. Optionally clarify in the spec that the '0' boundary is documented as unachievable and that size-1 groups are the accepted substitute, so downstream reviewers do not treat it as a missing target."
+    },
+    {
+     "agent": "designer",
+     "severity": "minor",
+     "evidence": "Specification lists null_in_count_column for Participants_in_Events.Event_ID and Participants_in_Events.Participant_ID, but both columns are NOT NULL in the schema. The spec itself notes this target is vacuous. Execution feedback shows nullable_columns: [] and no NULL violations.",
+     "requested_revision": "No blocking change. Optionally drop the vacuous null_in_count_column target for NOT NULL columns to avoid confusion."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "Execution summary shows rows_skipped: {\"Participants_in_Events\": 28} across 20 instances (50 added, 28 skipped). The writer retries failing rows individually and counts them; skipped rows are likely composite-PK collisions from _apply_group_sizes_to_fk re-arranging FK values after PK uniqueness was enforced. This is not silent (counted), and integrity checks report 0 pk_duplicates / 0 fk_violations / 0 not_null_violations, so the written instances are valid.",
+     "requested_revision": "No blocking change. Optionally re-apply composite-PK deduplication after _apply_group_sizes_to_fk so fewer rows are skipped, improving yield; but the current behavior is safe and reported."
+    },
+    {
+     "agent": "engineer",
+     "severity": "minor",
+     "evidence": "construction_pairs: eligible 47, separated 9. Many atomic-op pairs are not separated by the generated instances. Per instructions, missing separation alone does not establish a generation error. The program implements the specified domains (enums via EnumSampler, exact literal 'Kenyatta Kuhn' + near-variant, group sizes 1/2/>=3 via _group_size_plan, duplicate share via _distinct_cap, NULL planting via _plant_nulls, FK copying via fill_foreign_keys_consistently, fresh PKs via _fresh_pk_sequence).",
+     "requested_revision": "No blocking change. Separation is a property of the query pairs, not a program defect; the samplers implement the specified rules by construction."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the 9/47 separated construction pairs is sufficient for the intended test-suite coverage is a downstream evaluation question, not a generation-correctness question; not resolvable from the provided evidence without held-out pairs (which must not be used).",
+    "The exact cause of the 28 skipped Participants_in_Events rows is inferred (composite-PK collision after FK group-size re-arrangement) rather than directly logged; the writer counts them and integrity checks pass, so this does not block."
+   ],
+   "summary": "The program ran successfully (returncode 0, 20/20 instances valid, reproducible, 0 FK/NOT NULL/PK violations, compact rows preserved via copy-then-append). The specification's semantic rules are supported by schema evidence (enums, NOT NULL PKs/FKs, nullable columns) and the program implements them by construction: enum-only sampling, exact literal + near-variant, group sizes 1/2/>=3, 20-50% duplicate share, NULL planting per nullable column, FK copying from parents, fresh sequential PKs, and append-only writing in FK order. The two acknowledged unachievable targets (COUNT 0 under inner join; NULL-in-count on NOT NULL columns) are documented in the spec and do not block. Minor non-blocking observations: 28 skipped PIE rows (counted, not silent) and low construction-pair separation (not a generation error per instructions). Recommend pass."
+  }
+ ]
 }

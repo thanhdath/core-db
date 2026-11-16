@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -39,11 +41,15 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if lo is not None and hi is not None:
+            self.min, self.max = int(lo), int(hi)
+        else:
+            h = min(10 ** scale, _MAX)
+            self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-h, h)
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -67,7 +73,10 @@ class NumberSampler(ColumnSampler):
             v += 2 * d
         elif r.random() < 1 / 3:
             v -= 2 * d
-        return self._cast(v)
+        v = self._cast(v)
+        if self.is_int:
+            v = max(self.min, min(self.max, v))
+        return v
 
 
 class StringSampler(ColumnSampler):
@@ -105,6 +114,68 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Uniform pick from a fixed enum list (spec.ENUMS); occasionally a case variant."""
+
+    def __init__(self, values: list, rng, case_variants: bool = False):
+        super().__init__(list(values), 1.0, float('inf'), rng)
+        self.case_variants = case_variants
+
+    def sample(self):
+        v = self.rng.choice(self.elements)
+        if self.case_variants and self.rng.random() < 0.15:
+            v = v.lower() if self.rng.random() < 0.5 else v.upper()
+        return v
+
+
+class DuplicateShareSampler(ColumnSampler):
+    """Wraps a base sampler and reuses an already drawn value with probability `share` (20-50 % duplicate share on
+    DISTINCT columns)."""
+
+    def __init__(self, base: ColumnSampler, share: float, rng):
+        self.base, self.share, self.rng = base, share, rng
+        self.seen: list = []
+
+    def sample(self):
+        if self.seen and self.rng.random() < self.share:
+            return self.rng.choice(self.seen)
+        v = self.base.sample()
+        self.seen.append(v)
+        return v
+
+
+class GroupSizeSampler(ColumnSampler):
+    """Produces values whose group sizes include 1, 2 and >= 3 (spec.GROUP_SIZE_COLUMNS)."""
+
+    def __init__(self, base: ColumnSampler, n: int, rng):
+        self.base, self.n, self.rng = base, n, rng
+        self.plan: list = []
+        self._build_plan()
+
+    def _build_plan(self):
+        r = self.rng
+        plan = [('new', 1), ('new', 2), ('new', 3)]
+        used = 6
+        while used < self.n:
+            k = r.choice([1, 1, 2, 3])
+            plan.append(('new', k))
+            used += k
+        self.plan = plan
+        self.pool: list = []
+        self.queue: list = []
+
+    def sample(self):
+        if not self.queue:
+            if self.plan:
+                kind, k = self.plan.pop(0)
+                v = self.base.sample()
+                self.pool.append(v)
+                self.queue = [v] * k
+            else:
+                self.queue = [self.rng.choice(self.pool)] if self.pool else [self.base.sample()]
+        return self.queue.pop(0)
 
 
 def _parse_date(s: str):
@@ -233,3 +304,30 @@ def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, 
     """Initialise one column fuzzer (fuzz.py:198-224) and draw n values."""
     s = _init_sampler(column_meta, literal_pool, original_values, p, rng, 1 if column_meta.pk_pos else 0, max_l0)
     return [s.sample() for _ in range(n)]
+
+
+def spec_sampler(table: str, column, literal_pool: list, original_values, rng, n_rows: int) -> ColumnSampler:
+    """Build a sampler that implements the specification for (table, column) by construction."""
+    key = (table, column.name)
+    ov = list(original_values or [])
+    els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
+    p = 0.0 if column.checked else 0.2
+    max_l0 = float('inf')
+
+    if key in spec.ENUMS:
+        case_variants = key in (('player', 'Gender'), ('coach', 'Gender'))
+        return EnumSampler(spec.ENUMS[key], rng, case_variants=case_variants)
+
+    if key in spec.RANGES:
+        lo, hi = spec.RANGES[key]
+        return NumberSampler(els, p, max_l0, rng, is_int=True, lo=lo, hi=hi)
+
+    base = make_column_sampler(column, els, p, max_l0, rng)
+
+    if key in spec.GROUP_SIZE_COLUMNS:
+        return GroupSizeSampler(base, n_rows, rng)
+
+    if key in spec.DUP_SHARE:
+        return DuplicateShareSampler(base, spec.DUP_SHARE[key], rng)
+
+    return base

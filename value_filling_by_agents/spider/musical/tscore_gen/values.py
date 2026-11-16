@@ -3,9 +3,23 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def near_variants(v: str) -> list:
+    """Case changes, leading/trailing spaces and truncations of a literal."""
+    if not isinstance(v, str) or not v:
+        return []
+    out = {v.lower(), v.upper(), v.title(), ' ' + v, v + ' ', ' ' + v + ' '}
+    if len(v) > 2:
+        out.add(v[:-1])
+        out.add(v[1:])
+        out.add(v[:max(1, len(v) // 2)])
+    return [x for x in out if x != v]
 
 
 class ColumnSampler:
@@ -39,19 +53,27 @@ def _num(x):
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None, boundary=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        hi_s = min(10 ** scale, _MAX)
+        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi_s, hi_s)
+        if lo is not None:
+            self.min = lo
+        if hi is not None:
+            self.max = hi
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
+        self.boundary = [b for b in (boundary or []) if isinstance(b, (int, float))]
 
     def _cast(self, v):
         return int(round(v)) if self.is_int else (round(v, self.precision) if self.precision else v)
 
     def sample(self):
         r = self.rng
+        if self.boundary and r.random() < 0.15:
+            return self._cast(r.choice(self.boundary))
         if not self.elements or r.random() < self.p:
             full = r.random() < self.p or len(self.elements) <= 1
             lo, hi = (self.min, self.max) if full else (self.list_min, self.list_max)
@@ -105,6 +127,34 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Explicit enum list + near-variants for comparison-boundary coverage."""
+
+    def __init__(self, enum: list, boundary: list, p: float, max_l0: float, rng):
+        pool = list(enum)
+        for v in boundary:
+            if v not in pool:
+                pool.append(v)
+        for v in list(enum):
+            pool.extend(near_variants(v))
+        super().__init__(pool, p, max_l0, rng)
+        self.enum = list(enum)
+        self.boundary = list(boundary)
+
+    def sample(self):
+        r = self.rng
+        u = r.random()
+        if u < 0.60:
+            return r.choice(self.enum)
+        if u < 0.80 and self.boundary:
+            return r.choice(self.boundary)
+        if u < 0.80 + spec.NEAR_VARIANT_P:
+            base = r.choice(self.enum)
+            nv = near_variants(base)
+            return r.choice(nv) if nv else base
+        return r.choice(self.elements)
 
 
 def _parse_date(s: str):
@@ -215,8 +265,9 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
-                  max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+                  max_l0: float = float('inf'), pk_range=None) -> ColumnSampler:
+    """Per-column initialisation of fuzz/fuzz.py:198-224, extended with the spec pools."""
+    key = (column.table, column.name)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,6 +276,15 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
+    if key in spec.ENUMS:
+        return EnumSampler(spec.ENUMS[key], spec.BOUNDARY_VALUES.get(key, []), p, max_l0, rng)
+    if key in spec.RANGES:
+        lo, hi = spec.RANGES[key]
+        if column.pk_pos > 0 and pk_range is not None:
+            lo, hi = pk_range
+        boundary = [b for b in spec.BOUNDARY_VALUES.get(key, []) if isinstance(b, int)]
+        return NumberSampler(els + [str(x) for x in boundary], p, max_l0, rng, is_int=True,
+                             lo=lo, hi=hi, boundary=boundary)
     return make_column_sampler(column, els, p, max_l0, rng)
 
 

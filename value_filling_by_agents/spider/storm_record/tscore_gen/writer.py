@@ -1,5 +1,6 @@
-"""Unit writing (sql_util/writedb.py:292-369)."""
+"""Unit writing (sql_util/writedb.py:292-369) adapted for round 1."""
 import os
+import shutil
 import sqlite3
 
 from .schema import q
@@ -11,34 +12,78 @@ def unit_path(root: str, ds: str, db: str, i: int, tag: str = 'gen') -> str:
     return os.path.join(root, ds, name, name + '.sqlite')
 
 
-def write_instance_sqlite(schema, instance: dict, path: str) -> dict:
-    """Empty DDL clone + row-by-row insert, failing rows skipped (writedb.py:292-319); atomic, mode 0644."""
+def _dedup_rows(tm, unique_sets, rows: list, compact_keys: set) -> list:
+    """Deduplicate PK tuples and UNIQUE tuples (single and composite) before insert."""
+    seen_pk = set(compact_keys)
+    seen_u = {uset: set() for uset in unique_sets}
+    names = [c.name for c in tm.columns]
+    pos = {c: j for j, c in enumerate(names)}
+    out = []
+    for row in rows:
+        if tm.primary_key:
+            k = tuple(row[pos[c]] for c in tm.primary_key)
+            if k in seen_pk:
+                continue
+            seen_pk.add(k)
+        ok = True
+        for uset in unique_sets:
+            k = tuple(row[pos[c]] for c in uset)
+            if k in seen_u[uset]:
+                ok = False
+                break
+        if not ok:
+            continue
+        for uset in unique_sets:
+            seen_u[uset].add(tuple(row[pos[c]] for c in uset))
+        out.append(row)
+    return out
+
+
+def write_instance_sqlite(schema, instance: dict, path: str, orig: str = None) -> dict:
+    """Copy the compact database, append generated rows with executemany in one transaction."""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     part = path + '.part'
     if os.path.exists(part):
         os.remove(part)
+    if orig is not None:
+        shutil.copyfile(orig, part)
     con = sqlite3.connect(part)
     ok, bad = {}, {}
     try:
+        con.execute('pragma journal_mode = MEMORY')
+        con.execute('pragma synchronous = OFF')
+        con.execute('pragma temp_store = MEMORY')
         con.execute('pragma foreign_keys = OFF')
-        for s in schema.ddl:
-            try:
-                con.execute(s)
-            except sqlite3.Error:
-                pass
+        if orig is None:
+            for s in schema.ddl:
+                try:
+                    con.execute(s)
+                except sqlite3.Error:
+                    pass
         con.execute('begin')
         for t, tm in schema.tables.items():
             cols = instance.get(t, {})
             names = [c.name for c in tm.columns]
             n = len(cols.get(names[0], [])) if names else 0
-            sql = 'INSERT INTO %s VALUES (%s)' % (q(t), ','.join('?' * len(names)))
             ok[t] = bad[t] = 0
-            for i in range(n):
-                try:
-                    con.execute(sql, [cols[c][i] for c in names])
-                    ok[t] += 1
-                except (sqlite3.Error, OverflowError):
-                    bad[t] += 1
+            if n == 0:
+                continue
+            rows = [[cols[c][i] for c in names] for i in range(n)]
+            rows = _dedup_rows(tm, schema.unique_sets.get(t, []), rows, schema.compact_keys.get(t, set()))
+            sql = 'INSERT INTO %s VALUES (%s)' % (q(t), ','.join('?' * len(names)))
+            good = []
+            for row in rows:
+                good.append(row)
+            try:
+                con.executemany(sql, good)
+                ok[t] = len(good)
+            except (sqlite3.Error, OverflowError):
+                for row in good:
+                    try:
+                        con.execute(sql, row)
+                        ok[t] += 1
+                    except (sqlite3.Error, OverflowError):
+                        bad[t] += 1
         con.commit()
     finally:
         con.close()

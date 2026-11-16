@@ -1,8 +1,5 @@
 """Run the official Spider evaluator (test-suite-sql-eval ``evaluation.py``, execution match) and save its
-per-question verdicts; ``eval_exec_match`` is wrapped, not modified.
-
-Usage: python spider_persample.py <test-suite-sql-eval dir> <out.json> <gold.sql> <pred.sql> <database dir>
-"""
+per-question verdicts; ``eval_exec_match`` is wrapped, not modified."""
 import json
 import os
 import sys

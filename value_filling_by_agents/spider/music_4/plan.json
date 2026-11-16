@@ -1,52 +1,278 @@
 {
  "db": "music_4",
- "operator_io_quirks": [
-  "All identifiers are mixed-case (Artist_ID, Famous_Release_date, Music_Festival); must be double-quoted in generated SQL.",
-  "DDL mixes quoting styles: CREATE TABLE uses \"...\" but FK clauses use backticks (`Artist_ID` REFERENCES `artist`).",
-  "All columns are declared NOT NULL=0 (nullable) and no CHECK/UNIQUE constraints; only PKs and 2 FKs.",
-  "Date-like columns are declared TEXT (Famous_Release_date, Issue_Date, Date_of_ceremony) -> dispatch to String fuzzer, not Date.",
-  "Date text formats are heterogeneous and non-ISO: 'November 2007', 'January 21, 2008', '2009', '27 December 1986 - 10 January', '17 January', '9 May', '18 February 2011'.",
-  "Volume_Issue values are issue codes like '45:14 \u00a7', '45:21-22', '46:5' (contains non-ASCII \u00a7 and ranges).",
-  "Song values have leading/trailing spaces (' The Way', ' Everybody Have Fun Tonight ').",
-  "Weeks_on_Top is REAL but stores whole numbers (3.0,1.0,2.0), only 3 distinct.",
-  "Date_of_ceremony has distinct=1 (single value '18 February 2011') -> Date/String range degenerate.",
-  "Tiny tables (7/10/9 rows); FK volume.Artist_ID has 5 distinct of 7 parents (not all artists referenced); music_festival.Volume 9 distinct of 10.",
-  "FK chain artist <- volume <- music_festival; both FKs point to single-column INT PKs (unique parents, no dangling).",
-  "PKs are INT single-column; no composite keys, no self-references."
- ],
- "operator_ts_expectations": [
-  "Artist_ID/Volume_ID/ID/Age/Volume/Weeks_on_Top -> Number fuzzer: uniform ints/floats in [-10^scale,10^scale] with +-1/+-2 perturbation; Age will get implausible values (negatives, huge).",
-  "Weeks_on_Top REAL -> Number scale from 'real' (no args) -> wide float range, not the 1-3 observed.",
-  "Artist, Famous_Title, Volume_Issue, Issue_Date, Song, Music_Festival, Category, Result, Date_of_ceremony -> String fuzzer: random a-zA-Z0-9() strings length 0-20 plus contamination, so date-like text becomes gibberish -> FN on date-format predicates.",
-  "Date_of_ceremony single distinct value: String sampler range [len,len+1] narrow but still random chars; loses the '18 February 2011' shape.",
-  "FK columns drawn from parent's final values with replacement -> duplicates in child FK, and only 5-7 distinct parent keys -> many-to-one ties created (good for joins, may create FP on DISTINCT/count queries).",
-  "PK dedup keeps first occurrence; with tiny sizes (level0=1+30u, x4) tables may be small or empty -> empty-result FPs.",
-  "String contamination (prefix/suffix/drop char) breaks equality/join on text columns -> FN on exact-match predicates.",
-  "Number perturbation on Artist_ID/Volume_ID may break FK consistency only if drawn fresh; FK path uses parent values so joins survive, but non-FK numeric predicates get implausible values.",
-  "Date text columns never get the Date fuzzer, so TS cannot produce 'November 2007'-style values -> misses on LIKE '%2007%' or month-name predicates.",
-  "Leading/trailing spaces in Song are not preserved by String fuzzer -> FN on TRIM/equality queries.",
-  "Tiny original sizes mean TS's 30-200 row sizes are much larger than original -> cardinality-based FPs (e.g. count comparisons)."
- ],
- "challenger_refs": [
-  "g3f7780a6",
-  "gb90fb31e",
-  "gbac95cb8",
-  "g76fdbdb7",
-  "g42910ba9",
-  "g42910ba9",
-  "gb05b0dcc",
-  "gb05b0dcc",
-  "g6abaf0db",
-  "gdfe35df0",
-  "g33c3ec38",
-  "g33c3ec38",
-  "g9dbeb0b2"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table; never NULL; never overwritten by any planter (ties, nulls, group_sizes, different_values) \u2014 planters must exclude PK columns.",
+   "integer_fk": "Sample from parent PK pool (existing parent rows only); allow NULL with probability 0.15 when nullable; NEVER emit orphan values (no parent PK + 1000); unmatched_join_rows is satisfied only by NULL child FKs and by parent rows with no children.",
+   "integer_numeric": "Uniform integer in [min-1, max+1] of observed range; include boundary values at each listed literal and one step on each side.",
+   "real_numeric": "Uniform real rounded to 1 decimal in [min-1, max+1]; include boundary values at each listed literal and one step on each side.",
+   "text_short": "Sample from observed value pool; enforce 20-50% duplicate share on non-PK, non-FK text columns by capping fresh distinct values; add near-variants (case changes, trailing space, empty string) with probability 0.10.",
+   "text_date": "Sample from observed date-string pool; preserve format; add one-day-shifted variants for boundary testing.",
+   "text_enum": "Sample from observed distinct values; ensure each value appears at least once; boundary values listed in per_column_exceptions are injected into the enum pool (not ignored); add near-variants (case changes, empty string) with probability 0.10.",
+   "null_rule": "For every nullable column, each instance contains at least one NULL row; NULL share follows compact database share (5-30% for columns with null_rows pattern, 0% otherwise); planted NULLs are never replaced to satisfy a rule; planters run in order nulls -> group_sizes -> ties -> different_values, and each planter excludes PK columns and re-verifies prior structures.",
+   "planter_order": "nulls, then group_sizes, then ties, then different_values; each planter excludes PK columns; after all planters, re-verify group-size and tie structures and re-plant if overwritten."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "columns": [
+      "artist.Artist_ID",
+      "volume.Volume_ID",
+      "volume.Artist_ID",
+      "music_festival.ID",
+      "music_festival.Volume"
+     ],
+     "rule": "Parent rows without children: at least one artist with no volume, one volume with no music_festival. Child rows with NULL FK: volume.Artist_ID and music_festival.Volume get NULL in 5-30% of rows. No orphan (non-NULL, non-existent) FK values are permitted; foreign_keys pragma must be ON during insert."
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "columns": [
+      "volume.Song",
+      "volume.Issue_Date",
+      "artist.Famous_Title",
+      "music_festival.Category"
+     ],
+     "rule": "Duplicate share 20-50% on these non-PK, non-FK DISTINCT columns; ensure COUNT(DISTINCT col) < COUNT(col). PK columns (artist.Artist_ID, music_festival.ID) and FK column volume.Artist_ID are excluded (PKs cannot duplicate; FK duplicates arise naturally from FK sampling)."
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "columns": [
+      "volume.Artist_ID",
+      "music_festival.Result"
+     ],
+     "rule": "NULL share 5-30% of generated rows; at least one NULL row per column per instance; _plant_nulls must actually set NULLs in music_festival.Result (verify Result is in cols and not overwritten by later planters)."
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "columns": [
+      "artist.Artist_ID",
+      "artist.Age",
+      "artist.Artist",
+      "music_festival.Result"
+     ],
+     "rule": "At least two rows tie at rank 1 for DESC order on artist.Age and artist.Artist; artist.Artist_ID is a PK and is excluded from tie planting (PKs must stay unique). For music_festival.Result ensure ties at rank 1 and rank 100 on COUNT(*) and COUNT(DISTINCT id) in both ASC and DESC."
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "columns": [
+      "artist.Age",
+      "music_festival.Result",
+      "volume.Weeks_on_Top"
+     ],
+     "rule": "artist.Age: include values 22,23,24,25,26,31,32,33. music_festival.Result: include 'Nominated','nominated','','x','NOMINATED' \u2014 these are injected into the EnumSampler pool; the enum formula for Result is relaxed to allow these boundary variants (see semantic_rules_and_formulas). volume.Weeks_on_Top: include 1,2,3."
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "columns": [
+      "artist.Age",
+      "volume.Weeks_on_Top"
+     ],
+     "rule": "Ensure at least 2 rows per group with different values for MAX/SUM/AVG and MIN aggregates."
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "columns": [
+      "music_festival.Result"
+     ],
+     "rule": "Group sizes for music_festival.Result must include groups of size 1, 2, and >=3; when fewer than 3 distinct values exist, draw from the enum/observed pool or synthesize distinct values rather than collapsing to pool[0]."
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "columns": [
+      "music_festival.Category"
+     ],
+     "rule": "Ensure at least one Category group has COUNT(*) > 2 and at least one has COUNT(*) <= 1; requires a dedicated aggregate_boundary planter."
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child_column": "volume.Artist_ID",
+    "parent_table": "artist",
+    "parent_column": "Artist_ID",
+    "copied_columns": []
+   },
+   {
+    "child_column": "music_festival.Volume",
+    "parent_table": "volume",
+    "parent_column": "Volume_ID",
+    "copied_columns": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "artist",
+    "column": "Artist_ID",
+    "formula": "Artist_ID > 0",
+    "evidence": "Primary key, positive integer"
+   },
+   {
+    "table": "artist",
+    "column": "Age",
+    "formula": "Age BETWEEN 18 AND 49",
+    "evidence": "Observed range 18-49"
+   },
+   {
+    "table": "volume",
+    "column": "Volume_ID",
+    "formula": "Volume_ID > 0",
+    "evidence": "Primary key, positive integer"
+   },
+   {
+    "table": "volume",
+    "column": "Weeks_on_Top",
+    "formula": "Weeks_on_Top BETWEEN 1.0 AND 3.0",
+    "evidence": "Observed values 1.0, 2.0, 3.0"
+   },
+   {
+    "table": "music_festival",
+    "column": "ID",
+    "formula": "ID > 0",
+    "evidence": "Primary key, positive integer"
+   },
+   {
+    "table": "music_festival",
+    "column": "Result",
+    "formula": "Result IN ('Nominated','Awarded','nominated','NOMINATED','','x') OR Result IS NULL",
+    "evidence": "Observed values Nominated, Awarded; boundary variants required by comparison_boundary"
+   },
+   {
+    "table": "music_festival",
+    "column": "Category",
+    "formula": "Category IN ('Best Song','Best Lyrics','Best Sound Song') OR Category IS NULL",
+    "evidence": "Observed values"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "artist": 7,
+   "volume": 10,
+   "music_festival": 9
+  },
+  "null_targets": [
+   "volume.Artist_ID",
+   "music_festival.Result"
+  ],
+  "supporting_evidence": {
+   "artist.Age_range": "Rows: 34,35,22,18,27,49 -> min 18, max 49",
+   "volume.Weeks_on_Top_range": "Rows: 3.0,1.0,2.0 -> min 1.0, max 3.0",
+   "music_festival.Result_enum": "Rows: Nominated, Awarded; boundary variants nominated, NOMINATED, '', x added per comparison_boundary",
+   "music_festival.Category_enum": "Rows: Best Song, Best Lyrics, Best Sound Song"
+  },
+  "uncertainty": "Date_of_ceremony has only one distinct value; no order rule applicable. Famous_Release_date format varies; no formula. Volume_Issue and Issue_Date formats are free text; no formula. Artist name duplicates observed (5 distinct of 7 rows) but no formula. music_festival.Result enum formula relaxed to include boundary variants; if boundary variants are not intended, remove them from comparison_boundary and restore strict enum."
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: integrity.fk_violations = 56 and validity.invalid = 19/20 with reason 'new_integrity_failures'. The writer (writer.py) sets 'pragma foreign_keys = OFF' before inserting generated rows, so FK violations are never caught at insert time; the orphan-FK rule (parent PK + 1000) in instance.py fill_foreign_keys_consistently injects orphan values into volume.Artist_ID and music_festival.Volume, and _plant_parent_without_child can also leave dangling references. The spec's unmatched_join_rows rule only asks for parent rows without children and child rows with NULL FK \u2014 it does not authorize orphan (non-NULL, non-existent) FK values.",
+     "requested_revision": "Do not emit orphan FK values (parent PK + 1000) for volume.Artist_ID or music_festival.Volume; the unmatched_join_rows target is satisfied by NULL child FKs and by parent rows with no children. Either remove the orphan injection or restrict it to columns where the specification explicitly permits orphan values. Additionally, enable 'pragma foreign_keys = ON' (or validate FKs before commit) so that any residual FK violation is caught and counted rather than silently written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: rows_skipped.artist = 86 out of 128 attempted (42 added). The artist table has a single-column PK (Artist_ID) and the writer inserts generated rows with executemany; the fallback row-by-row path skips rows that violate constraints. instance.py _next_pk starts after the compact max, but _plant_ties / _plant_different_values / _plant_nulls run after PK assignment and can overwrite Artist_ID values (ties rule targets artist.Artist_ID), producing duplicate PKs that are then skipped. This silently discards ~67% of generated artist rows and undermines the ties_for_order_limit rule for artist.Artist_ID.",
+     "requested_revision": "Exclude primary-key columns from _plant_ties, _plant_nulls, _plant_different_values and _plant_group_sizes (or re-assign PKs after planting). Ensure generated PKs remain unique and sequential so that no generated row is skipped for PK reasons; report rows_skipped.artist near zero."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback nullable_columns: 'music_festival.Result: generated rows: NULL 0 / 174'. The specification lists music_festival.Result under null_rows (NULL share 5-30%) and null_targets. In instance.py, _plant_nulls only plants NULLs for columns present in cols; Result is sampled by EnumSampler and then _plant_nulls should set some to None \u2014 but the feedback shows zero NULLs, indicating the planting is being overwritten or the column is not reached (e.g. Result is not in the sampler dict path or _plant_nulls runs before a later overwrite). Per the interface rule this is noted for the engineer and does not by itself block a pass, but it contradicts the specification's null_rows target.",
+     "requested_revision": "Ensure _plant_nulls actually plants NULLs in music_festival.Result (verify ordering relative to other planters and that Result is included in cols). Target NULL share 5-30% with at least one NULL row per instance."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification semantic_rules_and_formulas: music_festival.Result formula 'Result IN (\\'Nominated\\',\\'Awarded\\') OR Result IS NULL' and Category formula 'Category IN (\\'Best Song\\',\\'Best Lyrics\\',\\'Best Sound Song\\') OR Category IS NULL'. But per_column_exceptions comparison_boundary for music_festival.Result requires values 'Nominated','nominated','','x','NOMINATED', and text_short/text_enum generic rules add near-variants (case changes, empty string) with probability 0.10. These two requirements conflict: the enum formula forbids 'nominated', '', 'x', 'NOMINATED', while the boundary rule requires them. The program resolves this by passing boundaries only to NumberSampler (values.py make_column_sampler ignores boundaries for EnumSampler), so the Result boundary values are never generated \u2014 the comparison_boundary target for music_festival.Result is unimplemented.",
+     "requested_revision": "Reconcile the specification: either drop the enum formula for music_festival.Result (allowing the boundary variants) or drop the boundary variants from the comparison_boundary target. If boundary variants are intended, the program must inject them into the EnumSampler pool; if not, remove them from the spec so the program and spec agree."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "values.py make_column_sampler: 'boundaries' is only forwarded to NumberSampler; EnumSampler and StringSampler ignore it. spec.py stores boundaries for music_festival.Result ('Nominated','nominated','','x','NOMINATED') but they are never used. Similarly, spec_for returns 'aggregate_boundary' for music_festival.Category but instance.py has no planter for aggregate_boundary (only _plant_group_sizes, _plant_ties, _plant_different_values, _plant_nulls), so the aggregate_boundary rule (COUNT(*) > 2 and <= 1 per Category group) is not implemented by construction.",
+     "requested_revision": "Implement boundary injection for text/enum columns (add boundary values to the EnumSampler/StringSampler element pool) and add an aggregate_boundary planter that guarantees at least one Category group with COUNT(*) > 2 and one with COUNT(*) <= 1. Alternatively, remove these targets from the specification if they are not intended."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes: 'v1, v2, v3 = rng.sample(pool, 3) if len(set(map(str, pool))) >= 3 else (pool[0], pool[0], pool[0])'. When fewer than 3 distinct values exist, all three are set to pool[0], so group sizes 1, 2, >=3 are not actually created. Also _plant_ties and _plant_different_values can overwrite the group-size assignments afterwards (planters run in order: nulls, group_sizes, ties, different_values), potentially destroying the 1/2/>=3 structure. The ties_for_order_limit target for music_festival.Result ('ties at rank 1 and rank 100 on COUNT(*) and COUNT(DISTINCT id) in both ASC and DESC') is not implemented at all \u2014 _plant_ties only creates two equal values, not rank-100 ties.",
+     "requested_revision": "Make _plant_group_sizes robust when fewer than 3 distinct values exist (draw from the enum/observed pool or synthesize distinct values). Reorder planters so that group-size and tie structures are not overwritten, or re-verify after planting. Implement the rank-100 tie requirement for music_festival.Result or remove it from the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py fill_foreign_keys_consistently: 'nullable = not cm.notnull and cm.pk_pos == 0'. For volume.Artist_ID and music_festival.Volume the schema declares them as plain INT (not NOT NULL), so nullable is True and NULLs are planted \u2014 consistent with the spec. However, the same function also applies orphan values (base + 1000) to non-NULL FK values with probability orphan_prob=0.10, which is the source of the 56 FK violations. The spec's unmatched_join_rows rule does not request orphan values, only NULL child FKs and parent rows without children.",
+     "requested_revision": "Remove the orphan-value branch from fill_foreign_keys_consistently (or gate it behind an explicit spec flag that is not set for this database). Keep NULL child FKs and parent-without-child planting, which satisfy the unmatched_join_rows target without violating referential integrity."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification supporting_evidence: 'Artist name duplicates observed (5 distinct of 7 rows) but no formula.' The duplicates_for_distinct rule targets artist.Artist_ID, music_festival.ID, volume.Artist_ID, volume.Song, volume.Issue_Date, artist.Famous_Title, music_festival.Category with 'Duplicate share 20-50%'. But artist.Artist_ID and music_festival.ID are primary keys and cannot have duplicates; volume.Artist_ID is a foreign key whose duplicates arise naturally from FK sampling. The rule as written is partly unsatisfiable (PKs) and partly redundant. The program does not implement a duplicate-share cap for text columns (StringSampler has no duplicate cap; only max_l0 reuse), so the 20-50% duplicate share for volume.Song, volume.Issue_Date, artist.Famous_Title, music_festival.Category is not guaranteed.",
+     "requested_revision": "Restrict duplicates_for_distinct to non-PK, non-FK columns (volume.Song, volume.Issue_Date, artist.Famous_Title, music_festival.Category) and have the program enforce a 20-50% duplicate share on those columns (e.g. cap distinct fresh values). Remove PK columns from the target list."
+    }
+   ],
+   "unresolved_checks": [
+    "construction_pairs: 44/100 separated, 0 unknown executions \u2014 separation is partial; this alone does not prove equivalence or a generation error, but combined with the FK violations and skipped rows it indicates the generated instances are not faithful to the specification.",
+    "music_festival.Result NULL 0/174 contradicts the null_rows target; noted per interface rule 7 but should be fixed.",
+    "Whether the compact rows are preserved: writer.py copies the original file and appends, so compact rows are preserved; no evidence of modification. Confirmed by design, not independently re-verified here.",
+    "Reproducibility: execution feedback reports reproducible=true; seed handling in cli.py (seed_base * 100003 + i) is deterministic. Confirmed."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "The specification's `unmatched_join_rows` exception lists `music_festival.ID` and `volume.Volume_ID` as columns whose parent rows must have no children, and the atomic-operation extraction reports `music_festival.ID` joins with `volume.Volume_ID` (a join that is not a declared FK). The schema declares `music_festival.Volume -> volume.Volume_ID` and `volume.Artist_ID -> artist.Artist_ID`; there is no FK from `volume` to `music_festival`. The spec's `parent_without_child` list is derived by regex `one (\\w+) with no` from the rule text, which yields `artist` and `volume` only, so the `music_festival.ID`/`volume.Volume_ID` join direction is not enforced.",
+     "requested_revision": "Clarify in the specification that the `music_festival.ID = volume.Volume_ID` join is a non-FK join and that unmatched-join coverage for it is satisfied only by the declared FK directions (artist->volume, volume->music_festival). No program change is required; the current behavior (NULL child FKs + parent rows without children on the declared FKs) is consistent with the schema."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The `ties_for_order_limit` exception lists `music_festival.Result` with ties at rank 1 and rank 100 on `COUNT(*)` and `COUNT(DISTINCT id)` in both ASC and DESC. The spec's `_plant_ties` only plants two equal values at rank 1 for a single column; there is no construction for rank-100 ties or for aggregate-count ties. The atomic-op extraction shows `ORDER(COUNT(*), DESC)` and `ORDER(music_festival.result, DESC)` with `tie_at_rank: [1, 100]`.",
+     "requested_revision": "Either (a) relax the `ties_for_order_limit` target for `music_festival.Result` to rank-1 ties only (matching what the planter can construct), or (b) add an explicit construction rule for rank-100 / aggregate-count ties. The current spec text overstates what is implemented; the program is consistent with the weaker rank-1 interpretation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_nulls` runs last in `build_random_instance` (order: group_sizes, aggregate_boundary, ties, different_values, duplicates, nulls), which matches the spec's `planter_order` note that nulls run last and are never overwritten. However, the spec's `generic_sampling_rules.planter_order` states 'nulls, then group_sizes, then ties, then different_values' \u2014 the program runs nulls last, not first. The spec's own `null_rule` says 'planted NULLs are never replaced to satisfy a rule; planters run in order nulls -> group_sizes -> ties -> different_values', which contradicts the program's order.",
+     "requested_revision": "Reconcile the spec's `planter_order` text with the program: the program's order (nulls last) is the one that actually guarantees NULLs are not overwritten, and the spec's `null_rule` sentence already says NULLs must not be replaced. Update the spec's `planter_order` to 'group_sizes, aggregate_boundary, ties, different_values, duplicates, nulls' so the specification and program agree. No program change needed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback shows `music_festival.Result: generated rows: NULL 27 / 177` and `volume.Artist_ID: generated rows: NULL 45 / 178`, both within the 5-30% target. `artist.Age`, `artist.Artist`, `artist.Famous_Title`, `artist.Famous_Release_date`, `volume.Song`, `volume.Issue_Date`, `volume.Volume_Issue`, `volume.Weeks_on_Top`, `music_festival.Category`, `music_festival.Date_of_ceremony`, `music_festival.Music_Festival` all show NULL 20-27 / n, i.e. ~15% \u2014 consistent with `_compact_null_share` fallback to `spec['null_share']=0.15` when the compact share is 0. This is the intended behavior per the NULL rule (share follows compact share, at least one NULL per nullable column).",
+     "requested_revision": "None; noted for the record. The NULL rule is satisfied for every nullable column, including nullable FKs (`volume.Artist_ID`, `music_festival.Volume`)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_duplicates` enforces a 20-50% duplicate share on `duplicate_targets` (volume.Song, volume.Issue_Date, artist.Famous_Title, music_festival.Category) by copying from a head of `k = round(n*(1-share))` rows. `_plant_group_sizes` and `_plant_aggregate_boundary` run before `_plant_duplicates`, so duplicates may overwrite group-size structure. The spec's `planter_order` says 'after all planters, re-verify group-size and tie structures and re-plant if overwritten' \u2014 the program does not re-verify after `_plant_duplicates`.",
+     "requested_revision": "Add a re-verification pass after `_plant_duplicates` (and after `_plant_nulls`) that re-checks group-size (1, 2, >=3) and tie (rank-1) structures and re-plants if overwritten, as the spec requires. This is a robustness fix; the current run produced 0 invalid instances, so it is not blocking, but it is a spec-compliance gap."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "`_plant_parent_without_child` only sets `vals[0] = unused[0]` for the first child row, which may be overwritten by `_plant_nulls` (which runs before it in the loop, but `_plant_parent_without_child` runs after the per-table loop, so it is not overwritten). However, `_plant_parent_without_child` is called once after all tables are built, and it only handles the first unused parent per FK; if `vals[0]` is NULL (planted by `_plant_nulls`), it is replaced with a non-NULL unused parent, which is fine. The construction is sound but fragile: it assumes `vals[0]` is not the only child row pointing at the unused parent.",
+     "requested_revision": "None blocking; the construction is correct for the current schema. Optionally make `_plant_parent_without_child` pick a child row that is not NULL and not the sole reference to the chosen parent, to be robust to future schemas."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's `semantic_rules_and_formulas` for `music_festival.Result` is `Result IN ('Nominated','Awarded','nominated','NOMINATED','','x') OR Result IS NULL`, and the `uncertainty` note says the enum formula is relaxed to include boundary variants. The program's `EnumSampler` injects boundaries into the pool and adds near-variants (upper/lower/trailing space/empty) with probability 0.10, which can produce values outside the declared enum (e.g. 'NOMINATED ' with trailing space, or 'awarded'). The spec's `text_enum` rule explicitly allows near-variants with probability 0.10, so this is consistent with the generic rule but not with the strict `IN (...)` formula.",
+     "requested_revision": "Clarify in the spec that the `Result` formula is a *pool* constraint (values are drawn from the pool plus near-variants), not a strict `IN` constraint, so that the `EnumSampler`'s near-variant behavior is explicitly sanctioned. No program change needed."
+    }
+   ],
+   "unresolved_checks": [
+    "The `ties_for_order_limit` target for `music_festival.Result` at rank 100 on `COUNT(*)`/`COUNT(DISTINCT id)` is not constructed by the program; the spec text and program disagree. This is a spec-vs-program mismatch, not a generation error, and does not block a pass.",
+    "The spec's `planter_order` text ('nulls, then group_sizes, then ties, then different_values') contradicts the program's actual order (nulls last) and the spec's own `null_rule` sentence. The program's order is the correct one; the spec text should be updated.",
+    "The `music_festival.ID = volume.Volume_ID` join is not a declared FK; unmatched-join coverage for it is not enforced. This is a schema-level observation, not a program error.",
+    "Construction-pair separation is 43/100; the remaining 57 pairs are not separated by the generated instances. Per the instructions, a missing separation alone does not establish a generation error or prove query equivalence, and no held-out pairs were used. The program's value domains (ranges, enums, boundaries, NULLs, duplicates, group sizes, ties, different values) are all implemented by construction and the execution feedback shows 0 integrity violations, 0 invalid instances, and reproducible generation."
+   ]
+  }
+ ]
 }

@@ -1,48 +1,569 @@
 {
  "db": "apartment_rentals",
- "operator_io_quirks": [
-  "Mixed-case table names (Apartment_Buildings, View_Unit_Status) and CamelCase columns; must double-quote identifiers and compare case-insensitively.",
-  "All tables tiny (7-20 rows); no huge-table sampling needed, but read_schema must still work with max_rows_per_table.",
-  "DATETIME columns store TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no T, no timezone); Date fuzzer template must parse this.",
-  "View_Unit_Status PK is status_date alone (DATETIME) \u2014 a date column as sole PK; composite-PK member rule does not apply, single-PK inf max_l0 applies.",
-  "Apartment_Facilities has composite PK (apt_id, facility_code) with apt_id also an FK to Apartments \u2014 composite-PK member + FK child overlap.",
-  "Apartments.building_id FK values (808,624,225,744,191) do NOT match Apartment_Buildings.building_id samples (133,153,191,196,225) \u2014 only 191/225 overlap; FK parent set is small (15) and child distinct is 9, so ties/duplicates expected.",
-  "room_count declared CHAR(5) but stores integer-looking text ('7','5','8') \u2014 String fuzzer with int-like element expansion applies.",
-  "available_yn declared BIT, storage integer 0/1 \u2014 Bit fuzzer, not Bool.",
-  "gender_code CHAR(1) stores 'Male'/'Female'/'Unknown' (length > 1) \u2014 declared length contradicts stored values; String length range from elements will be [4,8].",
-  "building_phone VARCHAR(80) has varied formats ('(948)040-1064x387','915-617-2408x832','681.772.2454','1-724-982-9507x640') \u2014 String fuzzer will contaminate these.",
-  "building_address contains embedded newlines and commas \u2014 String fuzzer charset excludes newline, so fresh values differ structurally.",
-  "No dangling FKs, no self-references, no missing parents; all parent_exists=true."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on DATETIME columns: template inferred from first parsable element = '%Y-%m-%d %H:%M:%S'; range from min/max of 5 sampled originals (e.g. 1970..2007 for status_date, 2016..2018 for booking dates).",
-  "Date fuzzer p-inversion: p=0.2 means element returned w.p. 0.2, fresh dates w.p. 0.8 \u2014 most generated dates are fresh uniform in the narrow original range, so date predicates like 'between 2016 and 2017' stay plausible but ties to specific originals are lost.",
-  "Number fuzzer on INTEGER PKs (building_id, apt_id, guest_id, apt_booking_id): range [-10^4,10^4] (scale=4 default for bare INTEGER? actually scale from args absent -> scale=0 -> [-1,1]? upstream default scale=4 when no args) \u2014 likely wide range, so PK values far from originals; joins on PK still work because FK draws from parent.",
-  "String fuzzer on names/addresses/phones: fresh random strings over a-zA-Z 0-9() with 50% contamination \u2014 implausible for LIKE '%Court%' or exact-name predicates -> FN.",
-  "String fuzzer on low-cardinality enums (apt_type_code 3 distinct, booking_status_code 2, facility_code 4, gender_code 3): elements dominate (p=0.2 fresh), so enum equality mostly preserved; but contamination can corrupt 'Studio'->'StudioXY' -> occasional FN.",
-  "Bit fuzzer on available_yn: 0/1 with p=0.2 element, else random 0/1 \u2014 fine.",
-  "FK consistency: Apartment_Bookings.apt_id drawn from Apartments.apt_id final values; View_Unit_Status.apt_booking_id from Apartment_Bookings.apt_booking_id \u2014 joins preserved, but child distinct counts (10,12) vs parent sizes (15) mean duplicates/ties appear.",
-  "View_Unit_Status PK = status_date alone: sample_fresh_primary_keys drops duplicate dates; Date fuzzer with max_l0=inf (single PK) draws fresh dates each row, so PK collisions rare -> table keeps ~n rows.",
-  "Apartment_Facilities composite PK (apt_id, facility_code): apt_id is FK child (drawn from Apartments, ~15 values) and facility_code String (4 elements) \u2014 PK dedup keeps first occurrence, so at most 15*4=60 distinct pairs; with n~30-200 many rows dropped -> small table, ties on apt_id expected.",
-  "Known FN driver: String fuzzer on building_short_name/full_name/address/phone destroys exact-match and LIKE predicates; Date fuzzer on booking_start/end_date loses original date ties.",
-  "Known FP driver: missing duplicates \u2014 original Apartments.building_id has 9 distinct over 15 rows (duplicates), but FK draw with replacement from 15 parents gives similar multiplicity; View_Unit_Status.apt_id 12 distinct over 20 rows, FK draw may under/over-represent."
- ],
- "challenger_refs": [
-  "G3",
-  "G9",
-  "G1",
-  "G5",
-  "G8",
-  "G6",
-  "G7",
-  "G2",
-  "G4"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 2,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers starting at 1, unique per table, never NULL; generated rows are appended after the compact rows so PKs never collide with compact PKs.",
+   "integer_fk": "Copy from the parent table's PK pool restricted to PKs actually present in the written instance (compact + generated); 5% NULL only when the column is nullable; never plant NULL on a NOT NULL FK.",
+   "integer_quantity": "Uniform integer in [1, 6]; never negative. Per-column exceptions override this rule.",
+   "char_enum": "Pick uniformly from the enum list defined in per_column_exceptions; canonical values only, no case/whitespace variants.",
+   "char_code": "Pick from a small fixed pool of 3-6 short strings; 10% near-variants (case/whitespace).",
+   "varchar_name": "Pick from a pool of 20 first/last names; 20-40% duplicate share across rows.",
+   "varchar_address": "Synthesize 'NNN Street Name\\nCity, ST ZIP'; 20-40% duplicate share.",
+   "varchar_phone": "Synthesize '(NNN)NNN-NNNN' or 'NNN-NNN-NNNNxNNN'.",
+   "datetime": "Uniform timestamp in [2015-01-01, 2018-12-31] formatted '%Y-%m-%d %H:%M:%S'; 20-40% duplicate share.",
+   "bit_flag": "Uniform in {0, 1}.",
+   "boundary_numeric": "For each listed literal L, include L-1, L, L+1 within the column's declared domain.",
+   "boundary_text": "For each listed literal L, include L and a case-variant (lower/upper).",
+   "tie_order": "Ensure at least 3 rows share the tie value at the listed rank; ranks must be reachable at the table size.",
+   "null_share": "5% NULL on nullable columns; at least one NULL row per nullable column; NULLs are planted after all value-shaping rules and are never overwritten.",
+   "duplicate_share": "For DISTINCT targets, copy a non-NULL source value into 20-50% of rows; skip NULL cells."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Apartment_Buildings.building_description",
+    "pattern": "enum",
+    "targets": [
+     "Studio",
+     "Flat",
+     "Duplex"
+    ]
+   },
+   {
+    "column": "Apartment_Buildings.building_short_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Columbus Square",
+     "columbus square"
+    ]
+   },
+   {
+    "column": "Apartment_Buildings.building_full_name",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Columbus Square",
+     "columbus square"
+    ]
+   },
+   {
+    "column": "Apartment_Buildings.building_address",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartment_Buildings.building_manager",
+    "pattern": "literal_pool",
+    "targets": [
+     "Kyle",
+     "Brenden",
+     "Emma"
+    ]
+   },
+   {
+    "column": "Apartments.apt_type_code",
+    "pattern": "enum",
+    "targets": [
+     "Flat",
+     "Studio",
+     "Duplex"
+    ]
+   },
+   {
+    "column": "Apartments.apt_type_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Duplex",
+     "duplex"
+    ]
+   },
+   {
+    "column": "Apartments.apt_type_code",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1,
+      3
+     ],
+     "direction": "DESC",
+     "tie_on": [
+      "AVG(room_count)",
+      "SUM(bathroom_count)"
+     ]
+    }
+   },
+   {
+    "column": "Apartments.apt_type_code",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartments.apt_type_code",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "aggregate": "COUNT(*)",
+     "values": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   {
+    "column": "Apartments.apt_number",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Suite 634",
+     "suite 634"
+    ]
+   },
+   {
+    "column": "Apartments.apt_number",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartments.apt_number",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any",
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Apartments.bathroom_count",
+    "pattern": "comparison_boundary",
+    "targets": [
+     0,
+     1,
+     2
+    ]
+   },
+   {
+    "column": "Apartments.bedroom_count",
+    "pattern": "comparison_boundary",
+    "targets": [
+     2,
+     3,
+     4
+    ]
+   },
+   {
+    "column": "Apartments.bedroom_count",
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "qualifying_rows": ">= 2 per group with different values"
+    }
+   },
+   {
+    "column": "Apartments.room_count",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": [
+      1
+     ],
+     "direction": "ASC"
+    }
+   },
+   {
+    "column": "Apartment_Facilities.facility_code",
+    "pattern": "enum",
+    "targets": [
+     "Boardband",
+     "Gym",
+     "Swimming Pool",
+     "Cable TV"
+    ]
+   },
+   {
+    "column": "Guests.gender_code",
+    "pattern": "enum",
+    "targets": [
+     "M",
+     "F",
+     "U"
+    ]
+   },
+   {
+    "column": "Guests.gender_code",
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "tie_at_rank": "any",
+     "direction": "DESC",
+     "tie_on": [
+      "COUNT(*)",
+      "COUNT(guest_id)"
+     ]
+    }
+   },
+   {
+    "column": "Guests.guest_first_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Guests.guest_last_name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Guests.date_of_birth",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartment_Bookings.booking_status_code",
+    "pattern": "enum",
+    "targets": [
+     "Provisional",
+     "Confirmed"
+    ]
+   },
+   {
+    "column": "Apartment_Bookings.booking_status_code",
+    "pattern": "comparison_boundary",
+    "targets": [
+     "Confirmed",
+     "confirmed",
+     "Provisional",
+     "provisional"
+    ]
+   },
+   {
+    "column": "Apartment_Bookings.booking_start_date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartment_Bookings.booking_end_date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Apartment_Bookings.apt_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "Apartments.apt_id",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "parent_rows_without_children": true,
+     "child_rows_with_null_fk": true
+    }
+   },
+   {
+    "column": "View_Unit_Status.available_yn",
+    "pattern": "bit_flag",
+    "targets": [
+     0,
+     1
+    ]
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Apartments.building_id",
+    "parent": "Apartment_Buildings.building_id",
+    "copied": []
+   },
+   {
+    "child": "Apartment_Facilities.apt_id",
+    "parent": "Apartments.apt_id",
+    "copied": []
+   },
+   {
+    "child": "Apartment_Bookings.apt_id",
+    "parent": "Apartments.apt_id",
+    "copied": []
+   },
+   {
+    "child": "Apartment_Bookings.guest_id",
+    "parent": "Guests.guest_id",
+    "copied": []
+   },
+   {
+    "child": "View_Unit_Status.apt_id",
+    "parent": "Apartments.apt_id",
+    "copied": []
+   },
+   {
+    "child": "View_Unit_Status.apt_booking_id",
+    "parent": "Apartment_Bookings.apt_booking_id",
+    "copied": []
+   },
+   {
+    "unique": "Apartment_Facilities(apt_id, facility_code)"
+   },
+   {
+    "unique": "View_Unit_Status(status_date)"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Apartment_Buildings",
+    "column": "building_description",
+    "formula": "building_description IN ('Studio','Flat','Duplex')"
+   },
+   {
+    "table": "Apartments",
+    "column": "apt_type_code",
+    "formula": "apt_type_code IN ('Flat','Studio','Duplex')"
+   },
+   {
+    "table": "Apartments",
+    "column": "bathroom_count",
+    "formula": "bathroom_count BETWEEN 1 AND 3"
+   },
+   {
+    "table": "Apartments",
+    "column": "bedroom_count",
+    "formula": "bedroom_count BETWEEN 3 AND 6"
+   },
+   {
+    "table": "Apartments",
+    "column": "room_count",
+    "formula": "CAST(room_count AS INTEGER) BETWEEN 3 AND 9"
+   },
+   {
+    "table": "Apartment_Facilities",
+    "column": "facility_code",
+    "formula": "facility_code IN ('Boardband','Gym','Swimming Pool','Cable TV')"
+   },
+   {
+    "table": "Guests",
+    "column": "gender_code",
+    "formula": "gender_code IN ('M','F','U')"
+   },
+   {
+    "table": "Apartment_Bookings",
+    "column": "booking_status_code",
+    "formula": "booking_status_code IN ('Provisional','Confirmed')"
+   },
+   {
+    "table": "Apartment_Bookings",
+    "column": "booking_end_date",
+    "formula": "booking_end_date >= booking_start_date"
+   },
+   {
+    "table": "View_Unit_Status",
+    "column": "available_yn",
+    "formula": "available_yn IN (0, 1)"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Apartment_Buildings": 15,
+   "Apartments": 15,
+   "Apartment_Facilities": 7,
+   "Guests": 15,
+   "Apartment_Bookings": 15,
+   "View_Unit_Status": 20
+  },
+  "null_targets": [
+   "Apartment_Bookings.apt_id",
+   "View_Unit_Status.apt_id",
+   "View_Unit_Status.apt_booking_id",
+   "View_Unit_Status.available_yn"
+  ],
+  "supporting_evidence": {
+   "booking_end_date >= booking_start_date": [
+    "Apartment_Bookings rows 258, 279, 337, 343, 365, 401, 497, 526 all satisfy end >= start"
+   ],
+   "bathroom_count BETWEEN 1 AND 3": [
+    "Apartments sample bathroom_count values 1,2,3"
+   ],
+   "bedroom_count BETWEEN 3 AND 6": [
+    "Apartments sample bedroom_count values 3,4,5,6"
+   ],
+   "room_count BETWEEN 3 AND 9": [
+    "Apartments sample room_count values 3,5,6,7,8,9"
+   ],
+   "apt_type_code IN ('Flat','Studio','Duplex')": [
+    "Apartments sample apt_type_code values Flat, Studio, Duplex"
+   ],
+   "booking_status_code IN ('Provisional','Confirmed')": [
+    "Apartment_Bookings sample statuses Provisional, Confirmed"
+   ],
+   "gender_code IN ('M','F','U')": [
+    "Guests sample gender_code values Male, Female, Unknown mapped to M/F/U"
+   ],
+   "facility_code IN (...)": [
+    "Apartment_Facilities sample facility_code values Boardband, Gym, Swimming Pool, Cable TV"
+   ]
+  },
+  "uncertainty": [
+   "gender_code declared CHAR(1) but sample shows 'Male','Female','Unknown'; enum uses single-char codes M/F/U to fit CHAR(1).",
+   "room_count declared CHAR(5) but holds numeric strings; range rule casts to INTEGER.",
+   "View_Unit_Status.status_date is PK and must be unique; no order rule with booking dates is enforced since no aligned sample.",
+   "Apartment_Bookings.apt_id nullable per schema; NULL FK rows generated per null_targets.",
+   "bedroom_count boundary literals changed from [-3,-2,-1,1,2,3] to [2,3,4] to stay within the semantic range 3..6; the negative-side comparison PRED(bedroom_count > -2) is trivially true for all rows in range.",
+   "room_count tie_at_rank changed from [100] to [1] because table size is 15 and rank 100 is unreachable.",
+   "apt_type_code ties_for_order_limit on AVG(room_count)/SUM(bathroom_count) at ranks 1 and 3 are not guaranteed by the tie rule alone; the tie rule only forces shared apt_type_code values, and aggregate ties are left to natural variation.",
+   "The instance must be a copy of the compact database plus appended rows; the writer must receive the original database path and FK pools must be restricted to PKs present in the written instance."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: validity.invalid = 20/20 with reasons compact_rows_missing (20), new_integrity_failures (20), no_rows_added (7); integrity.fk_violations = 553. The writer (tscore_gen/writer.py) is called from cli._one as `write_instance_sqlite(_G['schema'], inst, p)` with no `orig_path`, so the compact database is never copied; instead the writer creates an empty schema and inserts only generated rows. This both drops the compact rows (compact_rows_missing) and, because generated FKs draw from `_parent_pool` which includes compact original values (schema.original_values) that are not present in the fresh DB, produces 553 FK violations.",
+     "requested_revision": "Pass the original database path through to the writer (e.g. `write_instance_sqlite(schema, inst, p, orig_path=orig)`), or restrict `_parent_pool` to values actually present in the written DB. The instance must be a copy of the compact database plus appended rows, with zero FK violations and compact rows preserved."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_null_rule` plants NULLs on every nullable column using `rng.sample(range(n), k)` with `k = max(1, round(share*n))`, and `_apply_unmatched_join` additionally forces a NULL into every nullable FK. Combined with `fill_foreign_keys_consistently` drawing from `_parent_pool` (which includes compact values), the generated FK columns contain values that are not in the written parent table, contributing to the 553 FK violations. Also, `_apply_null_rule` runs before `_apply_booking_date_rule`/`_apply_room_count_rule`/`_apply_*_tie`/`_apply_duplicate_share`, so planted NULLs can be overwritten by later rules (e.g. `_apply_duplicate_share` copies `col[0]` into `col[1..k]`, and `_apply_apt_number_tie`/`_apply_room_count_tie`/`_apply_gender_tie` overwrite indices 1..2), violating the interface rule that a planted NULL is never replaced.",
+     "requested_revision": "Apply NULL planting after all value-shaping rules, or make the shaping rules skip NULL cells. Ensure FK NULLs are only planted on nullable FK columns and that non-NULL FK values are drawn from the parent PK pool actually written to the instance."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_duplicate_share` forces `col[i] = col[0]` for i in 1..k on `Apartment_Bookings.booking_start_date` and `booking_end_date` independently, and `_apply_booking_date_rule` runs before `_apply_duplicate_share`. After duplication, `booking_end_date >= booking_start_date` is not re-checked, so the semantic rule can be violated. Similarly `_apply_room_count_rule` runs before `_apply_room_count_tie`, which copies `room_count[0]` into indices 1..2 \u2014 safe only if `room_count[0]` is in range, but the tie rule can also overwrite a NULL planted earlier.",
+     "requested_revision": "Reorder rules so that semantic constraints (booking_end_date >= booking_start_date, room_count in [3,9], bathroom_count in [1,3], bedroom_count in [3,6]) are enforced last, or re-validate after each shaping step. Do not overwrite NULLs."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` lists `Guests.gender_code` enum targets as `[\"Male\",\"Female\",\"Unknown\"]`, but the semantic rule and `specification.py` ENUMS use `['M','F','U']` (CHAR(1)). The specification's own `uncertainty` note acknowledges this. The atomic-operation extraction also shows `Guests.gender_code` ties_for_order_limit on COUNT(*)/COUNT(guest_id) DESC, which is satisfiable with either domain, but the enum list is internally inconsistent.",
+     "requested_revision": "Make the enum list in `per_column_exceptions` consistent with the semantic rule and `specification.py` (use `['M','F','U']`), or change the semantic rule and column type. Document the resolution."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `per_column_exceptions` for `Apartments.apt_type_code` ties_for_order_limit targets `tie_at_rank: [1,3]` with `tie_on: [\"AVG(room_count)\",\"SUM(bathroom_count)\"]`, but `_apply_tie_order` only forces three rows to share `apt_type_code`; it does not control the aggregate values AVG(room_count) or SUM(bathroom_count) per group, so the tie at ranks 1 and 3 on those aggregates is not guaranteed. Similarly `Apartments.room_count` ties_for_order_limit targets `tie_at_rank: [100]` with `LIMIT(100)` but table size is 15, so rank 100 is unreachable.",
+     "requested_revision": "Either adjust the tie targets to be achievable at the specified table sizes (e.g. rank within 15 rows), or extend the construction to control the aggregate values per group. Document the intended interpretation."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_aggregate_boundary` forces `apt_type_code[1] = apt_type_code[0]` to create a group of size 2, but `_apply_tie_order` then forces indices 1..2 to equal index 0, producing a group of size 3 \u2014 the aggregate_boundary target `COUNT(*) in {0,1,2}` is not actually guaranteed (a group of size 3 exists). Also `_apply_duplicate_share` for `apt_type_code` copies `col[0]` into indices 1..k, further inflating group sizes.",
+     "requested_revision": "Coordinate the aggregate_boundary, tie_order and duplicate_share rules for `apt_type_code` so that at least one group has COUNT(*) in {0,1,2} while ties at the specified ranks are also present, or relax the aggregate_boundary target in the specification."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_bedroom_different_values` uses `spec.NUMERIC_RANGES[('Apartments','bedroom_count')] = (3,6)` and assigns `lo + (j % (hi-lo+1))`, but the boundary_numeric target for bedroom_count is `[-3,-2,-1,1,2,3]`; the range sampler `RangeIntSampler(3,6, boundary=[-3,-2,-1,1,2,3])` clamps boundary values to [3,6], so the negative boundary literals are never generated. The comparison_boundary target `PRED(bedroom_count > -2)` and `PRED(bedroom_count > 2)` cannot be exercised on the negative side.",
+     "requested_revision": "Reconcile the semantic range (3..6) with the boundary literals (-3..3): either widen the range to include the boundary values, or change the boundary literals to values within [3,6] (e.g. 2,3,4)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_null_rule` computes `share` from `schema.original_values` but the writer never copies the compact DB (see issue 1), so the 'compact share' is not reflected in the written instance. Additionally, `_apply_null_rule` uses `rng.sample(range(n), k)` which can select the same index as a later tie/duplicate rule, and the interface requires 'rows with NULL and rows with non-NULL values' per nullable column \u2014 with n=15 and k=1 this is satisfied, but the overwrite risk (issue 2) can eliminate the NULL.",
+     "requested_revision": "After fixing issue 1, verify per-instance that each nullable column has at least one NULL and at least one non-NULL generated row, and that the NULL share matches the compact share. Add an assertion in the writer or a post-check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_unmatched_join` plants a NULL in every nullable FK column of every table, including `Apartment_Bookings.apt_id` and `View_Unit_Status.apt_id`/`apt_booking_id`, but does not ensure 'parent rows without children' \u2014 it relies on 'natural' unreferenced PKs, which is not guaranteed given the small table sizes and the FK sampling from `_parent_pool` (which includes all compact + generated parent values). The unmatched_join_rows target `parent_rows_without_children: true` is therefore not enforced.",
+     "requested_revision": "Explicitly reserve at least one parent PK per parent table that is not referenced by any generated child row, and verify it in a post-check."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_duplicate_share` targets `Apartment_Buildings.building_address` with `col[i] = col[0]`, but `building_address` is nullable and `_apply_null_rule` may have set `col[0] = None`; then all duplicated rows become NULL, violating the 'rows with non-NULL values' requirement and the duplicate_share target (NULLs are not duplicates for DISTINCT in the intended sense).",
+     "requested_revision": "In `_apply_duplicate_share`, choose a non-NULL source value (e.g. first non-NULL index) and skip NULL cells when duplicating."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `generic_sampling_rules.integer_quantity` says 'Uniform integer in [1, 6]; never negative', but `Apartments.bedroom_count` boundary_numeric targets include negative values (-3,-2,-1) and the semantic rule says BETWEEN 3 AND 6. The generic rule and the per-column rule conflict.",
+     "requested_revision": "Clarify that per-column exceptions override the generic integer_quantity rule, and state the intended domain for bedroom_count (3..6) and how the negative boundary literals are to be exercised (e.g. via a separate column or by relaxing the range)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/values.py `EnumSampler` applies a 10% near-variant (lower/upper/trailing space) to enum values, including `Guests.gender_code` (M/F/U) and `Apartment_Bookings.booking_status_code`. The specification's `char_enum` rule says 'Pick uniformly from the enum list defined in per_column_exceptions' with no variant rate; the 10% variant rate is only specified for `char_code`, not `char_enum`. This can produce values outside the declared enum (e.g. 'm', 'M '), which may violate the semantic rule `gender_code IN ('M','F','U')` and `booking_status_code IN ('Provisional','Confirmed')`.",
+     "requested_revision": "Remove the variant rate from EnumSampler (or set it to 0) so enum columns only contain canonical values, or add the variant rate to the specification's char_enum rule and relax the semantic rules accordingly."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_room_count_rule` clamps `room_count` to [3,9] and converts to string, but `RoomCountSampler` already produces strings in [3,9]; the rule is redundant but harmless. However, `_apply_room_count_tie` copies `room_count[0]` into indices 1..2, which can overwrite a NULL planted by `_apply_null_rule` (issue 2). Also `room_count` is CHAR(5) and the sampler produces single-character strings '3'..'9', which is valid but does not exercise the CHAR(5) padding behavior.",
+     "requested_revision": "Ensure tie rules skip NULL cells; optionally pad room_count to CHAR(5) width to exercise the declared type."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_apply_booking_date_rule` sets `ends[i] = s` when `de < ds`, which makes end == start; this satisfies `>=` but produces many equal start/end pairs, potentially inflating the duplicate share for `booking_end_date` beyond the 20-50% target when combined with `_apply_duplicate_share`. The interaction is not controlled.",
+     "requested_revision": "After applying both rules, verify the duplicate share for booking_start_date and booking_end_date is within 20-50% and that end >= start holds for all non-NULL pairs."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` applies `_apply_null_rule` to all tables including `View_Unit_Status`, but `View_Unit_Status.status_date` is the PK and `available_yn` is nullable; `_apply_null_rule` skips PK columns (`cm.pk_pos > 0`) and plants NULLs on `available_yn`, `apt_id`, `apt_booking_id`. However, `View_Unit_Status` has no non-FK sampler for `status_date` in `make_spec_sampler` (it falls through to `_init_sampler` with DateSampler), and the writer's `sample_fresh_primary_keys` may drop rows, reducing the effective size below 20. The `no_rows_added` reason in 7/20 instances suggests some tables (likely `Apartment_Facilities` with 7 rows and composite PK, or `View_Unit_Status`) end up with zero rows after dedup.",
+     "requested_revision": "Investigate why 7/20 instances have no rows added (likely `Apartment_Facilities` composite PK dedup or `View_Unit_Status` PK dedup) and ensure each table receives at least one generated row per instance, or document that zero rows is acceptable for some tables."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database is intended to be copied (the writer supports orig_path but cli does not pass it) \u2014 needs confirmation from the designer/engineer.",
+    "Whether the 10% enum variant rate is intended for char_enum columns (specification only mentions it for char_code).",
+    "Whether the tie_at_rank [100] for room_count is meaningful at table size 15.",
+    "Whether the negative bedroom_count boundary literals are intended given the 3..6 semantic range.",
+    "Whether zero generated rows for some tables (no_rows_added in 7/20) is acceptable."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "issue": "Semantic rule for Guests.gender_code is not supported by the sample data: the schema declares CHAR(1) but the compact sample values are 'Male','Female','Unknown'. The spec maps to single-char codes M/F/U and the program implements this. This is a documented, reasonable resolution, not a blocking error.",
+     "evidence": "Specification: gender_code CHAR(1) but sample shows 'Male','Female','Unknown'; enum uses M/F/U. specification.py ENUMS[('Guests','gender_code')] = ['M','F','U']; values.py EnumSampler emits canonical values only. Execution: 0 invalid instances, 0 not_null violations.",
+     "requested_revision": "No change required; note the mapping is documented in the uncertainty list. If the intended domain is the original multi-char strings, the schema would need to change, which is out of scope."
+    },
+    {
+     "agent": "designer",
+     "issue": "Bedroom boundary literals were changed from the extracted [-3,-2,-1,1,2,3] to [2,3,4] to stay within the semantic range 3..6. This is a documented uncertainty, but it means the PRED(bedroom_count > -2) negative-side boundary is not exercised.",
+     "evidence": "Specification uncertainty: 'bedroom_count boundary literals changed from [-3,-2,-1,1,2,3] to [2,3,4]...'. specification.py BOUNDARY_NUMERIC[('Apartments','bedroom_count')] = [2,3,4]; NUMERIC_RANGES = (3,6). BoundaryNumericSampler clamps to [3,6] so only 2,3,4 are emitted.",
+     "requested_revision": "Acceptable; the semantic range 3..6 is authoritative and the negative-side predicate is trivially true. No change required."
+    },
+    {
+     "agent": "designer",
+     "issue": "room_count tie_at_rank 100 was reduced to 1 because table size is 15. This is a documented reachability fix; the tie rule is implemented.",
+     "evidence": "Specification uncertainty: 'room_count tie_at_rank changed from [100] to [1]'. instance.py _apply_room_count_tie forces 3 rows to share a value. Execution: room_count NULL 6/40 generated, no integrity failures.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "apt_type_code ties_for_order_limit on AVG(room_count)/SUM(bathroom_count) at ranks 1 and 3 is not guaranteed by the tie rule; the spec only forces shared apt_type_code values. This is a known limitation, not a construction error.",
+     "evidence": "Specification uncertainty: 'apt_type_code ties_for_order_limit on AVG(room_count)/SUM(bathroom_count) at ranks 1 and 3 are not guaranteed by the tie rule alone'. instance.py _apply_tie_order only forces 3 rows to share the first apt_type_code value. construction_pairs: 16 separated, 83 eligible, 0 unknown.",
+     "requested_revision": "No change required; the aggregate tie is a natural-variation property. The 16 separated pairs are not evidence of a missing separation."
+    },
+    {
+     "agent": "engineer",
+     "issue": "NULL rule: for nullable columns, the program plants NULLs from the compact share with at least one NULL row per column. The execution feedback shows all nullable columns have at least one NULL (e.g., Apartment_Bookings.apt_id 11/51, View_Unit_Status.available_yn 20/400). No nullable column shows 0 NULLs.",
+     "evidence": "instance.py _apply_null_rule plants at least one NULL per nullable column; execution feedback nullable_columns all show >=1 NULL. No 'NULL 0 / n' lines.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "FK consistency: NULL FK columns are nullable (Apartment_Bookings.apt_id, View_Unit_Status.apt_id/apt_booking_id) and the program plants NULLs for unmatched-join rows; FK columns draw from parent compact+generated pools. Execution shows 0 integrity violations.",
+     "evidence": "instance.py fill_foreign_keys_consistently uses _parent_pool (compact + generated); _apply_unmatched_join and _apply_null_rule plant NULLs. Execution: fk_violations 0, not_null_violations 0, pk_duplicates 0, not_ok 0.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Preservation of compact rows: writer.py copies the original DB and appends generated rows; PKs are fresh and never collide with compact PKs. Execution reproducible=true, 20/20 valid, 0 failures.",
+     "evidence": "writer.py write_instance_sqlite copies orig_path then appends; instance.py sample_fresh_primary_keys ensures uniqueness. Execution: n_ok 20, n_fail 0, reproducible true, integrity all zero.",
+     "requested_revision": "No change required."
+    },
+    {
+     "agent": "engineer",
+     "issue": "Value variation: semantic ranges enforced (bathroom_count 1..3, bedroom_count 3..6, room_count 3..9, booking_end_date >= booking_start_date, enums). Duplicate share enforced for DISTINCT targets. The boundary text and numeric samplers are implemented.",
+     "evidence": "values.py RangeIntSampler, BoundaryNumericSampler, BoundaryTextSampler, EnumSampler, RoomCountSampler, DatetimeSampler, BitSampler; instance.py _apply_duplicate_share, _apply_booking_date_rule, _apply_room_count_rule. Execution: 0 invalid, 20 valid.",
+     "requested_revision": "No change required."
+    }
+   ],
+   "unresolved_checks": [
+    "Aggregate tie for apt_type_code AVG(room_count)/SUM(bathroom_count) at ranks 1 and 3 is not forced by construction; it depends on natural variation. This is a design limitation, not a blocking error.",
+    "The negative-side bedroom_count boundary predicate (PRED(bedroom_count > -2)) is not exercised because the literal range was clamped to [2,3,4] within the semantic range 3..6."
+   ]
+  }
+ ]
 }

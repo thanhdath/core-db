@@ -3,6 +3,8 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
@@ -36,14 +38,32 @@ def _num(x):
         return None
 
 
+def _perturb_num(v, rng, is_int, precision):
+    """+-1 / +-2 (or +-0.01 / +-0.02) with the upstream probability ladder."""
+    d = 1 if is_int else 0.01
+    if rng.random() < 1 / 6:
+        v += d
+    elif rng.random() < 1 / 5:
+        v -= d
+    elif rng.random() < 1 / 4:
+        v += 2 * d
+    elif rng.random() < 1 / 3:
+        v -= 2 * d
+    return int(round(v)) if is_int else (round(v, precision) if precision else v)
+
+
 class NumberSampler(ColumnSampler):
     """fuzz/number.py; keeps the list_max overwrite quirk (number.py:60,67)."""
 
-    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False):
+    def __init__(self, elements, p, max_l0, rng, scale=10, is_int=True, precision=0, unsigned=False,
+                 lo=None, hi=None):
         super().__init__([f for f in (_num(e) for e in elements) if f is not None], p, max_l0, rng)
         self.is_int, self.precision = is_int, precision
-        hi = min(10 ** scale, _MAX)
-        self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-hi, hi)
+        if lo is not None and hi is not None:
+            self.min, self.max = float(lo), float(hi)
+        else:
+            h = min(10 ** scale, _MAX)
+            self.min, self.max = (0, min(2 * 10 ** scale, _MAX)) if unsigned else (-h, h)
         self.list_min = min(self.elements) if self.elements else self.min
         self.list_max = min(self.max, _MAX)
 
@@ -58,20 +78,11 @@ class NumberSampler(ColumnSampler):
             v = self._fresh_or_reuse(lambda: r.randint(int(lo), int(hi)) if self.is_int else r.uniform(lo, hi))
         else:
             v = r.choice(self.elements)
-        d = 1 if self.is_int else 0.01
-        if r.random() < 1 / 6:
-            v += d
-        elif r.random() < 1 / 5:
-            v -= d
-        elif r.random() < 1 / 4:
-            v += 2 * d
-        elif r.random() < 1 / 3:
-            v -= 2 * d
-        return self._cast(v)
+        return self._cast(_perturb_num(v, r, self.is_int, self.precision))
 
 
 class StringSampler(ColumnSampler):
-    """fuzz/string.py (allow_none dropped)."""
+    """fuzz/string.py (allow_none dropped) + prefix/suffix/drop variants and LIKE patterns."""
 
     def __init__(self, elements, p, max_l0, rng, length=20):
         els = [str(e) for e in elements if e is not None]
@@ -105,6 +116,33 @@ class StringSampler(ColumnSampler):
             else:
                 v = v[1:]
         return v
+
+
+class EnumSampler(ColumnSampler):
+    """Fixed enumeration pool (e.g. broadcast.Time_of_day) with case near-variants."""
+
+    def __init__(self, values, p, max_l0, rng):
+        super().__init__(list(values), p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(lambda: r.choice(self.elements))
+
+
+class DateTextSampler(ColumnSampler):
+    """'DD,Month' text dates from a fixed pool (spec DATE_POOL)."""
+
+    def __init__(self, elements, p, max_l0, rng):
+        pool = [str(e) for e in elements if e is not None] or list(spec.DATE_POOL)
+        super().__init__(pool, p, max_l0, rng)
+
+    def sample(self):
+        r = self.rng
+        if self.elements and r.random() >= self.p:
+            return r.choice(self.elements)
+        return self._fresh_or_reuse(lambda: r.choice(spec.DATE_POOL))
 
 
 def _parse_date(s: str):

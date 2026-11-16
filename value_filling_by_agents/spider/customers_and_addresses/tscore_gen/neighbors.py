@@ -10,19 +10,18 @@ FAMILIES = [['count', 'min', 'max', 'avg', 'sum'], ['>', '<', '>=', '<=', '=', '
 _ALL = {x for f in FAMILIES for x in f}
 
 
-def _join(toks: list) -> str:
+def _join(toks):
     return ''.join(toks).strip().replace('  ', ' ')
 
 
-def _droppable(span: list) -> bool:
-    """neighbor.py:110-129."""
+def _droppable(span):
     s = ''.join(span).strip().lower()
     if not s or s in ('asc', '*', 'as', ';', 'as result'):
         return False
     return not re.fullmatch(r'\w+\s*\.', s)
 
 
-def _str_variants(v: str) -> list:
+def _str_variants(v):
     qc, body = v[0], v[1:-1]
     out = {''}
     n = len(body)
@@ -34,7 +33,7 @@ def _str_variants(v: str) -> list:
     return [qc + x.replace(qc, qc * 2) + qc for x in sorted(out)]
 
 
-def _family(low: str, v: str) -> list:
+def _family(low, v):
     out = []
     for fam in FAMILIES:
         if low in fam:
@@ -42,7 +41,7 @@ def _family(low: str, v: str) -> list:
     return out
 
 
-def _replacements(tok, cols: list, collow: set, rng) -> list:
+def _replacements(tok, cols, collow, rng):
     v, low = tok.value, tok.value.lower()
     out = _family(low, v)
     if tok.ttype in T.Name or low in collow:
@@ -58,13 +57,12 @@ def _replacements(tok, cols: list, collow: set, rng) -> list:
     return out
 
 
-def _norm(s: str) -> str:
+def _norm(s):
     return re.sub(r'count\s*\([^)]*\)', 'count()', s, flags=re.I).strip().rstrip(';').strip()
 
 
-def neighbor_queries(sql: str, schema, rng, max_neighbors: int = 50000) -> list:
-    """Span drops + token replacements kept if executable on an empty schema clone (neighbor.py:1-177).
-    Neighbours that lose the FROM clause of a query that has one are excluded (new, recorded)."""
+def neighbor_queries(sql, schema, rng, max_neighbors=50000):
+    """Span drops + token replacements kept if executable on an empty schema clone (neighbor.py:1-177)."""
     try:
         toks = [t for st in sqlparse.parse(sql) for t in st.flatten()]
     except Exception:

@@ -3,9 +3,37 @@ import datetime as dt
 import re
 import string
 
+from . import spec
+
 _MAX = 2 ** 31 - 1
 CHARSET = string.ascii_letters + ' ' + string.digits + '()'
 _TEMPLATES = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d-%b-%Y', '%Y%m%d', '%Y-%m']
+
+
+def _typo(v: str, rng) -> str:
+    """One typo variant: drop a char, swap two chars, or change case of one char."""
+    if not v:
+        return v
+    k = rng.randrange(3)
+    i = rng.randrange(len(v))
+    if k == 0 and len(v) > 1:
+        return v[:i] + v[i + 1:]
+    if k == 1 and len(v) > 1:
+        j = (i + 1) % len(v)
+        return v[:i] + v[j] + v[i] + v[i + 2:]
+    c = v[i]
+    return v[:i] + (c.lower() if c.isupper() else c.upper()) + v[i + 1:]
+
+
+def boundary_variants(values: list, rng, domain=None) -> list:
+    """L, lower(L), upper(L), one typo variant for each listed literal, filtered by domain."""
+    out = []
+    for v in values:
+        cands = [v, v.lower(), v.upper(), _typo(v, rng)]
+        if domain is not None:
+            cands = [c for c in cands if c in domain]
+        out += cands
+    return out
 
 
 class ColumnSampler:
@@ -131,8 +159,8 @@ class DateSampler(ColumnSampler):
             if d is not None:
                 self.template = self.template or t
                 parsed.append(d)
-        self.template = self.template or '%Y-%m-%d'
-        self.full = (dt.datetime(1800, 1, 1), dt.datetime(2100, 1, 1))
+        self.template = self.template or '%Y-%m-%d %H:%M:%S'
+        self.full = (dt.datetime(1980, 1, 1), dt.datetime(2020, 12, 31, 23, 59, 59))
         self.rng_dates = (min(parsed), max(parsed)) if len(set(parsed)) >= 2 else self.full
         self.n_parsed = len(set(parsed))
         self.strip0 = not any(s.startswith('0') or '-0' in s for s in strs)
@@ -182,6 +210,71 @@ class BoolSampler(ColumnSampler):
         return self.rng.choice(self.elements)
 
 
+class EnumSampler(ColumnSampler):
+    """Enum pool sampler: draws only from the enum pool (plus boundary variants)."""
+
+    def __init__(self, pool: list, rng):
+        super().__init__(pool, 0.0, float('inf'), rng)
+
+    def sample(self):
+        return self.rng.choice(self.elements)
+
+
+class BoundaryStringSampler(ColumnSampler):
+    """Boundary-text sampler: cycles through L/lower/upper/typo variants, then fresh strings."""
+
+    def __init__(self, variants: list, rng, length=20):
+        super().__init__(variants, 0.0, float('inf'), rng)
+        self.length = length
+        self._i = 0
+
+    def sample(self):
+        r = self.rng
+        if self._i < len(self.elements):
+            v = self.elements[self._i]
+            self._i += 1
+            return v
+        if r.random() < 0.5 and self.elements:
+            return r.choice(self.elements)
+        return ''.join(r.choice(CHARSET) for _ in range(r.randint(3, self.length)))
+
+
+class DuplicateShareSampler(ColumnSampler):
+    """Wraps a base sampler; with probability `share` repeats an already drawn value."""
+
+    def __init__(self, base: ColumnSampler, share: float, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.base = base
+        self.share = share
+        self.seen: list = []
+
+    def sample(self):
+        r = self.rng
+        if self.seen and r.random() < self.share:
+            return r.choice(self.seen)
+        v = self.base.sample()
+        self.seen.append(v)
+        return v
+
+
+class TieSampler(ColumnSampler):
+    """Ensures at least two rows share the value at the LIMIT rank (first two draws equal)."""
+
+    def __init__(self, base: ColumnSampler, rng):
+        super().__init__([], 0.0, float('inf'), rng)
+        self.base = base
+        self.first = None
+        self.n = 0
+
+    def sample(self):
+        if self.n < 2:
+            if self.first is None:
+                self.first = self.base.sample()
+            self.n += 1
+            return self.first
+        return self.base.sample()
+
+
 def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) -> ColumnSampler:
     """Pick the fuzzer by declared type (fuzz/fuzz.py:40-80); unknown types fall back to String."""
     els = [e for e in elements if rng.random() < 0.9]
@@ -216,7 +309,8 @@ def make_column_sampler(column, elements: list, p: float, max_l0: float, rng) ->
 
 def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_pk: int,
                   max_l0: float = float('inf')) -> ColumnSampler:
-    """Per-column initialisation of fuzz/fuzz.py:198-224."""
+    """Per-column initialisation of fuzz/fuzz.py:198-224, extended with spec pools."""
+    key = (column.table, column.name)
     ov = list(original_values)
     els = (rng.choices(ov, k=min(5, len(ov))) if ov else []) + sorted({str(v) for v in literal_pool})
     if column.checked:
@@ -225,7 +319,42 @@ def _init_sampler(column, literal_pool: list, original_values, p: float, rng, n_
         max_l0 = rng.random() * 30
         if column.pk_pos > 0:
             max_l0 = float('inf') if n_pk == 1 else 30
-    return make_column_sampler(column, els, p, max_l0, rng)
+
+    if key in spec.ENUMS:
+        pool = list(spec.ENUMS[key])
+        if key in spec.BOUNDARY_NUM:
+            lits, step = spec.BOUNDARY_NUM[key]
+            for L in lits:
+                try:
+                    n = int(L)
+                except ValueError:
+                    continue
+                for v in (n - step, n + step):
+                    if str(v) in pool:
+                        pool.append(str(v))
+        if key in spec.BOUNDARY_NUM:
+            lits, _ = spec.BOUNDARY_NUM[key]
+            for L in lits:
+                if L not in pool:
+                    pool.append(L)
+        return EnumSampler(pool, rng)
+
+    base = make_column_sampler(column, els, p, max_l0, rng)
+
+    if key in spec.BOUNDARY_TEXT:
+        domain = spec.RESTRICTED_DOMAIN.get(key)
+        variants = boundary_variants(spec.BOUNDARY_TEXT[key], rng, domain=domain)
+        variants = list(spec.BOUNDARY_TEXT[key]) + [v for v in variants if v not in spec.BOUNDARY_TEXT[key]]
+        base = BoundaryStringSampler(variants, rng)
+
+    if key in spec.DUP_SHARE:
+        share = rng.uniform(0.2, 0.5)
+        base = DuplicateShareSampler(base, share, rng)
+
+    if key in spec.TIE_ORDER:
+        base = TieSampler(base, rng)
+
+    return base
 
 
 def random_values_for_a_column(column_meta, literal_pool: list, n: int, rng, *, original_values: list = (),

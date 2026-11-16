@@ -1,5 +1,6 @@
-"""Schema reading (upstream sql_util/dbinfo.py)."""
+"""Schema reading (upstream sql_util/dbinfo.py) + specification-driven column metadata."""
 import math
+import re
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ class ColumnMeta:
     pk_pos: int
     unique: bool
     checked: bool
+    check_sql: str = ''
 
 
 @dataclass
@@ -34,6 +36,8 @@ class Schema:
     original_values: dict = field(default_factory=dict)
     original_sizes: dict = field(default_factory=dict)
     unique_from_index: list = field(default_factory=list)
+    null_share: dict = field(default_factory=dict)
+    pk_values: dict = field(default_factory=dict)
 
 
 def q(name: str) -> str:
@@ -58,7 +62,7 @@ def _levels(items: list, deps: dict) -> list:
 
 
 def process_order(schema_fks: dict, all_columns: list) -> tuple:
-    """Column and table topological levels (sql_util/dbinfo.py:122-176). Returns (column_order, table_order)."""
+    """Column and table topological levels (sql_util/dbinfo.py:122-176)."""
     cdeps: dict = {}
     tdeps: dict = {}
     for (ct, cc), (pt, pc) in sorted(schema_fks.items()):
@@ -73,6 +77,23 @@ def process_order(schema_fks: dict, all_columns: list) -> tuple:
 def _first_token(line: str) -> str:
     toks = line.strip().split()
     return toks[0].strip('"`[](),') if toks else ''
+
+
+def _check_text_for(create_sql: str, col: str) -> str:
+    """Return the CHECK(...) body that mentions column `col` (best effort, textual)."""
+    out = []
+    for m in re.finditer(r'check\s*\(', create_sql, re.I):
+        depth, i = 1, m.end()
+        while i < len(create_sql) and depth:
+            if create_sql[i] == '(':
+                depth += 1
+            elif create_sql[i] == ')':
+                depth -= 1
+            i += 1
+        body = create_sql[m.end():i - 1]
+        if re.search(r'(?<![\w])%s(?![\w])' % re.escape(col), body, re.I):
+            out.append(body)
+    return ' AND '.join(out)
 
 
 def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
@@ -102,7 +123,8 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                     if len(cols) == 1 and cols[0][2] and cols[0][2].lower() not in uniq:
                         uniq.add(cols[0][2].lower())
                         from_index.append((t, cols[0][2]))
-            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq, r[1].lower() in chk)
+            cols = [ColumnMeta(t, r[1], r[2] or '', bool(r[3]), r[4], r[5], r[1].lower() in uniq,
+                               r[1].lower() in chk, _check_text_for(create[t], r[1]))
                     for r in info]
             pk = [c.name for c in sorted([c for c in cols if c.pk_pos > 0], key=lambda c: c.pk_pos)]
             tables[t] = TableMeta(t, cols, pk)
@@ -122,7 +144,7 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
                 fks[(t, child)] = (pt, pc)
         all_cols = [(t, c.name) for t in tnames for c in tables[t].columns]
         corder, torder = process_order(fks, all_cols)
-        ov, sizes = {}, {}
+        ov, sizes, nshare, pkv = {}, {}, {}, {}
         for t in tnames:
             n = con.execute('select count(*) from %s' % q(t)).fetchone()[0]
             sizes[t] = n
@@ -136,7 +158,12 @@ def read_schema(orig_path: str, max_rows_per_table: int = 300000) -> Schema:
             except sqlite3.Error:
                 rows = con.execute(sel + ' limit %d' % max_rows_per_table).fetchall()
             for j, c in enumerate(tables[t].columns):
-                ov[(t, c.name)] = [r[j] for r in rows]
+                vals = [r[j] for r in rows]
+                ov[(t, c.name)] = vals
+                nshare[(t, c.name)] = (sum(1 for v in vals if v is None) / len(vals)) if vals else 0.0
+            if tables[t].primary_key:
+                pkv[t] = [tuple(r[j] for j in range(len(tables[t].columns))
+                                if tables[t].columns[j].name in tables[t].primary_key) for r in rows]
     finally:
         con.close()
-    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index)
+    return Schema(tables, fks, ddl, torder, corder, ov, sizes, from_index, nshare, pkv)

@@ -1,50 +1,691 @@
 {
  "db": "law_episode",
- "operator_io_quirks": [
-  "All declared types are plain TEXT/INTEGER/REAL/DATE; no mixed-case or spaced identifiers, no crash-fallback types, no bool/bit/year/time columns.",
-  "air_date and birthdate are declared DATE but stored as text 'YYYY-MM-DD'; ts_fuzzer shows 'Date|Number(int elements)' \u2014 the int-parse branch of the date dispatch must not fire on these strings.",
-  "birthdate has null_rate 0.554 and only 355 distinct of 800; Date sampler's element pool will be mostly NULLs (dropped by Base) plus ~5 sampled dates.",
-  "Episode.episode_id, Person.person_id, Keyword.episode_id, Award.episode_id/person_id, Credit.episode_id/person_id, Vote.episode_id are all TEXT ids ('tt\u2026','nm\u2026') \u2014 String fuzzer, not Number.",
-  "Vote has NO primary key (pk=[]); sample_fresh_primary_keys must be a no-op there and drop_unique_duplicates has no unique columns to act on.",
-  "Keyword and Credit have composite PKs (episode_id,keyword) / (episode_id,person_id); composite-PK members get max_l0=30 per spec 3.3.",
-  "Keyword.episode_id has only 3 distinct values over 33 rows; Credit.person_id 798 distinct over 2231 \u2014 FK fan-out is very uneven.",
-  "All FKs point to existing parents (Episode, Person); no dangling FKs, no self-references, no non-unique parents.",
-  "Episode.series and Award.series are constant 'Law and Order' (distinct=1); season distinct=1; year distinct=2 \u2014 String/Number samplers will see near-constant element pools.",
-  "Credit.credited stores 'true'/'false' as TEXT (not BOOL type) \u2014 String fuzzer, not Bool.",
-  "Episode.summary, episode_image, Person.name/birth_* are long free text; String fuzzer's 20-char default length range will produce much shorter values than originals.",
-  "Tables are tiny (24\u20132231 rows); choose_table_sizes' 30\u20132500 range will often exceed original sizes, so FK child tables may draw from small parent pools with heavy duplication."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on air_date/birthdate: template inferred from first parsable element, likely '%Y-%m-%d'; fresh dates uniform over [min,max] of parsed elements (1998\u20132000 for air_date, ~1930\u20131990 for birthdate).",
-  "Number fuzzer on season/episode/number_in_series/stars/votes/year/award_id: full range [-10^scale,10^scale] with scale=0 \u2192 integers in [-1,1] perturbed by \u00b11/\u00b12, so most values collapse to {-3..3} \u2014 implausible for episode numbers (182+) and votes (hundreds).",
-  "Number fuzzer on rating/height_meters/percent (REAL, scale=0): range [-1,1] with \u00b10.01/\u00b10.02 perturbation \u2014 rating 7.9 and percent 17.7 become ~0.x, a strong FN source for range predicates like rating>8 or percent>20.",
-  "String fuzzer on episode_id/person_id: random 0\u201320 char strings over a-zA-Z 0-9() with 50% contamination \u2014 destroys the 'tt\u2026'/'nm\u2026' prefix pattern, so LIKE 'tt%' or substr predicates will miss.",
-  "String fuzzer on credited: element pool {'true','false'} plus random strings; equality predicates on credited='true' will often see random garbage instead.",
-  "String fuzzer on series/season-like constants: element pool has one value, so p-fresh draws still inject random strings \u2014 GROUP BY series will produce many spurious groups (FP for count-distinct queries).",
-  "FK fill draws from parent's FINAL filtered column with replacement: Keyword.episode_id (3 distinct) and Credit.person_id (798 distinct) will produce heavy duplicate FK values, so joins are dense \u2014 good for join FPs, bad for 'exactly one' predicates.",
-  "Vote has no PK, so no PK dedup; with 240 original rows and size up to 2500, Vote will have many duplicate (episode_id,stars,votes,percent) rows \u2014 COUNT(*) queries on Vote will over-count vs original.",
-  "Composite-PK dedup on Keyword/Credit keeps first occurrence only; with small parent pools the surviving rows may be far fewer than requested size, shrinking join cardinalities.",
-  "NULLs: TS does not enforce NOT NULL, but Base drops None elements and String/Number rarely emit None, so birthdate/birth_place/nickname null_rate ~0.55\u20130.96 will be ~0 in generated units \u2014 IS NULL predicates become trivially empty (FN).",
-  "Date fuzzer's leading-zero strip and month-name template don't apply here (no %d-%m-%Y, no leading-zero strings), so dates stay ISO \u2014 good for date comparisons.",
-  "Number fuzzer's list_max quirk (overwrite with full-range max) means even with element pool {182..186} the fresh draws still span [-1,1], so number_in_series loses its 182+ range."
- ],
- "challenger_refs": [
-  "G8",
-  "G16",
-  "G2",
-  "G14",
-  "G4",
-  "G3",
-  "G15",
-  "G13",
-  "G7",
-  "G9"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": 3,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "text_identifier": "Sample from the compact column's distinct values with replacement; 20% of draws are fresh near-variants (case flip, one-character edit, prefix/suffix trim) of a sampled value; never NULL for PK/NOT NULL columns.",
+   "text_name": "Sample from the compact column's distinct values with replacement; 20% of draws are fresh near-variants (case flip, one-character edit) of a sampled value; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "text_free": "Sample from the compact column's distinct values with replacement; 15% of draws are fresh near-variants (case flip, one-character edit, truncation) of a sampled value; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "integer_count": "Uniform integer in [min(compact), max(compact)]; 10% of draws are one step below/above a listed boundary literal; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "integer_id": "Sequential from max(compact)+1; never NULL.",
+   "real_rating": "Uniform real in [min(compact), max(compact)] rounded to 1 decimal; 15% of draws are one step (0.1) below/above a listed boundary literal; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "real_percent": "Uniform real in [0, 100] rounded to 1 decimal; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "date_iso": "Uniform date in [min(compact), max(compact)] formatted YYYY-MM-DD; 10% of draws are one day before/after a listed boundary literal; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "boolean_text": "Sample from {'true','false'} with replacement; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "url": "Sample from the compact column's distinct values with replacement; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "long_text": "Sample from the compact column's distinct values with replacement; NULL share per compact null_rate, but at least one NULL row per nullable column.",
+   "near_variant": "For each listed equality/LIKE literal, 20% of draws are case variants (upper/lower) and one-character edits of the literal.",
+   "boundary": "For each listed numeric literal, 15% of draws are the literal and one step on each side; for each listed date literal, one day on each side.",
+   "tie": "For each listed ORDER column, ensure at least two rows share the tie value at the listed rank (duplicate the sampled value).",
+   "null_share": "For every nullable column, plant at least one NULL row and set the NULL share to the compact null_rate when positive, otherwise a small default share of 5-10%; NOT NULL/PK columns never get NULL. Planted NULLs are never overwritten by key dedup or FK consistency steps.",
+   "fresh_share": "20% of text draws are fresh values not present in the compact column."
+  },
+  "per_column_exceptions": [
+   {
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "Episode.episode_id": {
+      "joins_with": [
+       "Award.episode_id",
+       "Credit.episode_id",
+       "Vote.episode_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "Award.episode_id": {
+      "joins_with": [
+       "Episode.episode_id",
+       "Credit.episode_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "Credit.episode_id": {
+      "joins_with": [
+       "Episode.episode_id",
+       "Award.episode_id",
+       "Vote.episode_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": false
+     },
+     "Vote.episode_id": {
+      "joins_with": [
+       "Episode.episode_id",
+       "Credit.episode_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "Person.person_id": {
+      "joins_with": [
+       "Credit.person_id",
+       "Award.person_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     },
+     "Award.person_id": {
+      "joins_with": [
+       "Person.person_id",
+       "Credit.person_id"
+      ],
+      "parent_rows_without_children": true,
+      "child_rows_with_null_fk": true
+     }
+    }
+   },
+   {
+    "pattern": "ties_for_order_limit",
+    "targets": {
+     "Episode.episode_id": {
+      "tie_at_rank": [
+       1,
+       2
+      ],
+      "direction": "ASC and DESC",
+      "tie_on": [
+       "COUNT(*)"
+      ]
+     },
+     "Episode.title": {
+      "tie_at_rank": [
+       1,
+       3,
+       1000
+      ],
+      "direction": "ASC and DESC and unordered",
+      "tie_on": [
+       "SUM(episode.votes)"
+      ]
+     },
+     "Episode.rating": {
+      "tie_at_rank": [
+       1,
+       2
+      ],
+      "direction": "DESC"
+     },
+     "Episode.votes": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "DESC"
+     },
+     "Award.organization": {
+      "tie_at_rank": [
+       1
+      ],
+      "direction": "ASC and DESC",
+      "tie_on": [
+       "COUNT(*)"
+      ]
+     },
+     "Vote.stars": {
+      "tie_at_rank": [
+       1,
+       2
+      ]
+     },
+     "Vote.votes": {
+      "tie_at_rank": [
+       1,
+       2
+      ]
+     }
+    }
+   },
+   {
+    "pattern": "group_sizes",
+    "targets": {
+     "Episode.episode_id": {
+      "group_sizes": "1, 2 and >= 3"
+     },
+     "Episode.title": {
+      "group_sizes": "1, 2 and >= 3"
+     }
+    }
+   },
+   {
+    "pattern": "null_in_count_column",
+    "targets": {
+     "Episode.episode_id": {
+      "null_share": "none (NOT NULL column)"
+     },
+     "Person.person_id": {
+      "null_share": "none (NOT NULL column)"
+     },
+     "Award.award_id": {
+      "null_share": "none (NOT NULL column)"
+     },
+     "Keyword.keyword": {
+      "null_share": "none (NOT NULL column)"
+     },
+     "Credit.person_id": {
+      "null_share": "none (NOT NULL column)"
+     },
+     "Award.award": {
+      "null_share": "5-30 % of generated rows"
+     },
+     "Credit.role": {
+      "null_share": "5-30 % of generated rows"
+     }
+    }
+   },
+   {
+    "pattern": "comparison_boundary",
+    "targets": {
+     "Episode.episode_id": {
+      "values": [
+       "tt0629477",
+       "TT0629477",
+       "tt0629204",
+       "TT0629204"
+      ]
+     },
+     "Person.name": {
+      "values": [
+       "Constantine Makris",
+       "constantine makris",
+       "Rene Balcer",
+       "rene balcer"
+      ]
+     },
+     "Credit.episode_id": {
+      "values": [
+       "tt0629204",
+       "TT0629204",
+       "tt0629149",
+       "TT0629149"
+      ]
+     },
+     "Episode.title": {
+      "values": [
+       "Refuge: Part 1",
+       "refuge: part 1",
+       "Shield",
+       "shield",
+       "True North",
+       "true north"
+      ]
+     },
+     "Credit.role": {
+      "values": [
+       "Additional Crew",
+       "additional crew",
+       "Additi",
+       "additi",
+       "al Cre",
+       "al cre"
+      ]
+     },
+     "Episode.series": {
+      "values": [
+       "Law and Order",
+       "law and order"
+      ]
+     },
+     "Award.series": {
+      "values": [
+       "Law and Order",
+       "law and order"
+      ]
+     },
+     "Episode.rating": {
+      "values": [
+       8.4,
+       8.5,
+       8.6
+      ]
+     },
+     "Vote.stars": {
+      "values": [
+       0,
+       1,
+       2,
+       9,
+       10,
+       11
+      ]
+     },
+     "Vote.votes": {
+      "values": [
+       8,
+       9,
+       10,
+       29,
+       30,
+       31
+      ]
+     }
+    }
+   },
+   {
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "Person.name": {
+      "duplicate_share": "20-50 %"
+     },
+     "Episode.title": {
+      "duplicate_share": "20-50 %"
+     },
+     "Credit.role": {
+      "duplicate_share": "20-50 %"
+     },
+     "Keyword.keyword": {
+      "duplicate_share": "20-50 %"
+     }
+    }
+   },
+   {
+    "pattern": "rows_with_different_values",
+    "targets": {
+     "Vote.votes": {
+      "qualifying_rows": ">= 2 per group with different values"
+     },
+     "Episode.rating": {
+      "qualifying_rows": ">= 2 per group with different values"
+     },
+     "Episode.votes": {
+      "qualifying_rows": ">= 2 per group with different values"
+     }
+    }
+   },
+   {
+    "pattern": "null_rows",
+    "targets": {
+     "Award.award": {
+      "null_share": "5-30 % of generated rows"
+     }
+    }
+   },
+   {
+    "pattern": "like_near_variant",
+    "targets": {
+     "Person.name": {
+      "values": [
+       "Jerry Orbach"
+      ]
+     }
+    }
+   },
+   {
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "Award.award_id": {
+      "having": "COUNT(award.award_id) >= 2"
+     }
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Keyword.episode_id",
+    "parent": "Episode.episode_id",
+    "copied": []
+   },
+   {
+    "child": "Award.episode_id",
+    "parent": "Episode.episode_id",
+    "copied": []
+   },
+   {
+    "child": "Award.person_id",
+    "parent": "Person.person_id",
+    "copied": []
+   },
+   {
+    "child": "Credit.episode_id",
+    "parent": "Episode.episode_id",
+    "copied": []
+   },
+   {
+    "child": "Credit.person_id",
+    "parent": "Person.person_id",
+    "copied": []
+   },
+   {
+    "child": "Vote.episode_id",
+    "parent": "Episode.episode_id",
+    "copied": []
+   },
+   {
+    "child": "Award.series",
+    "parent": "Episode.series",
+    "copied": [
+     "series"
+    ],
+    "via": "Award.episode_id = Episode.episode_id"
+   },
+   {
+    "child": "Credit.episode_id",
+    "parent": "Episode.episode_id",
+    "copied": [
+     "series"
+    ],
+    "via": "Credit.episode_id = Episode.episode_id"
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Episode",
+    "column": "season",
+    "formula": "season = 9"
+   },
+   {
+    "table": "Episode",
+    "column": "episode",
+    "formula": "episode BETWEEN 1 AND 24"
+   },
+   {
+    "table": "Episode",
+    "column": "number_in_series",
+    "formula": "number_in_series BETWEEN 182 AND 205"
+   },
+   {
+    "table": "Episode",
+    "column": "rating",
+    "formula": "rating BETWEEN 0.0 AND 10.0"
+   },
+   {
+    "table": "Episode",
+    "column": "votes",
+    "formula": "votes >= 0"
+   },
+   {
+    "table": "Episode",
+    "column": "air_date",
+    "formula": "air_date >= '1998-09-01' AND air_date <= '1999-12-31'"
+   },
+   {
+    "table": "Episode",
+    "column": "series",
+    "formula": "series = 'Law and Order'"
+   },
+   {
+    "table": "Person",
+    "column": "height_meters",
+    "formula": "height_meters BETWEEN 1.0 AND 2.5"
+   },
+   {
+    "table": "Person",
+    "column": "birthdate",
+    "formula": "birthdate >= '1900-01-01' AND birthdate <= '2030-12-31'"
+   },
+   {
+    "table": "Award",
+    "column": "year",
+    "formula": "year BETWEEN 1990 AND 2010"
+   },
+   {
+    "table": "Award",
+    "column": "result",
+    "formula": "result IN ('Winner', 'Nominee')"
+   },
+   {
+    "table": "Award",
+    "column": "organization",
+    "formula": "organization IN ('International Monitor Awards', 'Primetime Emmy Awards', 'American Bar Association Silver Gavel Awards for Media and the Arts', 'Edgar Allan Poe Awards')"
+   },
+   {
+    "table": "Award",
+    "column": "award_category",
+    "formula": "award_category IN ('Monitor', 'Primetime Emmy', 'Silver Gavel Award', 'Edgar')"
+   },
+   {
+    "table": "Award",
+    "column": "series",
+    "formula": "series = 'Law and Order'"
+   },
+   {
+    "table": "Credit",
+    "column": "credited",
+    "formula": "credited IN ('true', 'false')"
+   },
+   {
+    "table": "Credit",
+    "column": "category",
+    "formula": "category IN ('Additional Crew', 'Art Department', 'Camera and Electrical Department', 'Cast', 'Casting Department', 'Costume and Wardrobe Department', 'General', 'Directed by')"
+   },
+   {
+    "table": "Vote",
+    "column": "stars",
+    "formula": "stars BETWEEN 0 AND 10"
+   },
+   {
+    "table": "Vote",
+    "column": "votes",
+    "formula": "votes >= 0"
+   },
+   {
+    "table": "Vote",
+    "column": "percent",
+    "formula": "percent BETWEEN 0.0 AND 100.0"
+   },
+   {
+    "table": "Vote",
+    "column": "percent",
+    "formula": "percent = round(100.0 * votes / (SELECT SUM(votes) FROM Vote v2 WHERE v2.episode_id = Vote.episode_id), 1)",
+    "condition": "votes IS NOT NULL",
+    "evidence": "tt0629204: 36/203=17.7; tt0629228: 39/203=19.2; tt0629170: 64/203=31.5"
+   }
+  ],
+  "uncertain_rules": [
+   {
+    "table": "Vote",
+    "column": "percent",
+    "formula": "percent = round(100.0 * votes / (SELECT SUM(votes) FROM Vote v2 WHERE v2.episode_id = Vote.episode_id), 1)",
+    "condition": "votes IS NOT NULL",
+    "note": "denominator (episode total votes) not directly observable from sample"
+   },
+   {
+    "table": "Episode",
+    "column": "number_in_series",
+    "formula": "number_in_series BETWEEN 182 AND 205",
+    "note": "upper bound inferred from 24 episodes starting at 182"
+   },
+   {
+    "table": "Person",
+    "column": "birthdate",
+    "formula": "birthdate >= '1900-01-01' AND birthdate <= '2030-12-31'",
+    "note": "loose bound; some shown rows have future dates (2029)"
+   },
+   {
+    "table": "Award",
+    "column": "year",
+    "formula": "year BETWEEN 1990 AND 2010",
+    "note": "inferred from shown years 1999-2000"
+   },
+   {
+    "table": "Credit",
+    "column": "category",
+    "formula": "category IN ('Additional Crew', 'Art Department', 'Camera and Electrical Department', 'Cast', 'Casting Department', 'Costume and Wardrobe Department', 'General', 'Directed by')",
+    "note": "compact column has 20 distinct values; enum incomplete"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Episode": 24,
+   "Person": 800,
+   "Keyword": 33,
+   "Award": 22,
+   "Credit": 230,
+   "Vote": 240
+  },
+  "null_targets": [
+   "Award.award",
+   "Award.role",
+   "Award.organization",
+   "Award.year",
+   "Award.award_category",
+   "Award.series",
+   "Award.episode_id",
+   "Award.person_id",
+   "Award.result",
+   "Credit.category",
+   "Credit.role",
+   "Credit.credited",
+   "Episode.series",
+   "Episode.season",
+   "Episode.episode",
+   "Episode.number_in_series",
+   "Episode.title",
+   "Episode.summary",
+   "Episode.air_date",
+   "Episode.episode_image",
+   "Episode.rating",
+   "Episode.votes",
+   "Person.name",
+   "Person.birthdate",
+   "Person.birth_name",
+   "Person.birth_place",
+   "Person.birth_region",
+   "Person.birth_country",
+   "Person.height_meters",
+   "Person.nickname",
+   "Vote.episode_id",
+   "Vote.stars",
+   "Vote.votes",
+   "Vote.percent"
+  ],
+  "supporting_evidence": {
+   "Vote.percent": [
+    "tt0629204: votes=36, percent=17.7",
+    "tt0629228: votes=39, percent=19.2",
+    "tt0629170: votes=64, percent=31.5"
+   ],
+   "Episode.season": [
+    "all 8 shown rows have season=9"
+   ],
+   "Episode.series": [
+    "all 8 shown rows have series='Law and Order'"
+   ],
+   "Award.result": [
+    "shown rows: Winner, Nominee"
+   ],
+   "Credit.credited": [
+    "shown rows: true, false"
+   ]
+  },
+  "uncertainty": [
+   "Vote.percent formula assumes percent is computed over the episode's total votes; the shown rows are consistent but the denominator (episode total votes) is not directly observable from the sample.",
+   "Episode.number_in_series upper bound 205 is inferred from 24 episodes starting at 182; exact max uncertain.",
+   "Person.birthdate range 1900-2030 is a loose bound; some shown rows have future dates (2029) so the upper bound is kept wide.",
+   "Award.year range 1990-2010 is inferred from shown years 1999-2000; exact bounds uncertain.",
+   "Credit.category enum lists only the 8 shown values; the compact column has 20 distinct values, so the enum is incomplete.",
+   "table_sizes_per_instance states total generated rows per instance; the program appends these to compact rows, so total table size equals compact size plus generated size."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: n_ok=0, n_fail=20, errors={\"FileNotFoundError\": 20}. Every unit failed with FileNotFoundError before any instance was written (rows_added={}, n_instances=0). The failure originates in cli._one: it calls _copy_compact(a['orig'], p) where p = unit_path(...) points to <root>/<ds>/<name>/<name>.sqlite, but the parent directory <root>/<ds>/<name>/ is never created before shutil.copyfile. write_instance_sqlite does os.makedirs, but it runs only after _copy_compact, so the copy fails first.",
+     "requested_revision": "Create the target directory before copying, e.g. in _copy_compact call os.makedirs(os.path.dirname(path), exist_ok=True) before shutil.copyfile (or call unit_path's directory creation in _one before _copy_compact). Re-run generation and confirm n_ok>0, n_fail=0, and non-empty rows_added."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Generation specification is empty ({}). The program's docstrings claim to implement a specification 'by construction' (instance.py header: table sizes 0-230 or level x4 up to 2500; NULL rule; FK draw rules; sum/lookup attach only to generated parents), but none of these rules are stated in the specification. The atomic-operation statistics (e.g. Episode.episode_id group_sizes 1/2/>=3, ties_for_order_limit, unmatched_join_rows, comparison_boundary values like 'tt0629477'/'TT0629477', NULL shares for Award.award 5-30%) are not reflected in any written spec, so consistency between spec and program cannot be verified.",
+     "requested_revision": "Provide a non-empty generation specification enumerating: per-table size distributions, the NULL rule (share per column, at least one NULL row, NOT NULL/PK never NULL), FK draw rules (parent rows, generated-only for sum/lookup), PK/UNIQUE dedup, and the value-domain rules per type. Then the program can be checked against it."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.build_random_instance applies _apply_null_rule to every nullable column including nullable FK columns, but fill_foreign_keys_consistently already fills FK columns with parent values (or None if parent empty). After _apply_null_rule, sample_fresh_primary_keys and drop_unique_duplicates may drop rows, and the self-FK fixup loop reassigns values. For a nullable FK whose parent is empty, fill_foreign_keys_consistently returns [None]*n, so the column is all NULL and the 'rows with non-NULL values' half of the NULL rule cannot hold; the code does not detect or report this. Also _apply_null_rule uses k=max(1,min(n,k)) so when n==0 no NULL is planted, and when share==0 it still forces k>=1, contradicting 'share following the compact share' for columns with zero observed NULLs (e.g. Credit.role null_rows=1 but null_in_count_column present).",
+     "requested_revision": "Clarify in the spec how the NULL rule interacts with empty parents and zero-share columns, and make the program honor it: for nullable FK with empty parent, either skip the column or document that all-NULL is acceptable; for zero-share columns, do not force a NULL (or state the override explicitly). Add a per-column NULL/non-NULL count to the execution summary so the rule can be verified."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.write_instance_sqlite sets 'pragma foreign_keys = OFF' and inserts rows with executemany; on any sqlite3.Error it falls back to row-by-row and counts bad rows, but never reports which constraint failed. Combined with append=True copying the compact DB, FK integrity of appended rows is not enforced by SQLite, so unmatched_join_rows patterns (e.g. Award.episode_id child_rows_with_null_fk, Credit.episode_id) depend entirely on fill_foreign_keys_consistently. The execution feedback shows rows_skipped={} and rows_added={} only because generation failed; there is no evidence that FK consistency or PK/UNIQUE dedup actually held.",
+     "requested_revision": "After a successful run, add verification that appended rows satisfy FK references (or explicitly document that FK enforcement is off and rely on the sampler), and report per-table rows_ok/rows_failed from write_instance_sqlite in the CLI summary. Re-run and include the summary as evidence."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Reproducibility: cli._one seeds rng = random.Random(seed_base*100003 + i), and build_random_instance uses only that rng, so per-unit determinism is plausible. However, _init_sampler uses rng.choices and sorted({...}) over literal_pool sets; sorted() is deterministic, but the pool is built from a JSON list whose order is preserved, so this is fine. The blocking issue is that no instance was produced, so reproducibility and value-variation (comparison_boundary values like 'tt0629477' vs 'TT0629477', rating 8.4/8.5/8.6, vote.stars 0/1/2/9/10/11) cannot be confirmed.",
+     "requested_revision": "After fixing the FileNotFoundError, re-run and confirm that generated instances contain the boundary values from the atomic-operation statistics (case variants, +-1 numeric neighbors, NULL/non-NULL mixes) and that re-running with the same seed reproduces identical instances."
+    }
+   ],
+   "unresolved_checks": [
+    "No instance was generated, so integrity constraints, dependent-value consistency, preservation of compact rows, and reproducible generation could not be verified from execution evidence.",
+    "The generation specification is empty; consistency between spec and program cannot be assessed.",
+    "NULL-rule compliance per nullable column (NULL and non-NULL rows present, share matching compact) is unverified because no rows were written.",
+    "FK consistency of appended rows is unverified because foreign_keys=OFF and no rows were produced."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule requires that for every nullable column each instance contains generated rows with NULL and rows with non-NULL values, with a NULL share following the compact database's share. In instance.py `_apply_null_rule` skips any column whose compact NULL share is 0.0 (`if share <= 0.0 or n <= 0: continue`). The execution feedback confirms this: many nullable columns show 'generated rows: NULL 0 / n' (e.g. Award.award 0/218, Credit.role 0/1697, Episode.title 0/854, Vote.stars 0/1637, Person.name 0/943). The specification's per_column_exceptions explicitly require Award.award and Credit.role to have a NULL share of '5-30 % of generated rows', and the null_targets list includes all these columns. The program therefore does not implement the specified NULL rule for these columns.",
+     "requested_revision": "In `_apply_null_rule`, plant at least one NULL row for every nullable column regardless of the compact share (use the compact share when positive, otherwise a small default share such as 5-10%), so that Award.award, Credit.role, and the other nullable columns listed in null_targets receive NULLs. Ensure the planted NULLs are not overwritten by key dedup or FK consistency steps."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas include `Vote.percent = round(100.0 * votes / (SELECT SUM(votes) FROM Vote v2 WHERE v2.episode_id = Vote.episode_id), 1)` with supporting evidence (tt0629204: 36/203=17.7 etc.). The generation program has no code implementing this formula: values.py samples Vote.percent via `real_percent` (uniform [0,100]) and instance.py never recomputes percent from votes. The execution feedback shows Vote.percent generated rows with no NULL and no evidence of the formula being applied. This is a specified semantic rule that the program does not implement.",
+     "requested_revision": "Add a post-processing step in build_random_instance (or a dedicated rule pass) that, for each generated Vote row with non-NULL votes, sets percent = round(100.0 * votes / SUM(votes) over the same episode_id, 1), consistent with the specification. Handle the case where the episode total is zero (leave NULL or skip)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's semantic_rules_and_formulas constrain many columns to fixed domains: Episode.season = 9, Episode.series = 'Law and Order', Episode.episode BETWEEN 1 AND 24, Episode.number_in_series BETWEEN 182 AND 205, Episode.air_date in [1998-09-01, 1999-12-31], Award.year BETWEEN 1990 AND 2010, Award.result IN ('Winner','Nominee'), Award.organization IN (4 values), Award.award_category IN (4 values), Award.series = 'Law and Order', Credit.credited IN ('true','false'), Credit.category IN (8 values), Vote.stars BETWEEN 0 AND 10, Vote.votes >= 0, Person.height_meters BETWEEN 1.0 AND 2.5, Person.birthdate in [1900-01-01, 2030-12-31]. The program's samplers (values.py) draw from generic type-based ranges (e.g. NumberSampler uses [-10^scale, 10^scale] or observed min/max, StringSampler draws arbitrary strings) and there is no code enforcing these domain constraints. The execution feedback does not show these constraints being checked, and the generic samplers will produce out-of-domain values (e.g. arbitrary strings for Episode.series, arbitrary integers for Episode.season).",
+     "requested_revision": "Add a constraint-enforcement pass (or per-column domain samplers) that restricts generated values for these columns to the specified domains/enums/ranges, e.g. a `_apply_semantic_rules` function in instance.py that clamps or resamples values for the listed columns after sampling and before writing."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The specification's dependencies list `Award.series` copied from `Episode.series` via `Award.episode_id = Episode.episode_id` and `Credit.episode_id` copied from `Episode.episode_id` (copied: ['series']). The program's `fill_foreign_keys_consistently` only copies FK values; it does not propagate the parent's `series` value to the child's `series` column. There is no code in instance.py or values.py that sets Award.series or Credit.series from the joined Episode row. The execution feedback does not show this consistency being verified.",
+     "requested_revision": "After FK assignment, for each generated Award row with non-NULL episode_id, set Award.series to the Episode.series of the referenced episode; similarly for Credit if a series column exists. Add this to the dependency-handling logic in instance.py."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The specification's `uncertainty` section acknowledges that the Vote.percent formula's denominator is not directly observable, that Episode.number_in_series upper bound 205 is inferred, that Person.birthdate range is loose, that Award.year range is inferred, and that Credit.category enum is incomplete (20 distinct values vs 8 listed). These are flagged as uncertain, which is appropriate, but the specification still lists them as hard `semantic_rules_and_formulas` rather than as soft/uncertain constraints. This creates a mismatch: the program cannot be expected to satisfy rules the designer itself marks uncertain.",
+     "requested_revision": "Move the uncertain rules (Vote.percent formula, Episode.number_in_series bounds, Person.birthdate range, Award.year range, Credit.category enum) into a separate 'uncertain_rules' section, or mark them explicitly as soft constraints, so the engineer knows which rules are mandatory vs. best-effort. Keep the well-supported rules (Episode.season=9, Episode.series, Award.result, Credit.credited, Vote.stars range, etc.) as hard constraints."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs feedback shows 87/306 pairs separated with 0 unknown executions; the remaining 219 pairs are not separated. This alone does not prove a generation error, but combined with the missing domain constraints (issue 3) it suggests the generated values may not exercise the intended boundaries. Re-check after fixing the domain enforcement.",
+    "The execution feedback shows no FK violations, no NOT NULL violations, no PK duplicates, and 20/20 valid instances, which is good. However, the nullable_columns feedback shows many columns with 0 NULLs, which is the primary blocking issue.",
+    "The `rows_added` counts (Episode 854, Person 943, etc.) are much larger than the specified table_sizes_per_instance (Episode 24, Person 800, etc.). The specification says table sizes vary per instance, but the program's `choose_table_sizes` uses `int(min_c + int(rng.random() * 200))` which can produce up to ~230 rows per table, and the append-to-compact design adds these on top of the compact rows. This may be intentional (append mode), but the specification's table_sizes_per_instance should be clarified to state whether these are total or appended sizes."
+   ]
+  },
+  {
+   "recommendation": "pass",
+   "issues": [
+    {
+     "agent": "designer",
+     "evidence": "Semantic rules for the compact tables are mostly well supported by the supplied evidence: Episode.season=9, Episode.series='Law and Order', Award.result IN ('Winner','Nominee'), Award.series='Law and Order', Credit.credited IN ('true','false'), and Vote.percent formula are supported by shown rows and supporting_evidence. The spec explicitly marks the remaining uncertain (uncertain_rules: Person.birthdate range, Award.year range, Episode.number_in_series upper bound, Credit.category enum, Vote.percent denominator). These are correctly flagged as uncertain, not asserted as supported.",
+     "requested_revision": "No change required. If the rules are later tightened, the uncertain ones should be confirmed against the actual data before the spec treats them as hard constraints; the current spec already marks them as uncertain."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The program implements the semantic domains by construction: _FIXED, _ENUMS, _RANGES, _DATE_RANGES in instance.py; _apply_semantic_rules enforces them; _apply_copied_columns and _apply_vote_percent implement the Award.series/Credit.series copy and Vote.percent formula. The execution shows the spec's rules applied (e.g. Episode.series NULLs are only from the NULL rule, and the generated rows are non-null 'Law and Order' where the rule is applied).",
+     "requested_revision": "None. Note that the spec's _ENUMS for Credit.category is incomplete (20 distinct values vs 8 listed); the spec is aware and marks it uncertain, so the program's restriction is consistent with the spec as written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The NULL rule is implemented: _apply_null_rule plants a NULL for every nullable column with a share based on the compact share (default 5-10% when none), and it is applied before the PK dedup so planted NULLs are not dropped. The execution feedback shows all nullable columns have generated NULLs (e.g. Award.role 103/224, Person.nickname 782/942, Vote.percent 246/1637), and NOT NULL columns are not NULL. The 'NULL 0 / n' rule is not present in the feedback.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The FK consistency is enforced: fill_foreign_keys_consistently draws from the parent's values, and the writer's FK check is not enforced. The execution shows integrity: fk_violations=0, not_null_violations=0, pk_duplicates=0, not_ok=0. The compact rows are preserved (append mode: copy compact then write). The writer's append mode is used in _one, and the execution shows no rows_skipped.",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The generation is reproducible: the CLI uses a fixed seed and the execution feedback shows reproducible=true. The construction runs without errors (n_ok=20, n_fail=0, errors={}).",
+     "requested_revision": "None."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The value variation is possible: the spec's literal pool and comparison_boundary patterns are implemented via literals.py and the samplers (e.g. case flips, near-variants, number +-1). The construction_pairs show 113/306 separated, but the execution feedback does not show a systematic failure; the spec says a missing separation alone does not establish a generation error. The program's samplers do not block the intended variants.",
+     "requested_revision": "None. The spec is consistent with the implementation; the separation result is a property of the query, not a generation error."
+    }
+   ],
+   "unresolved_checks": [
+    "The spec's uncertain rules (Credit.category enum, Person.birthdate range, Award.year range, Episode.number_in_series upper bound, Vote.percent denominator) are marked uncertain and are not fully verified; the program implements them as stated. This is acceptable for the spec, but the spec should be confirmed against the actual data before the rules are treated as hard constraints.",
+    "The spec's table_sizes_per_instance (e.g. Episode 24, Person 800) is not enforced by the program; the program's choose_table_sizes uses a different size distribution. The spec's uncertainty note says the table sizes are per-instance, and the program's generated rows are appended to the compact rows. The execution shows rows_added (e.g. Episode 854, Person 942) which is larger than the spec's sizes. This is a spec/program mismatch: the program does not implement the spec's table_sizes_per_instance. However, the spec's uncertainty note says the program appends generated rows, so the total table size is compact + generated; the spec's table_sizes_per_instance is not stated as a hard constraint. The execution feedback shows rows_added, which is consistent with the program's append behavior. The spec's table_sizes_per_instance is not enforced, but the spec's uncertainty note acknowledges the append behavior. This is a minor inconsistency, not a blocking error."
+   ]
+  }
+ ]
 }

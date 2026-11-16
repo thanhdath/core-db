@@ -1,10 +1,5 @@
 """RQ1 decodes: sampled (20 candidates, temperature 1.0) and greedy SQL for the 100 BIRD-train + 100 Spider-train
-questions of ``evaluation_sets/rq1_questions200.jsonl`` (FINER-SQL prompt format, SQL after ``</think>``).
-
-Output JSON lines: {"question_uid", "ds", "db", "gold_sql", "pred_sql", "decoding", "draw"}.
-Usage:
-    python scripts/rq1_decode.py --model thanhdath/FINER-SQL-0.5B-v2 --out outputs/rq1/finer05b.jsonl [--limit 5]
-"""
+questions of ``evaluation_sets/rq1_questions200.jsonl`` (FINER-SQL prompt format, SQL after ``</think>``)."""
 import argparse
 import json
 from pathlib import Path

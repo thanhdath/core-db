@@ -1,48 +1,704 @@
 {
  "db": "cre_Docs_and_Epenses",
- "operator_io_quirks": [
-  "All identifiers are mixed-case with underscores (Ref_Document_Types, Document_Type_Code); must be double-quoted in generated SQL.",
-  "Tiny DB: max table 15 rows (Documents, Accounts), most 2-5; original_values lists are short, so rng.choices(k=min(5,len)) often returns all rows.",
-  "Document_Date declared DATETIME, storage class text, format 'YYYY-MM-DD HH:MM:SS' (e.g. '2004-08-28 06:59:19'); ts_fuzzer dispatch: contains 'date' -> first element parses as int? no -> Date fuzzer.",
-  "Document_Description and Other_Details are 100% NULL (distinct=0, storage ['null']); original_values are all None; String sampler drops None -> empty elements -> p:=1 (always fresh).",
-  "Statements.Statement_ID is BOTH the PK and an FK to Documents.Document_ID (self-ish chain, not self-table); table order must place Documents before Statements.",
-  "Documents_with_Expenses.Document_ID is PK and FK to Documents.Document_ID; Accounts.Statement_ID FK to Statements.Statement_ID (which is itself an FK).",
-  "All FKs point to existing parents with unique PKs; no dangling FKs, no composite keys, no self-references within a table.",
-  "CHAR(15) columns (Document_Type_Code, Budget_Type_Code) dispatch to String fuzzer with length=15; values are short codes ('BK','CV','GV','ORG','SF').",
-  "INTEGER PKs (Project_ID, Document_ID, Statement_ID, Account_ID) dispatch to Number fuzzer; samples are small ints (7..240), not sequential.",
-  "Account_Details is VARCHAR but stores numeric-looking strings ('495.063','12223.93'); String fuzzer will treat as text, not Number.",
-  "No views, triggers, or indexes beyond PKs in the DDL; empty clone is cheap.",
-  "Document_Type_Description has distinct=4 < rows=5 (a duplicate 'good'/'excellent' style value); not a unique column, so drop_unique_duplicates won't fire."
- ],
- "operator_ts_expectations": [
-  "Date fuzzer on Document_Date: template inferred from first parsable element -> '%Y-%m-%d %H:%M:%S'; range from min/max parsed dates (~1970..2012); fresh dates uniform in that range, formatted with template.",
-  "String fuzzer on Document_Type_Code / Budget_Type_Code: length range from elements (2-3 chars) up to 15; fresh strings over a-zA-Z0-9() plus contaminate; likely produces codes not in the 3-5 real values -> FN on equality joins to Ref_* tables unless FK fill copies parent values.",
-  "String fuzzer on Document_Description / Other_Details: all-None originals -> p=1, always fresh random strings; any query filtering these on real values will miss (FN).",
-  "Number fuzzer on INTEGER PKs: range [-10^0,10^0]=[-1,1]? scale=0 -> [-1,1] plus perturbation; but list range uses min(el)..max(el)+1 overwritten to full max -> fresh draws near 0/1, far from real 7..240 -> FN on range predicates, FP on ties.",
-  "FK fill: Documents.Document_Type_Code draws from Ref_Document_Types.Document_Type_Code final values (5 codes) with replacement -> duplicates in Documents; Documents.Project_ID from Projects (5 values) -> duplicates; realistic join cardinalities preserved.",
-  "Statements.Statement_ID is PK+FK: drawn from Documents.Document_ID final values, then PK-dedup keeps first occurrence -> Statements may shrink to 1-2 rows; Accounts.Statement_ID then draws from that small set.",
-  "Documents_with_Expenses.Document_ID PK+FK to Documents: drawn from Documents final IDs, PK-dedup; Budget_Type_Code from Ref_Budget_Codes (3 values) -> heavy duplication.",
-  "choose_table_sizes: w.p. 0.5 flat ~30-230 rows per table, else level-based (level0 1-31, next x4 capped 2500) -> Ref_* tables may get 30+ rows vs real 3-5, inflating join results (FP on COUNT).",
-  "NOT NULL not enforced in Python: String sampler can emit None? (no, drops None) but Number/Date fresh draws are non-null; PK/unique dedup may still leave rows that violate FK if parent empty -> insert fails, row skipped (writedb).",
-  "Known miss drivers: FN from implausible fresh strings/numbers on low-cardinality code columns; FP from missing ties (real 5 codes vs 30+ generated) and from Date range mismatch on 'year' predicates."
- ],
- "challenger_refs": [
-  "G4",
-  "G15",
-  "G16",
-  "G18",
-  "G3",
-  "G20",
-  "G5",
-  "G8",
-  "G9",
-  "G11"
- ],
- "challenger_cases_file": "reviewer_cases.json",
- "consumed_by": {
-  "challenger_cases": "oracle differential tests of tscore_gen on this DB (construction_tests)",
-  "operator_notes": "engineer prompt (only when this DB's construction tests fail)"
+ "shipped_round": null,
+ "generation_specification": {
+  "generic_sampling_rules": {
+   "integer_pk": "Sequential integers, unique per table, never NULL; drawn once before any child FK is drawn and never re-sampled or dropped. If appending to compact rows, start above the maximum compact PK.",
+   "integer_fk": "Copy from the generated parent PK pool (inst[parent][pk]); nullable FKs get at most one NULL row per instance; for parent-side unmatched_join_rows targets leave >=1 parent PK out of the child FK draw so a parent row has no child; NEVER plant a child FK value outside the parent PK pool.",
+   "char_code": "Sample from the enum pool of the referenced table; exact case as listed; never store query literals (e.g. lowercase variants) or rank integers in the column.",
+   "varchar_text": "Short descriptive phrases; 20-50% duplicate share on DISTINCT columns; near-variants of listed literals; recompute and adjust the achieved share after all planting.",
+   "datetime": "Uniform dates in 1970-01-01..2013-12-31 23:59:59, format %Y-%m-%d %H:%M:%S (zero-padded); 20-50% duplicate share; adjust after duplicate planting; every emitted value must parse under %Y-%m-%d %H:%M:%S.",
+   "numeric_amount": "Decimal string with 2-3 fractional digits, >= 0; used for Accounts.Account_Details.",
+   "boundary": "Boundary literals are query literals, not stored column values; do not plant them into enum or PK columns. For non-enum columns add the literal, one step below and one step above (numbers by step, dates by one day).",
+   "tie": "Ties are realized by making >=2 rows share an existing value from the column pool (repeated enum value, repeated FK, repeated rank); never write the rank integer into a CHAR/FK column.",
+   "null_share": "Nullable columns: at least one NULL row and at least one non-NULL row per instance; exactly the compact share where stated; NOT NULL columns never NULL; a planted NULL is never replaced to satisfy a rule.",
+   "compose_planting": "Compute one value list per column satisfying all applicable targets in a single pass; do not let later planting steps overwrite earlier ones on the same column.",
+   "fk_integrity": "All generated FK values must belong to the parent PK value set (only exception nullable-FK NULLs). Unmatched-join targets are satisfied exclusively via parent_rows_without_children. Writers must enable foreign_keys=ON during insert or validate row FK membership before insert; each instance must end with new_fk_violations == 0.",
+   "size_semantics": "table_sizes_per_instance is the FINAL table size per instance; generated rows = spec_size - compact_size (min 0); compact rows are copied unchanged first and never deleted.",
+   "post_validation": "After all planting verify and REPORT (do not drop rows): FK membership against parent PK set, group sizes (1,2,>=3), aggregate boundary counts, duplicate shares (20-50%), NULL rule per nullable column, date format/range, and tie ranks. Failures must be surfaced in the CLI summary."
+  },
+  "per_column_exceptions": [
+   {
+    "column": "Documents.Document_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Documents_with_Expenses.Document_ID",
+      "Statements.Statement_ID"
+     ],
+     "parent_rows_without_children": true,
+     "note": "leave >=1 Documents PK unreferenced by each child; no child FK may fall outside the Documents PK pool"
+    }
+   },
+   {
+    "column": "Documents.Document_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3,
+      4
+     ],
+     "ops": [
+      "COUNT(DISTINCT documents.document_id) > 2",
+      "COUNT(documents.document_id) < 3"
+     ],
+     "note": "satisfied by >=4 distinct PK rows; no literal values planted on PK"
+    }
+   },
+   {
+    "column": "Documents.Document_ID",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %",
+     "note": "PK unique; COUNT(DISTINCT) semantics applies, no stored duplicates"
+    }
+   },
+   {
+    "column": "Documents_with_Expenses.Document_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Documents.Document_ID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Documents_with_Expenses.Document_ID",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Documents_with_Expenses.Budget_Type_Code",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Ref_Budget_Codes.Budget_Type_Code"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Documents_with_Expenses.Budget_Type_Code",
+    "pattern": "null_rows",
+    "targets": {
+     "null_share": "none (NOT NULL column)"
+    }
+   },
+   {
+    "column": "Documents_with_Expenses.Budget_Type_Code",
+    "pattern": "composition_enum",
+    "targets": {
+     "values": [
+      "GV",
+      "ORG",
+      "SF"
+     ],
+     "group_sizes": "1, 2 and >= 3",
+     "duplicate_share": "20-50 %",
+     "ties": ">=2 rows share one enum value",
+     "note": "single composed value list; ties = repeated enum values (never rank integers); literal 'ORG','SF','org','sf' remain query literals only"
+    }
+   },
+   {
+    "column": "Accounts.Statement_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3"
+    }
+   },
+   {
+    "column": "Accounts.Statement_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Statements.Statement_ID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Statements.Statement_ID",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Accounts.Statement_ID"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Statements.Statement_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "note": "applies to Accounts.Statement_ID groups; Statements PK stays unique"
+    }
+   },
+   {
+    "column": "Documents.Project_ID",
+    "pattern": "group_sizes+aggregate_boundary",
+    "targets": {
+     "values_source": "Projects.Project_ID pool only",
+     "group_sizes": "1, 2 and >= 3",
+     "aggregate_counts": [
+      1,
+      2,
+      3
+     ],
+     "note": "single composed value list from parent PK pool; no literal [1,2,3] overwrite"
+    }
+   },
+   {
+    "column": "Documents.Document_Type_Code",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "values_source": "Ref_Document_Types.Document_Type_Code pool"
+    }
+   },
+   {
+    "column": "Ref_Budget_Codes.Budget_Type_Code",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Documents_with_Expenses.Budget_Type_Code"
+     ],
+     "parent_rows_without_children": true
+    }
+   },
+   {
+    "column": "Projects.Project_ID",
+    "pattern": "group_sizes",
+    "targets": {
+     "group_sizes": "1, 2 and >= 3",
+     "note": "applies to Documents.Project_ID groups; Projects PK stays unique"
+    }
+   },
+   {
+    "column": "Projects.Project_ID",
+    "pattern": "aggregate_boundary",
+    "targets": {
+     "values": [
+      1,
+      2,
+      3
+     ],
+     "ops": [
+      "COUNT(*) > 2",
+      "COUNT(*) >= 2"
+     ],
+     "note": "realized via Documents.Project_ID group counts; not planted on PK"
+    }
+   },
+   {
+    "column": "Ref_Document_Types.Document_Type_Code",
+    "pattern": "unmatched_join_rows",
+    "targets": {
+     "joins_with": [
+      "Documents.Document_Type_Code"
+     ],
+     "parent_rows_without_children": true,
+     "note": "with 5 types and enough Documents rows, >=1 type left unused; else target reported unmet"
+    }
+   },
+   {
+    "column": "Accounts.Account_Details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Projects.Project_Details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Ref_Budget_Codes.Budget_Type_Description",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Ref_Document_Types.Document_Type_Description",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Ref_Document_Types.Document_Type_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Statements.Statement_Details",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Documents.Document_Name",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Documents.Document_Date",
+    "pattern": "duplicates_for_distinct",
+    "targets": {
+     "duplicate_share": "20-50 %"
+    }
+   },
+   {
+    "column": "Documents.Document_Description",
+    "pattern": "all_null_compact",
+    "targets": {
+     "null_rows": "exactly n-1 NULLs per instance",
+     "non_null_value": "descriptive phrase, not the literal 'non-null value'"
+    }
+   },
+   {
+    "column": "Documents.Other_Details",
+    "pattern": "all_null_compact",
+    "targets": {
+     "null_rows": "exactly n-1 NULLs per instance",
+     "non_null_value": "descriptive phrase, not the literal 'non-null value'"
+    }
+   },
+   {
+    "column": "Statements.Statement_ID",
+    "pattern": "size_for_group_sizes",
+    "targets": {
+     "min_rows": 3,
+     "note": "Statements final size must be >=3 so Accounts.Statement_ID can realize a >=3 group"
+    }
+   }
+  ],
+  "dependencies": [
+   {
+    "child": "Documents.Document_Type_Code",
+    "parent": "Ref_Document_Types.Document_Type_Code",
+    "copied": []
+   },
+   {
+    "child": "Documents.Project_ID",
+    "parent": "Projects.Project_ID",
+    "copied": []
+   },
+   {
+    "child": "Statements.Statement_ID",
+    "parent": "Documents.Document_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_with_Expenses.Document_ID",
+    "parent": "Documents.Document_ID",
+    "copied": []
+   },
+   {
+    "child": "Documents_with_Expenses.Budget_Type_Code",
+    "parent": "Ref_Budget_Codes.Budget_Type_Code",
+    "copied": []
+   },
+   {
+    "child": "Accounts.Statement_ID",
+    "parent": "Statements.Statement_ID",
+    "copied": []
+   }
+  ],
+  "semantic_rules_and_formulas": [
+   {
+    "table": "Ref_Document_Types",
+    "column": "Document_Type_Code",
+    "formula": "Document_Type_Code IN ('BK','CV','FM','PP','PT')"
+   },
+   {
+    "table": "Ref_Budget_Codes",
+    "column": "Budget_Type_Code",
+    "formula": "Budget_Type_Code IN ('GV','ORG','SF')"
+   },
+   {
+    "table": "Documents",
+    "column": "Document_Type_Code",
+    "formula": "Document_Type_Code IN ('BK','CV','FM','PP','PT')"
+   },
+   {
+    "table": "Documents_with_Expenses",
+    "column": "Budget_Type_Code",
+    "formula": "Budget_Type_Code IN ('GV','ORG','SF')"
+   },
+   {
+    "table": "Accounts",
+    "column": "Account_Details",
+    "formula": "Account_Details IS NULL OR (Account_Details GLOB '[0-9]*' AND CAST(Account_Details AS REAL) >= 0)",
+    "evidence": "495.063, 930.14, 6035.84, 199.52, 12223.93, 11130.23, 1230.454, 6352.31"
+   },
+   {
+    "table": "Documents",
+    "column": "Document_Date",
+    "formula": "Document_Date IS NULL OR Document_Date BETWEEN '1970-01-01 00:00:00' AND '2013-12-31 23:59:59'",
+    "evidence": "2004-08-28 06:59:19, 2012-12-27 19:09:18, 1980-10-22 14:17:11, 1981-11-29 10:23:01, 1970-06-17 14:03:21, 2013-01-26 15:15:25, 1991-07-08 08:49:59, 1970-03-06 07:34:49"
+   }
+  ],
+  "table_sizes_per_instance": {
+   "Ref_Document_Types": 5,
+   "Ref_Budget_Codes": 3,
+   "Projects": 5,
+   "Documents": 15,
+   "Statements": 3,
+   "Documents_with_Expenses": 10,
+   "Accounts": 15
+  },
+  "null_targets": [
+   "Documents.Document_Date",
+   "Documents.Document_Name",
+   "Documents.Document_Description",
+   "Documents.Other_Details",
+   "Statements.Statement_Details",
+   "Accounts.Account_Details",
+   "Projects.Project_Details",
+   "Documents_with_Expenses.Document_Details"
+  ],
+  "supporting_evidence": [
+   {
+    "formula": "Accounts.Account_Details numeric string >= 0",
+    "rows": [
+     "495.063",
+     "930.14",
+     "6035.84",
+     "199.52",
+     "12223.93",
+     "11130.23",
+     "1230.454",
+     "6352.31"
+    ]
+   },
+   {
+    "formula": "Documents.Document_Date range",
+    "rows": [
+     "2004-08-28 06:59:19",
+     "2012-12-27 19:09:18",
+     "1980-10-22 14:17:11",
+     "1981-11-29 10:23:01",
+     "1970-06-17 14:03:21",
+     "2013-01-26 15:15:25",
+     "1991-07-08 08:49:59",
+     "1970-03-06 07:34:49"
+    ]
+   },
+   {
+    "formula": "Documents.Document_Type_Code enum",
+    "rows": [
+     "CV",
+     "BK",
+     "PP",
+     "FM"
+    ]
+   },
+   {
+    "formula": "Documents_with_Expenses.Budget_Type_Code enum",
+    "rows": [
+     "GV",
+     "SF",
+     "ORG"
+    ]
+   }
+  ],
+  "uncertainty": [
+   "Document_Description and Other_Details are 100% NULL in the compact sample; generated instances use exactly n-1 NULLs and one non-NULL descriptive phrase per instance (if n=1 the at-least-one-NULL rule takes precedence).",
+   "Statements final size raised from 2 to 3 so Accounts.Statement_ID can realize group sizes 1, 2 and >=3.",
+   "No date pairs exist in a single table, so no order rule is stated.",
+   "No calculated column is derivable from the shown rows; no formula beyond range/enum rules.",
+   "Compact rows are preserved unchanged; table_sizes_per_instance are final target sizes and generated counts = spec_size - compact_size (min 0).",
+   "Group_sizes and aggregate_boundary targets on PK columns are realized via child grouping / distinct-row counts, never as stored duplicate PK values.",
+   "Documents_with_Expenses.Budget_Type_Code single composed plan (10 rows): GV x5, ORG x1, SF x4 gives group sizes 1 and >=3, a 20-50% duplicate share if achieved, and one repeated tie; avoid using all three enum values if Ref_Budget_Codes unmatched_join needs a parent without child.",
+   "Documents.Project_ID composed plan: use only Projects.Project_ID values, one group of size 1, one of size 2, and one >=3 covering counts 1,2,3.",
+   "All generated FK values must belong to the parent PK set; unmatched-join targets satisfied only via parent_rows_without_children; writers enable foreign_keys=ON or pre-validate; post-validation reports unmet targets and must surface them in the CLI summary."
+  ]
  },
- "engineer": "skipped: construction tests pass with the shared agent-generated package (reuse declared)",
- "package_sha": "277556861949c7da"
+ "reviews": [
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: all 20 units fail with AttributeError(\"'Schema' object has no attribute 'orig_path'\") at tscore_gen/writer.py:26 (`src = sqlite3.connect('file:%s?mode=ro&immutable=1' % schema.orig_path, uri=True)`). The Schema dataclass in tscore_gen/schema.py defines fields tables, fks, ddl, table_order, column_order, original_values, original_sizes, unique_from_index \u2014 no orig_path. read_schema() never stores the path. Result: n_ok=0, n_fail=20, 0 instance directories written.",
+     "requested_revision": "Add an `orig_path` field to the Schema dataclass (or pass the original path through to write_instance_spec) and set it in read_schema(). Re-run generation so that instances are actually written; the current run produces no instances at all, which blocks any verification of integrity, dependent-value consistency, compact-row preservation, or reproducibility."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_unmatched_children` only plants an unmatched value when the column is in SPEC_UNMATCHED_JOINS and the parent pool is non-empty, but it never removes/avoids matching values, and it is applied to child FK columns whose values were just drawn from the parent pool by `fill_foreign_keys_consistently`. For NOT NULL FK columns (e.g. Documents_with_Expenses.Document_ID, Documents.Project_ID, Documents.Document_Type_Code, Statements.Statement_ID, Accounts.Statement_ID) the spec's `unmatched_join_rows` target is 'parent_rows_without_children' (i.e. parent rows with no child), not child rows with dangling FKs. The code conflates the two: it plants dangling child FKs (which would violate the declared FOREIGN KEY constraints if foreign_keys were ON) while the writer disables `pragma foreign_keys = OFF`, so violations are silently accepted rather than prevented. The spec's `integer_fk` rule also says 'Copy from parent PK pool; nullable FKs get ~10% NULL rows plus parent rows without children' \u2014 the program does not implement the ~10% NULL share for nullable FKs (there are no nullable FKs in this schema, but the rule is stated generically) and does not guarantee parent rows without children for the parent-side targets (Documents.Document_ID, Ref_Budget_Codes.Budget_Type_Code, Projects.Project_ID, Ref_Document_Types.Document_Type_Code).",
+     "requested_revision": "Separate the two concepts: (a) for parent-side `unmatched_join_rows` targets, ensure at least one parent row has no child (e.g. by leaving a parent PK out of the child FK draw); (b) for child-side targets, do not plant dangling FK values that violate the declared FOREIGN KEY constraints \u2014 instead keep the FK values within the parent pool and rely on parent rows without children. Also implement the stated ~10% NULL share for nullable FKs (none here, but the rule is generic). Keep `pragma foreign_keys = OFF` only if the spec explicitly permits dangling FKs; otherwise enable it so violations are caught."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_group_sizes` for ('Statements','Statement_ID') and ('Projects','Project_ID') and ('Documents','Project_ID') uses `schema.original_values.get((pt, pc), [])` as the pool, but for Statements.Statement_ID the FK is to Documents.Document_ID (pt='Documents', pc='Document_ID'), and for Projects.Project_ID there is no FK entry (it is a PK), so `pool` falls back to `range(1, max(2,n)+1)`. For Projects.Project_ID the spec's group_sizes target is on the PK column itself, which is unique \u2014 group sizes of 1, 2, >=3 are impossible on a PK. The spec lists ('Projects','Project_ID') group_sizes [1,2,3] and aggregate_boundary [1,2,3], but Projects.Project_ID is the PRIMARY KEY and must be unique; planting duplicate values there will be dropped by `sample_fresh_primary_keys`, so the target cannot be met. Similarly ('Statements','Statement_ID') is a PK (and FK to Documents.Document_ID) \u2014 group sizes >1 are impossible.",
+     "requested_revision": "Designer: remove or reinterpret the group_sizes / aggregate_boundary targets on primary-key columns (Projects.Project_ID, Statements.Statement_ID) \u2014 they are unsatisfiable under the PK uniqueness constraint. Engineer: for grouping columns that are FKs, draw the pool from the actual parent PK values (via schema.fks), not from original_values of a possibly wrong key; and skip planting group sizes on PK columns."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_agg_boundary` for ('Documents','Document_ID') plants values [1,2,3,4] on the PK column, but Documents.Document_ID is the PRIMARY KEY and must be unique; `sample_fresh_primary_keys` will drop duplicates, so the aggregate-boundary values 1..4 cannot all survive as distinct rows unless n>=4 and they are assigned to distinct rows. The current code assigns `values = [1,2,3,4]` then fills with random choices from targets, producing many duplicates that are then dropped, shrinking the table below the spec size (15). The spec's aggregate_boundary target for Documents.Document_ID is about COUNT(DISTINCT documents.document_id) > 2 and COUNT(documents.document_id) < 3 \u2014 these are satisfied by any table with >=3 distinct IDs, not by planting literal values 1..4 on the PK.",
+     "requested_revision": "Engineer: do not plant aggregate-boundary literal values on PK columns; instead ensure the table has enough distinct PK rows (>=4) to satisfy COUNT(DISTINCT) > 2 and COUNT < 3 boundaries. For non-PK counted columns (Documents.Project_ID), planting values is fine but must not conflict with group_sizes planting on the same column (currently both `_plant_group_sizes` and `_plant_agg_boundary` write to Documents.Project_ID, and the later one overwrites the earlier \u2014 order in the loop is group_sizes then agg_boundary, so group_sizes is lost)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py: in the specification-driven loop, for each column the code applies `_plant_group_sizes`, then `_plant_agg_boundary`, then `_plant_duplicates`, then `_plant_nulls`, then `_plant_unmatched_children`, then `_plant_date_range` \u2014 each overwriting `inst[t][col]`. For Documents.Project_ID both group_sizes and agg_boundary targets exist; agg_boundary overwrites group_sizes, so the group-size target (1,2,>=3) is not met. For Documents_with_Expenses.Budget_Type_Code, `_plant_enum_pool` sets values, then `_plant_group_sizes` overwrites with a cyclic pattern, then `_plant_unmatched_children` may replace one with 'UNMATCHED' (a string not in the enum pool), violating the enum domain `Budget_Type_Code IN ('GV','ORG','SF')` and the comparison-boundary literals ORG/org/SF/sf. Similarly `_plant_unmatched_children` on Documents.Document_Type_Code can inject 'UNMATCHED' into an enum column.",
+     "requested_revision": "Engineer: make the planting steps compose rather than overwrite \u2014 e.g. compute a single value list per column that satisfies all applicable targets, or apply unmatched-join planting only to non-enum FK columns and only by choosing a value outside the parent pool that is still within the column's declared domain (for enum columns, there is no such value, so the unmatched-join target must be met via parent rows without children instead). Ensure enum columns only ever contain values from the declared enum pool (exact case as listed)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_duplicates` for ('Documents','Document_Date') replaces positions with duplicates of existing values, but `_plant_date_range` runs after and re-parses/clamps values; duplicates are preserved only if the same string is produced. More importantly, `_plant_nulls` for Documents.Document_Date sets a position to None, and `_plant_date_range` preserves None \u2014 fine. But `_plant_duplicates` for Documents.Document_Name / Document_Description runs before `_plant_nulls`, and `_plant_nulls` may overwrite a duplicated value with None, reducing the duplicate share below 20%. The spec's duplicate_share 20-50% is a target on DISTINCT columns; the program does not verify the achieved share after all planting steps.",
+     "requested_revision": "Engineer: after all planting steps, verify (and if needed re-plant) the duplicate share on SPEC_DUP_COLUMNS to be within 20-50% of non-NULL rows, and verify group sizes and aggregate boundaries on the final column values. Add a post-construction validation pass that checks each spec target against the in-memory instance and reports unmet targets (without silently dropping rows)."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `semantic_rules_and_formulas` includes `Accounts.Account_Details: CAST(Account_Details AS REAL) >= 0` and `Documents.Document_Date IS NULL OR Document_Date BETWEEN '1970-01-01 00:00:00' AND '2013-12-31 23:59:59'`. The program's `_plant_date_range` clamps dates to the range, but `_plant_duplicates` and `_plant_nulls` run before it and may produce values that `_plant_date_range` then clamps \u2014 OK. However, `Accounts.Account_Details` is a VARCHAR(255) column; the program's StringSampler generates arbitrary strings (CHARSET includes letters, spaces, digits, parentheses), which will not satisfy `CAST(... AS REAL) >= 0` (CAST of a non-numeric string yields 0 in SQLite, which is >= 0, so the rule holds vacuously \u2014 but the spec's supporting_evidence shows numeric strings like '495.063'). The spec does not state a formula constraining Account_Details to numeric strings, yet the supporting evidence implies it. This is an under-specified rule.",
+     "requested_revision": "Designer: either (a) add an explicit formula `Account_Details IS NULL OR Account_Details GLOB '[0-9]*'` (or similar) to the semantic rules, or (b) remove the CAST rule and supporting evidence if non-numeric strings are acceptable. Engineer: if (a) is chosen, constrain the Account_Details sampler to numeric strings with 2-3 fractional digits (matching the numeric_amount rule) and plant at least one NULL."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `uncertainty` states 'Document_Description and Other_Details are 100% NULL in the sample; generated instances keep them nullable with at least one NULL row.' The program's `_plant_nulls` for these columns sets at least one NULL and then, using the original null_share (1.0), sets `n_null = int(n * 1.0) = n` and overwrites all positions with NULL \u2014 so the entire column becomes NULL, which is consistent with the compact database but means the 'rows with non-NULL values' part of the NULL rule (instruction 7) is not met. Instruction 7 requires 'each instance contains generated rows with NULL and rows with non-NULL values' for every nullable column.",
+     "requested_revision": "Designer: clarify whether 100%-NULL columns in the compact database should remain 100% NULL in generated instances (contradicting instruction 7) or should get at least one non-NULL row. Engineer: if the NULL rule requires both NULL and non-NULL rows, cap the planted NULL share at n-1 (leave at least one non-NULL) for columns whose compact share is 1.0, and note the deviation from the compact share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/writer.py copies the compact database via `src.backup(dst)` and then appends generated rows. The spec's `table_sizes_per_instance` gives absolute sizes (e.g. Documents: 15), but the writer appends to the compact rows, so the final table size is compact_size + generated_size, not the spec size. The spec's `choose_table_sizes` jitter is applied to the generated count, not the final count. This means the final instance does not match the specified per-instance sizes, and aggregate/group-size targets computed on the generated rows may be diluted by compact rows.",
+     "requested_revision": "Engineer: either (a) generate rows to replace (not append to) the compact rows so final sizes match the spec, or (b) adjust `choose_table_sizes` to account for compact row counts (generated = spec_size - compact_size, min 0) and document that compact rows are preserved. The spec should state explicitly whether compact rows are preserved and how spec sizes relate to final sizes."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `build_random_instance` calls `_init_sampler` with `p = 0.0 if rng.random() < 0.3 else 0.2` and `max_l0` defaulting to `float('inf')`; `_init_sampler` then may set `max_l0 = rng.random() * 30` or `float('inf')`. The spec's `generic_sampling_rules` do not mention this p/max_l0 randomization, but it is inherited from the upstream fuzzer. More importantly, the spec's `integer_pk` rule says 'Sequential integers starting at 1, unique per table; never NULL', but the program uses NumberSampler for INTEGER PKs, which draws random integers in [-10^10, 10^10] (or [0, 2*10^10] if unsigned) \u2014 not sequential starting at 1. `sample_fresh_primary_keys` only deduplicates; it does not make PKs sequential.",
+     "requested_revision": "Engineer: implement the `integer_pk` rule explicitly \u2014 generate PK values as sequential integers starting at 1 (or at compact_max+1 if appending), unique per table, never NULL. Do not rely on NumberSampler for PK columns. Similarly, `integer_fk` should copy from the parent PK pool (already done via `fill_foreign_keys_consistently`), but the parent pool must be the sequential PKs, not random integers."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_enum_pool` for ('Documents_with_Expenses','Budget_Type_Code') appends 'org' and 'sf' (lowercase) to the pool, but the schema declares `Budget_Type_Code CHAR(15)` and the spec's `char_code` rule says 'Sample from the enum pool of the referenced table; exact case as listed.' The enum pool for Ref_Budget_Codes.Budget_Type_Code is ['GV','ORG','SF'] (uppercase). Adding lowercase 'org'/'sf' to Documents_with_Expenses.Budget_Type_Code violates the FK to Ref_Budget_Codes (no 'org'/'sf' parent rows) and the enum domain. The comparison_boundary target lists values ['ORG','org','SF','sf'] as literals to compare against, not as values to store in the column.",
+     "requested_revision": "Engineer: do not store lowercase 'org'/'sf' in Documents_with_Expenses.Budget_Type_Code. The comparison_boundary literals are query literals, not column values; they should be planted in the literal pool (for query generation), not in the data. Keep the column values within the parent enum pool ['GV','ORG','SF'] to satisfy the FK."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_unmatched_children` for ('Documents','Document_ID') and ('Documents_with_Expenses','Document_ID') etc. uses `schema.original_values.get((pt, pc), [])` to determine the parent pool, but the parent values in the generated instance are not the original values \u2014 they are freshly generated. So the 'unmatched' check compares against the wrong pool, and may either fail to plant an unmatched value or plant a value that actually matches a generated parent. This makes the unmatched-join target unreliable.",
+     "requested_revision": "Engineer: compute the parent pool from the generated instance (`inst[pt][pc]`), not from `schema.original_values`. Apply unmatched-join planting after all parent tables are fully generated (the current loop iterates in topological order, so parents are available, but the code uses original_values instead of inst)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "tscore_gen/instance.py `_plant_group_sizes` for ('Documents','Document_Type_Code') uses `_plant_enum_pool` which returns ['BK','CV','FM','PP','PT'] (5 values) and cycles through targets [1,2,3] assigning `pool[i % len(pool)]` with group size `targets[i % len(targets)]`. With n=15, this produces groups of sizes 1,2,3,1,2,3,... but the values cycle independently, so the same value may appear in multiple groups of different sizes \u2014 the actual group sizes in the final column may not be 1, 2, >=3. The code does not verify the achieved group sizes.",
+     "requested_revision": "Engineer: construct the grouping column by explicitly assigning each distinct value a group size from the targets (e.g. value A appears 1 time, value B appears 2 times, value C appears >=3 times), then fill remaining rows with additional values, and verify the achieved group sizes. Do not rely on independent cycling of values and sizes."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification `dependencies` lists `Statements.Statement_ID -> Documents.Document_ID` and `Documents_with_Expenses.Document_ID -> Documents.Document_ID` and `Accounts.Statement_ID -> Statements.Statement_ID`, but the schema also has `Statements.Statement_ID` as PRIMARY KEY and FK to Documents.Document_ID, and `Documents_with_Expenses.Document_ID` as PRIMARY KEY and FK to Documents.Document_ID. The spec's `table_sizes_per_instance` gives Statements: 2 and Documents_with_Expenses: 10, but Statements.Statement_ID must be a subset of Documents.Document_ID (FK) and unique (PK) \u2014 with Documents: 15, this is feasible. However, the spec's `unmatched_join_rows` target for Statements.Statement_ID says 'parent_rows_without_children: true' joining with Accounts.Statement_ID and Documents.Document_ID \u2014 but Statements.Statement_ID is a child of Documents, not a parent of Documents. The direction is confused.",
+     "requested_revision": "Designer: correct the unmatched_join_rows direction for Statements.Statement_ID \u2014 it is a child of Documents.Document_ID and a parent of Accounts.Statement_ID. The 'parent_rows_without_children' target should apply to Documents.Document_ID (parent of Statements) and Statements.Statement_ID (parent of Accounts), not to Statements.Statement_ID as a child of Documents. Engineer: implement the corrected direction."
+    }
+   ],
+   "unresolved_checks": [
+    "No instances were produced (n_ok=0), so integrity constraints, dependent-value consistency, compact-row preservation, and reproducibility could not be verified from execution evidence.",
+    "The spec's `integer_pk` sequential rule vs. the program's random-integer PK generation was not verified against actual output because no output exists.",
+    "The spec's `integer_fk` ~10% NULL share for nullable FKs could not be verified (no nullable FKs in this schema, but the rule is generic).",
+    "The spec's `numeric_amount` rule (decimal with 2-3 fractional digits, >= 0) is not applied to any column in the program; Accounts.Account_Details is generated as arbitrary strings. Whether this is intended is unresolved.",
+    "The spec's `tie` rule (plant at least two rows sharing the listed rank value) is listed for Documents_with_Expenses.Budget_Type_Code and Accounts.Statement_ID, but the program does not implement tie planting explicitly; it relies on group_sizes planting, which may or may not produce ties. Unverified.",
+    "The spec's `boundary` rule (for each listed literal add the literal, one step below and one step above) is not implemented for comparison_boundary literals in the data; the program only adds the literals to the enum pool. Unverified whether this is intended for data or only for query literals."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances is invalid due to new FK violations. instance.validity.valid = 0/20, reasons {new_integrity_failures: 20}. Aggregated: Documents.Project_ID -> Projects.Project_ID (197 rows, 20 instances), Documents_with_Expenses.Document_ID -> Documents.Document_ID (20 rows), Accounts.Statement_ID -> Statements.Statement_ID (15 rows), Statements.Statement_ID -> Documents.Document_ID (11 rows).",
+     "requested_revision": "Fix the generator so that generated FKs to Projects.Project_ID, Documents.Document_ID, Statements.Statement_ID are not dangling. The unmatched-join requirement ('parent rows without children') means leaving some parent rows unreferenced, not planting child FK values outside the parent pool. Concretely, _plant_unmatched_children must not inject a value outside the parent pool (the 'max(parent)+1' / 'UNMATCHED' branch), and the FK fill/reroute logic must guarantee no row-level FK violation. Note also that instance.py's own docstring says 'keeping some child FK values that do not match any parent (only where the schema allows it)' \u2014 this contradicts the schema's NOT NULL FKs and the specification's generic_sampling_rules ('never plant dangling FK values outside the parent pool')."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_enum_pool` only fills enum columns from the spec enum pool but `_plant_unmatched_children` skips enum columns entirely; combined with _plant_group_sizes for ('Documents_with_Expenses','Budget_Type_Code') which draws from the enum pool, and the fact that writers set `pragma foreign_keys = OFF` in write_instance_sqlite (writer.py), integrity is not enforced during insert and violations silently persist. The reported fk_violations count 243 while instances show only aggregated new_fk_violations per instance, so both the generator and the writer need to enforce or at least detect FK consistency.",
+     "requested_revision": "Enable foreign_keys=ON during insert (or validate row FK membership before insert) and make the construction loop wrap FK values so all generated FK values are in the parent pool. Confirm each of the 20 instances has new_fk_violations == 0 after the fix."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` sets FK grouping column values from parent_pool (which is `inst[pt][pc]`). For Documents.Project_ID, this means Documents FK values are set from generated Projects PKs \u2014 fine \u2014 but the ordering in build_random_instance applies SPEC_GROUP_SIZES AFTER fill_foreign_keys_consistently and after sample_fresh_primary_keys. However, Documents.Project_ID group sizes on the FK column can be violated later: after the spec-driven loop, `sample_fresh_primary_keys`/`drop_unique_duplicates` are called for all tables, which can drop Documents rows (when PKs duplicate) and shrink group sizes. The post-construction validator only checks SPEC_DUP_COLUMNS and never verifies group sizes or aggregate boundaries. So the group-size and aggregate targets are not guaranteed.",
+     "requested_revision": "Verify group-size (1,2,>=3) and aggregate-boundary (COUNT(*)=1,2,3) targets after the second dedupe pass; either re-run planting to restore them or use PK generation that does not collide (sequential PKs as stated in generic_sampling_rules). Add a post-construction check that reports unmet targets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec: per_column_exceptions for Documents.Document_ID says 'unmatched_join_rows ... joins_with [Documents_with_Expenses.Document_ID, Statements.Statement_ID, Accounts.Statement_ID]' with 'parent_rows_without_children': true. But Documents_with_Expenses.Document_ID is the PK of Documents_with_Expenses and is FK to Documents; Documents.Document_ID (parent) simply needs at least one row with no child in Documents_with_Expenses/Statements. The current spec text is silent on the fact that child-side targets on Accounts.Statement_ID and Statements.Statement_ID are also listed for the same Documents.Document_ID. Given the Program's option to satisfy parent-side unmatched via parent_rows_without_children, the spec should explicitly state that no child FK value may fall outside the parent PK pool. Currently instance.py's docstring says 'keeping some child FK values that do not match any parent (only where the schema allows it)', reading as if planting such values is intended.",
+     "requested_revision": "Revise the specification to state unambiguously that all generated FK values must belong to the parent PK value set (the ONLY exception is nullable-FK ~10% NULLs), and delete the phrase 'keeping some child FK values that do not match any parent' from the interface description. Unmatched-join targets are satisfied exclusively via parent_rows_without_children."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `build_random_instance` at the second dedupe loop runs `sample_fresh_primary_keys(tm, inst[t])` and `drop_unique_duplicates(tm, inst[t])` on every table after construction. sample_fresh_primary_keys on a table whose PK is also the FK target of another table can silently drop parent rows whose children were generated earlier (child FK values then become dangling). This is the most likely source of new_fk_violations in instances 0010 and 0014 (largest counts, 15).",
+     "requested_revision": "Remove the second `sample_fresh_primary_keys` pass or run it before any child FK is drawn. Ensure PKs drawn sequentially per generic_sampling_rules 'integer_pk' so subsequent dedupe cannot drop parent rows."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` plants NULL at a random position (possibly a row already NULL, or over rows later 'corrected' by downstream planting such as _plant_date_range). _plant_date_range, _plant_numeric_amount, _plant_unmatched_children all run AFTER _plant_nulls in the same loop body, so a NULL is never overwritten (they preserve None), but if _plant_duplicates or _plant_group_sizes is added later (not currently) NULLs would be lost. Also spec null rule caps NULL share at n-1, and the post-construction validator has no NULL check at all.",
+     "requested_revision": "Add explicit post-construction validation of the NULL rule per SPEC_NULL_COLUMNS: each such column must have at least one NULL row and at least one non-NULL row, and NULL share must not exceed the compact share. Report (do not drop) unmet targets."
+    },
+    {
+     "agent": "designer",
+     "evidence": "spec uncertainty item: 'Document_Description and Other_Details are 100% NULL in the sample'. The compact databases show NULL 37/51 and NULL 37/51 in generated rows (just over 70%), but the NULL rule requires NULL share to follow compact share with at least one non-NULL. Compact share is 100%; the spec's 'cap at n-1' allows the implementation to satisfy this, which is fine. However, the spec does not state which of the SPEC_NULL_COLUMNS rows in evidence shows 100% NULL vs. partial, so reviewers cannot distinguish between 'required at least one non-NULL because compact share was 100%' vs. 'choose non-NULL where compact had none'. Clarify the NULL rule for the 100%-NULL-in-compact columns: 'since compact is all NULL, NULL share is capped at n-1 and the remaining single row must be non-NULL'.",
+     "requested_revision": "Add explicit text in the specification for 100%-NULL compact columns: exactly n-1 NULL rows and one non-NULL row per instance, and confirm that if n=1 the rule 'at least one NULL row' takes precedence (no non-NULL planted)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_date_range` only runs on ('Documents','Document_Date') and clamps parsed or fresh values. But the source DateSampler already stryps leading zeros (`strip0`), and produces formats _TEMPLATES = ..., which can truncate date-only strings. The spec formula requires Document_Date to parse as %Y-%m-%d %H:%M:%S BETWEEN 1970..2013. Any date value that ends up as e.g. '2004-8-28' would fail the writer insert into SQLite (DATETIME stores as text) but not violate the formula in SQL. No test shows Document_Date outputs yet; the parser shape is unchecked in the feedback.",
+     "requested_revision": "Either disable `strip0` for Documents.Document_Date starts, or force DateSampler's template to '%Y-%m-%d %H:%M:%S' for that column, or make _plant_date_range emit %Y-%m-%d %H:%M:%S strings. Add a verification that all generated Document_Date values parse under that format and lie within the range."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` counts distinct values over non-NULL values but never reports duplicate share. The feedback shows duplicate shares are not measured (`construction_pairs` does not report duplicate shares); the post-construction `_verify_duplicate_share` is called but on failure the code does `pass`, so unmet targets are silently ignored.",
+     "requested_revision": "Surface the duplicate-share check in the run output (per SPEC_DUP_COLUMNS), and rerun duplicate planting once (up to N retries) on failure rather than silently passing. Do not drop rows, but record which columns failed."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "Spec calls for tie rule: for ORDER/LIMIT columns plant at least two rows sharing the listed rank value (`ties_for_order_limit`). SPEC_BUDGET_CODE tie targets ranks [1,2,3] are not implemented anywhere in instance.py; SPEC_BUDGET_CODE duplicates_for_distinct not implemented either. This is a missing-spec issue \u2014 the tie and duplicate targets for Documents_with_Expenses.Budget_Type_Code are not in SPEC_GROUP_SIZES-driven planting or duplicate planting lists.",
+     "requested_revision": "Add tie planting for SPEC columns with `ties_for_order_limit` (spec says ranks [1,2,3] for Documents_with_Expenses.Budget_Type_Code) and add Documents_with_Expenses.Budget_Type_Code to SPEC_DUP_COLUMNS (the extracted-atomic-operations list has `minor_patterns.duplicates_for_distinct: 4` for that column)."
+    }
+   ],
+   "unresolved_checks": [
+    "The construction_pairs report (eligible 129, separated 31) is incomplete: `construction_pairs_by_group` is empty \u2014 no per-group separation is reported, so per-column separation verification cannot be confirmed.",
+    "Date format of generated Documents.Document_Date is not verified in the feedback; DateSampler can emit non-'%Y-%m-%d %H:%M:%S' strings that would still satisfy SQLite's loose DATETIME storage.",
+    "Cannot verify that the 'rows_added' counts for nullable columns with high duplicate share (Account_Details, Statement_Details, Project_Details) meet the 20-50% duplicate criterion without per-column duplicate counts in feedback.",
+    "Whether the compact rows are truly byte-identical: writer.py copies compact DB with `src.backup(dst)` and appends; feedback shows `dc_rows_missing_or_changed` is 0 for all instances, consistent, but this is not independently re-checked on the `sqlite`-level copy vs source."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances is invalid with new_integrity_failures; total fk_violations = 280. Constraint breakdown: 'Documents.Project_ID -> Projects.Project_ID' 197 rows across 20 instances, and 'Documents_with_Expenses.Budget_Type_Code -> Ref_Budget_Codes.Budget_Type_Code' 83 rows across 20 instances. The spec explicitly requires 'each instance must end with new_fk_violations == 0' and 'NEVER plant a child FK value outside the parent PK pool'.",
+     "requested_revision": "Fix the FK generation so that every generated child FK value is a member of the parent PK set. Root causes visible in instance.py: (a) `_plant_group_sizes` for ('Documents','Project_ID') builds values from `parent_pool` but then `_plant_agg_boundary` overwrites the same column with `[1,2,3]` values that are not guaranteed to be in Projects.Project_ID; (b) `_plant_enum_pool` for ('Documents_with_Expenses','Budget_Type_Code') draws from ['GV','ORG','SF'] but the group-size/ties planting then overwrites with integer ranks 1,2,3 (from SPEC_TIES) that are not valid Budget_Type_Code values. Ensure the aggregate-boundary and tie planting for FK/enum columns only emits values from the parent PK / enum pool, and re-validate FK membership after all planting (the current post-validation pass only checks dup share, group sizes, nulls, and date format \u2014 it never checks FK membership)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_ties` writes integer ranks `r` (1,2,3) into Documents_with_Expenses.Budget_Type_Code, which is a CHAR(15) FK to Ref_Budget_Codes whose domain is ['GV','ORG','SF']. This directly violates the spec rule 'stored values stay in [GV,ORG,SF]' and the generic rule 'char_code: never store query literals ... exact case as listed'. It is the source of the 83 Budget_Type_Code FK violations.",
+     "requested_revision": "Implement ties_for_order_limit on Budget_Type_Code by making at least two rows share an existing enum value (e.g. two rows with 'GV'), not by writing the rank integer. The tie target is about ORDER/LIMIT rank sharing, not about storing the rank number in the column."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_agg_boundary` for ('Documents','Project_ID') returns `[1,2,3]` plus random choices from that set, overwriting the FK-consistent values produced by `_plant_group_sizes`. Projects.Project_ID is generated by the sampler and is not guaranteed to contain 1,2,3 (and even if it did, the overwrite discards the group-size planting). This is the source of the 197 Project_ID FK violations.",
+     "requested_revision": "Compose group_sizes and aggregate_boundary on Documents.Project_ID into a single value list drawn only from the generated Projects.Project_ID pool, with group sizes 1, 2 and >=3 and counts 1,2,3 present. Do not run two independent overwriting planters on the same column; the spec's compose_planting rule requires one value list per column satisfying all applicable targets."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets `pragma foreign_keys = OFF` and inserts rows without validating FK membership ('Foreign keys are validated row-by-row before insert' is claimed in the docstring but no such validation exists in the code). The spec requires 'Writers must enable foreign_keys=ON during insert (or validate row FK membership before insert)'. Because of this, the 280 FK violations were silently written instead of being caught.",
+     "requested_revision": "Either enable `pragma foreign_keys = ON` for the generated-row inserts (with the compact rows copied first, or with deferred checks), or add an explicit pre-insert FK membership check that skips/counts violating rows and reports them. The writer must not silently commit rows that violate FK constraints."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py post-construction validation calls `_verify_duplicate_share`, `_verify_group_sizes`, `_verify_nulls`, `_verify_date_format` but discards their boolean return values and never checks FK membership, aggregate boundaries, or tie ranks. The spec's post_validation rule requires verifying 'FK membership, group sizes, aggregate boundaries, duplicate shares, NULL rule, date format/range, and tie ranks' and reporting unmet targets.",
+     "requested_revision": "Make the post-validation pass actually collect and report unmet targets (including FK membership against the parent PK set, aggregate boundary counts, and tie ranks), and surface them in the CLI summary so failures are visible rather than silent."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's per_column_exceptions for ('Documents_with_Expenses','Budget_Type_Code') lists both group_sizes '1, 2 and >= 3' and ties_for_order_limit ranks [1,2,3] on a 3-value enum column with only 10 rows, while also requiring duplicate_share 20-50% and unmatched_join_rows (parent_rows_without_children). These targets are mutually tension-y on a 3-value enum: group sizes 1,2,>=3 plus 20-50% duplicate share plus at least one parent row without children is hard to satisfy simultaneously and the spec does not say how to compose them. The engineer's integer-rank interpretation is a symptom of this ambiguity.",
+     "requested_revision": "Clarify how group_sizes, ties_for_order_limit, and duplicate_share compose on a small enum FK column: state that ties are realized by repeated enum values (not rank integers), and give an explicit target multiset (e.g. counts per enum value) that satisfies all three simultaneously, or relax one of the targets for this column."
+    },
+    {
+     "agent": "designer",
+     "evidence": "The spec's table_sizes_per_instance gives Documents=15, Statements=2, Documents_with_Expenses=10, Accounts=15, but the execution feedback shows generated rows per instance of Documents ~51, Statements ~19, Documents_with_Expenses ~30, Accounts ~39 (e.g. 'Documents.Document_Date: generated rows: NULL 2 / 51'). The spec says 'table_sizes_per_instance are final target sizes and generated counts must be adjusted to spec_size - compact_size (min 0)', but the program's `choose_table_sizes` uses `base + jitter` as the number of *generated* rows, not the final size minus compact size. The spec text and the program disagree on what the size means.",
+     "requested_revision": "State unambiguously whether table_sizes_per_instance is the final table size (so generated rows = spec_size - compact_size) or the number of generated rows. If final size, the program must subtract the compact row count; if generated rows, remove the 'adjusted to spec_size - compact_size' sentence. Also reconcile the jitter (\u00b11) with the 'final target sizes' wording."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_nulls` for SPEC_ALL_NULL_COLUMNS writes the literal string 'non-null value' into Documents.Document_Description and Documents.Other_Details. The spec's uncertainty note says these columns are 100% NULL in the compact sample and should get n-1 NULLs and one non-NULL row, but does not authorize a placeholder literal; the generic varchar_text rule requires 'short descriptive phrases'. Execution feedback shows Document_Description NULL 48/51 and Other_Details NULL 46/51, i.e. the n-1 rule is not even being applied consistently (it should be exactly n-1 NULLs).",
+     "requested_revision": "Use a descriptive phrase (not the literal 'non-null value') for the single non-NULL row, and enforce exactly n-1 NULLs for these columns as the spec states. Also note the observed NULL counts (48/51, 46/51) do not match n-1, indicating the planting is being overwritten by later steps or the n used differs from the final row count."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_duplicates` picks `n_dup = max(1, int(n*share))` source values and replaces `n_dup` positions, but does not guarantee the resulting distinct count yields a 20-50% duplicate share (replacing a position with a value already at that position, or with a value that is itself later replaced, can leave the share outside range). `_verify_duplicate_share` computes the share but its result is ignored. The spec requires 'verify achieved share after all planting'.",
+     "requested_revision": "After planting, recompute the duplicate share and adjust (add/remove duplicates) until it is within 20-50%, and make the verification result actually gate/report. Do not silently accept out-of-range shares."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py `_plant_group_sizes` for ('Accounts','Statement_ID') uses `parent_pool` from Statements.Statement_ID, but Statements has only 2 rows per instance (spec size 2), so group sizes 1, 2 and >=3 cannot all be realized on Accounts.Statement_ID (max group size is 2). Similarly ('Documents','Document_Type_Code') with 5 enum values and 15 rows can realize >=3, but the interaction with the enum overwrite (the enum pool is re-drawn after group-size planting in the loop order) may discard the group-size structure. The spec requires group sizes 1, 2 and >=3 on these columns.",
+     "requested_revision": "Reconcile the Statements size (2) with the Accounts.Statement_ID group-size target (needs >=3 rows in one group, so Statements must have at least 3 rows, or the target must be relaxed). Also ensure the enum-pool overwrite for Documents.Document_Type_Code does not run after group-size planting and destroy it; compose them into one value list."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's original rows already contain FK violations (the feedback counts 'new_fk_violations', so the 280 are attributed to generated rows, but the writer copies compact rows as-is with foreign_keys=OFF, so pre-existing violations would not be distinguished).",
+    "Whether the 'construction_pairs separated 23 of 129' result reflects genuine value variation or is an artifact of the FK violations (many pairs may be separated only because invalid FK values were written).",
+    "Whether the spec's table_sizes_per_instance semantics (final size vs generated rows) is intended as written; the program and spec text disagree and this affects all size-dependent targets."
+   ]
+  },
+  {
+   "recommendation": "revise",
+   "issues": [
+    {
+     "agent": "engineer",
+     "evidence": "Execution feedback: every one of the 20 instances has new_fk_violations=2 (40 total), specifically 'Documents_with_Expenses.Document_ID -> Documents.Document_ID' (20 rows) and 'Statements.Statement_ID -> Documents.Document_ID' (20 rows). The CLI summary also reports 'FK Documents_with_Expenses.Budget_Type_Code -> Ref_Budget_Codes.Budget_Type_Code: 1 bad values' for all 20 instances. valid=0/20, reasons {new_integrity_failures: 20}.",
+     "requested_revision": "Fix the FK generation so no child FK value falls outside the parent PK set. Root cause: in build_random_instance, Documents is generated with n = max(0, 15 - compact_size). The compact Documents table already has 15 rows, so n=0 and no new Documents PKs are produced; but Statements (spec size 3, compact 0 -> 3 rows) and Documents_with_Expenses (spec size 10, compact 0 -> 10 rows) still draw Document_ID from the Documents PK pool. The pool used is inst['Documents']['Document_ID'] (generated only), which is empty, so fill_foreign_keys_consistently returns [None]*n \u2014 but the writer's _fk_membership_ok only checks non-NULL values, and the actual inserted rows still carry values that are not in the parent set (or the parent set built in writer.py from schema.original_values + instance is inconsistent with what is inserted). Ensure the parent PK pool used for child FK draws includes the compact parent PKs (schema.original_values) when generated parent rows are 0, and that writer.py's parent_sets and the in-memory draw use the same pool. Also fix the Budget_Type_Code bad value: the composed enum plan for Documents_with_Expenses.Budget_Type_Code must only emit values from Ref_Budget_Codes.Budget_Type_Code ('GV','ORG','SF'); the '1 bad value' indicates a value outside that set (likely a rank integer or a value from a different pool) is being written."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "CLI summary unmet_targets shows nearly every specification target unmet in all 20 instances: null_rule for Projects.Project_Details, Documents.Document_Date, Documents.Document_Name, Documents.Document_Description, Documents.Other_Details, Documents_with_Expenses.Document_Details, Statements.Statement_Details; group_sizes for Documents.Document_Type_Code, Documents.Project_ID, Documents_with_Expenses.Budget_Type_Code, Accounts.Statement_ID; agg_boundary Documents.Project_ID; ties Documents_with_Expenses.Budget_Type_Code; dup_share Accounts.Account_Details. rows_added shows Documents=0, Accounts=0, Projects=0, Ref_*=0; only Statements and Documents_with_Expenses got rows. rows_skipped Accounts=139.",
+     "requested_revision": "The specification's table_sizes_per_instance are FINAL sizes, and the compact database already contains Documents=15, Accounts=15, Projects=5, Ref_*=5/3. With generated = max(0, spec - compact), Documents and Accounts generate 0 rows, so all planting on those tables (group sizes, agg boundary, NULLs, dup shares) is vacuous and reported unmet. Either (a) the specification must raise the final sizes above the compact sizes so that generated rows exist for every table that carries targets (e.g. Documents >= 16, Accounts >= 16, Projects >= 6), or (b) the engineer must apply the planting to the compact rows as well (the spec says compact rows are copied unchanged, so this requires a spec change). As written, the spec and program are mutually inconsistent: the spec demands targets on tables that the size rule leaves with zero generated rows. Also fix the Accounts rows_skipped=139: Accounts rows are being rejected (likely FK to Statements.Statement_ID or NOT NULL), which must be diagnosed and eliminated."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification table_sizes_per_instance: Documents=15, Accounts=15, Projects=5, Ref_Document_Types=5, Ref_Budget_Codes=3. Compact sizes (from execution: Documents=15, Accounts=15, Projects=5, Ref_*=5/3) equal or exceed these, so generated rows = 0 for those tables. Yet the spec places group_sizes, agg_boundary, NULL, and dup_share targets on Documents, Accounts, Projects, and Ref_* columns.",
+     "requested_revision": "Revise table_sizes_per_instance so that every table carrying a target has at least one generated row (final size > compact size), or explicitly state that targets are evaluated over compact+generated rows and adjust the program accordingly. The current spec is internally inconsistent with the 'generated = spec - compact' size semantics."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_group_sizes / _plant_agg_boundary / _plant_duplicates / _plant_nulls are only invoked inside the loop 'for t in order: ... if n == 0: continue', where n = len(inst[t][first_column]). When generated rows are 0 (Documents, Accounts, Projects, Ref_*), none of the planting runs, so the spec targets on those tables are silently skipped and only reported as unmet. Additionally, _plant_duplicates for Accounts.Account_Details is applied before _plant_numeric_amount, and _plant_numeric_amount overwrites every non-NULL value with a fresh random number, destroying the planted duplicate share \u2014 this is why dup_share Accounts.Account_Details is unmet even when rows exist.",
+     "requested_revision": "Apply planting to the full final column (compact + generated) where the spec requires it, or ensure generated rows exist. Reorder so that _plant_numeric_amount runs before _plant_duplicates (or make _plant_duplicates operate on the numeric values) so the duplicate share survives. Ensure the 'compose_planting' rule (one value list per column, no later step overwriting earlier ones) is actually honored \u2014 currently numeric planting overwrites duplicate planting on Accounts.Account_Details."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "writer.py sets 'pragma foreign_keys = OFF' during insert and relies on _fk_membership_ok against parent_sets built from schema.original_values + instance. But the execution feedback shows 40 FK violations committed, so the pre-insert validation is not catching the bad values. The spec's fk_integrity rule requires 'writers must enable foreign_keys=ON during insert or validate row FK membership before insert; each instance must end with new_fk_violations == 0'.",
+     "requested_revision": "Enable 'pragma foreign_keys = ON' during insert (after the backup) so SQLite enforces FK integrity, and/or fix _fk_membership_ok so it validates against the actual parent PK set present in the target database (compact + generated). The current validation passes rows that violate FKs, as proven by the 40 committed violations."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py SPEC_UNMATCHED_JOINS includes entries like ('Accounts','Statement_ID'): [('Statements','Statement_ID'), ('Documents','Document_ID')] and ('Statements','Statement_ID'): [('Accounts','Statement_ID'), ('Documents','Document_ID')], but the actual schema FK for Accounts.Statement_ID is only to Statements.Statement_ID, and Statements.Statement_ID is to Documents.Document_ID. The extra ('Documents','Document_ID') entries are not real FKs and are not used by any planting code, so they are dead/incorrect metadata. More importantly, the unmatched-join targets (parent_rows_without_children) are never actually planted: no code leaves a parent PK out of the child FK draw.",
+     "requested_revision": "Remove the incorrect SPEC_UNMATCHED_JOINS entries and implement the parent_rows_without_children planting: when drawing child FKs, deliberately exclude at least one parent PK from the draw so a parent row has no child. Currently the unmatched_join_rows targets are not realized at all."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_ties for Documents_with_Expenses.Budget_Type_Code picks two random positions and sets them to a random existing value, but this runs before _plant_duplicates and _plant_nulls, and the composed group-size plan (GV x5, ORG x1, SF x4) already produces ties. The execution feedback reports 'ties Documents_with_Expenses.Budget_Type_Code' unmet in all 20 instances, indicating the tie planting is not effective (likely because the column has 0 generated rows in some path, or the value pool is empty).",
+     "requested_revision": "Ensure the tie planting operates on a non-empty value pool and is verified after all other planting on that column. The current order and empty-pool handling cause the tie target to be unmet."
+    },
+    {
+     "agent": "designer",
+     "evidence": "Specification uncertainty note: 'Documents_with_Expenses.Budget_Type_Code single composed plan (10 rows): GV x5, ORG x1, SF x4 gives group sizes 1 and >=3, a 20-50% duplicate share if achieved, and one repeated tie; avoid using all three enum values if Ref_Budget_Codes unmatched_join needs a parent without child.' This plan uses all three enum values (GV, ORG, SF), contradicting the instruction to avoid using all three if Ref_Budget_Codes needs a parent without child. Ref_Budget_Codes has 3 rows and the unmatched_join target requires >=1 parent without child, so at most 2 enum values may be used by Documents_with_Expenses.",
+     "requested_revision": "Revise the composed plan to use at most 2 of the 3 budget codes (e.g. GV x6, SF x4) so that at least one Ref_Budget_Codes row has no child, satisfying the unmatched_join target while still achieving group sizes 1, 2, >=3 and a 20-50% duplicate share."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_nulls for non-all-null columns plants at least one NULL and then additional NULLs based on the compact share, but for columns with 0 generated rows (Documents.Document_Date, Documents.Document_Name, Documents.Document_Description, Documents.Other_Details, Projects.Project_Details) the planting never runs, so the NULL rule is unmet. For Statements.Statement_Details and Documents_with_Expenses.Document_Details, the execution feedback shows 'generated rows: NULL 20 / 20' \u2014 i.e. all generated rows are NULL, violating the rule that each instance must contain both NULL and non-NULL generated rows.",
+     "requested_revision": "Fix _plant_nulls so that for every nullable column with generated rows, at least one row is NULL and at least one is non-NULL. The current code for Statements.Statement_Details and Documents_with_Expenses.Document_Details produces 100% NULL, which violates the NULL rule. Also ensure nullable columns on tables with 0 generated rows are handled (see the size inconsistency issue)."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "instance.py _plant_date_range and _plant_numeric_amount are applied after _plant_duplicates and _plant_nulls, and _plant_numeric_amount overwrites all non-NULL values with fresh random numbers, destroying any planted duplicate share and any planted NULL pattern consistency. The spec's compose_planting rule requires a single composed value list per column with no later overwriting.",
+     "requested_revision": "Reorder planting so that type-specific value generation (date range, numeric amount) happens first, then duplicate/NULL/tie planting, and verify the final column satisfies all targets. Do not let _plant_numeric_amount overwrite values planted by _plant_duplicates."
+    },
+    {
+     "agent": "engineer",
+     "evidence": "The execution feedback shows construction_pairs separated=4 out of 129 eligible, and previous rounds all recommended 'revise' with valid=0. The program reports n_ok=20, n_fail=0, errors={} but valid=0/20 due to new_integrity_failures. The CLI summary surfaces unmet targets but the program still writes instances with FK violations, so the post_validation rule ('Failures must be surfaced in the CLI summary') is only partially met \u2014 the FK violations are surfaced as unmet targets but the instances are still written and counted as ok.",
+     "requested_revision": "Do not count an instance as ok when it has FK violations or other integrity failures. The writer should either skip the violating rows (and report them) or fail the unit. Currently rows with bad FKs are committed, producing invalid instances."
+    }
+   ],
+   "unresolved_checks": [
+    "Whether the compact database's Documents table truly has 15 rows (making generated Documents=0) \u2014 inferred from rows_added Documents=0 and the spec size 15; needs confirmation from the original DB.",
+    "Whether the '1 bad value' for Documents_with_Expenses.Budget_Type_Code is a rank integer, a lowercase literal, or a value from a different pool \u2014 the exact bad value is not shown in the feedback.",
+    "Whether the Accounts rows_skipped=139 are due to FK to Statements.Statement_ID, NOT NULL, or PK collision \u2014 not diagnosed in the feedback.",
+    "Whether the intended value variation (construction_pairs separated=4/129) is sufficient \u2014 a low separation alone does not prove a generation error, but combined with the integrity failures it indicates the planting is not effective."
+   ]
+  }
+ ]
 }
